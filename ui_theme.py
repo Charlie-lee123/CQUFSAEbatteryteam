@@ -1,0 +1,863 @@
+"""主题系统：亮/暗两套 token、跟随 Windows 主题、全局样式表。
+
+设计方向 —— 黑白 + 小米风格 + 车队规范
+- 界面严格黑白灰，不引入任何色相。所以在黑白系统里「强调」不是靠某个色相，
+  而是靠反白：主按钮在浅色主题下是墨色实底、深色主题下是近白实底。
+- 版式走小米那套：大圆角（卡片 20、控件 12、按钮药丸）、留白给足、
+  靠柔和阴影而不是重描边分层、字重层级分明。
+- 颜色 token 用名字取值（token("ink")），不用模块级常量。因为要支持两套主题，
+  写死的常量没法跟着主题走；控件在绘制时取值，换主题只需重设 token 再重绘。
+- 字体栈把 MiSans 放前面（装了就用），退到 Segoe UI Variable 与雅黑。
+  数字用 Bahnschrift —— 这是车队 VIS 规范里写明的「编号和参数使用 Bahnschrift」。
+"""
+
+from __future__ import annotations
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QFont
+
+# ------------------------------------------------------------------ token
+
+LIGHT = {
+    # 页面**纯白**。早先这里是一道对角渐变（bg_hi → bg_lo，#AEB8C4 那一端会把
+    # 右下角压成一片脏灰，用户明确否掉了）。留着三个 token 是为了让取值方不用改。
+    "bg": "#FFFFFF",              # 页面底色
+    "bg_hi": "#FFFFFF",           # 背景亮端
+    "bg_lo": "#FFFFFF",           # 背景暗端 —— 与亮端同值 = 没有渐变
+    "surface": "#FFFFFF",         # 卡片
+    "surface_2": "#F7F8FA",       # 次级面（输入框、下拉框底）
+    "surface_hover": "#ECEFF3",
+    "ink": "#111214",             # 主文字（近黑）
+    "ink_2": "#5F6368",           # 次要文字
+    "ink_3": "#8A9099",           # 弱化文字 / 占位
+    "ink_disabled": "#BFC4CB",
+    "line": "#E4E7EB",            # 描边与分隔
+    "line_strong": "#D2D7DD",
+    "fill_primary": "#111214",    # 主按钮底：黑白系统里强调靠反白
+    "fill_primary_hover": "#2C2F33",
+    "on_primary": "#FFFFFF",
+    "sel": "#111214",
+    "on_sel": "#FFFFFF",
+    "shadow": "#0B0F14",
+    "pulse": "#111214",
+    "rim": "#FFFFFF",             # 玻璃上缘兜住的光（见 ui_surface 的描边）
+    "volt_high": "#C42B1C",       # 电压超上限（红）—— 浅底用深红才够对比
+    "volt_low": "#0E7B3D",        # 电压低于下限（绿）
+    "bms_error": "#A16207",       # BMS ERROR（黄/琥珀）—— 纯黄在浅底看不清
+    "temp_warn": "#A16207",       # 温度越界（黄）—— 与 BMS 同一支黄：都是"异常"这一档
+    "alert_red": "#C42B1C",       # 界面上的警示红（「定位异常」那枚三角感叹号）
+}
+
+DARK = {
+    # 页面也是**纯色**（用户："背景不要渐变，要纯色"）。早先这里是 bg_hi #2E333B
+    # 到 bg_lo #050506 的对角渐变，现在统一填 bg；两个旧 token 留着同值，
+    # 免得取值方还要为"哪个主题有没有两端颜色"分情况。
+    "bg": "#0D0D0F",
+    "bg_hi": "#0D0D0F",
+    "bg_lo": "#0D0D0F",
+    "surface": "#1A1B1E",
+    "surface_2": "#141518",
+    "surface_hover": "#26282C",
+    "ink": "#F2F3F5",
+    "ink_2": "#9CA1A8",
+    "ink_3": "#6E737A",
+    "ink_disabled": "#4A4E54",
+    "line": "#272A2E",
+    "line_strong": "#383C42",
+    "fill_primary": "#F2F3F5",
+    "fill_primary_hover": "#FFFFFF",
+    "on_primary": "#101113",
+    "sel": "#F2F3F5",
+    "on_sel": "#101113",
+    "shadow": "#000000",
+    "pulse": "#F2F3F5",
+    "rim": "#FFFFFF",             # 玻璃上缘兜住的光（见 ui_surface 的描边）
+    "volt_high": "#FF6B6B",       # 电压超上限（红）
+    "volt_low": "#51CF66",        # 电压低于下限（绿）
+    "bms_error": "#FACC15",       # BMS ERROR（黄）
+    "temp_warn": "#FACC15",       # 温度越界（黄）
+    "alert_red": "#FF6B6B",       # 界面上的警示红（「定位异常」那枚三角感叹号）
+}
+
+_PALETTES = {"light": LIGHT, "dark": DARK}
+_SCHEME = "dark"
+_TOKENS = dict(DARK)
+
+# 阴影在深色主题下几乎看不见，也不该看见；浅色主题才是它的主场
+SHADOW_ALPHA = {"light": 30, "dark": 0}
+
+# ---------------------------------------------------------------- 毛玻璃强度
+#
+# 毛玻璃效果由两个量共同决定，**必须一起调**（这也是设置面板那根滑杆真正在动的东西）：
+# - 面板面色不透明度：玻璃能透出多少底色；
+# - 表面颗粒幅度：玻璃被打毛到什么程度。
+# 只调不透明度 —— 透出来的是干净底色，那叫"透明"不叫"磨砂"；
+# 只调颗粒 —— 玻璃仍是不透明白底，粉感像贴了张贴纸。
+# 所以强度 t(0~1) 同时插值这两条曲线，滑杆向右 = 越透 + 越毛。
+#
+# （早先这里还有第三个量：背景的高斯模糊半径。背景改成纯色之后它已经没有意义 ——
+#   纯色糊多少遍还是纯色 —— 所以连同背景虚化那一套一起删掉了。）
+GLASS_ALPHA_RANGE = {"light": (210, 118), "dark": (206, 116)}
+
+DEFAULT_GLASS = 0                 # 默认强度（0~100）。用户："暂时不要毛玻璃了，初始设成 0"
+
+# 历史上出现过的**默认值**（68 是更早的，100 是上一版）。
+# 之所以要留着它们：配置里的 glass 无论用户动没动过滑杆都会被写盘（关窗时保存当前值），
+# 所以"值等于旧默认"只说明它可能是从没被选过的 —— 这种配置迁到当前默认。
+# 但用户**明确选过**的值一律尊重，哪怕是 100 这个旧默认值本身；
+# "选过没有"由一个单独的标记记录（glass_chosen），见 MainWindow._restore_settings。
+LEGACY_GLASS = (68, 100)
+
+_GLASS = DEFAULT_GLASS
+
+
+def set_glass_strength(value: int) -> None:
+    global _GLASS
+    _GLASS = max(0, min(100, int(value)))
+
+
+def glass_strength() -> int:
+    return _GLASS
+
+
+def _glass_t() -> float:
+    return _GLASS / 100.0
+
+
+def glass_alpha() -> int:
+    """面板面色不透明度：强度越高越透，背景才透得上来。"""
+    low, high = GLASS_ALPHA_RANGE.get(_SCHEME, GLASS_ALPHA_RANGE["dark"])
+    return int(round(low + _glass_t() * (high - low)))
+
+
+# ---------------------------------------------------------------- 磨砂颗粒
+#
+# 浅色主题的页面是**纯白**的，背景里没有任何中频细节可以模糊 ——
+# 把一张纯白图糊上十遍还是纯白，光靠"虚化背景"这条路在浅色主题下已经走不通了。
+#
+# 所以浅色主题的磨砂改由**玻璃自身**承担：面板上铺一层**糊过的**随机颗粒（雾面）。
+# 这不是退而求其次 —— 磨砂玻璃真正的物理特征本来就是表面微结构把透过的光打散，
+# 一块酸蚀毛玻璃贴在白墙上，照样看得出"毛"，靠的正是这层颗粒而不是身后有什么。
+#
+# **两个主题现在都铺颗粒**：深色主题的页面也改成纯色之后，它身后不再有明暗起伏可糊，
+# 和浅色一样只能靠玻璃自身的颗粒承载磨砂感。颗粒方向按主题反着来 ——
+# 浅色是暗颗粒压在亮面上，深色是亮颗粒压在暗面上，两边都是在"把面打毛"。
+#
+# 三个参数：
+#   amp  —— 逐像素随机 alpha 的上限（按强度滑杆 0~1 插值）。
+#   blur —— **生成后整体模糊的半径（逻辑像素）**。这一项不是可选项，是"玻璃还是纸"的分界。
+#   tile —— 贴图边长（逻辑像素）。
+#
+# ⚠️ **blur 必须 > 0**。逐像素的硬噪点不管幅度多低，落在屏幕上都被读成**砂纸 / 粗纸**的
+# 纹理（用户原话："是要毛玻璃效果而不是粗纸啊"）—— 因为真磨砂玻璃的散射结构远小于一个
+# 像素，眼睛看到的是**雾**，不是砂砾。糊一道之后相邻像素被平均成 2~3px 的柔和起伏，
+# 那个"雾"才出得来。
+# 模糊**不会削掉面板的存在感**：它保均值、只削方差。原来靠"平均变暗"撑起来的
+# 「卡片比页面深一档」原样保留，被削掉的只是刺眼的颗粒对比度。
+#
+# 定档依据（都是 1:1 物理像素目视定的）：blur 再小（1.0）仍然看得出砂砾；2.0 才干净。
+# 幅度反过来要**提上去**才有"毛"可看 —— 硬噪点时代 amp 26 就够刺眼，糊过之后同样
+# 幅度只剩一层几乎看不见的平色，所以提到 50（面板平均密度与改动前基本一致：
+# 浅色卡面 231 → 229，深色 30 → 38）。两个主题同档：面色明度差都在 200 上下，
+# 同样的额外不透明度看着是同一个粗细。
+FROST_GRAIN = {
+    "light": {"color": "#45505E", "amp": (0, 50), "blur": 2.0, "tile": 128},
+    "dark": {"color": "#FFFFFF", "amp": (0, 50), "blur": 2.0, "tile": 128},
+}
+
+
+def frost_gain() -> float:
+    """磨砂颗粒的铺陈强度 0~1。返回 0 表示该主题不铺颗粒。
+
+    颗粒贴图只按**最大幅度**生成一张，幅度靠这里的返回值去 ``setOpacity()`` 缩放。
+    """
+    spec = FROST_GRAIN.get(_SCHEME, FROST_GRAIN["dark"])
+    top = spec["amp"][1]
+    if top <= 0:
+        return 0.0
+    low, _ = spec["amp"]
+    return max(0.0, min(1.0, (low + _glass_t() * (top - low)) / top))
+
+# 品牌页头。VIS 规范：横排中英文组合最小屏幕宽度 560px，所以页头高度由它按比例
+# 算出来（约 132px），不是随便定的。
+LOCKUP_MIN_W = 560.0
+HEADER_PAD = 16
+
+# 拨动开关：开启时蓝色轨道 + 白色圆点，浅色和深色主题**完全一致**（用户指定）。
+# 这是界面里唯一的功能性彩色，不参与黑白主题那套明暗互换的规则 ——
+# 开关是状态指示，用固定色比"深色底反白"更容易一眼读懂。
+SWITCH_ON = "#3482FF"
+SWITCH_KNOB = "#FFFFFF"
+# 关闭态的轨道仍然跟着主题走（浅色浅灰 / 深色深灰），否则分不出开还是关
+SWITCH_OFF = {"light": "#D5D9DE", "dark": "#3A3E44"}
+
+# ------------------------------------------------------------------ 尺寸
+
+CARD_RADIUS = 26
+CONTROL_RADIUS = 16
+PILL_RADIUS = 999          # 药丸按钮由高度算出来，见 ui_controls
+CARD_PAD = 18
+# 卡片间距留得比较足，给圆角和阴影喘息的空间，也更接近小米那种疏朗的密度
+GAP = 18
+TITLE_H = 30
+SHADOW_PAD = 6             # 卡片四周为阴影预留的空隙
+SHADOW_BLUR = 18
+
+# 自绘标题栏（见 ui_brand.CaptionBar）：窗口改成**无边框**之后系统标题栏没了，
+# 最小化/最大化还原/关闭这三颗由我们自己画。条高 34、键 46×30 —— 比 Windows
+# 原生的 32 高一点点，给悬停色块上下留 2px 呼吸。
+CAPTION_H = 34
+CAPTION_BTN_W = 46
+CAPTION_BTN_H = 30
+CAPTION_INSET = 6          # 关闭键右边缘离标题栏右端留一点，别贴着窗口边
+CAPTION_GAP = 2            # 三颗键之间
+
+# 字体族：MiSans 装了就优先（小米自家字体），否则退到 Windows 的系统 UI 字体
+_UI_FAMILIES = ["MiSans", "MiSans VF", "Segoe UI Variable Display", "Segoe UI",
+                "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "sans-serif"]
+# 车队 VIS 规范：编号和参数使用 Bahnschrift
+_NUM_FAMILIES = ["Bahnschrift", "Segoe UI Variable Display", "Segoe UI",
+                 "Microsoft YaHei UI", "sans-serif"]
+_MONO_FAMILIES = ["Cascadia Mono", "Consolas", "JetBrains Mono", "DejaVu Sans Mono",
+                  "monospace"]
+
+
+def ui_font(size: float = 12.5, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
+    font = QFont()
+    font.setFamilies(_UI_FAMILIES)
+    font.setPointSizeF(size)
+    font.setWeight(weight)
+    return font
+
+
+def num_font(size: float = 12.5, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
+    """数字与参数读值。规范指定 Bahnschrift。"""
+    font = QFont()
+    font.setFamilies(_NUM_FAMILIES)
+    font.setPointSizeF(size)
+    font.setWeight(weight)
+    return font
+
+
+def mono_font(size: float = 10.5) -> QFont:
+    font = QFont()
+    font.setFamilies(_MONO_FAMILIES)
+    font.setPointSizeF(size)
+    return font
+
+
+# --------------------------------------------------------------- 图标字体
+
+# Windows 自带的图标字体：Win11 用 Segoe Fluent Icons，Win10 退到 Segoe MDL2 Assets。
+# 用系统自带图标字体，字形天然就是「Windows 那套」，既不用自己画也不用带素材进来。
+_ICON_FAMILIES = ["Segoe Fluent Icons", "Segoe MDL2 Assets"]
+
+
+def icon_font(pixel_size: int = 15) -> QFont:
+    font = QFont()
+    font.setFamilies(_ICON_FAMILIES)
+    font.setPixelSize(pixel_size)
+    return font
+
+
+# 图标码位。**这几个都是渲染出来逐个看过确认的**，别凭记忆改 ——
+# 记错一个码位出来的就是个毫不相干的符号，而且在界面上看着"像个图标"，很容易漏掉。
+GLYPH_REFRESH = "\uE72C"          # 环形箭头
+GLYPH_CLEAR = "\uE74D"            # 垃圾桶
+GLYPH_SAVE = "\uE74E"             # 软盘
+GLYPH_EXPAND = "\uE740"           # 箭头朝外（展开）
+GLYPH_RESTORE = "\uE73F"          # 箭头朝内（还原）
+GLYPH_SEND = "\uE724"             # 纸飞机
+GLYPH_SETTINGS = "\uE713"         # 齿轮
+GLYPH_POWER = "\uE7E8"            # 电源
+GLYPH_COLLAPSE = "\uE70D"         # 向下小箭头
+GLYPH_EXPAND_CHEVRON = "\uE70E"   # 向上小箭头
+# 上下 chevron 的通用名。搜索条拿它当"上一个 / 下一个"，比借 expand/collapse 那对名字好读
+GLYPH_CHEVRON_DOWN = GLYPH_COLLAPSE
+GLYPH_CHEVRON_UP = GLYPH_EXPAND_CHEVRON
+GLYPH_SEARCH = "\uE721"           # 放大镜
+GLYPH_CLOSE = "\uE711"            # 关闭（叉）
+GLYPH_PAUSE = "\uE769"            # 暂停（两竖）
+GLYPH_PLAY = "\uE768"             # 播放（三角）
+GLYPH_COPY = "\uE8C8"             # 复制（两张纸）
+
+# 窗口标题栏三键的字形。用系统那套 Chrome* 码位而不是上面几个通用图标：
+# 这几个就是 Windows 自己画在标题栏上的形状（细横线 / 方框 / 叠方框 / 细叉），
+# 和用户在系统窗口上看到的完全一致 —— 自绘标题栏最怕"看着不像系统键"。
+GLYPH_WIN_MIN = "\uE921"          # 最小化（一条横线）
+GLYPH_WIN_MAX = "\uE922"          # 最大化（方框）
+GLYPH_WIN_RESTORE = "\uE923"      # 还原（两个叠着的方框）
+GLYPH_WIN_CLOSE = "\uE8BB"        # 关闭（细叉）
+
+# 搜索命中的底色。界面是严格黑白灰，所以不做"搜索黄"那种彩色标记 ——
+# 两档灰就够分层：全部命中一档淡的，当前命中一档重的。
+MATCH_FILL = {"light": "#D2D9E1", "dark": "#343A43"}
+MATCH_FILL_CURRENT = {"light": "#A7B3C1", "dark": "#4D5764"}
+
+
+def match_fill(current: bool = False) -> QColor:
+    table = MATCH_FILL_CURRENT if current else MATCH_FILL
+    return QColor(table.get(_SCHEME, table["dark"]))
+
+
+# 接收区里"时间戳"和"序号"的着色（用户指定：序号蓝、时间戳紫，见 ui_highlight）。
+#
+# 界面本来是严格黑白灰、唯一的功能色是开关那支蓝（SWITCH_ON）。序号沿用**同一族**
+# 蓝，让"彩色 = 结构与状态提示"这条规矩保持一致：浅色底用偏深的蓝才够对比度
+# （#3482FF 落在近白底上只有 3.6:1，读小字偏吃力），深色底用偏亮的蓝才不糊。
+# 时间戳用户点名要紫 —— 和序号蓝同档亮度，一个冷一个暖，扫一眼就能分开"什么时候"
+# 和"第几个点"。
+RX_ACCENT = {"light": "#1A6BE0", "dark": "#5C9DFF"}
+STAMP_ACCENT = {"light": "#7C3AED", "dark": "#C084FC"}
+
+
+def rx_accent() -> QColor:
+    return QColor(RX_ACCENT.get(_SCHEME, RX_ACCENT["dark"]))
+
+
+def stamp_accent() -> QColor:
+    return QColor(STAMP_ACCENT.get(_SCHEME, STAMP_ACCENT["dark"]))
+
+
+# ------------------------------------------------------------------ 取值
+
+def current_scheme() -> str:
+    return _SCHEME
+
+
+def set_scheme(scheme: str) -> None:
+    """切换主题。控件在绘制时读 token，所以只要重绘就会跟上。"""
+    global _SCHEME
+    _SCHEME = scheme if scheme in _PALETTES else "dark"
+    _TOKENS.clear()
+    _TOKENS.update(_PALETTES[_SCHEME])
+
+
+def token(name: str) -> str:
+    try:
+        return _TOKENS[name]
+    except KeyError:
+        raise KeyError(f"主题里没有这个 token：{name!r}") from None
+
+
+def qcolor(name: str, alpha: int | None = None) -> QColor:
+    result = QColor(token(name))
+    if alpha is not None:
+        result.setAlpha(alpha)
+    return result
+
+
+def scheme_qcolor(name: str, scheme: str, alpha: int | None = None) -> QColor:
+    """按**指定主题**取色，不动全局 token。
+
+    给"绘制时主题由参数决定"的路径用（页面背景就是这样：换个主题要立刻按新主题重绘，
+    而自动重绘的时序里可能还没轮到全局 token 切换）。
+    """
+    palette = _PALETTES.get(scheme, DARK)
+    try:
+        result = QColor(palette[name])
+    except KeyError:
+        raise KeyError(f"主题里没有这个 token：{name!r}") from None
+    if alpha is not None:
+        result.setAlpha(alpha)
+    return result
+
+
+def rgb(name: str) -> str:
+    """给 QSS 里拼 rgba() 用，因为 QSS 不吃 QColor。"""
+    c = QColor(token(name))
+    return f"{c.red()},{c.green()},{c.blue()}"
+
+
+def shadow_alpha() -> int:
+    return SHADOW_ALPHA.get(_SCHEME, 0)
+
+
+def switch_off_color() -> QColor:
+    return QColor(SWITCH_OFF.get(_SCHEME, SWITCH_OFF["dark"]))
+
+
+# 文本区底色。不透明是用户明确要求的：输入和输出的地方不要高斯模糊 ——
+# 日志要的是对比度和稳定，让背景纹理透上来只会干扰读数字。
+EDITOR_RGBA = {"light": "#F6F7F9", "dark": "#131417"}
+
+
+def editor_rgba() -> str:
+    return EDITOR_RGBA.get(_SCHEME, EDITOR_RGBA["dark"])
+
+
+def mix(first: QColor, second: QColor, t: float) -> QColor:
+    t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+    return QColor(
+        round(first.red() + (second.red() - first.red()) * t),
+        round(first.green() + (second.green() - first.green()) * t),
+        round(first.blue() + (second.blue() - first.blue()) * t),
+        round(first.alpha() + (second.alpha() - first.alpha()) * t),
+    )
+
+
+def detect_system_scheme() -> str:
+    """系统当前是亮色还是暗色。
+
+    优先用 Qt 的 colorScheme（6.5+ 支持，还能监听变化）；拿不到时退到注册表。
+    """
+    try:
+        from PySide6.QtGui import QGuiApplication
+
+        hints = QGuiApplication.styleHints()
+        scheme = hints.colorScheme()
+        if scheme == Qt.ColorScheme.Light:
+            return "light"
+        if scheme == Qt.ColorScheme.Dark:
+            return "dark"
+    except Exception:
+        pass
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+            return "light" if winreg.QueryValueEx(key, "AppsUseLightTheme")[0] else "dark"
+    except Exception:
+        return "dark"
+
+
+# ------------------------------------------------------------------ 样式表
+
+_QSS = """
+QWidget {
+    color: @ink@;
+}
+
+/* ---- 悬停提示 ----
+   字号必须在这里写死。tooltip 默认取应用字体（入口设的是 12.5pt ≈ 16.7px），
+   对一行中文提示来说太大了 —— 悬停这种瞬时信息不该比它旁边的正文还抢眼。
+   12px 与 Windows 系统提示同档。 */
+QToolTip {
+    background: @surface@;
+    color: @ink@;
+    border: 1px solid @line@;
+    border-radius: 8px;
+    padding: 5px 9px;
+    font-size: 12px;
+}
+
+QLabel {
+    background: transparent;
+    color: @ink_2@;
+}
+
+QLabel#title {
+    color: @ink@;
+}
+
+/* ---- 文本区 ---- */
+QPlainTextEdit {
+    background: @editor@;
+    border: 1px solid @line@;
+    border-radius: @CONTROL_RADIUS@px;
+    padding: 10px 12px;
+    color: @ink@;
+    selection-background-color: rgba(@sel_rgb@,0.18);
+    selection-color: @ink@;
+}
+
+QPlainTextEdit:focus {
+    border: 1px solid @line_strong@;
+}
+
+/* 发送输入框：上下内边距**故意不相等** —— 为的是让第一行文字在框里垂直居中。
+   一行的高度是照字体度量排出来的，而中文字形在这个行盒里天生偏上：本机实测
+   （Cascadia Mono + 中文回退字体）行盒内墨迹上沿 1.5px、下沿 14.8px，于是
+   "上边框到字"比"字到下边框"少 8px（实测 15.5 : 23.5），看着就是字贴着上面。
+   把原来的 10/10 拆成 14/6 正好补掉这 8px。
+   ⚠️ **上下之和仍然是 20**，所以 main_window.TX_EDITOR_CHROME 不用跟着改；
+   改这两个数就得同时改它，否则输入框的最小高度会算错。 */
+QPlainTextEdit#txEditor {
+    padding: 14px 12px 6px 12px;
+}
+
+/* ---- 接收区搜索框 ----
+   按 objectName 限定，不用裸 QLineEdit：串口名和波特率的下拉框是可编辑的，
+   里面各藏着一个 QLineEdit，裸规则会连它们一起改掉。 */
+QLineEdit#searchEdit {
+    background: @surface_2@;
+    border: 1px solid @line@;
+    border-radius: @CONTROL_RADIUS@px;
+    padding: 5px 10px;
+    color: @ink@;
+    selection-background-color: rgba(@sel_rgb@,0.18);
+    selection-color: @ink@;
+}
+
+QLineEdit#searchEdit:hover {
+    background: @surface_hover@;
+}
+
+QLineEdit#searchEdit:focus {
+    border: 1px solid @line_strong@;
+}
+
+QLabel#searchCount {
+    color: @ink_3@;
+}
+
+/* ---- 接收区右上角的实时时钟 ----
+   放在卡片标题栏右侧，属于"参数"性质，用 Bahnschrift。 */
+QLabel#rxClock {
+    color: @ink_2@;
+}
+
+/* ---- 下拉框 / 数字框：药丸感，靠圆角而不是描边 ----
+   min/max 一起写死：QSpinBox 自带的 sizeHint 比下拉框高 4px（它把上下步进按钮
+   也算进去了），两者并排放在"串口配置"表单里会一高一矮。把高度夹死成同一档，
+   行高就齐了。 */
+QComboBox, QSpinBox {
+    background: @surface_2@;
+    border: 1px solid @line@;
+    border-radius: @CONTROL_RADIUS@px;
+    /* 上下必须**对称**：QLineEdit 会把单行文字在内容区里垂直居中，对称的
+       内边距在任何缩放下都居中。之前试过 4/8 的不对称"视觉修正"—— 那是按
+       2x 缩放标定的，缩放一变（1.43x）就过校正成明显偏上（用户点名不对称）。
+       ⚠️ 上下之和必须仍是 12 —— 框高 = min-height 20 + 12 + 边框 2 = 34，
+       改了这个和就得连 min/max-height 一起动。 */
+    padding: 6px 10px 6px 12px;
+    min-height: 20px;
+    max-height: 20px;
+    color: @ink@;
+}
+
+QComboBox:hover, QSpinBox:hover {
+    background: @surface_hover@;
+}
+
+QComboBox:focus, QSpinBox:focus {
+    border: 1px solid @line_strong@;
+}
+
+QComboBox:disabled, QSpinBox:disabled {
+    color: @ink_disabled@;
+    background: transparent;
+    border-color: @line@;
+}
+
+QComboBox::drop-down {
+    border: none;
+    width: 24px;
+}
+
+/* 箭头不由 QSS 画：QSS 的三角靠"零尺寸 + 彩色边框"拼，Fusion 下常被挤成一个小方块。
+   现在改为自绘 chevron（ChevronComboBox / ChevronSpinBox），字形取自系统图标字体，
+   与界面其它图标同源，主题跟随、高 DPI 下也锐利。这里只把原生箭头彻底关掉。 */
+QComboBox::down-arrow {
+    image: none;
+    width: 0;
+    height: 0;
+    border: none;
+}
+
+QComboBox::down-arrow:disabled {
+    image: none;
+}
+
+/* 弹出列表：容器窗口已被 ChevronComboBox 改成无边框 + 半透明（见 showPopup），
+   这里的圆角才真正可见。margin 给圆角留出呼吸空间——半透明的四角透出底色，
+   不会出现"圆角贴着直角窗边"的裁切感。item 自带圆角 + 悬停底色，选中态跟随。 */
+QComboBox QAbstractItemView {
+    background: @surface@;
+    border: 1px solid @line@;
+    border-radius: 12px;
+    padding: 6px;
+    margin: 10px 12px;
+    color: @ink@;
+    outline: none;
+    selection-background-color: rgba(@sel_rgb@,0.12);
+    selection-color: @ink@;
+}
+
+QComboBox QAbstractItemView::item {
+    border-radius: 8px;
+    padding: 4px 8px;
+    margin: 2px 4px;
+    min-height: 20px;
+}
+
+QComboBox QAbstractItemView::item:hover {
+    background: rgba(@sel_rgb@,0.12);
+}
+
+QComboBox QAbstractItemView::item:selected {
+    background: rgba(@sel_rgb@,0.12);
+}
+
+QSpinBox::up-button, QSpinBox::down-button {
+    background: transparent;
+    border: none;
+    width: 22px;
+}
+
+/* 同 QComboBox：原生箭头关掉，改由 ChevronSpinBox 自绘 chevron */
+QSpinBox::up-arrow, QSpinBox::down-arrow {
+    image: none;
+    width: 0;
+    height: 0;
+    border: none;
+}
+
+/* ---- 滑杆：设置面板里的毛玻璃强度（无级） ---- */
+QSlider::groove:horizontal {
+    height: 4px;
+    background: @line_strong@;
+    border-radius: 2px;
+}
+
+QSlider::sub-page:horizontal {
+    height: 4px;
+    background: @ink@;
+    border-radius: 2px;
+}
+
+QSlider::add-page:horizontal {
+    height: 4px;
+    background: @line_strong@;
+    border-radius: 2px;
+}
+
+QSlider::handle:horizontal {
+    background: @ink@;
+    border: none;
+    width: 15px;
+    height: 15px;
+    margin: -6px 0;
+    border-radius: 7px;
+}
+
+QSlider::handle:horizontal:hover {
+    background: @ink@;
+}
+
+QSlider::handle:horizontal:disabled {
+    background: @ink_disabled@;
+}
+
+/* ---- 次级按钮：主按钮是自绘的 InkButton，不走这套 ----
+   这里**不能**写 min-height：QSS 的 min-height 会直接覆盖控件的
+   setMinimumSize，而 IconButton 是用 setFixedSize 定尺寸的 ——
+   一旦被覆盖，图标按钮就只剩 sizeHint 那么高（实测 20px），悬停浮出的圆角块
+   跟着被压扁。高度交给 padding 撑（7px 上下 + 一行文字 ≈ 36px），
+   自绘的那两个类则各自把 padding 清零、由自己的尺寸说了算。 */
+QPushButton {
+    background: @surface_2@;
+    border: 1px solid @line@;
+    border-radius: @CONTROL_RADIUS@px;
+    padding: 7px 16px;
+    color: @ink@;
+}
+
+QPushButton:hover {
+    background: @surface_hover@;
+    border-color: @line_strong@;
+}
+
+QPushButton:pressed {
+    background: rgba(@sel_rgb@,0.10);
+}
+
+QPushButton:disabled {
+    color: @ink_disabled@;
+    border-color: @line@;
+    background: transparent;
+}
+
+/* 自绘的主按钮整块绕开上面这套，否则会在自绘圆角外再描一圈轮廓 */
+QPushButton#inkButton {
+    background: transparent;
+    border: none;
+    padding: 0;
+}
+
+/* 图标按钮同理，而且是**必须**绕开 —— 不只是描边的问题：
+   上面那条 QPushButton 的 padding(7px 上下) 会把内容最小高度顶到 36px，
+   而 IconButton 是用 setFixedSize 定尺寸的（30、28、24 各不相同）。
+   漏掉这一条时每个图标按钮都长成"宽 30、高 36"的竖长条：悬停浮出的圆角块
+   被拉长，摆进底栏时还会跟相邻文字错开 4px。清零 padding 与描边之后，
+   setFixedSize 才真正说了算 —— 所以这里也**不能**写 min-height/min-width，
+   写了反而会把 setFixedSize 的最小值覆盖成 0。 */
+QPushButton#iconButton {
+    background: transparent;
+    border: none;
+    padding: 0;
+}
+
+/* ---- 滚动条：极细，悬停才显出来 ---- */
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 3px 2px;
+}
+
+QScrollBar::handle:vertical {
+    background: rgba(@ink3_rgb@,0.38);
+    border-radius: 3px;
+    min-height: 36px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: rgba(@ink3_rgb@,0.70);
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 2px 3px;
+}
+
+QScrollBar::handle:horizontal {
+    background: rgba(@ink3_rgb@,0.38);
+    border-radius: 3px;
+    min-width: 36px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background: rgba(@ink3_rgb@,0.70);
+}
+
+QScrollBar::add-line, QScrollBar::sub-line {
+    width: 0; height: 0; background: transparent; border: none;
+}
+
+QScrollBar::add-page, QScrollBar::sub-page {
+    background: transparent;
+}
+
+/* ---- 分割条：不画线，只留一条悬停才亮的提示 ---- */
+QSplitter::handle {
+    background: transparent;
+}
+
+QSplitter::handle:vertical {
+    height: 10px;
+}
+
+QSplitter::handle:vertical:hover {
+    background: rgba(@ink3_rgb@,0.28);
+    border-radius: 5px;
+}
+
+/* ---- 底部信息条：取代 QStatusBar。
+   不用 QStatusBar 是因为 showMessage 的临时提示会把普通控件隐藏掉，
+   左下角的设置按钮会跟着一起消失。自己排一行就没这个问题。
+   **不铺底色**：页面已经是通篇一个颜色，再给这条铺一层半透明面色，窗口底下就会
+   横着一条比页面亮一档的色带（用户："这个位置不要有背景颜色，太突兀了"）。
+   只留一条上边框当分隔线。 ---- */
+QWidget#bottomBar {
+    background: transparent;
+    border-top: 1px solid @line@;
+}
+
+QWidget#bottomBar QLabel {
+    color: @ink_3@;
+}
+
+QDialog {
+    background: @surface@;
+}
+
+/* 设置面板里的分组小标题（"接收区""发送区"这类） */
+QLabel#groupCaption {
+    color: @ink_3@;
+}
+
+/* 设置面板里按钮开关那段是放在滚动区里的。滚动区默认会按调色板的 Base
+   铺一层底，在对话框自己的 surface 上会显出一块色差 —— 全部设成透明。 */
+QScrollArea {
+    background: transparent;
+    border: none;
+}
+
+QScrollArea > QWidget > QWidget {
+    background: transparent;
+}
+
+QMessageBox {
+    background: @surface@;
+}
+
+QMessageBox QLabel {
+    color: @ink@;
+}
+"""
+
+
+def stylesheet() -> str:
+    tokens = {
+        "@bg@": token("bg"), "@surface@": token("surface"),
+        "@surface_2@": token("surface_2"), "@surface_hover@": token("surface_hover"),
+        "@ink@": token("ink"), "@ink_2@": token("ink_2"), "@ink_3@": token("ink_3"),
+        "@ink_disabled@": token("ink_disabled"),
+        "@line@": token("line"), "@line_strong@": token("line_strong"),
+        "@CONTROL_RADIUS@": str(CONTROL_RADIUS),
+        "@sel_rgb@": rgb("sel"), "@ink3_rgb@": rgb("ink_3"),
+        "@editor@": editor_rgba(),
+    }
+    qss = _QSS
+    for name, value in tokens.items():
+        qss = qss.replace(name, value)
+    return qss
+
+
+def apply_scheme(scheme: str) -> None:
+    """设主题：换 token、重刷样式表、同步原生配色（菜单/提示框/标题栏）。"""
+    from PySide6.QtGui import QGuiApplication, QPalette
+
+    set_scheme(scheme)
+    app = QGuiApplication.instance()
+    if app is None:
+        return
+    app.setStyleSheet(stylesheet())
+    palette = app.palette()
+    palette.setColor(QPalette.ColorRole.Window, qcolor("bg"))
+    palette.setColor(QPalette.ColorRole.Base, qcolor("surface"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, qcolor("surface_2"))
+    palette.setColor(QPalette.ColorRole.Text, qcolor("ink"))
+    palette.setColor(QPalette.ColorRole.WindowText, qcolor("ink"))
+    palette.setColor(QPalette.ColorRole.ButtonText, qcolor("ink"))
+    palette.setColor(QPalette.ColorRole.Button, qcolor("surface_2"))
+    palette.setColor(QPalette.ColorRole.Highlight, qcolor("sel"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, qcolor("on_sel"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, qcolor("surface"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, qcolor("ink"))
+    app.setPalette(palette)
+
+# ---------------------------------------------------------------- 系统标题栏主题
+
+def apply_titlebar_theme(window, scheme: str, rounded: bool = True) -> None:
+    """让系统标题栏跟着主题走、窗口用圆角。非 Windows 或旧系统失败就静默跳过。
+
+    主窗口和设置对话框都要调（对话框原来没调，深色主题下标题栏还是白的，
+    和整个面板撞色）。非 QMainWindow 也一样适用 —— 只用 winId。
+
+    ``rounded=False`` 时把窗口角设成 **方角**（``DWMWCP_DONOTROUND``）。主窗口
+    **全屏时必须传 False**：圆角是在窗口内侧切掉四块，全屏窗口四角一圆就露出
+    桌面 —— 这正是用户报的"改了设置之后四周出现缝隙"（换主题 → 重走本函数 →
+    圆角被重新打开 → 四角漏桌面）。
+    """
+    import sys as _sys
+    if _sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        hwnd = ctypes.windll.user32.GetParent(int(window.winId())) or int(window.winId())
+        dark = ctypes.c_int(1 if scheme == "dark" else 0)
+        # 20 是 Win11 的属性号，19 是 Win10 1809+ 的，两个都试，失败无副作用
+        for attribute in (20, 19):
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, attribute, ctypes.byref(dark), ctypes.sizeof(dark))
+        # DWMWCP_ROUND=2 / DWMWCP_DONOTROUND=1
+        corner = ctypes.c_int(2 if rounded else 1)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, 33, ctypes.byref(corner), ctypes.sizeof(corner))
+    except Exception:
+        pass

@@ -1,0 +1,179 @@
+"""串口通信层。
+
+界面层只通过 SerialWorker 的公开方法和信号与串口打交道，不直接持有 pyserial 对象，
+这样串口的开、关、收发都集中在这一个文件里，改协议或换实现不用动界面。
+
+端口参数一律走 ``serial.serial_for_url``，而不是直接构造 ``serial.Serial``：
+前者既能打开 "COM7"，也能打开 "loop://" 这类回环/伪端口地址，
+所以没有硬件时也能跑通完整收发链路（见 selftest.py）。
+"""
+
+from __future__ import annotations
+
+import codecs
+import re
+from collections import deque
+
+import serial
+from PySide6.QtCore import QThread, Signal
+from serial.tools import list_ports
+
+BAUD_PRESETS = ["1200", "2400", "4800", "9600", "19200", "38400", "57600",
+                "115200", "230400", "460800", "921600"]
+BYTESIZE_CHOICES = {"5": 5, "6": 6, "7": 7, "8": 8}
+# 无校验写成 "none" 而不是「无」：串口圈里 N(none) 是通用写法，
+# 中文的「无」放在一排参数里既容易和别的选项混淆，也不好和 8N1 那种记法对上。
+PARITY_CHOICES = {"none": serial.PARITY_NONE, "奇": serial.PARITY_ODD, "偶": serial.PARITY_EVEN,
+                  "标记": serial.PARITY_MARK, "空格": serial.PARITY_SPACE}
+# 状态栏里拼串口参数用的字母写法，串口圈约定是 8N1 这种，不写中文
+PARITY_LETTERS = {"none": "N", "奇": "O", "偶": "E", "标记": "M", "空格": "S"}
+STOPBIT_CHOICES = {"1": 1, "1.5": 1.5, "2": 2}
+ENCODINGS = ["utf-8", "gbk", "ascii", "latin-1"]
+
+# 单次阻塞读取的等待上限。读线程靠它周期性醒来，既不会空转烧 CPU，
+# 也决定了发送队列的排空延迟上限（见 SerialWorker.run）。
+READ_TIMEOUT_S = 0.03
+
+
+def _port_sort_key(device: str) -> tuple[str, int]:
+    """端口名的排序键：把结尾的编号当**数字**排。
+
+    直接按字符串排会得到 COM10 < COM2 —— 插拔自动连接时"挑第一个"就会挑错人，
+    用户看到的列表顺序也反直觉。``device`` 不含结尾数字（loop:// 这种）时编号取 -1，
+    排在同名带编号的前面。
+    """
+    head = device.rstrip("0123456789")
+    digits = device[len(head):]
+    return (head.lower(), int(digits) if digits else -1)
+
+
+def list_serial_ports() -> list[tuple[str, str]]:
+    """返回 [(设备名, 描述)]，按端口号排序。没有串口时返回空列表。
+
+    ⚠️ 元组的**第一个**元素才是能交给 pyserial 打开的端口名，第二个只是给人看的
+    描述（界面上拼成 "COM3 — STMicroelectronics STLink ..."）。两者搞混的后果见
+    ``main_window._selected_port`` 的说明。
+    """
+    ports = [(p.device, p.description or p.device) for p in list_ports.comports()]
+    return sorted(ports, key=lambda item: _port_sort_key(item[0]))
+
+
+def parse_hex(text: str) -> bytes:
+    """把 'AA 01 ff'、'AA01FF'、'AA,01' 这类写法解析成字节串。
+
+    含非 HEX 字符或字符个数为奇数时抛 ValueError，由调用方提示用户。
+    """
+    cleaned = re.sub(r"[\s,;:_-]+", "", text)
+    if not cleaned:
+        return b""
+    if len(cleaned) % 2:
+        raise ValueError("HEX 字符个数为奇数，无法两两凑成一个字节")
+    illegal = sorted(set(re.findall(r"[^0-9a-fA-F]", cleaned)))
+    if illegal:
+        raise ValueError("含非 HEX 字符：" + " ".join(illegal))
+    return bytes.fromhex(cleaned)
+
+
+def to_hex(data: bytes) -> str:
+    return " ".join(f"{byte:02X}" for byte in data)
+
+
+class StreamDecoder:
+    """增量文本解码器：跨数据块被切断的多字节字符会缓冲到下一块，不会显示成乱码。
+
+    codecs 的 incrementaldecoder 就是干这个的，不要自己拼半个字符。
+    """
+
+    def __init__(self, encoding: str = "utf-8") -> None:
+        self._encoding = encoding
+        self._decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+
+    @property
+    def encoding(self) -> str:
+        return self._encoding
+
+    def set_encoding(self, encoding: str) -> None:
+        if encoding != self._encoding:
+            self._encoding = encoding
+            # 换编码必须换解码器实例，只改名字的话还会拿旧编码去解新数据
+            self._decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+
+    def reset(self) -> None:
+        self._decoder.reset()
+
+    def feed(self, data: bytes) -> str:
+        return self._decoder.decode(data)
+
+
+class SerialWorker(QThread):
+    """一个串口 = 一个线程。收到数据发 received(bytes)，出错发 failed(str) 并终止。"""
+
+    received = Signal(bytes)
+    failed = Signal(str)
+
+    def __init__(self, port: str, *, baudrate: int = 115200, bytesize: int = 8,
+                 parity: str = serial.PARITY_NONE, stopbits: float = 1, parent=None) -> None:
+        super().__init__(parent)
+        self._port = port
+        self._config = dict(baudrate=baudrate, bytesize=bytesize,
+                            parity=parity, stopbits=stopbits, timeout=READ_TIMEOUT_S)
+        self._ser: serial.SerialBase | None = None
+        self._tx: deque[bytes] = deque()
+        self._running = False
+
+    @property
+    def port(self) -> str:
+        return self._port
+
+    def open(self) -> None:
+        """在主线程调用。
+
+        失败时抛 ``serial.SerialException``（端口不存在/被占用）或 ``ValueError``
+        （``serial_for_url`` 把带冒号的名字当 URL 解析、协议不认识），由界面提示用户。
+        """
+        ser = serial.serial_for_url(self._port, do_not_open=True, **self._config)
+        ser.open()
+        self._ser = ser
+        self._running = True
+        self.start()
+
+    def write(self, data: bytes) -> None:
+        """只入队，实际写入由读线程完成（见 run 里的说明）。"""
+        if data:
+            self._tx.append(data)
+
+    def stop(self) -> None:
+        self._running = False
+        self.wait(1000)
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:
+                # 设备已被拔掉时 close 也会抛，这里不影响退出流程
+                pass
+            self._ser = None
+
+    def run(self) -> None:
+        ser = self._ser
+        if ser is None:
+            return
+        while self._running:
+            # 发送队列统一在这里排空，而不是让界面线程直接调用 write()：
+            # pyserial 的句柄不保证读写线程并发安全，这样界面线程只管入队，
+            # 不用加锁。代价是发送延迟最多一个 READ_TIMEOUT_S。
+            while self._tx:
+                try:
+                    ser.write(self._tx.popleft())
+                except Exception as exc:
+                    self.failed.emit(f"发送失败：{exc}")
+                    self._running = False
+                    return
+            try:
+                pending = ser.in_waiting
+                data = ser.read(pending or 1)
+            except Exception as exc:
+                self.failed.emit(f"读取失败：{exc}")
+                self._running = False
+                return
+            if data:
+                self.received.emit(data)
