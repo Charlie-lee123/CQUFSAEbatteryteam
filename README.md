@@ -5,7 +5,18 @@
 针对车队电池管理系统的实际数据格式做了深度定制：一轮数据里时间戳、电压、温度、
 BMS 状态混在一起，这个工具负责把它们**按段正确着色、对齐、并能在出问题时一键定位**。
 
-当前版本：**v1.0**（2026-10-10 首次发布，作为项目备份基线）
+当前版本：**v1.1**（2026-10-10）
+
+## 一键下载
+
+[![下载 SerialAssistant.exe](https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E4%B8%8B%E8%BD%BD-SerialAssistant.exe-2ea44f?logo=github&logoColor=white)](https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant.exe)
+
+也可以直接打开：
+<https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant.exe>
+
+> 链接始终指向**最新 Release** 里的 `SerialAssistant.exe`（单文件、免安装，
+> 下载后双击即用，日志写在 exe 旁的 `logs/` 里）。
+> 注：链接在仓库发布第一个 Release 并上传该 exe 后生效。
 
 ## 界面
 
@@ -13,7 +24,7 @@ BMS 状态混在一起，这个工具负责把它们**按段正确着色、对�
 | --- | --- |
 | ![主界面](docs/images/main-window.png) | ![浅色主题](docs/images/main-light.png) |
 
-数据着色特写——电压超限红 / 欠压绿、温度越界黄、BMS ERROR 黄，一位数序号自动补零，
+数据着色特写——电压超限红 / 欠压绿、温度越界黄、BMS ERROR 橙，序号与数值自动补零，
 小数点竖向对齐：
 
 ![数据着色](docs/images/data-coloring.png)
@@ -28,7 +39,7 @@ BMS 状态混在一起，这个工具负责把它们**按段正确着色、对�
 - 采样点序号自动补零到两位，小数点竖向对齐；序号染蓝
 - 电压分级着色：超出上限红、低于下限绿（上下限可在设置里改，单位 mV）
 - 温度越界标黄（上下限可在设置里改，单位 ℃）
-- BMS ERROR 整行标黄
+- BMS ERROR 整行标橙（温度越界保持黄色，两者按色区分）
 - 「定位最近异常」按钮：跳到最近一次电压 / 温度越界的位置并整行高亮
   （BMS ERROR 作为兜底），高亮与搜索互不干扰
 - 暂停 = 冻结画面（新数据进后台队列），恢复时一次性刷入并追底；暂停时自动折叠
@@ -126,7 +137,7 @@ set QT_QPA_PLATFORM=windows && .venv\Scripts\python.exe selftest.py   # 真机�
 1.3820 2.3824 …         ← 电压数据（按 电压上下限 判红 / 绿）
 Temperature1:
 1.22 2.95 …             ← 温度数据（按 温度上下限 判黄）
-BMS ERROR               ← BMS 状态（黄），到此为止：其后的数值不再参与分段
+BMS ERROR               ← BMS 状态（橙），到此为止：其后的数值不再参与分段
 ```
 
 - 采样点格式为 `序号.值`，电压值的单位是 mV、温度是 ℃（均取小数点后的整数部分）
@@ -137,6 +148,7 @@ BMS ERROR               ← BMS 状态（黄），到此为止：其后的数值
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
 | v1.0 | 2026-10-10 | 首个发布版本，项目备份基线 |
+| v1.1 | 2026-10-10 | 异常定位优先电压；数值段补零对齐；BMS ERROR 改橙色；修复设置面板滑轨与内容重叠；README 一键下载 |
 
 ## License
 

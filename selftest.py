@@ -27,6 +27,22 @@ from serial_io import (
 )
 
 
+def _depad(text: str) -> str:
+    """把 ``align_indexes`` 补出来的前导 0 摘掉（序号和值都摘），还原成设备原文。
+
+    值的补零 0 落在小数点**之后**（"1.5" -> "01.05"），正则摘前导 0 摘不到它，
+    所以用采样点结构化还原：每个 "序号.值" 各自 lstrip("0")。
+    """
+    from ui_highlight import SAMPLE_RE
+
+    def unpad(match):
+        index = match.group(1).lstrip("0") or "0"
+        value = match.group(2)[1:].lstrip("0") or "0"
+        return index + "." + value
+
+    return SAMPLE_RE.sub(unpad, text)
+
+
 def wait_for(app: QApplication, predicate, timeout: float = 3.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1348,6 +1364,26 @@ def check_customization(app: QApplication) -> None:
                 ("设置面板里的字段没有对齐到同一条竖线："
                  + "、".join(f"{type(w).__name__}={left_x(w)}" for w in fields))
 
+            # 6a-2) 滑轨不许压住内容（用户报"滑轨与内容区域重叠干涉"）：
+            #     widgetResizable 会把字段拉到视口宽，不给 body 留右内边距的话
+            #     字段右缘就贴着滚动条（实测间隙 0px）。要求至少 8px 空隙。
+            #     ⚠️ 用全局坐标量、且只在真机 windows 平台跑 —— offscreen 没有
+            #     真实屏幕，mapToGlobal 是模拟值（量出 -495/-234 这种怪值），
+            #     与全屏状态断言同一个豁免理由。
+            if sys.platform == "win32" and os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+                dialog.resize(760, 900)
+                dialog.layout().activate()
+                for _ in range(30):
+                    app.processEvents()
+                scroll_area = dialog.findChildren(QScrollArea)[0]
+                bar = scroll_area.verticalScrollBar()
+                bar_left = bar.mapToGlobal(bar.rect().topLeft()).x()
+                field_right = max(w.mapToGlobal(w.rect().topRight()).x()
+                                  for w in fields)
+                assert bar_left - field_right >= 8, \
+                    (f"滚动条与内容之间只剩 {bar_left - field_right}px —— "
+                     "滑轨压在内容上了")
+
             # 6b) 输入框里的文字要竖直居中（上下留白之差 ≤1.5px）。旧实现给数字框
             #     的编辑框塞了个 top=4 的"墨迹补偿"，真机量出来上 11 / 下 6 ——
             #     明显偏低，和下拉框（10.5 / 10）对不上，就是用户报的"间距不一致"。
@@ -1767,8 +1803,8 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
         # 摘掉之后必须和原文逐字相同。以前这里比的是"去掉空白后逐字相同"，改成
         # 补零之后那个判据失效了（0 不是空白），换成正则摘前导零。
         import re as _re
-        assert _re.sub(r"(?<!\S)0+(?=\d)", "", shown).rstrip("\n") == \
-            frame.rstrip("\n"), "补齐序号时动了序号以外的字符：内容对不上原文"
+        assert _depad(shown).rstrip("\n") == frame.rstrip("\n"), \
+            "补齐序号时动了序号以外的字符：内容对不上原文"
 
         # ---- 1b) 序号补齐本身：一位数前面补 0，小数点要竖着对齐 ----
         # 用户点名："一位数的数值在前方补零以对齐占位，并让序号以'.'对齐。"
@@ -1788,6 +1824,22 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
         # 只认"序号.值"，别的数字一个都不许补
         for plain in ("I=-250.00 V=0.00", "CWMax=3831,  Min=0", "Voltage1:"):
             assert align_indexes(plain) == plain, f"{plain!r} 被误补了"
+
+        # ---- 1c) 带段标题的整帧：**值**也补零（用户点名"将单位数数值前方补零
+        #     以对齐占位宽度"）—— 宽度按段内最宽的值算；BMS 之后的散值不动。
+        import re as _re_align
+        frame_sample = ("Voltage1:\n1.3700 2.3820\n"
+                        "Temperature1:\n1.5 2.22 10.3\n"
+                        "BMS ERROR\n1.99")
+        aligned_frame = align_indexes(frame_sample)
+        assert "01.3700 02.3820" in aligned_frame, aligned_frame   # 电压值全 4 位不变
+        assert "01.05 02.22 10.03" in aligned_frame, aligned_frame  # 温度值补到 2 位
+        assert "\n01.99" in aligned_frame, aligned_frame  # BMS 之后的散值：序号照补、值不动
+        assert _depad(aligned_frame) == frame_sample, \
+            "值补零动了前导 0 以外的字符"
+        # 无段标题（对齐函数不知道单位语义）时只补序号、不补值
+        assert align_indexes("1.5 2.22") == "01.5 02.22", \
+            "无段标题时不应盲补值"
 
         # ---- 2) 暂停 = 冻结显示：画面一个像素都不动，新数据进后台队列；----
         #         继续 = 一次性刷进来并追底（恢复到最新读取的数据位置）
@@ -2180,10 +2232,11 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
             f"温度越界没有标黄：{painted_spans(temp_row)}（应染 {want_temp}）"
         assert temp_by_color.get(rx_accent().name()) == index_spans(temp_row_text), \
             f"温度段的序号蓝被挤掉了：{painted_spans(temp_row)}"
-        # 温度越界与 BMS ERROR 用的都是"异常"那一档黄，但**不是同一支 token**：
-        # 将来要把温度调成别的颜色时，别把 BMS 的指示色一起带走。
-        assert temp_yellow == yellow, \
-            "温度与 BMS 的黄色约定要一致（用户看到的都是同一支黄）"
+        # BMS 是**橙**、温度越界是**黄** —— 用户点名分开（"BMS ERROR 的显示颜色
+        # 从黄色改为橙色"）。两支 token 各自独立，改一支不许带走另一支。
+        assert temp_yellow != yellow, \
+            "温度黄与 BMS 橙不该是同一支颜色（用户要求 BMS 改橙）"
+        assert qcolor("bms_error").name() != qcolor("temp_warn").name()
         # 温度范围改了立刻生效（高亮器重读阈值）
         customization.set("temp_limit_high", 99)
         window._rx_highlighter.refresh()
@@ -2708,6 +2761,28 @@ def check_alert_locate(app: QApplication) -> None:
         row = window.txt_rx.document().findBlockByNumber(both[0]).text()
         assert "2.95" in row, \
             f"有越界的温度时不该跳到 BMS ERROR 那一行，实际跳到：{row!r}"
+
+        # 6) 优先级：**电压异常 > 温度异常 > BMS**（用户点名）。电压与温度同时
+        #    有问题时，一键定位必须落在电压那一行 —— 不管谁先出现。
+        customization.set("volt_limit_low", 3750)
+        customization.set("volt_limit_high", 3800)
+        window._rx_highlighter.refresh()
+        window._clear_receive()
+        window._emit_block("Temperature1:\n1.22 2.95\n"      # 温度 95 越界（先出现）
+                           "Voltage1:\n1.3700 2.3820")        # 电压 3700 欠压（后出现）
+        app.processEvents()
+        found = window._last_error_block()
+        row = window.txt_rx.document().findBlockByNumber(found[0]).text()
+        assert "1.3700" in row, \
+            f"电压与温度同时异常时应优先定位电压行，实际定位到：{row!r}"
+        window._clear_receive()
+        window._emit_block("Voltage1:\n1.3700 2.3820\n"      # 电压在前
+                           "Temperature1:\n1.22 2.95")        # 温度在后
+        app.processEvents()
+        found = window._last_error_block()
+        row = window.txt_rx.document().findBlockByNumber(found[0]).text()
+        assert "1.3700" in row, \
+            f"电压在前温度在后时仍应选电压行，实际定位到：{row!r}"
     finally:
         window.close()
         for key in settings.allKeys():

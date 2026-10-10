@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 
 # 软件版本号（发布 / 备份以它为准，git 上同时打同名 tag）。
-__version__ = "1.0"
+__version__ = "1.1"
 
 from PySide6.QtWidgets import QApplication
 

@@ -43,8 +43,8 @@ LIGHT = {
     "rim": "#FFFFFF",             # 玻璃上缘兜住的光（见 ui_surface 的描边）
     "volt_high": "#C42B1C",       # 电压超上限（红）—— 浅底用深红才够对比
     "volt_low": "#0E7B3D",        # 电压低于下限（绿）
-    "bms_error": "#A16207",       # BMS ERROR（黄/琥珀）—— 纯黄在浅底看不清
-    "temp_warn": "#A16207",       # 温度越界（黄）—— 与 BMS 同一支黄：都是"异常"这一档
+    "bms_error": "#C2410C",       # BMS ERROR（橙）—— 浅底用深橙才够对比（用户：黄改橙）
+    "temp_warn": "#A16207",       # 温度越界（黄）—— 与 BMS 区分开：BMS 是橙、温度是黄
     "alert_red": "#C42B1C",       # 界面上的警示红（「定位异常」那枚三角感叹号）
 }
 
@@ -74,7 +74,7 @@ DARK = {
     "rim": "#FFFFFF",             # 玻璃上缘兜住的光（见 ui_surface 的描边）
     "volt_high": "#FF6B6B",       # 电压超上限（红）
     "volt_low": "#51CF66",        # 电压低于下限（绿）
-    "bms_error": "#FACC15",       # BMS ERROR（黄）
+    "bms_error": "#FB923C",       # BMS ERROR（橙）
     "temp_warn": "#FACC15",       # 温度越界（黄）
     "alert_red": "#FF6B6B",       # 界面上的警示红（「定位异常」那枚三角感叹号）
 }

@@ -101,29 +101,52 @@ def index_spans(text: str) -> list[tuple[int, int]]:
 
 
 # 序号补齐到几位（"1.3820" -> "01.3820"）。用户点名："一位数的数值在前方补零
-# 以对齐占位，并让序号以'.'对齐" —— 他的数据每段就 20~40 个点，两位足够。
+# 以对齐占位宽度，并让序号以'.'对齐" —— 他的数据每段就 20~40 个点，两位足够。
 INDEX_PAD_WIDTH = 2
 
 
-def align_indexes(text: str, width: int = INDEX_PAD_WIDTH) -> str:
-    """把采样点的**序号**补零到固定宽度，让小数点上下对齐。
+def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
+                  section: str = SECTION_OTHER) -> str:
+    """采样点排版对齐：序号补零到固定宽度；**电压/温度段里的值**也补零到该段内
+    最宽值的位数（用户点名："将单位数数值前方补零以对齐占位宽度"）。
 
-    "1.3820   2.3824   10.3824" 直接显示时，一位数的点会比两位数的点整体左移一格，
-    竖着扫一列数值就参差不齐；补一个前导 **0**（接收区是**等宽字体**，一位数字
-    正好一格）之后，所有序号都是 `width` 位，"序号" 后面那个 "." 就落在同一列。
+    - 序号：`"1.3820"` -> `"01.3820"`，一行里所有小数点落到同一列；
+    - 值：段内按最宽的值补零（温度段 `"1.5"` 跟 `"2.22"` 同排 -> `"01.05 02.22"`）；
+      电压/温度之外的段（BMS 之后的散值、判定不了单位的行）**不动值** ——
+      不知道单位语义，盲补反而会摆出假数据的样子。
 
-    ⚠️ 补的是数字 0 而不是空格（用户点名"在前方补零"）。前导零不影响数值语义，
-    但会让复制出去的文本与设备原文**不完全相同** —— 所以只动序号前面，
-    值一个字符都不碰（自测里有一条"去掉空白后必须逐字相同"兜着）。
+    ``section`` 是这块文本**之前**所处的段（``section_of`` 的状态，由调用方在块间
+    维护）。值宽按"块内该段的最大值宽"算 —— 一帧数据各点位数一致，跨帧各自对齐。
+
+    ⚠️ 补的都是数字 0（用户："在前方补零"），且只出现在**前导位置** ——
+    自测用"摘掉前导 0 后逐字等于原文"兜底，保证除补零外一个字符都没动。
     """
-    if width <= 1:
-        return text
+    lines = text.split("\n")
 
-    def pad(match) -> str:
-        index = match.group(1)
-        return "0" * max(0, width - len(index)) + index + match.group(2)
+    # 第一遍：段内最宽的值有几位
+    current = section
+    widths: dict[str, int] = {}
+    for line in lines:
+        current = section_of(line, current)
+        if current in (SECTION_VOLT, SECTION_TEMP):
+            for match in SAMPLE_RE.finditer(line):
+                widths[current] = max(widths.get(current, 0),
+                                      len(match.group(2)) - 1)
 
-    return SAMPLE_RE.sub(pad, text)
+    # 第二遍：替换
+    out: list[str] = []
+    current = section
+    for line in lines:
+        current = section_of(line, current)
+
+        def pad(match, current=current) -> str:
+            index = match.group(1)
+            value = match.group(2)[1:]
+            value = "0" * max(0, widths.get(current, 0) - len(value)) + value
+            return "0" * max(0, index_width - len(index)) + index + "." + value
+
+        out.append(SAMPLE_RE.sub(pad, line))
+    return "\n".join(out)
 
 
 def _ordered(low, high) -> tuple[int, int]:

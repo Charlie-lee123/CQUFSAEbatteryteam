@@ -39,8 +39,8 @@ from ui_anim import Reveal
 from ui_backdrop import frost_tile, paint_backdrop
 from ui_brand import BrandHeader, CaptionBar
 from ui_highlight import (
-    RxHighlighter, align_indexes, bms_error_spans, measure_error_spans,
-    section_of, stamp_span,
+    SECTION_OTHER, SECTION_TEMP, SECTION_VOLT, RxHighlighter, align_indexes,
+    bms_error_spans, section_of, stamp_span, temp_spans, value_spans,
 )
 from ui_controls import (
     AlertButton, ChevronComboBox, ChevronSpinBox, IconButton, IconLabel,
@@ -213,6 +213,8 @@ class MainWindow(QMainWindow):
         # 搜索高亮的区间列表。搜索和异常定位**共用** setExtraSelections，
         # 所以两边都先存到自己这儿，再合并出去（见 _apply_extra_selections）。
         self._search_selections: list = []
+        # 排版对齐的段状态（跨块延续，规则同着色器，见 ui_highlight.section_of）
+        self._align_section = SECTION_OTHER
 
         self._send_timer = QTimer(self)
         self._send_timer.setTimerType(Qt.PreciseTimer)
@@ -1798,10 +1800,14 @@ class MainWindow(QMainWindow):
         text = text.strip("\r\n")
         if not text:
             return                      # 空帧（设备只发了个换行）不值得占一行
-        # 序号补齐到固定宽度（"1.3820" -> " 1.3820"）：接收区是等宽字体，补的空格
-        # 正好是一个数字宽，小数点就能竖着对齐（用户点名）。放在这个**唯一入口**上，
-        # 于是时间戳判断、着色、复制、暂停队列拿到的都是补齐后的同一份文本。
-        text = align_indexes(text)
+        # 排版对齐（序号补零 + 电压/温度段值补零）需要知道这块属于哪个段 ——
+        # 段状态在块间延续（时间戳重置成电压、Temperature1 切温度、BMS 关闭，
+        # 规则见 ui_highlight.section_of），所以由主窗口维护、逐块喂给对齐函数。
+        # 放在这个**唯一入口**上，时间戳判断、着色、复制、暂停队列拿到的都是
+        # 补齐后的同一份文本。
+        text = align_indexes(text, section=self._align_section)
+        for line in text.split("\n"):
+            self._align_section = section_of(line, self._align_section)
         if self.chk_timestamp.isChecked() and self._stamp_needed(text):
             # 时间戳独占一行、本轮首行（Voltage1:）紧贴在它**下面**；它与
             # 上方（上一轮）的内容之间空一行 —— 轮与轮的视觉分隔（用户点名）。
@@ -2015,6 +2021,7 @@ class MainWindow(QMainWindow):
         self._rx_pending.clear()
         self._reset_matches()
         self._clear_alert_highlight()
+        self._align_section = SECTION_OTHER      # 画面清空 = 段状态归零
         # 画面清空 = 重新开始数，时间戳的"轮首标记见过没有"也跟着归零；
         # 暂停队列里攒着的帧也作废（清空本身就是"不要之前的东西了"）
         self._paused_frames.clear()
@@ -2026,11 +2033,12 @@ class MainWindow(QMainWindow):
     def _last_error_block(self) -> tuple[int, list[tuple[int, int]]] | None:
         """从文档**末尾往前**找最近一行有误的数据，返回 ``(块号, 有误区间)``。
 
-        "有误"的优先级（用户的说法是"定位到最近一次读取到的**电压有误或温度有误**
-        的位置"）：**先找电压/温度越界**，两样都没有时才退到 BMS ERROR 那一行
-        （BMS 也是"这里出了问题"的标记，但不该抢在真正的越界前面）。
-        判据与着色共用一个函数（``ui_highlight.measure_error_spans``），否则会出现
-        "染成红/绿/黄的那行"和"点按钮跳过去的那行"对不上的怪事。
+        优先级（用户点名"电压异常的显示和告警优先级应高于温度异常"）：
+        **电压越界 > 温度越界 > BMS ERROR**。也就是说电压和温度同时有问题时，
+        一键定位跳的是电压那一行；前两者都没有时才退到 BMS 那一行。
+        判据与着色共用同一批函数（``ui_highlight.value_spans`` / ``temp_spans`` /
+        ``bms_error_spans``），否则会出现"染成红/绿/黄的那行"和"点按钮跳过去
+        的那行"对不上的怪事。
 
         段落状态机（Voltage / Temperature / 其它）必须**从头正向**推：温度用温度
         阈值、电压用电压阈值，段边界靠时间戳和 Temperature1/BMS 切（见 section_of）。
@@ -2039,17 +2047,23 @@ class MainWindow(QMainWindow):
         volt = self._rx_highlighter.volt_limits()
         temp = self._rx_highlighter.temp_limits()
         section = section_of("")
-        last_measure = None
+        last_volt = None
+        last_temp = None
         last_bms = None
         for number in range(document.blockCount()):
             text = document.findBlockByNumber(number).text()
             section = section_of(text, section)
-            over = measure_error_spans(text, section, volt, temp)
-            if over:
-                last_measure = (number, over)     # 一直往后覆盖，留下最后一个
-            elif bms_error_spans(text):
+            if section == SECTION_VOLT:
+                over_high, over_low = value_spans(text, volt[0], volt[1])
+                if over_high or over_low:
+                    last_volt = (number, over_high + over_low)
+            elif section == SECTION_TEMP:
+                over = temp_spans(text, temp[0], temp[1])
+                if over:
+                    last_temp = (number, over)
+            if bms_error_spans(text):
                 last_bms = (number, bms_error_spans(text))
-        return last_measure or last_bms
+        return last_volt or last_temp or last_bms
 
     def _locate_last_error(self) -> None:
         """标题栏那枚三角按钮：跳到最近一次异常所在行并把它高亮出来。"""

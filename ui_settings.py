@@ -74,7 +74,11 @@ class SettingsDialog(QDialog):
         # 视口透明由全局 QSS（QScrollArea > QWidget > QWidget）负责，这里只放内容
         body = QWidget()
         body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(0, 0, 0, 0)
+        # ⚠️ 右侧必须给滚动条留出空隙（12px）：widgetResizable 会把 body 拉到
+        # 视口宽，字段（开关/下拉框）跟着拉伸到最右 —— 滑轨就贴着内容边缘画，
+        # 看起来是"滑轨压住内容"（用户报的"滑轨与内容区域重叠干涉"）。
+        # 实测字段右缘与滚动条左缘间隙为 0，留出 12px 后各归其位。
+        body_layout.setContentsMargins(0, 0, 12, 0)
         body_layout.setSpacing(GAP)
         scroll.setWidget(body)
         root.addWidget(scroll, 1)
