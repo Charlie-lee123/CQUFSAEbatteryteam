@@ -20,8 +20,8 @@ from datetime import datetime
 import serial
 from PySide6.QtCore import QEvent, QPoint, QRect, QSettings, Qt, QTimer
 from PySide6.QtGui import (
-    QColor, QGuiApplication, QKeySequence, QPainter, QShortcut, QTextCharFormat,
-    QTextCursor,
+    QColor, QFontMetricsF, QGuiApplication, QKeySequence, QPainter, QShortcut,
+    QTextCharFormat, QTextCursor,
 )
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLayout, QLineEdit,
@@ -96,6 +96,10 @@ RX_MERGE_MAX_BYTES = 4096
 # 兜底二：距这批首字节超过这么久就强制吐。设备一直不停发时静默窗口永远等不到，
 # 没有这条的话屏幕上会一个字都不出（数据全卡在缓冲里）。
 RX_MERGE_MAX_MS = 200
+# 半行缓发上限：静默窗到期时若缓冲**没以换行收尾**，多半是分包把一行劈成了
+# 两截（"…Over Vol" + "tage"）—— 再接着攒一会儿等后半截，最多攒这么久。
+# 300ms 覆盖 USB 读线程的调度抖动；不以换行收尾的设备最坏多等这一拍才见字。
+RX_HOLD_MAX_MS = 300
 
 # 时间戳打在哪儿：**只打在每一轮数据的轮首**，也就是用户要的"只放在 Voltage1 前面"。
 #
@@ -1719,7 +1723,8 @@ class MainWindow(QMainWindow):
 
     def _close_port(self, message: str = "") -> None:
         # 先把关口里剩下的那一批吐出来，别丢掉设备最后发的那几个字节
-        self._flush_rx()
+        # （force：没有下一批了，没等到换行的半行也要显示出来）
+        self._flush_rx(force=True)
         worker, self._worker = self._worker, None
         self._send_timer.stop()
         self.chk_timer_send.setChecked(False)
@@ -1775,13 +1780,27 @@ class MainWindow(QMainWindow):
         else:
             self._rx_flush.start(RX_MERGE_MS)
 
-    def _flush_rx(self) -> None:
-        """把缓冲里攒的这一批数据当作"一帧"显示出来。"""
+    def _flush_rx(self, force: bool = False) -> None:
+        """把缓冲里攒的这一批数据当作"一帧"显示出来。
+
+        ``force``：关串口这类"没有下一批了"的场合传 True —— 半行也吐，别吞尾巴。
+        """
         self._rx_flush.stop()
+        if not self._rx_pending:
+            return
+        # 半行缓发（用户 2026-10-11 点名"莫名其妙的换行"）：分包抖动会把一行
+        # 劈成两帧（"…Over Vol" + "tage"、"1.87" + " 2.87 …"），劈在哪、断行
+        # 就在哪。缓冲**没以换行收尾**说明它只是一行的前半截 —— 先别吐，继续
+        # 攒（最多 RX_HOLD_MAX_MS，没有后半截就整批照吐）；HEX 视图没有"行"
+        # 的概念，照旧直接吐。
+        if (not force and not self.chk_hex_view.isChecked()
+                and not self._rx_pending.endswith((b"\n", b"\r"))):
+            held_ms = (time.perf_counter() - self._rx_pending_since) * 1000.0
+            if held_ms < RX_HOLD_MAX_MS and len(self._rx_pending) < RX_MERGE_MAX_BYTES:
+                self._rx_flush.start(RX_MERGE_MS)
+                return
         data = bytes(self._rx_pending)
         self._rx_pending.clear()
-        if not data:
-            return
 
         if self.chk_hex_view.isChecked():
             self._emit_block(to_hex(data))
@@ -1792,6 +1811,30 @@ class MainWindow(QMainWindow):
         # 一帧显示成一条：整帧去掉尾部换行后交给 appendPlainText，
         # 帧内部的换行仍会正常折成多行，所以带换行和不带换行的设备都能看清楚。
         self._emit_block(text.rstrip("\r\n"))
+
+    def _rx_max_row_chars(self) -> int:
+        """接收区一行净宽能放下的等宽字符数（0 = 量不到，不设上限）。
+
+        网格重排的行宽一旦超过视口，软换行就在行尾甩出一个孤零零的单元格
+        （用户截图里"13.6553"单独占一行）—— 折行数必须按视口封顶。可用宽度
+        用"视口宽 - 2×行首起点"量（行首起点已含文档边距和内边距，两端一减就
+        是净宽）；再预留垂直滚动条可能出现的那一条 —— 宁可一行少放一格，也
+        不给它甩孤行的机会。
+        """
+        try:
+            cursor = self.txt_rx.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            left = self.txt_rx.cursorRect(cursor).x()
+            advance = QFontMetricsF(self.txt_rx.font()).horizontalAdvance("0")
+            viewport_w = self.txt_rx.viewport().width()
+        except RuntimeError:
+            return 0
+        if left < 0 or advance <= 0 or viewport_w <= 0:
+            return 0
+        scrollbar = self.txt_rx.verticalScrollBar()
+        reserve = 4 if scrollbar.isVisible() else 14
+        usable = viewport_w - 2 * left - reserve
+        return max(0, int(usable / advance))
 
     def _emit_block(self, text: str) -> None:
         # 一整帧显示成一条：整块去掉首尾换行后交给 appendPlainText，块内的
@@ -1805,7 +1848,8 @@ class MainWindow(QMainWindow):
         # 规则见 ui_highlight.section_of），所以由主窗口维护、逐块喂给对齐函数。
         # 放在这个**唯一入口**上，时间戳判断、着色、复制、暂停队列拿到的都是
         # 补齐后的同一份文本。
-        text = align_indexes(text, section=self._align_section)
+        text = align_indexes(text, section=self._align_section,
+                             max_row_chars=self._rx_max_row_chars())
         for line in text.split("\n"):
             self._align_section = section_of(line, self._align_section)
         if self.chk_timestamp.isChecked() and self._stamp_needed(text):

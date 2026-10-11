@@ -28,10 +28,13 @@ from serial_io import (
 
 
 def _depad(text: str) -> str:
-    """把 ``align_indexes`` 补出来的前导 0 摘掉（序号和值都摘），还原成设备原文。
+    """把 ``align_indexes`` 的排版还原成设备原文：摘掉前导 0（序号和值都摘）、
+    压平空白（连续空白 -> 单空格、去行首尾）。
 
-    值的补零 0 落在小数点**之后**（"1.5" -> "01.05"），正则摘前导 0 摘不到它，
+    值的补零 0 落在小数点**之后**（"1.5" -> "1.05"），正则摘前导 0 摘不到它，
     所以用采样点结构化还原：每个 "序号.值" 各自 lstrip("0")。
+    网格重排（2026-10-11）之后对齐还会把列距统一成 3 空格、去掉设备行首的
+    填充空格 —— 所以"还原"必须连空白一起归一，才能跟原文逐字比。
     """
     from ui_highlight import SAMPLE_RE
 
@@ -40,7 +43,8 @@ def _depad(text: str) -> str:
         value = match.group(2)[1:].lstrip("0") or "0"
         return index + "." + value
 
-    return SAMPLE_RE.sub(unpad, text)
+    depadded = SAMPLE_RE.sub(unpad, text)
+    return "\n".join(" ".join(line.split()) for line in depadded.split("\n"))
 
 
 def wait_for(app: QApplication, predicate, timeout: float = 3.0) -> bool:
@@ -313,12 +317,14 @@ def check_ui_roundtrip(app: QApplication) -> None:
             f"接收区没拿到回显: {window.txt_rx.toPlainText()!r}"
         assert "接收 4 字节" in window.lbl_count.text(), window.lbl_count.text()
 
-        # 2) 定时发送：50ms 间隔跑一会儿，至少发出去 3 帧
+        # 2) 定时发送：50ms 间隔跑一会儿，至少发出去 3 帧。
+        #    ⚠️ 用字符数不用行数：无换行尾的帧会按"半行缓发"连成一块显示
+        #    （2026-10-11 起），数行数会假挂。
         window.txt_tx.setPlainText("T")
         window.spin_interval.setValue(50)
         window.chk_timer_send.setChecked(True)
         window._clear_receive()
-        assert wait_for(app, lambda: window.txt_rx.toPlainText().splitlines().count("T") >= 3), \
+        assert wait_for(app, lambda: window.txt_rx.toPlainText().count("T") >= 3), \
             f"定时发送没跑起来: {window.txt_rx.toPlainText()!r}"
 
         # 3) 关掉定时发送后必须真的停下来
@@ -1902,35 +1908,48 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
         # 见 ui_highlight.align_indexes），所以不能直接逐字比 —— 跟补齐后的原文比。
         shown = "".join(line + "\n" for line in text.split("\n")
                         if not line.startswith("["))
-        assert shown.rstrip("\n") == align_indexes(frame).rstrip("\n"), \
+        # 显示和纯函数要用**同一个**视口封顶折行，否则逐字比必然假挂
+        assert shown.rstrip("\n") == align_indexes(
+            frame, max_row_chars=window._rx_max_row_chars()).rstrip("\n"), \
             "合并之后的内容和原始数据不一致（拼接处被吃掉了字节）"
         # 再钉一遍"值一个字符都没被动过"：补齐**只在序号前面插 0**，把这些前导 0
-        # 摘掉之后必须和原文逐字相同。以前这里比的是"去掉空白后逐字相同"，改成
-        # 补零之后那个判据失效了（0 不是空白），换成正则摘前导零。
+        # 摘掉之后必须和原文对得上。重排会动空白和折行位置，所以按**全空白压平
+        # 后的 token 序列**比，不逐行比。
         import re as _re
-        assert _depad(shown).rstrip("\n") == frame.rstrip("\n"), \
+        assert " ".join(_depad(shown).split()) == " ".join(frame.split()), \
             "补齐序号时动了序号以外的字符：内容对不上原文"
 
         # ---- 1b) 序号补齐本身：一位数前面补 0，小数点要竖着对齐 ----
         # 用户点名："一位数的数值在前方补零以对齐占位，并让序号以'.'对齐。"
+        # 序号补零**只发生在电压段**（2026-10-11 用户点名温度段、BMS 之后的
+        # 明细行都不补），所以裸数据要放进电压段的上下文里测。
         naive = " ".join(f"{j}.3820" for j in range(1, 26))
-        padded = align_indexes(naive)
-        dots = [i for i, ch in enumerate(padded) if ch == "."]
-        assert len(dots) == 25, f"补齐之后小数点个数不对：{padded[:80]!r}"
+        padded_row = align_indexes("Voltage1:\n" + naive).split("\n")[1]
+        dots = [i for i, ch in enumerate(padded_row) if ch == "."]
+        assert len(dots) == 25, f"补齐之后小数点个数不对：{padded_row[:80]!r}"
         assert len({b - a for a, b in zip(dots, dots[1:])}) == 1, \
-            f"补齐之后小数点还是没有对齐（间距不等）：{padded[:80]!r}"
-        assert padded.startswith("01.3820 02.3820 03.3820"), padded[:40]
-        assert "010.3820" not in padded, "两位数序号被多补了一个 0"
+            f"补齐之后小数点还是没有对齐（间距不等）：{padded_row[:80]!r}"
+        assert padded_row.startswith("01.3820   02.3820   03.3820"), padded_row[:40]
+        assert "010.3820" not in padded_row, "两位数序号被多补了一个 0"
         # 补的是数字 0（用户："在前方补零"），不是空格
-        assert " 1.3820" not in padded and " 2.3820" not in padded, \
-            f"补的还是空格，不是 0：{padded[:40]!r}"
-        assert _re.sub(r"(?<!\S)0+(?=\d)", "", padded).replace(" ", "") == \
+        assert " 1.3820" not in padded_row and " 2.3820" not in padded_row, \
+            f"补的还是空格，不是 0：{padded_row[:40]!r}"
+        assert _re.sub(r"(?<!\S)0+(?=\d)", "", padded_row).replace(" ", "") == \
             naive.replace(" ", ""), "补齐动了序号和值以外的字符"
         # 序号 0 不补占位（用户点名："序号为 0 时，序号前面不应再保留一个空格，
         # 请去掉该多余空格"）：补成 "00" 是在 0 号点前多出一个占位字符。
-        assert align_indexes("0.3820 1.3820") == "0.3820 01.3820", \
-            f"序号 0 不应补占位：{align_indexes('0.3820 1.3820')!r}"
-        assert align_indexes("0.38") == "0.38", "单独一个 0 号点也不该被补"
+        # （电压段数据行走等宽网格，单元格补空格对齐，按 token 比较不受列距影响）
+        assert align_indexes("Voltage1:\n0.3820 1.3820").split("\n")[1].split() == \
+            ["0.3820", "01.3820"], \
+            f"序号 0 不应补占位：{align_indexes('Voltage1:\n0.3820 1.3820')!r}"
+        assert align_indexes("Voltage1:\n0.38").split("\n")[1] == "0.38", \
+            "单独一个 0 号点也不该被补"
+        # BMS ERROR 之后的错误明细行：序号保持设备原样（2026-10-11 用户点名
+        # "BMSERROR后面的序号只有一位数，就不需要在前面加一个0"）
+        bms_aligned = align_indexes(
+            "BMS ERROR\n1.1 Over Voltage\n1.10 Over Voltage")
+        assert bms_aligned.split("\n")[1:] == \
+            ["1.1 Over Voltage", "1.10 Over Voltage"], bms_aligned
         # 只认"序号.值"，别的数字一个都不许补
         for plain in ("I=-250.00 V=0.00", "CWMax=3831,  Min=0", "Voltage1:"):
             assert align_indexes(plain) == plain, f"{plain!r} 被误补了"
@@ -1942,14 +1961,74 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
                         "Temperature1:\n1.5 2.22 10.3\n"
                         "BMS ERROR\n1.99")
         aligned_frame = align_indexes(frame_sample)
-        assert "01.3700 02.3820" in aligned_frame, aligned_frame   # 电压值全 4 位不变
-        assert "01.05 02.22 10.03" in aligned_frame, aligned_frame  # 温度值补到 2 位
-        assert "\n01.99" in aligned_frame, aligned_frame  # BMS 之后的散值：序号照补、值不动
+        assert "01.3700   02.3820" in aligned_frame, aligned_frame   # 电压值全 4 位不变；列距=3 空格
+        # 温度序号**不补零**（用户 2026-10-11 点名"温度区域序号不用加0"），值照补；
+        # 单元格补空格到等宽（"10.03" 5 字符）后 3 空格拼接，间隙 = 3 + 补白
+        assert "1.05    2.22    10.03" in aligned_frame, aligned_frame
+        assert "\n1.99" in aligned_frame, aligned_frame  # BMS 之后的散值：序号不加 0、值不动
         assert _depad(aligned_frame) == frame_sample, \
             "值补零动了前导 0 以外的字符"
-        # 无段标题（对齐函数不知道单位语义）时只补序号、不补值
-        assert align_indexes("1.5 2.22") == "01.5 02.22", \
-            "无段标题时不应盲补值"
+        # 无段标题（对齐函数不知道单位语义）时序号、值都不动
+        assert align_indexes("1.5 2.22") == "1.5 2.22", \
+            "无段标题时不应盲补"
+
+        # ---- 1d) 网格重排（用户 2026-10-11 点名"没有对齐/不该换行的地方
+        #     不要换行"）：设备两行数据的间隔宽窄不一（补零后列起点漂移的
+        #     根源），重排后各行小数点间距必须全等；数字序列一个都不能动。
+        volt_frame = ("Voltage1:\n"
+                      + " ".join(f"{j}.6553" for j in range(1, 13)) + "\n"
+                      + "  ".join(f"{j}.6553" for j in range(13, 26)))
+        grid_lines = align_indexes(volt_frame).split("\n")[1:]
+        pitches = set()
+        for gl in grid_lines:
+            dots = [k for k, ch in enumerate(gl) if ch == "."]
+            pitches |= {b - a for a, b in zip(dots, dots[1:])}
+        assert len(pitches) == 1, f"重排后各行小数点间距不一致：{grid_lines!r}"
+        # 重排会按统一列数折行（设备两行的 12/13 个会重排成 13/12），
+        # 所以数字不变这条按**全空白压平后的 token 序列**比，不逐行比。
+        assert " ".join(_depad("\n".join(grid_lines)).split()) == \
+            " ".join(volt_frame.split("\n", 1)[1].split()), \
+            "网格重排动了数字本身"
+
+        # 温度区孤行（分包把 " 4.87" 劈成单独一行）要并回 4 列网格；
+        # 温度序号保持设备原样（不补 0）
+        temp_aligned = align_indexes(
+            "Temperature1:\n1.87 2.87 3.87\n 4.87\n5.87 6.87 7.87 8.87")
+        assert temp_aligned.split("\n")[1:] == \
+            ["1.87   2.87   3.87   4.87", "5.87   6.87   7.87   8.87"], \
+            temp_aligned
+
+        # ---- 1e) 折行按视口封顶（用户 2026-10-11 截图：13 个一行的网格在只
+        #     装得下 12 个的视口里软换行，行尾甩出孤格"13.6553"）。封顶之后
+        #     每行都不得超出 max_row_chars，列距还得保持全等。
+        capped = align_indexes(
+            "Voltage1:\n" + " ".join(f"{j}.6553" for j in range(1, 26)),
+            max_row_chars=50)
+        capped_lines = capped.split("\n")[1:]
+        assert capped_lines and all(len(gl) <= 50 for gl in capped_lines), \
+            f"封顶后行宽仍超出 max_row_chars：{capped_lines!r}"
+        cap_pitches = set()
+        for gl in capped_lines:
+            dots = [k for k, ch in enumerate(gl) if ch == "."]
+            cap_pitches |= {b - a for a, b in zip(dots, dots[1:])}
+        assert len(cap_pitches) == 1, f"封顶折行后列距不一致：{capped_lines!r}"
+
+        # ---- 1f) 半行缓发（用户 2026-10-11 截图：分包把一行劈成两帧，出现
+        #     "Over Vol"/"tage" 这种莫名其妙的换行）。没以换行收尾的半行要先
+        #     攒住，等下一批接上再整行排版显示。
+        window._clear_receive()
+        window._on_received(
+            "Voltage1:\n1.3820 2.3820 3.3820 4.3820 5.3820 Over Vol".encode("utf-8"))
+        window._flush_rx()
+        app.processEvents()
+        assert window.txt_rx.toPlainText() == "", \
+            f"半行没攒住，提前显示了：{window.txt_rx.toPlainText()!r}"
+        window._on_received("tage\n6.3820\n".encode("utf-8"))
+        window._flush_rx()
+        app.processEvents()
+        shown_join = window.txt_rx.toPlainText()
+        assert "Over Voltage" in shown_join, f"劈开的一行没有被接回来：{shown_join!r}"
+        assert "01.3820" in shown_join and "06.3820" in shown_join, shown_join
 
         # ---- 2) 暂停 = 冻结显示：画面一个像素都不动，新数据进后台队列；----
         #         继续 = 一次性刷进来并追底（恢复到最新读取的数据位置）
@@ -2297,7 +2376,7 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
         window._clear_receive()
         window._on_received(("Voltage1:\n1.3700   2.3820   3.3900\n"
                              "Temperature1:\n1.22   2.95   3.45\n"
-                             "BMS ERROR\n").encode("utf-8"))
+                             "BMS ERROR\n1.1 Over Voltage\n").encode("utf-8"))
         window._flush_rx()
         app.processEvents()
         doc5 = window.txt_rx.document()
@@ -2363,6 +2442,22 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
         assert (texts[bms_row].index("BMS ERROR"), 9) in \
             [(s, n) for s, n, c in painted_spans(bms_row) if c.name() == yellow], \
             f"BMS ERROR 没有标黄：{painted_spans(bms_row)}"
+        # ---- 5d) BMS 错误明细行整行标橙（2026-10-11 用户点名"BMS Error
+        #     并没有被标橙色"）：BMS ERROR 起到下一轮时间戳为止都是错误块，
+        #     明细行（"1.1 Over Voltage" 这些）跟着标橙，序号保持蓝。
+        detail_row = next(i for i, t in enumerate(texts) if "Over Voltage" in t)
+        detail_text = texts[detail_row]
+        detail_idx = {s for s, _n in index_spans(detail_text)}
+        detail_chars = {}
+        for s, n, c in painted_spans(detail_row):
+            for p in range(s, s + n):
+                detail_chars[p] = c.name()
+        assert all(detail_chars.get(p) == yellow
+                   for p in range(len(detail_text)) if p not in detail_idx), \
+            f"BMS 错误明细行没有整行标橙：{painted_spans(detail_row)}"
+        assert all(detail_chars.get(p) == rx_accent().name()
+                   for p in detail_idx), \
+            f"错误明细行的序号蓝被挤掉了：{painted_spans(detail_row)}"
 
         # ---- 5c) 段落边界（用户点名）：电压在**时间戳 → Temperature1** 之间，
         #     温度在 **Temperature1 → BMS** 之间。所以不能只认 "Voltage1:" 标题 ——
@@ -2406,10 +2501,22 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
         assert any(c.name() == qcolor("temp_warn").name()
                    for _, _, c in painted_spans(temp_row_noheader)), \
             f"温度越界没有标黄：{painted_spans(temp_row_noheader)}"
-        assert all(c.name() == rx_accent().name()
-                   for _, _, c in painted_spans(after_bms)), \
-            ("BMS 之后的数值不该再按温度判"
-             f"（用户：温度数据只到 BMS 为止）：{painted_spans(after_bms)}")
+        # BMS 之后的数值行：作为**错误明细**整行标橙（2026-10-11 用户点名），
+        # 序号保持蓝；关键是不能按温度判成黄（用户：温度数据只到 BMS 为止）。
+        ab_text = rows[after_bms]
+        ab_idx = {s for s, _n in index_spans(ab_text)}
+        ab_chars = {}
+        for s, n, c in painted_spans(after_bms):
+            for p in range(s, s + n):
+                ab_chars[p] = c.name()
+        assert all(ab_chars.get(p) == yellow
+                   for p in range(len(ab_text)) if p not in ab_idx), \
+            f"BMS 错误明细行没有整行标橙：{painted_spans(after_bms)}"
+        assert all(ab_chars.get(p) == rx_accent().name() for p in ab_idx), \
+            f"明细行序号蓝被挤掉了：{painted_spans(after_bms)}"
+        assert not any(c.name() == qcolor("temp_warn").name()
+                       for _, _, c in painted_spans(after_bms)), \
+            "BMS 之后的数值不该再按温度判（用户：温度数据只到 BMS 为止）"
         # 范围复原
         customization.set("volt_limit_low", 2500)
         customization.set("volt_limit_high", 4500)
