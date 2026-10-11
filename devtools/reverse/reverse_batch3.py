@@ -123,6 +123,13 @@ elif MODE == "pressflip":
           "        if False:        # REVERSE: 按下不翻转，退回松开才切换\n"
           "            pass\n")
 
+elif MODE == "sentoggle":
+    # 「默认折叠发送区」不按配置初始化（硬编码回折叠）—— 配置不生效回归
+    patch("main_window.py",
+          "        self._set_send_collapsed(\n"
+          "            bool(customization.get(\"send_collapsed_startup\")), remember=False)\n",
+          "        self._set_send_collapsed(True, remember=False)   # REVERSE\n")
+
 else:
     raise SystemExit(f"未知模式 {MODE}")
 

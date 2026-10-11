@@ -403,9 +403,27 @@ class Switch(QCheckBox):
         self._t = 1.0 if self.isChecked() else 0.0
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFont(ui_font(11.0))
+        # 无障碍：自绘控件没有原生勾选框，读屏软件拿不到任何线索 —— 必须
+        # 显式给出角色、名称与状态。名称随文字走；「定制功能」区里开关自己
+        # 不带文字（名字在左侧 QLabel 上），由 set_accessible_label 补。
+        self.setAccessibleName(text)
+        self.toggled.connect(self._on_accessible_state)
+        self._sync_accessible_state()
         self.toggled.connect(self._on_toggled)
         # 滑块位移是小位移，用 out_quint 起步更干脆、收尾更慢，看着"贴手"
         self._knob_anim = Tween(190, out_quint, self._on_value, parent=self)
+
+    def set_accessible_label(self, name: str, description: str = "") -> None:
+        """给"无文字开关"补上读屏名称/说明（它自己画不出文字时读屏是哑的）。"""
+        self.setAccessibleName(name)
+        if description:
+            self.setAccessibleDescription(description)
+
+    def _sync_accessible_state(self) -> None:
+        self.setAccessibleDescription("已开启" if self.isChecked() else "已关闭")
+
+    def _on_accessible_state(self, _checked: bool) -> None:
+        self._sync_accessible_state()
 
     def sizeHint(self) -> QSize:
         metrics = QFontMetrics(self.font())

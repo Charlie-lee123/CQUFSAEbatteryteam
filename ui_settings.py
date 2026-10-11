@@ -212,6 +212,9 @@ class SettingsDialog(QDialog):
                 toggle = Switch("")
                 toggle.setFont(ui_font(11.0))
                 toggle.setChecked(bool(customization.get(spec["key"])))
+                # 无障碍：这枚开关自己不带文字（名字在左侧行标签上），读屏
+                # 只看到一个无名开关 —— 显式把行标签与说明交给它。
+                toggle.set_accessible_label(spec["label"], spec.get("tip", ""))
                 if spec["tip"]:
                     toggle.setToolTip(spec["tip"])
                 field: QWidget = toggle

@@ -1423,6 +1423,11 @@ def check_customization(app: QApplication) -> None:
                 assert toggle.isChecked() != was, \
                     f"{spec['key']} 按下瞬间没有翻转（退回松开才切换 = 延迟回归）"
                 toggle.setChecked(was)
+                # 无障碍：无文字开关必须有可读音名称与状态描述
+                assert toggle.accessibleName() == spec["label"], \
+                    f"{spec['key']} 开关缺少读屏名称（无障碍）"
+                assert toggle.accessibleDescription() in ("已开启", "已关闭"), \
+                    f"{spec['key']} 开关缺少状态描述（无障碍）"
                 labels = [c for c in dialog.findChildren(_QLabel)
                           if c.text() == spec["label"]]
                 assert labels, f"找不到 {spec['label']} 的行标签"
@@ -2749,6 +2754,72 @@ def check_caption_bar(app: QApplication) -> None:
         settings.sync()
 
 
+def check_send_collapsed_startup(app: QApplication) -> None:
+    """「默认折叠发送区」：默认开 = 保持老行为；关掉后**下次启动**发送区开局展开。
+
+    验证三件事：① 配置项存在、默认 True；② 值 True 时新窗口开局折叠、False 时
+    开局展开（跨"启动"就是重新 make_window）；③ 设置面板里确实生成了这枚开关
+    且与其它开关同款（Switch + 可读名称，无障碍）。
+    """
+    import customization
+    from ui_controls import Switch
+
+    settings = QSettings("MimoWorks", "SerialAssistant")
+    snapshot = {key: settings.value(key) for key in settings.allKeys()}
+    try:
+        spec = next(s for s in customization.specs()
+                    if s["key"] == "send_collapsed_startup")
+        assert spec["kind"] == "bool" and spec["default"] is True, \
+            f"「默认折叠发送区」应当是默认打开的布尔项：{spec}"
+        assert spec["label"] == "默认折叠发送区", f"标签文案变了：{spec['label']}"
+        assert spec["tip"], "这一项没有给说明文字（无障碍/悬停提示都需要）"
+
+        # 默认（开）→ 新窗口开局折叠
+        customization.set("send_collapsed_startup", True)
+        window = make_window()
+        try:
+            window.resize(1100, 820)
+            window.show()
+            app.processEvents()
+            assert window._tx_collapsed is True, \
+                "开关开着，发送区开局却不是折叠的"
+            assert not window._tx_content.isVisible(), "折叠态发送区内容还露着"
+        finally:
+            window.close()
+
+        # 关掉 → 新窗口开局展开（跨启动生效的关键路径）
+        customization.set("send_collapsed_startup", False)
+        window = make_window()
+        try:
+            window.resize(1100, 820)
+            window.show()
+            app.processEvents()
+            assert window._tx_collapsed is False, \
+                "关掉开关后，发送区开局仍然是折叠的（没有按配置初始化）"
+            assert window._tx_content.isVisible(), "展开态发送区内容没显示"
+        finally:
+            window.close()
+
+        # 设置面板里确实有这枚开关，且是统一款式的 Switch + 可读名称
+        from ui_settings import SettingsDialog
+        dialog = SettingsDialog("dark", 0)
+        try:
+            toggle = dialog._custom_widgets.get("send_collapsed_startup")
+            assert isinstance(toggle, Switch), \
+                "「默认折叠发送区」不是统一的拨动开关控件"
+            assert toggle.accessibleName() == "默认折叠发送区", \
+                "这枚开关缺少读屏名称（无障碍）"
+        finally:
+            dialog.close()
+    finally:
+        for key in settings.allKeys():
+            if key not in snapshot:
+                settings.remove(key)
+        for key, value in snapshot.items():
+            settings.setValue(key, value)
+        settings.sync()
+
+
 def check_startup_state(app: QApplication) -> None:
     """「启动时最大化」开关：默认开（整窗全屏、盖住任务栏），关掉则普通窗口起手。
 
@@ -3038,6 +3109,7 @@ CHECKS = [
     ("提示字号与按钮显隐", check_tooltip_and_buttons),
     ("自绘标题栏三键", check_caption_bar),
     ("启动时最大化开关", check_startup_state),
+    ("默认折叠发送区开关", check_send_collapsed_startup),
     ("定位最近异常按钮", check_alert_locate),
 ]
 

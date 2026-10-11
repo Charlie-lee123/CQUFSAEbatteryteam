@@ -472,11 +472,14 @@ class MainWindow(QMainWindow):
         root.addWidget(bar)
 
         self._update_counters()
-        # 发送区**开局就折叠**（用户点名："将发送区默认折叠起来"）。这台软件是
-        # "只看不发"的 BMS 读取工具，输入框常年闲着，与其占一排中文的高度，
-        # 不如把这份高度让给接收区。remember=False：此刻还没有"用户拖过的尺寸"，
-        # 留空 → 第一次点展开按自然尺寸（一排中文）铺开。
-        self._set_send_collapsed(True, remember=False)
+        # 发送区开局姿态由「定制功能 → 默认折叠发送区」决定。默认**开** =
+        # 保持老行为（用户点名过"将发送区默认折叠起来"）：这台软件是"只看不发"
+        # 的 BMS 读取工具，输入框常年闲着，与其占一排中文的高度，不如把这份
+        # 高度让给接收区。关掉则开局就展开。
+        # remember=False：此刻还没有"用户拖过的尺寸"，留空 → 第一次点展开
+        # 按自然尺寸（一排中文）铺开。
+        self._set_send_collapsed(
+            bool(customization.get("send_collapsed_startup")), remember=False)
 
     def _new_card(self, title: str) -> Card:
         card = Card(title)
