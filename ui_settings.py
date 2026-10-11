@@ -421,12 +421,14 @@ class SettingsDialog(QDialog):
                 return
             if latest <= self._local_version():
                 self.lbl_version.setText(f"已是最新版本 v{VERSION}")
+                self._flash_button_result("✓ 已是最新")
                 return
             latest_str = ".".join(str(p) for p in latest)
             # 有新版本：打开仓库主页（用户指定 —— releases/latest 在没建过
             # Release 的仓库上是 404，不能用）
             from version import REPO_URL
             self.lbl_version.setText(f"发现新版本 v{latest_str}，已打开仓库主页")
+            self._flash_button_result(f"发现 v{latest_str}！")
             QDesktopServices.openUrl(QUrl(REPO_URL))
         except Exception:
             # 兜底：任何解析/处理异常都不能变成"点了没反应"（实测 NameError
@@ -447,6 +449,20 @@ class SettingsDialog(QDialog):
 
     def _update_failed(self) -> None:
         self.lbl_version.setText("检查失败：连不上 GitHub（代理开了吗？）")
+        self._flash_button_result("网络失败")
+
+    def _flash_button_result(self, text: str) -> None:
+        """结果在**按钮上**原地显示 4 秒再复原。
+
+        只改版本行那行小灰字用户根本注意不到（"点了没反应"的体感就是
+        这么来的）—— 结果必须出现在手指按下过的地方。
+        """
+        self.btn_check_update.setText(text)
+        QTimer.singleShot(4000, self._restore_button_text)
+
+    def _restore_button_text(self) -> None:
+        if self.btn_check_update.text() != "检查中…":
+            self.btn_check_update.setText("检查更新")
 
     def _finish_update_check(self) -> None:
         self._pending_reply = None
