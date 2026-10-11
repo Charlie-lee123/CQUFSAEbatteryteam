@@ -101,11 +101,23 @@ elif MODE == "nopad":
           "        body_layout.setContentsMargins(0, 0, 0, 0)\n")
 
 elif MODE == "hitbtn":
-    # Switch 命中区域退回 QCheckBox 默认（只有原生 14px 勾选框可点）——
-    # "部分拨动开关无法点击"回归
+    # Switch 命中区域失效（只有原生 14px 勾选框可点）—— "部分拨动开关无法点击"回归
     patch("ui_controls.py",
-          "        return self.rect().contains(pos)\n",
-          "        return False        # REVERSE: 命中区域失效\n")
+          "        point = QPointF(pos)\n"
+          "        track = self._track_rect()\n",
+          "        return False        # REVERSE: 命中区域失效\n"
+          "        point = QPointF(pos)\n"
+          "        track = self._track_rect()\n")
+
+elif MODE == "hit_large":
+    # 命中区退回「整个控件矩形」（横向占满行、纵向占满控件高度含留白）——
+    # 用户报的"停在开关同一高度随便点一下就切换"回归
+    patch("ui_controls.py",
+          "        point = QPointF(pos)\n"
+          "        track = self._track_rect()\n",
+          "        return self.rect().contains(pos)   # REVERSE: 命中区过大\n"
+          "        point = QPointF(pos)\n"
+          "        track = self._track_rect()\n")
 
 elif MODE == "knobgeom":
     # GlassSlider 几何退回错位版（滑块中心不再贴轨道端点）
@@ -129,6 +141,13 @@ elif MODE == "sentoggle":
           "        self._set_send_collapsed(\n"
           "            bool(customization.get(\"send_collapsed_startup\")), remember=False)\n",
           "        self._set_send_collapsed(True, remember=False)   # REVERSE\n")
+
+elif MODE == "titlebar":
+    # 标题栏主题作用域退回"沿父链上溯" —— 设置对话框会把主窗口圆角重新打开
+    patch("ui_theme.py",
+          "        hwnd = int(window.winId())\n",
+          "        hwnd = ctypes.windll.user32.GetParent(int(window.winId())) "
+          "or int(window.winId())   # REVERSE\n")
 
 else:
     raise SystemExit(f"未知模式 {MODE}")

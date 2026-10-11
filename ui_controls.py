@@ -13,7 +13,9 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import (
+    QEvent, QLineF, QPoint, QPointF, QRectF, QSize, Qt, Signal,
+)
 from PySide6.QtGui import (
     QColor, QFontMetrics, QPainter, QPainterPath, QPen,
 )
@@ -434,17 +436,38 @@ class Switch(QCheckBox):
 
     minimumSizeHint = sizeHint
 
-    def hitButton(self, pos: QPoint) -> bool:
-        """整个控件矩形都可点。
+    def _track_rect(self) -> QRectF:
+        """胶囊轨道在控件里的位置（与 paintEvent 的绘制几何保持一致）。"""
+        return QRectF(0.0, (self.height() - self.TRACK_H) / 2.0,
+                      self.TRACK_W, self.TRACK_H)
 
-        ⚠️ QCheckBox 的默认命中区域按**原生勾选框**（Fusion 的 14px 小方框）
-        算，跟这里自绘的 40px 胶囊轨道完全对不上 —— 点轨道中段、右半边、
-        文字全都落在"点击区域"之外，表现就是"开关点了没反应"（真机实测：
-        点轨道中点 hitButton=False，只有最左侧 14px 生效；用户报的
-        "部分拨动开关无法点击或无法切换状态"就是它）。自绘控件的命中区域
-        必须自己定义 —— 整个矩形都算。
+    def hitButton(self, pos: QPoint) -> bool:
+        """命中区按**圆角胶囊轨道**（及其右侧的开关文字）算，不是整个控件矩形。
+
+        ⚠️ 两个历史坑叠在一起，这里必须同时避开：
+        1) QCheckBox 默认命中区按**原生勾选框**（Fusion 的 14px 小方框）算，
+           跟自绘的 40px 胶囊轨道对不上 —— 点轨道中段、右半边全是"没反应"
+           （用户报"部分拨动开关无法点击或无法切换状态"）；
+        2) 一度改成 ``rect().contains(pos)``（整个控件矩形）修上一条 —— 于是
+           横向占满整行、纵向占满控件高度（含轨道上下的留白）的区域都能触发，
+           "停在开关同一高度随便点一下也切换"（用户报的新问题）。
+        正确做法就是**几何跟着绘制走**：轨道内用胶囊判定（四角按圆角切掉），
+        轨道右侧的文字区矩形照常可点，其余留白一律不响应。
         """
-        return self.rect().contains(pos)
+        point = QPointF(pos)
+        track = self._track_rect()
+        if track.contains(point):
+            # 胶囊：把四个角的圆外区域排除 —— 与 fillPath 画的形状一致
+            radius = self.TRACK_H / 2.0
+            cx = min(max(point.x(), track.left() + radius), track.right() - radius)
+            cy = min(max(point.y(), track.top() + radius), track.bottom() - radius)
+            return QLineF(point, QPointF(cx, cy)).length() <= radius
+        if self.text():
+            text_rect = QRectF(self.TRACK_W + self.GAP_PX, 0.0,
+                               self.width() - self.TRACK_W - self.GAP_PX,
+                               float(self.height()))
+            return text_rect.contains(point)
+        return False
 
     def mousePressEvent(self, event) -> None:
         """按下即翻转，不等松开。

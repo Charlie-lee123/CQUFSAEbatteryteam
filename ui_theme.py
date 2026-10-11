@@ -818,7 +818,14 @@ def apply_titlebar_theme(window, scheme: str, rounded: bool = True) -> None:
     try:
         import ctypes
 
-        hwnd = ctypes.windll.user32.GetParent(int(window.winId())) or int(window.winId())
+        # ⚠️ 必须用窗口**自己的**句柄，绝不能沿父链上溯（曾经用
+        # ``GetParent(winId()) or winId()``）—— 设置面板是主窗口的模态子窗口，
+        # 它的 GetParent 恰好就是**主窗口**。于是"给对话框设标题栏主题"这一步
+        # 顺手把主窗口的圆角重新打开成圆角：主窗口此时全屏，四角当场被切掉、
+        # 露出桌面 —— 用户报的"点完设置保存退出后最大化界面四周有缝隙"根因
+        # 就是它（只在开过设置后出现，且与换不换主题无关）。
+        # Qt 的 winId() 本身就是顶层 HWND（无边框主窗口也一样），直接用。
+        hwnd = int(window.winId())
         dark = ctypes.c_int(1 if scheme == "dark" else 0)
         # 20 是 Win11 的属性号，19 是 Win10 1809+ 的，两个都试，失败无副作用
         for attribute in (20, 19):
