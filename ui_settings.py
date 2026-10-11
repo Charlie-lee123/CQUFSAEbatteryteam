@@ -412,23 +412,29 @@ class SettingsDialog(QDialog):
         try:
             import json
             tags = json.loads(bytes(reply.readAll()))
-        except ValueError:
-            self.lbl_version.setText("检查失败：GitHub 返回了看不懂的内容")
-            return
-        latest = self._latest_tag_version(tags)
-        if latest is None:
-            # 仓库还没有任何版本 tag（比如刚建仓）
-            self.lbl_version.setText(f"当前版本 v{VERSION}（仓库还没有发布过版本）")
-            return
-        if latest <= self._local_version():
-            self.lbl_version.setText(f"已是最新版本 v{VERSION}")
-            return
-        latest_str = ".".join(str(p) for p in latest)
-        # 有新版本：打开仓库主页（用户指定 —— releases/latest 在没建过
-        # Release 的仓库上是 404，不能用）
-        from version import REPO_URL
-        self.lbl_version.setText(f"发现新版本 v{latest_str}，已打开仓库主页")
-        QDesktopServices.openUrl(QUrl(REPO_URL))
+            from version import VERSION
+            latest = self._latest_tag_version(tags)
+            if latest is None:
+                # 仓库还没有任何版本 tag（比如刚建仓）
+                self.lbl_version.setText(
+                    f"当前版本 v{VERSION}（仓库还没有发布过版本）")
+                return
+            if latest <= self._local_version():
+                self.lbl_version.setText(f"已是最新版本 v{VERSION}")
+                return
+            latest_str = ".".join(str(p) for p in latest)
+            # 有新版本：打开仓库主页（用户指定 —— releases/latest 在没建过
+            # Release 的仓库上是 404，不能用）
+            from version import REPO_URL
+            self.lbl_version.setText(f"发现新版本 v{latest_str}，已打开仓库主页")
+            QDesktopServices.openUrl(QUrl(REPO_URL))
+        except Exception:
+            # 兜底：任何解析/处理异常都不能变成"点了没反应"（实测 NameError
+            # 被槽函数吞掉，用户看到的就是检查一秒结束、毫无反馈）
+            import traceback
+            app_log.error("检查更新处理异常: "
+                          + traceback.format_exc(limit=3))
+            self.lbl_version.setText("检查失败：更新信息解析出错")
 
     def _update_timed_out(self) -> None:
         if getattr(self, "_pending_reply", None) is None:
