@@ -7,7 +7,9 @@ set "GITEXE=D:\Git\cmd\git.exe"
 if not exist "%GITEXE%" set "GITEXE=git"
 
 echo 正在推送 main 与所有标签（如弹出 GitHub 登录/授权窗口，请完成授权）...
-"%GITEXE%" push origin main --follow-tags
+rem ⚠️ 用 --tags 而不是 --follow-tags：本仓库的 tag（v1.0~v1.4）都是**轻量 tag**，
+rem 而 --follow-tags 只推附注 tag —— 轻量的一个都推不上去（踩过）。
+"%GITEXE%" push origin main --tags
 if errorlevel 1 (
     echo.
     echo 推送失败。常见原因：
