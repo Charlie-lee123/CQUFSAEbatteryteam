@@ -1249,6 +1249,31 @@ def mw_button_specs():
     return main_window.BUTTON_SPECS
 
 
+def _assert_switch_hit_geometry(toggle, tag: str) -> None:
+    """拨动开关命中区几何：只有圆角胶囊轨道（四角圆外除外）与轨道右侧文字区可点。
+
+    用户报过两轮相反的问题，这一组断言必须同时钉住两端：
+    * 太**小** —— QCheckBox 原生命中区按 Fusion 的 14px 勾选框算，跟自绘的
+      40px 胶囊轨道对不上，点轨道中段/右半/文字全是"没反应"；
+    * 太**大** —— 一度改成 ``rect().contains(pos)``（整个控件矩形）修上一条，
+      于是横向占满整行、纵向占满控件高度（含轨道上下留白）都能触发，用户报
+      "停在开关同一高度随便点一下就切换"。
+    正确实现是**几何跟着绘制走**，这里按同一条几何做断言。
+    """
+    track = toggle._track_rect()
+    mid_y = int(track.center().y())
+    assert toggle.hitButton(QPoint(int(toggle.TRACK_W) - 1, mid_y)), \
+        f"{tag} 轨道右端不可点（命中区过小回归）"
+    assert not toggle.hitButton(
+        QPoint(int(toggle.TRACK_W / 2), int(track.top()) - 1)), \
+        f"{tag} 轨道正上方留白不该可点（命中区过大回归）"
+    assert not toggle.hitButton(
+        QPoint(int(toggle.TRACK_W / 2), int(track.bottom()) + 1)), \
+        f"{tag} 轨道正下方留白不该可点（命中区过大回归）"
+    assert not toggle.hitButton(QPoint(1, int(track.top()))), \
+        f"{tag} 轨道左上圆角外不该可点（圆角未切）"
+
+
 def check_customization(app: QApplication) -> None:
     """定制功能注册表：时间戳年月日开关、暂停定位行数、设置面板动态生成。"""
     import re
@@ -1261,6 +1286,22 @@ def check_customization(app: QApplication) -> None:
         window = make_window()
         window.show()
         app.processEvents()
+
+        # ---- 0) 拨动开关命中区几何（全 check 第一件事）----
+        # ⚠️ 必须**最先**跑：本 check 后段依赖真实收发数据（暂停定位行数要喂
+        # 足够多轮），在无串口/窗口偏矮的机器上会以"数据里没有时间戳行"中途
+        # 中止 —— 断言排在它后面就永远跑不到，反向验证时"打了补丁照样全绿"，
+        # 等于没有回归保护（hit_large 模式实测就是这样漏过去的）。
+        from ui_settings import SettingsDialog
+        _probe_dialog = SettingsDialog("dark", 55)
+        try:
+            for spec in customization.specs():
+                if spec["kind"] != "bool":
+                    continue
+                _assert_switch_hit_geometry(
+                    _probe_dialog._custom_widgets[spec["key"]], spec["key"])
+        finally:
+            _probe_dialog.close()
 
         # ---- 1) 时间戳：默认三段全开 = [YYYY-MM-DD HH:MM:SS] ----
         stamp = window._stamp()
@@ -1385,14 +1426,19 @@ def check_customization(app: QApplication) -> None:
                             if _REPO in c.text() and c.openExternalLinks()]
             assert _repo_labels, "设置面板没有附 GitHub 仓库链接（或链接不可点）"
             # 版本比对回归：远端 tag 和本地版本必须**补齐到三段**再比，
-            # 否则 (1,2,0) > (1,2) 会把 v1.2 自己误判成有新版（实测踩过）
+            # 否则 (1,2,0) > (1,2) 会把 v1.2 自己误判成有新版（实测踩过）。
+            # ⚠️ 本地版本不能硬编码（曾经写死 (1,2,0)，升到 1.3 后就陈旧了，
+            # 只因本 check 前段提前中止才没暴露）—— 一律从 version.py 现算。
+            from version import VERSION as _V
+            _expected = tuple(int(p) for p in _V.split("."))
+            _expected += (0,) * (3 - len(_expected))
             latest = dialog._latest_tag_version(
-                [{"name": "v1.2"}, {"name": "v1.0"}, {"name": "垃圾tag"}])
-            assert latest == (1, 2, 0), f"tag 解析错误：{latest}"
-            assert dialog._local_version() == (1, 2, 0), \
+                [{"name": f"v{_V}"}, {"name": "v1.0"}, {"name": "垃圾tag"}])
+            assert latest == _expected, f"tag 解析错误：{latest}"
+            assert dialog._local_version() == _expected, \
                 f"本地版本解析错误：{dialog._local_version()}"
             assert latest <= dialog._local_version(), \
-                "v1.2 对 v1.2 被误判为有新版本（元组长度没补齐）"
+                "同版本 tag 被误判为有新版本（元组长度没补齐）"
             for spec in customization.specs():
                 assert spec["key"] in dialog._custom_widgets, \
                     f"设置面板没有为 {spec['key']} 生成控件"
@@ -1412,6 +1458,8 @@ def check_customization(app: QApplication) -> None:
                 toggle = dialog._custom_widgets[spec["key"]]
                 assert toggle.hitButton(QPoint(toggle.TRACK_W // 2, toggle.height() // 2)), \
                     f"{spec['key']} 点轨道中点没有命中"
+                # 命中区几何回归（与第 4 节同一套断言，抽成共用函数）
+                _assert_switch_hit_geometry(toggle, spec["key"])
                 # 「按下即翻转」回归：按下瞬间状态必须已变（松开才变 = 手感延迟回归）
                 was = toggle.isChecked()
                 press_ev = _QMouse(QEvent.Type.MouseButtonPress,
@@ -2674,6 +2722,25 @@ def check_caption_bar(app: QApplication) -> None:
             window._apply_theme("dark")
             app.processEvents()
             assert corner_pref() == 1, "切回深色之后圆角又回来了"
+
+            # 3c) 打开**设置面板**再关掉，主窗口必须仍是方角。
+            #     ⚠️ 这条是用户报的"点完设置保存退出后最大化界面四周有缝隙"的
+            #     复现路径：设置面板是主窗口的模态子窗口，给对话框设标题栏主题
+            #     若沿父链上溯取句柄（GetParent），拿到的恰好就是**主窗口** ——
+            #     于是"给对话框设圆角"顺手把全屏主窗口的圆角重新打开，四角当场
+            #     切掉露出桌面。只有开过设置才会出现，与换不换主题无关。
+            from ui_settings import SettingsDialog as _SD
+            _dlg = _SD(window._theme_mode, 0, parent=window)
+            try:
+                _dlg.show()
+                app.processEvents()
+                assert corner_pref() == 1, \
+                    "打开设置面板后主窗口圆角被打开了（标题栏主题作用域错误）"
+            finally:
+                _dlg.close()
+            app.processEvents()
+            assert corner_pref() == 1, \
+                "关闭设置面板后主窗口圆角仍是圆的（四角漏桌面）"
 
         # 4) 无边框窗口没有系统的缩放边框，边缘那一圈得自己认。
         #    先把窗口弄回普通态：第 3 条可能把它留在全屏，而 offscreen 下
