@@ -143,7 +143,11 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
             index = match.group(1)
             value = match.group(2)[1:]
             value = "0" * max(0, widths.get(current, 0) - len(value)) + value
-            return "0" * max(0, index_width - len(index)) + index + "." + value
+            # 序号为 0 不补占位：0 号点是设备数据里的特殊行，补成 "00" 反而
+            # 在序号前面多出一个占位字符（用户点名"序号为 0 时，序号前面不应
+            # 再保留一个空格，去掉该多余空格"）—— 保持 "0.xxx" 原样。
+            pad_w = 0 if index == "0" else max(0, index_width - len(index))
+            return "0" * pad_w + index + "." + value
 
         out.append(SAMPLE_RE.sub(pad, line))
     return "\n".join(out)

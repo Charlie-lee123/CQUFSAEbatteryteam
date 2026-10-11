@@ -605,41 +605,10 @@ QSpinBox::up-arrow, QSpinBox::down-arrow {
     border: none;
 }
 
-/* ---- 滑杆：设置面板里的毛玻璃强度（无级） ---- */
-QSlider::groove:horizontal {
-    height: 4px;
-    background: @line_strong@;
-    border-radius: 2px;
-}
-
-QSlider::sub-page:horizontal {
-    height: 4px;
-    background: @ink@;
-    border-radius: 2px;
-}
-
-QSlider::add-page:horizontal {
-    height: 4px;
-    background: @line_strong@;
-    border-radius: 2px;
-}
-
-QSlider::handle:horizontal {
-    background: @ink@;
-    border: none;
-    width: 15px;
-    height: 15px;
-    margin: -6px 0;
-    border-radius: 7px;
-}
-
-QSlider::handle:horizontal:hover {
-    background: @ink@;
-}
-
-QSlider::handle:horizontal:disabled {
-    background: @ink_disabled@;
-}
+/* 滑杆（设置面板的毛玻璃强度）不再走 QSS：QSS 的子控件定位是隐式的，
+   真机（2x 缩放）实测 groove 被默认定位缩进了 ~17px 而滑块的滑动范围没有 ——
+   强度在两端时圆点整个悬在轨道外面（用户报"滑轨显示异常"）。
+   现在由 ui_controls.GlassSlider 完全自绘，几何自己算，这里不再写规则。 */
 
 /* ---- 次级按钮：主按钮是自绘的 InkButton，不走这套 ----
    这里**不能**写 min-height：QSS 的 min-height 会直接覆盖控件的

@@ -13,13 +13,13 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
     QColor, QFontMetrics, QPainter, QPainterPath, QPen,
 )
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox,
-    QWidget,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider,
+    QSpinBox, QWidget,
 )
 
 from ui_anim import Tween, out_cubic, out_quint
@@ -416,6 +416,38 @@ class Switch(QCheckBox):
 
     minimumSizeHint = sizeHint
 
+    def hitButton(self, pos: QPoint) -> bool:
+        """整个控件矩形都可点。
+
+        ⚠️ QCheckBox 的默认命中区域按**原生勾选框**（Fusion 的 14px 小方框）
+        算，跟这里自绘的 40px 胶囊轨道完全对不上 —— 点轨道中段、右半边、
+        文字全都落在"点击区域"之外，表现就是"开关点了没反应"（真机实测：
+        点轨道中点 hitButton=False，只有最左侧 14px 生效；用户报的
+        "部分拨动开关无法点击或无法切换状态"就是它）。自绘控件的命中区域
+        必须自己定义 —— 整个矩形都算。
+        """
+        return self.rect().contains(pos)
+
+    def mousePressEvent(self, event) -> None:
+        """按下即翻转，不等松开。
+
+        以前跟着 QCheckBox 默认走「松开才切换」：用户从按下到松开通常
+        100~200ms，再叠加 190ms 的滑块动画，手感就是"按下去半天没反应"
+        （用户报"设置里的拨动开关按下有延迟，和别的开关不一样"—— 实测
+        对照开关/定制开关/行标签三条路径全部只在松开瞬间翻转，探针
+        devtools/_probe_toggle_timing.py）。改成**按下瞬间**就翻转：
+        反馈提前到指尖落下的那一刻，所有 Switch 一致跟手。
+
+        注意这里不能调 super()：QAbstractButton 的按下处理会把 release
+        记成一次"点击"，松开时会再翻转一次（等于翻回去）。自己翻转完
+        直接 accept，release 落下来时 down 状态没置位，不会再触发切换。
+        """
+        if event.button() == Qt.MouseButton.LeftButton and self.isEnabled():
+            self.setChecked(not self.isChecked())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
     def _on_toggled(self, checked: bool) -> None:
         self._knob_anim.start(self._t, 1.0 if checked else 0.0)
 
@@ -461,6 +493,93 @@ class Switch(QCheckBox):
                 QRectF(self.TRACK_W + self.GAP_PX, 0.0,
                        self.width() - self.TRACK_W - self.GAP_PX, float(self.height())),
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.text())
+
+
+# ------------------------------------------------------------------ 滑杆
+
+class GlassSlider(QSlider):
+    """毛玻璃强度滑杆：轨道与滑块**完全自绘**。
+
+    为什么不用 QSS 画：QSS 的滑杆子控件定位是隐式的 —— 真机（2x 缩放）实测
+    groove 被默认定位缩进了 ~17px，而滑块的滑动范围仍从控件左缘起算，
+    强度在两端时圆点整个悬在轨道外面（用户报"滑轨显示异常仍未解决"）。
+    与其跟这套玄学规则纠缠，不如和 Switch 一样自己画：几何全部自己算，
+    任何缩放下都不会错位。
+
+    交互：点击轨道即跳到该值，按住拖动连续调；滚轮不改数值
+    （与 ChevronSpinBox/ChevronComboBox 同一条铁律 —— 避免误操作）。
+    """
+
+    TRACK_H = 4.0
+    KNOB_D = 15.0
+
+    def __init__(self, orientation=Qt.Orientation.Horizontal,
+                 parent: QWidget | None = None) -> None:
+        super().__init__(orientation, parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    # -- 几何 ------------------------------------------------------------
+    def _span(self) -> float:
+        """滑块中心可移动的距离（轨道两端各留出半个滑块半径）。"""
+        return max(1.0, self.width() - self.KNOB_D)
+
+    def _knob_cx(self) -> float:
+        rng = self.maximum() - self.minimum()
+        frac = ((self.value() - self.minimum()) / rng) if rng > 0 else 0.0
+        return self.KNOB_D / 2.0 + self._span() * frac
+
+    def _value_at(self, x: float) -> int:
+        frac = (x - self.KNOB_D / 2.0) / self._span()
+        frac = 0.0 if frac < 0.0 else 1.0 if frac > 1.0 else frac
+        rng = self.maximum() - self.minimum()
+        return int(round(self.minimum() + rng * frac))
+
+    # -- 绘制 ------------------------------------------------------------
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        cy = self.height() / 2.0
+        # 轨道（全宽、浅灰）与已填充段（左段、墨色）
+        track = QRectF(0.0, cy - self.TRACK_H / 2.0, self.width(), self.TRACK_H)
+        path = QPainterPath()
+        path.addRoundedRect(track, self.TRACK_H / 2.0, self.TRACK_H / 2.0)
+        painter.fillPath(path, qcolor("line_strong"))
+        knob_cx = self._knob_cx()
+        if knob_cx > self.KNOB_D / 2.0:
+            filled = track.adjusted(0.0, 0.0, knob_cx - self.width(), 0.0)
+            fill_path = QPainterPath()
+            fill_path.addRoundedRect(filled, self.TRACK_H / 2.0, self.TRACK_H / 2.0)
+            painter.fillPath(fill_path, qcolor("ink"))
+
+        # 滑块：墨色圆（QSS 时代的同款配色），一圈底色描边把圆从轨道上托出来
+        radius = self.KNOB_D / 2.0
+        knob = QRectF(knob_cx - radius, cy - radius, self.KNOB_D, self.KNOB_D)
+        if self.isEnabled():
+            painter.setPen(QPen(qcolor("surface"), 2.0))
+            painter.setBrush(qcolor("ink"))
+        else:
+            painter.setPen(QPen(qcolor("surface"), 2.0))
+            painter.setBrush(qcolor("ink_disabled"))
+        painter.drawEllipse(knob)
+
+    # -- 交互 ------------------------------------------------------------
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setValue(self._value_at(event.position().x()))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            self.setValue(self._value_at(event.position().x()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def wheelEvent(self, event) -> None:
+        event.ignore()      # 滚轮不许改数值（用户点名"避免误操作修改数值"）
 
 
 # ------------------------------------------------------------------ 静态图标

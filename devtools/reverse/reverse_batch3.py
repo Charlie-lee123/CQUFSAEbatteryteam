@@ -46,10 +46,10 @@ elif MODE == "altersel":
           "        self.txt_rx.setExtraSelections(selections)   # REVERSE\n")
 
 elif MODE == "pad":
-    # 序号补齐退回"补空格"（用户要的是补零）
+    # 序号补齐退回"不认 0 号点"（用户："序号为 0 时前面不应再保留占位"）
     patch("ui_highlight.py",
-          '        return "0" * max(0, index_width - len(index)) + index + "." + value\n',
-          '        return " " * max(0, index_width - len(index)) + index + "." + value\n')
+          '            pad_w = 0 if index == "0" else max(0, index_width - len(index))\n',
+          '            pad_w = max(0, index_width - len(index))   # REVERSE: 0 号点规则被删\n')
 
 elif MODE == "boundary":
     # 段落边界退回"只认 Voltage1 标题"（时间戳不再把段重置成电压）
@@ -99,6 +99,29 @@ elif MODE == "nopad":
     patch("ui_settings.py",
           "        body_layout.setContentsMargins(0, 0, 12, 0)\n",
           "        body_layout.setContentsMargins(0, 0, 0, 0)\n")
+
+elif MODE == "hitbtn":
+    # Switch 命中区域退回 QCheckBox 默认（只有原生 14px 勾选框可点）——
+    # "部分拨动开关无法点击"回归
+    patch("ui_controls.py",
+          "        return self.rect().contains(pos)\n",
+          "        return False        # REVERSE: 命中区域失效\n")
+
+elif MODE == "knobgeom":
+    # GlassSlider 几何退回错位版（滑块中心不再贴轨道端点）
+    patch("ui_controls.py",
+          "        return self.KNOB_D / 2.0 + self._span() * frac\n",
+          "        return self.KNOB_D / 2.0 + self._span() * frac + 17.5   # REVERSE: 错位回归\n")
+
+elif MODE == "pressflip":
+    # 开关退回「松开才翻转」（按下不响应）—— "按下有延迟"回归
+    patch("ui_controls.py",
+          "        if event.button() == Qt.MouseButton.LeftButton and self.isEnabled():\n"
+          "            self.setChecked(not self.isChecked())\n"
+          "            event.accept()\n"
+          "            return\n",
+          "        if False:        # REVERSE: 按下不翻转，退回松开才切换\n"
+          "            pass\n")
 
 else:
     raise SystemExit(f"未知模式 {MODE}")

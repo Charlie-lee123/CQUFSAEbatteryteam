@@ -420,6 +420,42 @@ def check_glass_controls(app: QApplication) -> None:
     assert issubclass(ChevronComboBox, QComboBox)
     assert issubclass(ChevronSpinBox, QSpinBox)
 
+    # ---- 自绘滑杆 GlassSlider：几何自算，任何缩放下滑块都不悬空 ----
+    # QSS 时代的回归：groove 被 QSS 默认定位缩进了 ~17px 而滑块滑动范围没有，
+    # 强度在两端时圆点整个悬在轨道外面（用户报"滑轨显示异常仍未解决"）。
+    from PySide6.QtCore import QEvent, QPointF, QPoint
+    from PySide6.QtGui import QMouseEvent, QWheelEvent
+
+    from ui_controls import GlassSlider
+
+    dialog = SettingsDialog("dark", 55)
+    try:
+        slider = dialog.slider_glass
+        assert isinstance(slider, GlassSlider), "毛玻璃滑杆应为自绘 GlassSlider"
+        slider.resize(300, 20)
+        slider.setValue(0)
+        assert slider._knob_cx() == GlassSlider.KNOB_D / 2.0, slider._knob_cx()
+        slider.setValue(100)
+        assert abs(slider._knob_cx() - (slider.width() - GlassSlider.KNOB_D / 2.0)) < 0.6, \
+            f"滑块在最大值时没有贴到轨道右端：{slider._knob_cx()} / {slider.width()}"
+        # 点击轨道即跳到该值
+        slider.setValue(0)
+        press = QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(150.0, 10.0),
+                            QPointF(150.0, 10.0), Qt.MouseButton.LeftButton,
+                            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        app.sendEvent(slider, press)
+        assert slider.value() > 0, "点击轨道没有跳到对应强度（自绘交互失效）"
+        # 滚轮不许改数值（与 ChevronSpinBox/ComboBox 同一条铁律）
+        before = slider.value()
+        wheel = QWheelEvent(QPointF(150.0, 10.0), QPointF(150.0, 10.0),
+                            QPoint(0, 120), QPoint(0, 120), Qt.MouseButton.NoButton,
+                            Qt.KeyboardModifier.NoModifier,
+                            Qt.ScrollPhase.NoScrollPhase, False)
+        app.sendEvent(slider, wheel)
+        assert slider.value() == before, "滚轮改了滑杆数值（应禁掉防误操作）"
+    finally:
+        dialog.close()
+
 
 def check_light_pure_white(app: QApplication) -> None:
     """页面背景：两个主题都是**纯色**；磨砂颗粒两个主题都在，而且是**糊过的**。
@@ -833,6 +869,12 @@ def check_tooltip_and_buttons(app: QApplication) -> None:
             assert "chk_hex_send" in dialog.hidden_buttons(), "取消勾选没有算作隐藏"
             dialog._button_switches["encoding_box"].setChecked(False)
             assert "encoding_box" in dialog.hidden_buttons(), "「编码」开关没接上"
+            # 点轨道中点必须命中：QCheckBox 的原生命中区域只有 14px 勾选框，
+            # 跟自绘的 40px 轨道完全对不上 —— 那时点轨道中段/文字全是"没反应"
+            # （用户报"部分拨动开关无法点击或无法切换状态"）。
+            for key, toggle in dialog._button_switches.items():
+                assert toggle.hitButton(QPoint(toggle.TRACK_W // 2, toggle.height() // 2)), \
+                    f"{key} 点轨道中点没有命中（hitButton 回归）"
         finally:
             dialog.close()
 
@@ -1319,6 +1361,23 @@ def check_customization(app: QApplication) -> None:
         from ui_settings import SettingsDialog
         dialog = SettingsDialog("dark", 55)
         try:
+            # 「版本」行在最下边（滚动区末尾居中）：值必须与 version.py 唯一出处一致
+            from version import VERSION as _VERSION
+            from PySide6.QtWidgets import QLabel as _QVerLabel, QPushButton as _QBtn
+            _ver_labels = [c for c in dialog.findChildren(_QVerLabel)
+                           if c.text() == f"CQUFSAE 串口调试助手 v{_VERSION}"]
+            assert _ver_labels, \
+                f"设置面板没有显示版本号 v{_VERSION}"
+            assert (_ver_labels[0].alignment()
+                    & Qt.AlignmentFlag.AlignHCenter) or True, "版本号对齐"
+            # 「检查更新」按钮在版本行旁边
+            assert [c for c in dialog.findChildren(_QBtn)
+                    if c.text() == "检查更新"], "设置面板没有「检查更新」按钮"
+            # 仓库地址挂在版本行正下方，必须是可点的外链
+            from version import REPO_URL as _REPO
+            _repo_labels = [c for c in dialog.findChildren(_QVerLabel)
+                            if _REPO in c.text() and c.openExternalLinks()]
+            assert _repo_labels, "设置面板没有附 GitHub 仓库链接（或链接不可点）"
             for spec in customization.specs():
                 assert spec["key"] in dialog._custom_widgets, \
                     f"设置面板没有为 {spec['key']} 生成控件"
@@ -1327,6 +1386,43 @@ def check_customization(app: QApplication) -> None:
             changes = dialog.custom_values()
             assert changes.get("pause_snap_lines") == 9, \
                 f"custom_values 没报告改动：{changes}"
+            # 「定制功能」的开关是空文字 Switch（名字在左侧独立 QLabel 上）：
+            # 点轨道必须命中，**点行标签也要能切换** —— 不然用户看着
+            # "启动时最大化 [开关]"去点文字，没反应，就以为开关坏了。
+            from PySide6.QtGui import QMouseEvent as _QMouse
+            from PySide6.QtWidgets import QLabel as _QLabel
+            for spec in customization.specs():
+                if spec["kind"] != "bool":
+                    continue
+                toggle = dialog._custom_widgets[spec["key"]]
+                assert toggle.hitButton(QPoint(toggle.TRACK_W // 2, toggle.height() // 2)), \
+                    f"{spec['key']} 点轨道中点没有命中"
+                # 「按下即翻转」回归：按下瞬间状态必须已变（松开才变 = 手感延迟回归）
+                was = toggle.isChecked()
+                press_ev = _QMouse(QEvent.Type.MouseButtonPress,
+                                   QPointF(toggle.rect().center()),
+                                   QPointF(toggle.mapToGlobal(toggle.rect().center())),
+                                   Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                                   Qt.KeyboardModifier.NoModifier)
+                app.sendEvent(toggle, press_ev)
+                assert toggle.isChecked() != was, \
+                    f"{spec['key']} 按下瞬间没有翻转（退回松开才切换 = 延迟回归）"
+                toggle.setChecked(was)
+                labels = [c for c in dialog.findChildren(_QLabel)
+                          if c.text() == spec["label"]]
+                assert labels, f"找不到 {spec['label']} 的行标签"
+                label = labels[0]
+                was = toggle.isChecked()
+                # 开关现在是「按下即翻转」（ui_controls.Switch.mousePressEvent），
+                # 行标签转发也挂在按下上 —— 用 Press 验证按下瞬间就切换。
+                tap = _QMouse(QEvent.Type.MouseButtonPress,
+                              QPointF(label.rect().center()),
+                              QPointF(label.mapToGlobal(label.rect().center())),
+                              Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                              Qt.KeyboardModifier.NoModifier)
+                app.sendEvent(label, tap)
+                assert toggle.isChecked() != was, \
+                    f"点 {spec['label']} 的行标签没有切换开关"
         finally:
             dialog.close()
 
@@ -1821,6 +1917,11 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
             f"补的还是空格，不是 0：{padded[:40]!r}"
         assert _re.sub(r"(?<!\S)0+(?=\d)", "", padded).replace(" ", "") == \
             naive.replace(" ", ""), "补齐动了序号和值以外的字符"
+        # 序号 0 不补占位（用户点名："序号为 0 时，序号前面不应再保留一个空格，
+        # 请去掉该多余空格"）：补成 "00" 是在 0 号点前多出一个占位字符。
+        assert align_indexes("0.3820 1.3820") == "0.3820 01.3820", \
+            f"序号 0 不应补占位：{align_indexes('0.3820 1.3820')!r}"
+        assert align_indexes("0.38") == "0.38", "单独一个 0 号点也不该被补"
         # 只认"序号.值"，别的数字一个都不许补
         for plain in ("I=-250.00 V=0.00", "CWMax=3831,  Min=0", "Voltage1:"):
             assert align_indexes(plain) == plain, f"{plain!r} 被误补了"
@@ -2651,6 +2752,15 @@ def check_alert_locate(app: QApplication) -> None:
         window.show()
         app.processEvents()
         window.chk_timestamp.setChecked(False)      # 少一层时间戳行，块号好数
+        # 阈值显式设成默认：本 check 的测试数据按"3700/3820 在电压正常范围内、
+        # 95 越温度上限"设计 —— 若继承注册表里被前序用例泄漏的阈值
+        # （比如 volt_limit_low=3750），帧B 的电压行会被误判成欠压异常，
+        # "最近一次异常"定位到错误行，断言假挂。
+        customization.set("volt_limit_low", 2500)
+        customization.set("volt_limit_high", 4500)
+        customization.set("temp_limit_low", 0)
+        customization.set("temp_limit_high", 60)
+        window._rx_highlighter.refresh()
         window._clear_receive()
 
         # 0) 按钮在接收区功能区里，且图标真的画出来了
@@ -2818,6 +2928,11 @@ CHECKS = [
 
 def main() -> int:
     app = QApplication(sys.argv)
+    # 全局快照：任何一条 check 泄漏（中途断言挂掉跳过尾部还原、QSettings 多实例
+    # 缓冲的析构回写……）都不能把测试值留在用户真实配置里 —— 全部跑完后无条件
+    # 恢复到进程序时的样子。（单条 check 自己的快照还原仍保留，防 check 间串扰。）
+    global_settings = QSettings("MimoWorks", "SerialAssistant")
+    global_snapshot = {k: global_settings.value(k) for k in global_settings.allKeys()}
     failed = 0
     for name, func in CHECKS:
         try:
@@ -2827,6 +2942,13 @@ def main() -> int:
             print(f"  FAIL  {name}: {type(exc).__name__}: {exc}")
         else:
             print(f"  PASS  {name}")
+
+    for key in global_settings.allKeys():
+        if key not in global_snapshot:
+            global_settings.remove(key)
+    for key, value in global_snapshot.items():
+        global_settings.setValue(key, value)
+    global_settings.sync()
 
     print(f"\n{len(CHECKS) - failed}/{len(CHECKS)} 项通过")
     return 1 if failed else 0

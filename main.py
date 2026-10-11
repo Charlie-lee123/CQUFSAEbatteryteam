@@ -5,7 +5,9 @@ from __future__ import annotations
 import sys
 
 # 软件版本号（发布 / 备份以它为准，git 上同时打同名 tag）。
-__version__ = "1.1"
+# 唯一出处是 version.py：main 一被 import 就会拉起 MainWindow，
+# 其它模块（如设置面板）要从 version.py 取，不能反向 import 这里。
+from version import VERSION as __version__
 
 from PySide6.QtWidgets import QApplication
 

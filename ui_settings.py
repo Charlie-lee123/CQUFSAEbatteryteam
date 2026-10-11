@@ -16,10 +16,13 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QTimer, Qt
+from PySide6.QtNetwork import (
+    QNetworkAccessManager, QNetworkReply, QNetworkRequest,
+)
 from PySide6.QtWidgets import (
     QDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QScrollArea,
-    QSlider, QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget,
 )
 
 import app_log
@@ -27,7 +30,7 @@ import customization
 from ui_theme import apply_titlebar_theme
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl
-from ui_controls import ChevronComboBox, ChevronSpinBox, InkButton, Switch
+from ui_controls import ChevronComboBox, ChevronSpinBox, GlassSlider, InkButton, Switch
 from ui_theme import DEFAULT_GLASS, GAP, detect_system_scheme, ui_font
 
 # (显示名, 存进配置的值)
@@ -103,7 +106,7 @@ class SettingsDialog(QDialog):
         form.addRow(self._label("主题"), self.cmb_theme)
 
         # 毛玻璃强度：0~100 无级。左端几乎不透明、不糊；右端最糊、最透。
-        self.slider_glass = QSlider(Qt.Orientation.Horizontal)
+        self.slider_glass = GlassSlider(Qt.Orientation.Horizontal)
         self.slider_glass.setRange(0, 100)
         self.slider_glass.setValue(max(0, min(100, int(glass))))
         self.slider_glass.setMinimumWidth(190)
@@ -132,6 +135,45 @@ class SettingsDialog(QDialog):
         self._build_log_section(form)
 
         body_layout.addStretch(1)
+
+        # 版本号：面板最底部**居中的一行小灰字**，右边跟「检查更新」按钮。
+        # 取自 version.py（唯一出处）。不做成表单里的一节 —— 那样它会跟设置项
+        # 抢视觉、看着像多了一个配置分类（用户反馈"显示位置有点奇怪"）；
+        # 沉到滚动区末尾居中，是常见桌面软件的惯例位置。
+        from version import VERSION
+        version_row = QHBoxLayout()
+        version_row.setSpacing(10)
+        version_row.addStretch(1)
+        self.lbl_version = QLabel(f"CQUFSAE 串口调试助手 v{VERSION}")
+        self.lbl_version.setFont(ui_font(10.5))
+        self.lbl_version.setObjectName("groupCaption")
+        version_row.addWidget(self.lbl_version)
+        self.btn_check_update = InkButton("检查更新", variant="ghost")
+        self.btn_check_update.clicked.connect(self._check_update)
+        version_row.addWidget(self.btn_check_update)
+        version_row.addStretch(1)
+        body_layout.addLayout(version_row)
+
+        # 仓库地址就挂在版本行正下方：点一下进 GitHub（用户点名要附上）。
+        from version import REPO_URL
+        repo_label = QLabel(
+            f'<a href="{REPO_URL}">github.com/Charlie-lee123/CQUFSAEbatteryteam</a>')
+        repo_label.setFont(ui_font(10.5))
+        repo_label.setObjectName("groupCaption")
+        repo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # 链接默认在 QLabel 里是"看着能点其实不动"——必须开 openExternalLinks
+        # 才会交给系统浏览器打开。
+        repo_label.setOpenExternalLinks(True)
+        body_layout.addWidget(repo_label)
+
+        # 检查更新的网络会话：复用同一个 manager（QNetworkAccessManager 应当
+        # 常驻而不是每次现建）。超时兜底 8 秒 —— GitHub 连不上（代理没开、
+        # 内网）时不能让按钮永远停在"检查中…"。
+        self._nam = QNetworkAccessManager(self)
+        self._update_timer = QTimer(self)
+        self._update_timer.setSingleShot(True)
+        self._update_timer.setInterval(8000)
+        self._update_timer.timeout.connect(self._update_timed_out)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -174,6 +216,14 @@ class SettingsDialog(QDialog):
                     toggle.setToolTip(spec["tip"])
                 field: QWidget = toggle
                 widget = toggle
+                # 行标签也要能点：这行的文字是独立 QLabel，不在开关的点击区域
+                # 里 —— 用户看到"启动时最大化 [开关]"，顺手点文字是再自然不过
+                # 的操作，没反应就会觉得"这个开关坏了"（用户报"部分开关无法
+                # 点击"的另一半原因）。给标签挂上对应的开关，点了就切换。
+                row_label = self._label(spec["label"])
+                row_label.setCursor(Qt.CursorShape.PointingHandCursor)
+                row_label.setProperty("toggleSwitch", toggle)
+                row_label.installEventFilter(self)
             else:
                 spin = ChevronSpinBox()
                 spin.setRange(spec["minimum"], spec["maximum"])
@@ -187,9 +237,10 @@ class SettingsDialog(QDialog):
                 spin.setFixedWidth(SPIN_COLUMN_W)
                 field = spin
                 widget = spin
+                row_label = self._label(spec["label"])
             # 记**输入控件本身**（不是包装容器）：custom_values() 要在它身上取值
             self._custom_widgets[spec["key"]] = widget
-            form.addRow(self._label(spec["label"]), field)
+            form.addRow(row_label, field)
 
     def custom_values(self) -> dict:
         """「定制功能」区里被**改动过**的项 {key: value}，由主窗口统一落盘。"""
@@ -285,7 +336,109 @@ class SettingsDialog(QDialog):
         return [key for key, toggle in self._button_switches.items()
                 if not toggle.isChecked()]
 
+    # ------------------------------------------------------------ 检查更新
+
+    # 本机 GitHub 直连通常不通（要靠 Clash）：第一遍走系统代理失败后，
+    # 第二遍显式走本机 Clash 常用端口再试一次，还不行才报失败。
+    FALLBACK_PROXY = ("127.0.0.1", 7897)
+
+    def _check_update(self) -> None:
+        """拉 GitHub 上的标签列表，找出最新版本 tag 跟本地 VERSION 比对。
+
+        tag 形如 v1.1 / v1.0，按数值比大小（不是字符串序 —— v1.10 得排在
+        v1.9 后面）。比本地新 → 直接打开发布页；相同或更旧 → 提示已最新；
+        网络失败/超时 → 提示并复原按钮，绝不静默。
+        """
+        self._proxy_attempt = 0
+        self._start_update_request()
+
+    def _start_update_request(self) -> None:
+        if self._proxy_attempt == 1:
+            from PySide6.QtNetwork import QNetworkProxy
+            QNetworkProxy.setApplicationProxy(QNetworkProxy(
+                QNetworkProxy.ProxyType.HttpProxy, *self.FALLBACK_PROXY))
+        self.btn_check_update.setEnabled(False)
+        self.btn_check_update.setText("检查中…")
+        from version import REPO_API_TAGS
+        self._pending_reply = self._nam.get(QNetworkRequest(QUrl(REPO_API_TAGS)))
+        self._pending_reply.finished.connect(self._on_update_reply)
+        self._update_timer.start()
+
+    def _on_update_reply(self) -> None:
+        reply = self.sender()
+        if reply is not getattr(self, "_pending_reply", None):
+            return                      # 超时后迟到的回应，忽略
+        self._update_timer.stop()
+        error = reply.error()
+        reply.deleteLater()
+        if error != QNetworkReply.NetworkError.NoError:
+            if self._proxy_attempt == 0:
+                # 直连不通：换本机代理再试一遍
+                self._proxy_attempt = 1
+                self._start_update_request()
+                return
+            self._finish_update_check()
+            self._update_failed()
+            return
+        self._finish_update_check()
+        try:
+            import json
+            tags = json.loads(bytes(reply.readAll()))
+        except ValueError:
+            self.lbl_version.setText("检查失败：GitHub 返回了看不懂的内容")
+            return
+        import re
+        latest = (-1, -1, -1)
+        for item in tags if isinstance(tags, list) else []:
+            m = re.fullmatch(r"v(\d+)\.(\d+)(?:\.(\d+))?",
+                             str(item.get("name", "")))
+            if m:
+                version = tuple(int(g or 0) for g in m.groups())
+                if version > latest:
+                    latest = version
+        from version import VERSION
+        local = tuple(int(p) for p in VERSION.split("."))
+        if latest <= local:
+            self.lbl_version.setText(f"已是最新版本 v{VERSION}")
+            return
+        latest_str = ".".join(str(p) for p in latest)
+        # 有新版本：直接打开发布页，让用户自己拿最新的 exe
+        from version import REPO_URL
+        self.lbl_version.setText(f"发现新版本 v{latest_str}，已打开发布页")
+        QDesktopServices.openUrl(QUrl(f"{REPO_URL}/releases/latest"))
+
+    def _update_timed_out(self) -> None:
+        if getattr(self, "_pending_reply", None) is None:
+            return
+        self._pending_reply.disconnect(self)
+        self._pending_reply.abort()
+        self._pending_reply = None
+        self._finish_update_check()
+        self._update_failed()
+
+    def _update_failed(self) -> None:
+        self.lbl_version.setText("检查失败：连不上 GitHub（代理开了吗？）")
+
+    def _finish_update_check(self) -> None:
+        self._pending_reply = None
+        self.btn_check_update.setEnabled(True)
+        self.btn_check_update.setText("检查更新")
+
     # ------------------------------------------------------------ 杂项
+
+    def eventFilter(self, obj, event) -> bool:
+        """「定制功能」行标签的点击转发：点文字 = 拨对应的开关。
+
+        转发挂在**按下**（MouseButtonPress）而不是松开：Switch 本体现在
+        也是按下即翻转（见 ui_controls.Switch.mousePressEvent），两条路径
+        时机必须一致 —— 挂在松开上，点标签就会比点开关慢半拍。
+        """
+        if event.type() == QEvent.Type.MouseButtonPress:
+            toggle = obj.property("toggleSwitch")
+            if toggle is not None:
+                toggle.toggle()
+                return True
+        return super().eventFilter(obj, event)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
