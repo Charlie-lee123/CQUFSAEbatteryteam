@@ -342,12 +342,40 @@ class SettingsDialog(QDialog):
     # 第二遍显式走本机 Clash 常用端口再试一次，还不行才报失败。
     FALLBACK_PROXY = ("127.0.0.1", 7897)
 
+    @staticmethod
+    def _latest_tag_version(tags) -> tuple | None:
+        """从 GitHub tags 接口的 JSON 里解析出最新版本三元组。
+
+        返回统一补齐到三段的 (major, minor, patch)（"v1.2" 视作 1.2.0）；
+        没有任何合法版本 tag 时返回 None。**长度必须补齐再比** —— 否则
+        远端 v1.2 的 (1,2,0) 会"大于"本地 1.2 的 (1,2)，把当前版本误判成
+        有更新（实测踩过：v1.2 发出去当天检查更新就提示有新版）。
+        """
+        import re
+        latest = None
+        for item in tags if isinstance(tags, list) else []:
+            m = re.fullmatch(r"v(\d+)\.(\d+)(?:\.(\d+))?",
+                             str(item.get("name", "")))
+            if not m:
+                continue
+            version = tuple(int(g or 0) for g in m.groups())
+            if latest is None or version > latest:
+                latest = version
+        return latest
+
+    @staticmethod
+    def _local_version() -> tuple:
+        """本地版本号，同样补齐到三段，跟远端 tag 的口径一致。"""
+        from version import VERSION
+        parts = tuple(int(p) for p in VERSION.split("."))
+        return parts + (0,) * (3 - len(parts))
+
     def _check_update(self) -> None:
         """拉 GitHub 上的标签列表，找出最新版本 tag 跟本地 VERSION 比对。
 
         tag 形如 v1.1 / v1.0，按数值比大小（不是字符串序 —— v1.10 得排在
-        v1.9 后面）。比本地新 → 直接打开发布页；相同或更旧 → 提示已最新；
-        网络失败/超时 → 提示并复原按钮，绝不静默。
+        v1.9 后面），双方都补齐到三段再比。比本地新 → 打开仓库主页；
+        相同或更旧 → 提示已最新；网络失败/超时 → 提示并复原按钮，绝不静默。
         """
         self._proxy_attempt = 0
         self._start_update_request()
@@ -387,25 +415,20 @@ class SettingsDialog(QDialog):
         except ValueError:
             self.lbl_version.setText("检查失败：GitHub 返回了看不懂的内容")
             return
-        import re
-        latest = (-1, -1, -1)
-        for item in tags if isinstance(tags, list) else []:
-            m = re.fullmatch(r"v(\d+)\.(\d+)(?:\.(\d+))?",
-                             str(item.get("name", "")))
-            if m:
-                version = tuple(int(g or 0) for g in m.groups())
-                if version > latest:
-                    latest = version
-        from version import VERSION
-        local = tuple(int(p) for p in VERSION.split("."))
-        if latest <= local:
+        latest = self._latest_tag_version(tags)
+        if latest is None:
+            # 仓库还没有任何版本 tag（比如刚建仓）
+            self.lbl_version.setText(f"当前版本 v{VERSION}（仓库还没有发布过版本）")
+            return
+        if latest <= self._local_version():
             self.lbl_version.setText(f"已是最新版本 v{VERSION}")
             return
         latest_str = ".".join(str(p) for p in latest)
-        # 有新版本：直接打开发布页，让用户自己拿最新的 exe
+        # 有新版本：打开仓库主页（用户指定 —— releases/latest 在没建过
+        # Release 的仓库上是 404，不能用）
         from version import REPO_URL
-        self.lbl_version.setText(f"发现新版本 v{latest_str}，已打开发布页")
-        QDesktopServices.openUrl(QUrl(f"{REPO_URL}/releases/latest"))
+        self.lbl_version.setText(f"发现新版本 v{latest_str}，已打开仓库主页")
+        QDesktopServices.openUrl(QUrl(REPO_URL))
 
     def _update_timed_out(self) -> None:
         if getattr(self, "_pending_reply", None) is None:

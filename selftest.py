@@ -1378,6 +1378,15 @@ def check_customization(app: QApplication) -> None:
             _repo_labels = [c for c in dialog.findChildren(_QVerLabel)
                             if _REPO in c.text() and c.openExternalLinks()]
             assert _repo_labels, "设置面板没有附 GitHub 仓库链接（或链接不可点）"
+            # 版本比对回归：远端 tag 和本地版本必须**补齐到三段**再比，
+            # 否则 (1,2,0) > (1,2) 会把 v1.2 自己误判成有新版（实测踩过）
+            latest = dialog._latest_tag_version(
+                [{"name": "v1.2"}, {"name": "v1.0"}, {"name": "垃圾tag"}])
+            assert latest == (1, 2, 0), f"tag 解析错误：{latest}"
+            assert dialog._local_version() == (1, 2, 0), \
+                f"本地版本解析错误：{dialog._local_version()}"
+            assert latest <= dialog._local_version(), \
+                "v1.2 对 v1.2 被误判为有新版本（元组长度没补齐）"
             for spec in customization.specs():
                 assert spec["key"] in dialog._custom_widgets, \
                     f"设置面板没有为 {spec['key']} 生成控件"
