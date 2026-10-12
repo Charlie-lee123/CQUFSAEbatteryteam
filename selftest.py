@@ -1432,7 +1432,7 @@ def check_customization(app: QApplication) -> None:
                 os.environ.get("QT_QPA_PLATFORM") != "offscreen":
             # 主动摆一次：位置只在 Move/Resize 时更新，不推一下的话反向验证
             # 把逻辑改掉也不生效，断言会永远绿。
-            _v_ctl = [("保留行数", window.spin_rx_lines),
+            _v_ctl = [("保留行数", window.cmb_rx_lines),
                       ("发送间隔", window.spin_interval),
                       ("波特率", window.cmb_baud),
                       ("停止位", window.cmb_stopbits),
@@ -1583,7 +1583,7 @@ def check_customization(app: QApplication) -> None:
                 os.environ.get("QT_QPA_PLATFORM") != "offscreen":
             _form_ctls = (window.cmb_baud, window.cmb_stopbits,
                           window.cmb_bytesize, window.cmb_parity,
-                          window.spin_rx_lines)
+                          window.cmb_rx_lines)
             for _ctl in _form_ctls:
                 if hasattr(_ctl, "_place_edit"):
                     _ctl._place_edit()
@@ -2037,15 +2037,54 @@ def check_config_parity_clock(app: QApplication) -> None:
             kept.close()
 
         # 2) 「接收区保留行数」现在长在串口配置栏里，改一下就立刻生效
-        assert window._config_card.isAncestorOf(window.spin_rx_lines), \
+        #    （2026-10-12 起是和波特率同一套的可编辑下拉：预设展开选 + 可输入）
+        assert window._config_card.isAncestorOf(window.cmb_rx_lines), \
             "「保留行数」不在串口配置栏里"
-        assert not window._rx_card.isAncestorOf(window.spin_rx_lines)
-        assert window.spin_rx_lines.value() == DEFAULT_RX_BLOCKS, window.spin_rx_lines.value()
-        original = window.spin_rx_lines.value()
-        window.spin_rx_lines.setValue(800)
+        assert not window._rx_card.isAncestorOf(window.cmb_rx_lines)
+        assert window.cmb_rx_lines.isEditable(), "保留行数应当和波特率一样可输入"
+        assert window.cmb_rx_lines.currentText() == str(DEFAULT_RX_BLOCKS), \
+            window.cmb_rx_lines.currentText()
+        assert f"{DEFAULT_RX_BLOCKS}" in [window.cmb_rx_lines.itemText(i)
+                                          for i in range(window.cmb_rx_lines.count())], \
+            "预设档位里应当有默认值 5000"
+        original = window.cmb_rx_lines.currentText()
+        window.cmb_rx_lines.setEditText("800")
         assert window.txt_rx.maximumBlockCount() == 800, window.txt_rx.maximumBlockCount()
         assert window._rx_blocks == 800
-        window.spin_rx_lines.setValue(original)
+        window.cmb_rx_lines.setEditText(original)
+
+        # 2b) 下拉弹层：宽度按最宽选项自适应 + 展开动画（2026-10-12 用户点名
+        #     "所有的都要像波特率一样展开，动画和UI都要这种"）。编码框的弹层
+        #     曾窄到把 latin-1 截成 "l...1"。
+        for _pname, _pc in (("编码", window.cmb_encoding),
+                            ("校验位", window.cmb_parity)):
+            _pc._fit_popup_width()
+            _fm = _pc.view().fontMetrics()
+            _widest = max((_fm.horizontalAdvance(_pc.itemText(i))
+                           for i in range(_pc.count())), default=0)
+            assert _pc.view().minimumWidth() >= _widest + 59, \
+                (f"{_pname} 的弹层宽度没按最宽选项自适应："
+                 f"视图最小宽 {_pc.view().minimumWidth()} < 最宽项 {_widest:.0f}+60")
+        _pc = window.cmb_stopbits
+        _pc.showPopup()
+        _win = _pc.view().window()
+        # 同步起始态：showPopup 刚返回时应当是**收起**的（约 1/4 高、半透明），
+        # 之后再逐帧长到全高。⚠️ 不能在 processEvents 之后量中间高度 —— 一轮
+        # 事件循环能消化掉大半段动画（弹层每帧都是半透明重绘，单帧不便宜），
+        # 机器一快断言点就飘（实测 2 次事件后已经到 73/134）。
+        _h_start = _win.height()
+        for _ in range(80):
+            app.processEvents()
+            if not _pc.view().isVisible():
+                break
+        _h_full = _win.height()
+        _pc.hidePopup()
+        for _ in range(8):
+            app.processEvents()
+        assert _h_start <= _h_full * 0.5, \
+            (f"弹层没有展开动画：起始高 {_h_start} / 完整高 {_h_full}"
+             "（应从约 1/4 高度长到全高）")
+        assert _h_full >= 100, f"弹层完整高度不对：{_h_full}"
 
         # 3) 接收区右上角的实时时钟：格式、归属、会走
         import re
@@ -2509,7 +2548,7 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
         shown = window.txt_rx.toPlainText()
         assert "drift 039" in shown, "恢复后最后一批数据没刷进来"
         assert bar.value() >= bar.maximum() - 1, "恢复后没有追底"
-        window._on_rx_lines_changed(window.spin_rx_lines.value())   # 还原保留行数
+        window._on_rx_lines_changed(window._rx_blocks)   # 还原保留行数
         window._clear_receive()
 
         # ---- 3) 串口开关在「串口配置」卡片**里面**，旁边有文字标注 ----

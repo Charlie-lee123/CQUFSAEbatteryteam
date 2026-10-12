@@ -26,6 +26,7 @@
     noreset   复原按钮不回默认值     -> check_customization 挂
     spinpad   输入框不做垂直补偿     -> check_customization 挂
     combofit  非编辑下拉不做实测矫正 -> check_customization 挂
+    popwidth  弹层宽度不自适应       -> check_config_parity_clock 挂
     hitblank  开关按下不过命中区     -> check_customization 挂
 
 ⚠️ 补丁一律写成**文件**再执行 —— `python -c "...\n..."` 里的反斜杠会被
@@ -250,6 +251,14 @@ elif MODE == "combofit":
     patch("ui_controls.py",
           "        shift = int(round(-base_delta))        # 目标位移（正 = 下移）\n",
           "        shift = 0   # REVERSE: 不做实测矫正\n")
+
+elif MODE == "popwidth":
+    # 弹层宽度不按内容自适应 —— 回到"跟控件同宽"，
+    # 编码框的 latin-1 会被截成 l...1（用户点名像波特率那样展开）
+    patch("ui_controls.py",
+          "        need = widest + 60\n"
+          "        view.setMinimumWidth(max(self.width(), need))\n",
+          "        view.setMinimumWidth(self.width())   # REVERSE: 不自适应\n")
 
 elif MODE == "hitblank":
     # mousePressEvent 退回"不检查命中区"——控件内任意位置按下都翻转

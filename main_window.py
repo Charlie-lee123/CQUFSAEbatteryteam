@@ -64,6 +64,9 @@ from ui_theme import (
 # 长时间跑的流式数据会把内存吃满。
 DEFAULT_RX_BLOCKS = 5000
 RX_LINES_MIN, RX_LINES_MAX = 500, 500_000
+# 「保留行数」下拉的预设档位（也可直接输入范围内的任意值）
+RX_LINE_PRESETS = (500, 1000, 2000, 3000, 5000, 8000, 10000, 20000, 50000,
+                   100000, 200000, 500000)
 MAX_HISTORY = 20
 TIMER_MIN_MS = 10
 # 发送区收起到只剩标题栏时的高度
@@ -698,20 +701,23 @@ class MainWindow(QMainWindow):
         # 接收区最多保留多少行日志。原来是设置面板里的一项，挪到了这栏 ——
         # 它和波特率、校验位一样是"整机参数"，放在参数栏里挨着更顺手。
         # 不设上限的话，长时间跑的流式数据会把内存吃满。
-        self.spin_rx_lines = ChevronSpinBox()
-        self.spin_rx_lines.setRange(RX_LINES_MIN, RX_LINES_MAX)
-        self.spin_rx_lines.setSingleStep(500)
-        self.spin_rx_lines.setValue(DEFAULT_RX_BLOCKS)
-        self.spin_rx_lines.setSuffix(" 行")
-        self.spin_rx_lines.setFont(num_font(11.5))
-        self.spin_rx_lines.setToolTip("接收区最多保留的行数，超出后最早的会被丢弃")
-        self.spin_rx_lines.valueChanged.connect(self._on_rx_lines_changed)
+        # 和波特率同一套交互：预设行数下拉展开选，也可以直接输入任意值
+        # （用户点名"需要展开选择的都要像波特率一样展开"）。旧版是数字框，
+        # 只能打字或点上下小箭头，没有"展开选择"这一说。
+        self.cmb_rx_lines = ChevronComboBox()
+        self.cmb_rx_lines.setEditable(True)
+        self.cmb_rx_lines.addItems(str(n) for n in RX_LINE_PRESETS)
+        self.cmb_rx_lines.setCurrentText(str(DEFAULT_RX_BLOCKS))
+        self.cmb_rx_lines.setFont(num_font(11.5))
+        self.cmb_rx_lines.setToolTip(
+            "接收区最多保留的行数，超出后最早的会被丢弃；可选预设，也可直接输入")
+        self.cmb_rx_lines.editTextChanged.connect(self._on_rx_lines_text_changed)
 
         # 标签固定宽度，控件吃掉剩余宽度 —— 右侧表单的经典排法。
         # 64px 放得下「保留行数」四字，三字标签也因此对齐
         for label, widget in (("波特率", self.cmb_baud), ("停止位", self.cmb_stopbits),
                               ("数据位", self.cmb_bytesize), ("校验位", self.cmb_parity),
-                              ("保留行数", self.spin_rx_lines)):
+                              ("保留行数", self.cmb_rx_lines)):
             row = QHBoxLayout()
             row.setSpacing(10)
             tag = self._field_label(label)
@@ -2435,8 +2441,22 @@ class MainWindow(QMainWindow):
         MaximumBlockCount 会即时裁剪，所以缩小之后超出的旧行马上被丢掉 ——
         这是"保留行数"该有的语义，不需要额外确认。
         """
-        self._rx_blocks = int(value)
+        self._rx_blocks = max(RX_LINES_MIN, min(RX_LINES_MAX, int(value)))
         self.txt_rx.setMaximumBlockCount(self._rx_blocks)
+
+    def _on_rx_lines_text_changed(self, text: str) -> None:
+        """「保留行数」下拉框的文字变了（选预设或手动输入）：解析出整数生效。
+
+        打字的过程中每个中间值都会实时生效（和旧数字框同一语义）；非法输入
+        （空、无数字）先不管 —— 等合法值出现再应用，不往控件里回写文字，
+        免得打断输入。
+        """
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if not digits:
+            return
+        value = int(digits)
+        if value != self._rx_blocks:
+            self._on_rx_lines_changed(value)
 
     def _update_counters(self) -> None:
         self.lbl_count.setText(f"接收 {self._rx_bytes} 字节 · 发送 {self._tx_bytes} 字节")
@@ -2575,9 +2595,11 @@ class MainWindow(QMainWindow):
         # 读值之前做，否则界面会先按旧值起一次。
         customization.migrate_defaults()
         self._theme_mode = str(settings.value("theme_mode", "system"))
-        self._rx_blocks = int(settings.value("rx_blocks", DEFAULT_RX_BLOCKS))
-        # 走数字框设置，_on_rx_lines_changed 会顺带把 txt_rx 的上限也定下来
-        self.spin_rx_lines.setValue(max(RX_LINES_MIN, min(RX_LINES_MAX, self._rx_blocks)))
+        self._rx_blocks = max(RX_LINES_MIN, min(RX_LINES_MAX,
+                                                int(settings.value("rx_blocks", DEFAULT_RX_BLOCKS))))
+        # 写回下拉框：editTextChanged → _on_rx_lines_text_changed 会把 txt_rx
+        # 的上限一并定下来（下面的 setMaximumBlockCount 是无信号时的兜底）
+        self.cmb_rx_lines.setEditText(str(self._rx_blocks))
         self.txt_rx.setMaximumBlockCount(self._rx_blocks)
         # 毛玻璃：默认档现在是 0（不要磨砂）。历史默认值（68 / 100）几乎不可能是
         # 用户特意调的 —— 何况 glass 每次关窗都会把当前值写盘，"值等于旧默认"根本
@@ -2622,7 +2644,7 @@ class MainWindow(QMainWindow):
     def _save_settings(self) -> None:
         settings = self._settings
         settings.setValue("theme_mode", self._theme_mode)
-        settings.setValue("rx_blocks", self.spin_rx_lines.value())
+        settings.setValue("rx_blocks", self._rx_blocks)
         settings.setValue("glass", glass_strength())
         settings.setValue("hidden_buttons", sorted(self._hidden_buttons))
         settings.setValue("baud", self.cmb_baud.currentText())

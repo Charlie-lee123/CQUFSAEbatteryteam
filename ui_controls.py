@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import (
-    QEvent, QLineF, QPoint, QPointF, QRectF, QSize, Qt, Signal,
+    QEvent, QLineF, QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal,
 )
 from PySide6.QtGui import (
     QColor, QFontMetrics, QFontMetricsF, QImage, QPainter, QPainterPath, QPen,
@@ -876,6 +876,10 @@ class ChevronComboBox(QComboBox):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._placing_edit = False
+        # 弹层展开动画（见 _animate_popup_open）；用到时才建 Tween
+        self._popup_tween: Tween | None = None
+        self._popup_target = None
+        self._popup_below = True
         # 非编辑态的文字垂直自适应（见 _fit_text_vertical）：
         # _fit_shift = 当前实例 padding 造成的文字位移（正 = 下移，0 = 全局基准）；
         # _fit_key = 已经量过并稳定的"字体+文字+尺寸+dpr"组合，避免重复抓图。
@@ -996,7 +1000,77 @@ class ChevronComboBox(QComboBox):
                                  | Qt.WindowType.FramelessWindowHint
                                  | Qt.WindowType.NoDropShadowWindowHint)
         container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._fit_popup_width()
         super().showPopup()
+        self._animate_popup_open()
+
+    def _fit_popup_width(self) -> None:
+        """弹层宽度按**最宽的选项**自适应（下限是控件自身宽度）。
+
+        弹层默认跟控件同宽 —— 控件窄的时候选项被截成 "l...1"（编码框实测），
+        而波特率的弹层因为控件宽看着就舒服。用户点名"所有的都要像波特率
+        一样展开"：量一遍最宽项，给视图一个够用的最小宽度。
+        """
+        view = self.view()
+        fm = view.fontMetrics()
+        widest = max((fm.horizontalAdvance(self.itemText(i))
+                      for i in range(self.count())), default=0)
+        # 视图左右内边距(QSS ~24) + 竖直滚动条(~22) + 弹层 margin/边框余量(~14)
+        need = widest + 60
+        view.setMinimumWidth(max(self.width(), need))
+
+    def _animate_popup_open(self) -> None:
+        """弹层展开动画：从锚点一侧"展开"到完整高度，同时淡入。
+
+        朝下开就从顶端往下长、朝上开就从底端往上长（Qt 会按屏幕空间自动
+        选一边）。150ms out_cubic，和界面其它动效同一套节拍（ui_anim 的
+        共享计时器，不另起 timer）。中途被关掉就立刻还原，不再推帧。
+        """
+        container = self.view().window()
+        target = container.geometry()
+        anchor_y = self.mapToGlobal(QPoint(0, self.height())).y()
+        below = target.y() >= anchor_y - 6          # 弹层在控件下方 = 朝下展开
+        self._popup_target = target
+        self._popup_below = below
+        start_h = max(14, int(target.height() * 0.25))
+        if below:
+            container.setGeometry(target.x(), target.y(), target.width(), start_h)
+        else:
+            container.setGeometry(target.x(), target.y() + target.height() - start_h,
+                                  target.width(), start_h)
+        container.setWindowOpacity(0.0)
+        if self._popup_tween is None:
+            self._popup_tween = Tween(150, out_cubic, self._on_popup_anim,
+                                      parent=self)
+        self._popup_tween.start(0.0, 1.0, 150)
+
+    def _on_popup_anim(self, t: float) -> None:
+        # ⚠️ 这里**不做任何"弹层还在不在"的守卫**：第一帧 tick 是同步发的，
+        # 那一刻容器/view 的 isVisible() 都还没翻成 True，拿可见性当开关会把
+        # 动画在第一帧就整个叫停（实测踩过：波特率弹层永远停在收起态）。
+        # 弹层要是真被关了，往隐藏窗口推几何无害；收尾统一交给 hidePopup。
+        if self._popup_target is None:
+            return
+        container = self.view().window()
+        geo = self._popup_target
+        h = max(14, int(round(geo.height() * t)))
+        if self._popup_below:
+            container.setGeometry(geo.x(), geo.y(), geo.width(), h)
+        else:
+            container.setGeometry(geo.x(), geo.y() + geo.height() - h,
+                                  geo.width(), h)
+        container.setWindowOpacity(min(1.0, 0.25 + 0.75 * t))
+
+    def hidePopup(self) -> None:
+        if self._popup_tween is not None and self._popup_tween.running:
+            self._popup_tween.stop()
+        container = self.view().window()
+        container.setWindowOpacity(1.0)
+        # 半途关掉的话容器还停在裁剪高度 —— 不还原的话，下一次 showPopup 拿
+        # "当前几何"当目标尺寸，弹层会越开越矮（复利式缩水）。
+        if self._popup_target is not None:
+            container.setGeometry(self._popup_target)
+        super().hidePopup()
 
     def wheelEvent(self, event) -> None:
         """滚轮**不改变选中项** —— 下拉框基本都躺在可滚动区域里（设置面板的
