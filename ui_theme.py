@@ -535,6 +535,23 @@ QComboBox:hover, QSpinBox:hover {
     background: @surface_hover@;
 }
 
+/* ---- 进度条（自动更新的下载进度）----
+   跟输入框同一族外观：surface_2 底 + line 描边 + 圆角；填充用主按钮那支墨色
+   （强调=反白体系里的同一支），百分比文字不放条里 —— 状态行走标签。 */
+QProgressBar {
+    background: @surface_2@;
+    border: 1px solid @line@;
+    border-radius: 7px;
+    min-height: 14px;
+    max-height: 14px;
+    color: transparent;
+}
+
+QProgressBar::chunk {
+    background: @fill_primary@;
+    border-radius: 6px;
+}
+
 /* 文字一律**左端对齐**（用户 2026-10-12 点名"这些地方需要左端对齐"）。
    ⚠️ 只在有 QSS 规则时才会暴露这个坑：QStyleSheetStyle 接管 CE_ComboBoxLabel
    之后，**不可编辑**的下拉框文字会改成**居中** —— 于是同一栏里"1""8""none"
@@ -788,6 +805,7 @@ def stylesheet() -> str:
         "@ink@": token("ink"), "@ink_2@": token("ink_2"), "@ink_3@": token("ink_3"),
         "@ink_disabled@": token("ink_disabled"),
         "@line@": token("line"), "@line_strong@": token("line_strong"),
+        "@fill_primary@": token("fill_primary"),
         "@CONTROL_RADIUS@": str(CONTROL_RADIUS),
         "@sel_rgb@": rgb("sel"), "@ink3_rgb@": rgb("ink_3"),
         "@editor@": editor_rgba(),

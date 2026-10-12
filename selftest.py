@@ -20,7 +20,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QSettings, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QPushButton
+
+from pathlib import Path
 
 from serial_io import (
     SerialWorker, StreamDecoder, _port_sort_key, list_serial_ports, parse_hex, to_hex,
@@ -759,6 +761,175 @@ def check_animation_engine(app: QApplication) -> None:
     #    这里要证明的是"最终会停"，不是"此刻恰好是停的"。
     assert wait_for(app, lambda: not ticker_active(), timeout=2.0), \
         "补间都跑完了，调度器还在转"
+
+
+def check_rx_history(app: QApplication) -> None:
+    """历史接收数据（rx_history.py）：入队、5000 行滚动、批量落盘、设置按钮。
+
+    全程用临时文件，不碰真实的 接收历史.log —— 模块全局状态先存后还。
+    """
+    import tempfile
+
+    import rx_history
+
+    saved = (rx_history._path, rx_history._file_lines, tuple(rx_history._lines))
+    rx_history._pending.clear()
+    try:
+        tmp = Path(tempfile.mkdtemp(prefix="rxhist_")) / "接收历史.log"
+        rx_history._path = tmp
+        rx_history._lines.clear()
+        rx_history._file_lines = 0
+
+        # 1) 空行不记、时间戳行照记
+        rx_history.feed("")
+        rx_history.feed("\n \n")
+        rx_history.feed("[2026-10-12 22:00:00]\nVoltage1: 0 3.75")
+        assert "[2026-10-12 22:00:00]" in rx_history.lines(), "时间戳行没进历史"
+        assert len(rx_history.lines()) == 2, f"空行不该入队：{len(rx_history.lines())}"
+
+        # 2) 超过 5000 行：deque 滚动，最老的先被挤掉
+        for i in range(5200):
+            rx_history.feed(f"data {i}")
+        assert len(rx_history.lines()) == rx_history.MAX_LINES, "deque 没滚动"
+        assert rx_history.lines()[0] == "data 200", \
+            f"最老行不对：{rx_history.lines()[0]}"
+
+        # 3) 落盘：追加（pending 不封顶，文件暂时超一点没关系，下一步收回）；
+        # 超阈值（5000+500）才整体重写收回到 5000
+        rx_history.flush()
+        n1 = len(tmp.read_text(encoding="utf-8").splitlines())
+        assert n1 == 5202, f"第一次落盘行数不对：{n1}"
+        assert n1 <= rx_history.MAX_LINES + rx_history.COMPACT_EXTRA + 500
+        for i in range(400):
+            rx_history.feed(f"more {i}")
+        rx_history.flush()          # 5602 > 5000+500 → 触发整体重写
+        rows = tmp.read_text(encoding="utf-8").splitlines()
+        assert len(rows) == rx_history.MAX_LINES, \
+            f"重写后应恰好 5000 行：{len(rows)}"
+        assert rows[0] == "data 600", f"重写后最老行不对：{rows[0]}"
+        assert "[2026-10-12 22:00:00]" not in rows, "时间戳行应已被滚动挤出"
+
+        # 4) flush 后无积压；路径为 None 时静默不炸
+        rx_history.feed("tail")
+        assert rx_history._pending, "feed 后应有待写"
+        rx_history.flush()
+        assert not rx_history._pending, "flush 后不应有积压"
+        saved_path = rx_history._path
+        rx_history._path = None
+        rx_history.feed("x")
+        rx_history.flush()          # 不应抛异常
+        rx_history._path = saved_path
+
+        # 5) 设置面板有「打开记录」按钮（路径已指向临时文件）
+        from ui_settings import SettingsDialog
+        dlg = SettingsDialog(None)
+        btns = [b for b in dlg.findChildren(QPushButton)
+                if b.text() == "打开记录"]
+        assert btns, "设置面板没有「打开记录」按钮"
+        dlg.deleteLater()
+
+        # 6) 路径定位不到时整行隐藏（无按钮、也不崩）
+        rx_history._path = None
+        dlg2 = SettingsDialog(None)
+        btns2 = [b for b in dlg2.findChildren(QPushButton)
+                 if b.text() == "打开记录"]
+        assert not btns2, "路径为 None 时不应显示打开记录按钮"
+        dlg2.deleteLater()
+    finally:
+        rx_history._path, rx_history._file_lines, _ = saved
+        rx_history._lines.clear()
+        rx_history._lines.extend(saved[2])
+        rx_history._pending.clear()
+
+
+def check_updater(app: QApplication) -> None:
+    """自动更新模块（updater.py）：源链、解析、完整性校验、弹窗交互。
+
+    全部离线可测：网络只信"解析器吃样例数据"，不打真网。
+    """
+    import hashlib
+    import json as _json
+
+    from updater import (
+        CHECK_PASSES, parse_apply_update_args, parse_tags_json,
+        parse_version_file, release_download_urls, verify_integrity,
+        version_sources, version_tuple,
+    )
+
+    # 1) 版本文件解析：VERSION + 哈希（仓库里 version.py 的真实格式）
+    sample = ('"""软件版本号"""\nVERSION = "1.6"\n\n'
+              'LATEST_EXE_SHA256 = "'
+              + 'ab' * 32 + '"\n')
+    info = parse_version_file(sample)
+    assert info == {"version": "1.6", "sha256": "ab" * 32}, info
+    # 哈希为空串（未记录）→ 不带 sha256 键
+    assert "sha256" not in (parse_version_file('VERSION = "1.6"') or {}), \
+        "空哈希不该出现在结果里"
+    assert parse_version_file("不是版本文件") is None, "垃圾输入应返回 None"
+
+    # 2) tag JSON 解析 + 版本比较：数值序（1.10 > 1.9）与同版本不误报
+    tags = _json.dumps([{"name": "v1.10"}, {"name": "v1.9"}, {"name": "垃圾"}])
+    assert version_tuple(parse_tags_json(tags)["version"]) == (1, 10), \
+        "tag 解析没按数值取最大"
+    assert version_tuple("1.2") <= version_tuple("1.2.0"), \
+        "元组前缀语义：同版本不得误判为新版"
+
+    # 3) 源链形态：≥3 级、首源是 jsDelivr（国内直连）、都走 https
+    sources = version_sources()
+    assert len(sources) >= 3, f"版本源太少：{[s[0] for s in sources]}"
+    assert sources[0][1].startswith("https://cdn.jsdelivr.net/"), \
+        f"首源应当是 jsDelivr（无代理直连）：{sources[0][1]}"
+    assert all(url.startswith("https://") for _n, url, _p in sources), \
+        "版本源必须都是 https"
+    # 下载源链：镜像在前、GitHub 直连兜底；tag 要出现在 URL 里
+    urls = release_download_urls("v1.6")
+    assert len(urls) >= 2 and "releases/download/v1.6/SerialAssistant.exe" in urls[-1], \
+        f"下载源链不对：{urls}"
+    assert "gh" in urls[0] and "github.com/Charlie-lee123" in urls[-1]
+
+    # 4) 完整性校验：哈希/大小/无信息 三条路径
+    data = b"SerialAssistant-exe-bytes"
+    ok, _why = verify_integrity(data, hashlib.sha256(data).hexdigest())
+    assert ok, "哈希一致应通过"
+    ok, why = verify_integrity(data, "0" * 64)
+    assert not ok, "哈希不符应拒绝"
+    ok, _why = verify_integrity(data, None, len(data))
+    assert ok, "大小一致应通过"
+    ok, why = verify_integrity(data, None, len(data) + 1)
+    assert not ok, "大小不符应拒绝"
+    ok, why = verify_integrity(data, None, None)
+    assert not ok, "没有任何校验信息应拒绝（宁可不装也不能装错包）"
+
+    # 5) --apply-update 参数解析
+    assert parse_apply_update_args(
+        ["main.py", "--apply-update", r"F://x//SerialAssistant.exe"]) == \
+        r"F://x//SerialAssistant.exe"
+    assert parse_apply_update_args(["main.py"]) is None
+    assert parse_apply_update_args(["main.py", "--apply-update"]) is None
+
+    # 6) 弹窗：三个选项、开发环境禁用「立即更新」、暂不更新发会话信号
+    from updater import UpdateDialog
+    dlg = UpdateDialog(latest="9.9", current="1.6", sha256=None,
+                       size=len(data), tag="v9.9")
+    try:
+        dlg.show()
+        app.processEvents()
+        assert dlg._btn_now.text() == "立即更新"
+        assert dlg._btn_later.text() == "暂不更新"
+        assert dlg._btn_repo.text() == "前往 GitHub 仓库"
+        assert not dlg._frozen and not dlg._btn_now.isEnabled(), \
+            "开发环境（未打包）应当禁用「立即更新」"
+        assert dlg._progress.isHidden(), "进度条初始应隐藏"
+        _dismissed = []
+        dlg.dismissed_session.connect(lambda: _dismissed.append(1))
+        dlg._later()
+        assert _dismissed == [1], "「暂不更新」必须发会话抑制信号"
+        assert dlg.result() == dlg.DialogCode.Rejected
+    finally:
+        dlg.close()
+
+    # 8) 源链重试轮数（用户要求失败自动重试）
+    assert CHECK_PASSES >= 2, "版本检测至少要整链重试一轮"
 
 
 def check_tooltip_and_buttons(app: QApplication) -> None:
@@ -1726,17 +1897,22 @@ def check_customization(app: QApplication) -> None:
             _repo_labels = [c for c in dialog.findChildren(_QVerLabel)
                             if _REPO in c.text() and c.openExternalLinks()]
             assert _repo_labels, "设置面板没有附 GitHub 仓库链接（或链接不可点）"
-            # 版本比对回归：远端 tag 和本地版本必须**补齐到三段**再比，
-            # 否则 (1,2,0) > (1,2) 会把 v1.2 自己误判成有新版（实测踩过）。
-            # ⚠️ 本地版本不能硬编码（曾经写死 (1,2,0)，升到 1.3 后就陈旧了，
-            # 只因本 check 前段提前中止才没暴露）—— 一律从 version.py 现算。
-            from version import VERSION as _V
-            _expected = tuple(int(p) for p in _V.split("."))
-            _expected += (0,) * (3 - len(_expected))
-            latest = dialog._latest_tag_version(
-                [{"name": f"v{_V}"}, {"name": "v1.0"}, {"name": "垃圾tag"}])
+            # 版本比对回归：远端 tag 和本地版本必须按**数值**比大小
+            # （"1.10" 排在 "1.9" 后面；v1.2 曾被 (1,2,0)>(1,2) 误判成有新版
+            # —— version_tuple 的元组前缀语义天然修掉了这个坑）。
+            # ⚠️ 本地版本不能硬编码（曾经写死 (1,2,0)，升到 1.3 后就陈旧了）。
+            from updater import parse_tags_json as _parse_tags
+            from updater import version_tuple as _vt
+            import json as _json
+            _expected = _vt(_VERSION)
+            _tags_json = _json.dumps([{"name": f"v{_VERSION}"}, {"name": "v1.0"},
+                                      {"name": "垃圾tag"}])
+            latest = _vt(_parse_tags(_tags_json)["version"])
             assert latest == _expected, f"tag 解析错误：{latest}"
-            assert dialog._local_version() == _expected, \
+            # ⚠️ 本地版本在 ui_settings 里补齐到三段（1.6 → (1,6,0)），
+            # 比较时口径一致；tag 解析的断言保持不补齐的 _expected。
+            _expected_padded = _expected + (0,) * (3 - len(_expected))
+            assert dialog._local_version() == _expected_padded, \
                 f"本地版本解析错误：{dialog._local_version()}"
             assert latest <= dialog._local_version(), \
                 "同版本 tag 被误判为有新版本（元组长度没补齐）"
@@ -2083,8 +2259,9 @@ def check_config_parity_clock(app: QApplication) -> None:
             app.processEvents()
         assert _h_start <= _h_full * 0.5, \
             (f"弹层没有展开动画：起始高 {_h_start} / 完整高 {_h_full}"
-             "（应从约 1/4 高度长到全高）")
-        assert _h_full >= 100, f"弹层完整高度不对：{_h_full}"
+             "（应从收起态长到全高）")
+        assert _h_full > _h_start + 20, \
+            f"弹层没有展开：完整高 {_h_full} / 起始高 {_h_start}"
 
         # 3) 接收区右上角的实时时钟：格式、归属、会走
         import re
@@ -2736,10 +2913,11 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
         # 包括序号"：只染值的话看不出是第几个点出的问题。
         assert high_spans == [(10, 6), (19, 6)], high_spans    # 3820/3900 超上限
         assert low_spans == [(1, 6)], low_spans                # 3700 低于下限
-        # ⚠️ value_spans 是纯文本函数、不管段上下文 —— 温度段不染色的过滤
-        # 发生在 highlightBlock 的段状态机里（见下面 painted 断言）
+        # ⚠️ 电压红/绿只认 4 位小数（mV 格式，VOLT_DECIMALS）—— 温度值
+        # （"1.22"，2 位小数）混进电压段状态也不按 mV 阈值误判，否则温度
+        # 采集区会整片被标绿（用户报的"标绿的区间不能到温度采集部分去"）。
         high_t, low_t = value_spans(" 1.22   2.22", 3750, 3800)
-        assert high_t == [] and low_t == [(1, 4), (8, 4)], (high_t, low_t)
+        assert high_t == [] and low_t == [], (high_t, low_t)
         assert bms_error_spans("xx BMS ERROR yy") == [(3, 9)]
         assert bms_error_spans("BMS OK") == []
 
@@ -2891,6 +3069,35 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
         assert all(detail_chars.get(p) == yellow
                    for p in range(len(detail_text))), \
             f"BMS 错误明细行没有整行标橙（含序号）：{painted_spans(detail_row)}"
+
+        # ---- 5c) 温度值落进电压段状态也不能标绿/标红（用户点名"标绿的区间
+        #     仅限于电压数据读取部分，不能到温度采集部分去"）：设备不发
+        #     Temperature1: 标题时温度行会停在电压段状态 —— 电压红/绿只认
+        #     mV 格式（4 位小数），且对齐补零不许把 "1.22" 造出 "01.0022"
+        #     这种假数据（凭空补位 = 篡改数值）。
+        window._clear_receive()
+        window._on_received(("[2026-10-12 20:00:00]\n"
+                             "01.3700 02.3820 03.3900\n"
+                             "1 1.22 2.87 3 1.19\n").encode("utf-8"))
+        window._flush_rx()
+        app.processEvents()
+        doc5c = window.txt_rx.document()
+        texts5c = [doc5c.findBlockByNumber(b).text()
+                   for b in range(doc5c.blockCount())]
+        volt_row5c = next(i for i, t in enumerate(texts5c) if ".3700" in t)
+        stray_row = next(i for i, t in enumerate(texts5c) if "1.22" in t)
+        # 温度值没有被补零成 4 位小数（"1.22" 还是 "1.22"，不是 "01.0022"）
+        assert texts5c[stray_row] == "1 1.22 2.87 3 1.19", \
+            f"电压段状态里的温度值被补零篡改了：{texts5c[stray_row]!r}"
+        # 该行没有任何电压分级色（红/绿都不许出现）
+        stray_spans = painted_spans(stray_row)
+        assert not [c for _, _, c in stray_spans
+                    if c.name() in (red, green)], \
+            f"温度值在电压段状态里被标了红/绿：{stray_spans}"
+        # 电压行照常分级（前提不破）
+        volt_spans5c = painted_spans(volt_row5c)
+        assert [c for _, _, c in volt_spans5c if c.name() == green], \
+            f"（前提）电压欠压行本该标绿：{volt_spans5c}"
 
         # ---- 5c) 段落边界（用户点名）：电压在**时间戳 → Temperature1** 之间，
         #     温度在 **Temperature1 → BMS** 之间。所以不能只认 "Voltage1:" 标题 ——
@@ -3614,6 +3821,8 @@ CHECKS = [
     ("全屏展开与复制全部", check_expand_and_copy_all),
     ("定制功能注册表", check_customization),
     ("校验位/保留行数/时钟/发送区一排", check_config_parity_clock),
+    ("自动更新模块", check_updater),
+    ("历史接收数据", check_rx_history),
     ("收包合并与暂停继续", check_rx_merge_and_pause),
     ("动画引擎 120fps 与非线性", check_animation_engine),
     ("提示字号与按钮显隐", check_tooltip_and_buttons),

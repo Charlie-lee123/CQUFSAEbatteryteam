@@ -1002,6 +1002,24 @@ class ChevronComboBox(QComboBox):
         container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._fit_popup_width()
         super().showPopup()
+        # ⚠️ 非编辑下拉的弹层容器布局里带「上下弹簧 + 底部箭头指示条」
+        # （Qt 6.12 私有装饰，编辑下拉这几项是 0 高）—— 5+10+5 的黑条垫在
+        # view 下面，QSS 圆角被裁成方角，观感跟波特率完全两样（用户点名：
+        # 停止位/数据位/校验位/编码/主题/发送历史不一致，根因就是它）。
+        # 不能只收缩容器（布局最小尺寸会把窗口顶回去，动画也会失效），
+        # 要把布局里**非 view 的项全部压成 0**，两种下拉的布局就对齐了。
+        view = self.view()
+        lay = view.window().layout()
+        if lay is not None:
+            for i in range(lay.count()):
+                it = lay.itemAt(i)
+                w = it.widget()
+                if w is not None and w is not view:
+                    w.setFixedHeight(0)
+                elif it.spacerItem() is not None:
+                    it.spacerItem().changeSize(0, 0)
+            lay.invalidate()
+            lay.activate()
         self._animate_popup_open()
 
     def _fit_popup_width(self) -> None:
@@ -1015,8 +1033,10 @@ class ChevronComboBox(QComboBox):
         fm = view.fontMetrics()
         widest = max((fm.horizontalAdvance(self.itemText(i))
                       for i in range(self.count())), default=0)
-        # 视图左右内边距(QSS ~24) + 竖直滚动条(~22) + 弹层 margin/边框余量(~14)
-        need = widest + 60
+        # 视图左右 QSS margin(24) + 内 padding(12) + item 自身 padding(16)
+        # + 竖直滚动条(~22) + 弹层边框/余量(~10)：少了 item 的 16 就会把
+        # 最宽项截成 "la...-1"（编码框实测）。
+        need = widest + 84
         view.setMinimumWidth(max(self.width(), need))
 
     def _animate_popup_open(self) -> None:

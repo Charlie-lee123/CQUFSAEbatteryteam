@@ -442,6 +442,32 @@ class SettingsDialog(QDialog):
         row.addWidget(open_button)
         form.addRow(self._row(row))
 
+        # 接收历史行（自动保存的最近 5000 行接收数据，与日志同目录）：
+        # 路径没定位到（只读盘符等）就整行不显示，别给一个点不动的按钮。
+        import rx_history
+        history_path = rx_history.path()
+        if history_path:
+            form.addRow(self._caption("接收历史"))
+            hrow = QHBoxLayout()
+            hrow.setSpacing(10)
+            hpath_label = QLabel(self._elide_middle(history_path))
+            hpath_label.setFont(ui_font(10.5))
+            hpath_label.setObjectName("groupCaption")
+            hpath_label.setMinimumWidth(1)      # 同日志行的坑（见上）
+            hpath_label.setToolTip(history_path)
+            hpath_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse)
+            hrow.addWidget(hpath_label, 1)
+            hist_button = InkButton("打开记录", variant="ghost")
+            hist_button.setToolTip(
+                f"打开历史接收数据（自动保存最近 {rx_history.MAX_LINES} 行，"
+                "含时间戳；到量自动滚动覆盖最早的数据）")
+            hist_button.clicked.connect(
+                lambda: QDesktopServices.openUrl(
+                    QUrl.fromLocalFile(history_path)))
+            hrow.addWidget(hist_button)
+            form.addRow(self._row(hrow))
+
     @staticmethod
     def _elide_middle(text: str, limit: int = 52) -> str:
         """超长的绝对路径在**中间**省略一段（头尾都留着，一眼能认出来是哪个盘/哪个文件）。
@@ -546,27 +572,6 @@ class SettingsDialog(QDialog):
     FALLBACK_PROXY = ("127.0.0.1", 7897)
 
     @staticmethod
-    def _latest_tag_version(tags) -> tuple | None:
-        """从 GitHub tags 接口的 JSON 里解析出最新版本三元组。
-
-        返回统一补齐到三段的 (major, minor, patch)（"v1.2" 视作 1.2.0）；
-        没有任何合法版本 tag 时返回 None。**长度必须补齐再比** —— 否则
-        远端 v1.2 的 (1,2,0) 会"大于"本地 1.2 的 (1,2)，把当前版本误判成
-        有更新（实测踩过：v1.2 发出去当天检查更新就提示有新版）。
-        """
-        import re
-        latest = None
-        for item in tags if isinstance(tags, list) else []:
-            m = re.fullmatch(r"v(\d+)\.(\d+)(?:\.(\d+))?",
-                             str(item.get("name", "")))
-            if not m:
-                continue
-            version = tuple(int(g or 0) for g in m.groups())
-            if latest is None or version > latest:
-                latest = version
-        return latest
-
-    @staticmethod
     def _local_version() -> tuple:
         """本地版本号，同样补齐到三段，跟远端 tag 的口径一致。"""
         from version import VERSION
@@ -574,26 +579,46 @@ class SettingsDialog(QDialog):
         return parts + (0,) * (3 - len(parts))
 
     def _check_update(self) -> None:
-        """拉 GitHub 上的标签列表，找出最新版本 tag 跟本地 VERSION 比对。
+        """多源检查更新（源链见 updater.version_sources）。
 
-        tag 形如 v1.1 / v1.0，按数值比大小（不是字符串序 —— v1.10 得排在
-        v1.9 后面），双方都补齐到三段再比。比本地新 → 打开仓库主页；
-        相同或更旧 → 提示已最新；网络失败/超时 → 提示并复原按钮，绝不静默。
+        无代理的网络走 jsDelivr/镜像（国内可直连）；开着代理的用户走链尾的
+        GitHub 直连。整条链失败且还没试过本机代理时，把同一条链经本机代理
+        再跑一遍。发现新版本 → 弹更新对话框（立即更新/暂不更新/前往仓库），
+        不再直接跳浏览器。
         """
         self._proxy_attempt = 0
+        self._update_src_idx = 0
+        self._update_pass = 0
         self._start_update_request()
 
     def _start_update_request(self) -> None:
-        if self._proxy_attempt == 1:
+        import updater
+        sources = updater.version_sources()
+        if self._update_src_idx >= len(sources):
+            self._update_pass += 1
+            self._update_src_idx = 0
+            if self._update_pass >= updater.CHECK_PASSES:
+                if self._proxy_attempt == 0:
+                    # 整条链直连都不通：换本机代理把链再跑一遍（代理开着的用户）
+                    self._proxy_attempt = 1
+                    self._update_src_idx = 0
+                    self._update_pass = 0
+                else:
+                    self._finish_update_check()
+                    self._update_failed()
+                    return
+        if self._proxy_attempt == 1 and self._update_src_idx == 0 \
+                and self._update_pass == 0:
             from PySide6.QtNetwork import QNetworkProxy
             QNetworkProxy.setApplicationProxy(QNetworkProxy(
                 QNetworkProxy.ProxyType.HttpProxy, *self.FALLBACK_PROXY))
+        _name, url, parser = sources[self._update_src_idx]
+        self._update_parser = parser
         self.btn_check_update.setEnabled(False)
         self.btn_check_update.setText("检查中…")
-        from version import REPO_API_TAGS
-        self._pending_reply = self._nam.get(QNetworkRequest(QUrl(REPO_API_TAGS)))
+        self._pending_reply = self._nam.get(QNetworkRequest(QUrl(url)))
         self._pending_reply.finished.connect(self._on_update_reply)
-        self._update_timer.start()
+        self._update_timer.start(updater.SOURCE_TIMEOUT_MS)
 
     def _on_update_reply(self) -> None:
         reply = self.sender()
@@ -601,45 +626,42 @@ class SettingsDialog(QDialog):
             return                      # 超时后迟到的回应，忽略
         self._update_timer.stop()
         error = reply.error()
+        data = bytes(reply.readAll())
         reply.deleteLater()
+        self._pending_reply = None
         if error != QNetworkReply.NetworkError.NoError:
-            if self._proxy_attempt == 0:
-                # 直连不通：换本机代理再试一遍
-                self._proxy_attempt = 1
-                self._start_update_request()
-                return
-            self._finish_update_check()
-            self._update_failed()
+            # 该源失败：回退下一源 / 下一轮 / 本机代理层
+            self._update_src_idx += 1
+            self._start_update_request()
+            return
+        try:
+            info = self._update_parser(data.decode("utf-8", errors="replace"))
+        except Exception:
+            import traceback
+            app_log.error("检查更新解析异常: " + traceback.format_exc(limit=3))
+            info = None
+        if not info or not info.get("version"):
+            self._update_src_idx += 1   # 解析不出当源失败，回退下一源
+            self._start_update_request()
             return
         self._finish_update_check()
-        try:
-            import json
-            tags = json.loads(bytes(reply.readAll()))
-            from version import VERSION
-            latest = self._latest_tag_version(tags)
-            if latest is None:
-                # 仓库还没有任何版本 tag（比如刚建仓）
-                self.lbl_version.setText(
-                    f"当前版本 v{VERSION}（仓库还没有发布过版本）")
-                return
-            if latest <= self._local_version():
-                self.lbl_version.setText(f"已是最新版本 v{VERSION}")
-                self._flash_button_result("✓ 已是最新")
-                return
-            latest_str = ".".join(str(p) for p in latest)
-            # 有新版本：打开仓库主页（用户指定 —— releases/latest 在没建过
-            # Release 的仓库上是 404，不能用）
-            from version import REPO_URL
-            self.lbl_version.setText(f"发现新版本 v{latest_str}，已打开仓库主页")
-            self._flash_button_result(f"发现 v{latest_str}！")
-            QDesktopServices.openUrl(QUrl(REPO_URL))
-        except Exception:
-            # 兜底：任何解析/处理异常都不能变成"点了没反应"（实测 NameError
-            # 被槽函数吞掉，用户看到的就是检查一秒结束、毫无反馈）
-            import traceback
-            app_log.error("检查更新处理异常: "
-                          + traceback.format_exc(limit=3))
-            self.lbl_version.setText("检查失败：更新信息解析出错")
+        self._handle_update_info(info)
+
+    def _handle_update_info(self, info: dict) -> None:
+        from updater import UpdateDialog, version_tuple
+        from version import VERSION
+        latest = version_tuple(info["version"])
+        if latest <= self._local_version():
+            self.lbl_version.setText(f"已是最新版本 v{VERSION}")
+            self._flash_button_result("✓ 已是最新")
+            return
+        latest_str = info["version"]
+        self.lbl_version.setText(f"发现新版本 v{latest_str}")
+        self._flash_button_result(f"发现 v{latest_str}！")
+        dialog = UpdateDialog(latest=latest_str, current=VERSION,
+                              sha256=info.get("sha256"),
+                              tag=f"v{latest_str}", auto=False, parent=self)
+        dialog.exec()
 
     def _update_timed_out(self) -> None:
         if getattr(self, "_pending_reply", None) is None:
@@ -647,11 +669,11 @@ class SettingsDialog(QDialog):
         self._pending_reply.disconnect(self)
         self._pending_reply.abort()
         self._pending_reply = None
-        self._finish_update_check()
-        self._update_failed()
+        self._update_src_idx += 1       # 单源超时 → 回退下一源/下一轮/代理层
+        self._start_update_request()
 
     def _update_failed(self) -> None:
-        self.lbl_version.setText("检查失败：连不上 GitHub（代理开了吗？）")
+        self.lbl_version.setText("检查失败：所有更新源都不可达（已尝试直连与本机代理）")
         self._flash_button_result("网络失败")
 
     def _flash_button_result(self, text: str) -> None:

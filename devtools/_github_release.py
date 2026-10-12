@@ -55,8 +55,13 @@ def api(op, token, url, method="GET", data=None, headers=None, timeout=120):
         body = data if isinstance(data, bytes) else json.dumps(data).encode()
         head.setdefault("Content-Type", "application/json")
     req = urllib.request.Request(url, data=body, headers=head, method=method)
-    with op.open(req, timeout=timeout) as resp:
-        return resp.status, json.loads(resp.read().decode() or "{}")
+    try:
+        with op.open(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:400]
+        print(f"  ! {method} {url} -> HTTP {e.code}: {detail}")
+        raise
 
 
 def main() -> int:
@@ -79,11 +84,14 @@ def main() -> int:
         body_text = body_text.replace(
             "{SHA256}", f"`{sha.hexdigest()}`").replace("{SIZE}", f"{size:,}")
 
-    # 1) 建 Release（已存在就复用）
-    status, rel = api(op, token, API + "/releases", method="POST",
-                      data={"tag_name": tag, "name": tag, "body": body_text,
-                            "draft": False, "prerelease": False})
-    if status == 422:      # already_exists → 取现有
+    # 1) 建 Release（已存在就复用 —— 422 already_exists 时转 GET by tag）
+    try:
+        status, rel = api(op, token, API + "/releases", method="POST",
+                          data={"tag_name": tag, "name": tag, "body": body_text,
+                                "draft": False, "prerelease": False})
+    except urllib.error.HTTPError as e:
+        if e.code != 422:
+            raise
         print("Release 已存在，改用现有的")
         status, rel = api(op, token, API + f"/releases/tags/{tag}")
     if status not in (200, 201):

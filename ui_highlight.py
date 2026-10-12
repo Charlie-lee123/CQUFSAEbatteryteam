@@ -123,6 +123,19 @@ def _is_data_line(line: str) -> bool:
     return bool(tokens) and all(_SAMPLE_TOKEN_RE.fullmatch(t) for t in tokens)
 
 
+def _is_volt_line(line: str) -> bool:
+    """电压段的**纯电压数据行**：整行都是采样点、且每个值都是 4 位小数
+    （mV 格式，见 VOLT_DECIMALS）。
+
+    温度值（"1.22"，2 位小数）万一落在电压段状态里（设备不发段标题等），
+    不能当电压数据重排 —— 否则补零会把 "1.22" 造出 "01.0022" 这种假数据
+    （凭空补位 = 篡改数值），着色也会把它按 mV 阈值误判成欠压绿
+    （用户报的"标绿的区间到温度采集部分去了"）。"""
+    return _is_data_line(line) and all(
+        re.fullmatch(r"\d+\.\d{%d}" % VOLT_DECIMALS, t)
+        for t in line.split())
+
+
 def _pad_line(line: str, section: str, widths: dict[str, int],
               index_width: int) -> str:
     """非数据行的原地补零（老规则）：**电压段**的序号补到 index_width
@@ -131,6 +144,10 @@ def _pad_line(line: str, section: str, widths: dict[str, int],
     只有一位数就不需要加0"）。电压/温度段的值补到段内最宽。混着其它字符的
     行不重排 —— 万一是判定不了结构的行，保持原布局最稳。"""
     def pad(match: re.Match, section: str = section) -> str:
+        # 电压段只重排 mV 格式（4 位小数）的采样点 —— 温度值等其它小数位数
+        # 的值一个字符都不动（见 _is_volt_line 的说明）。
+        if section == SECTION_VOLT and not _is_volt_value(match):
+            return match.group(0)
         index = match.group(1)
         value = match.group(2)[1:]
         value = "0" * max(0, widths.get(section, 0) - len(value)) + value
@@ -207,12 +224,19 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
     lines = text.split("\n")
 
     # 逐行推进段状态，同时标记"电压/温度段的纯数据行"（整行都是采样点）。
+    # ⚠️ 电压段只把 **mV 格式（4 位小数）** 的行算数据行 —— 温度值混进来时
+    # 不重排、不补零（见 _is_volt_line），温度段照旧。
     current = section
     marks: list[tuple[str, bool]] = []
     for line in lines:
         current = section_of(line, current)
-        marks.append((current, current in (SECTION_VOLT, SECTION_TEMP)
-                      and _is_data_line(line)))
+        if current == SECTION_VOLT:
+            grid = _is_volt_line(line)
+        elif current == SECTION_TEMP:
+            grid = _is_data_line(line)
+        else:
+            grid = False
+        marks.append((current, grid))
 
     # 第一遍：段内（帧内）最宽的值有几位 —— 宽度口径与旧版一致。
     widths: dict[str, int] = {}
@@ -263,15 +287,32 @@ def _entry_span(match: re.Match) -> tuple[int, int]:
     return match.start(1), match.end(2) - match.start(1)
 
 
+# 电压值的小数位数（设备协议：mV 值固定 4 位小数，"01.3820" → 组 2 = ".3820"）。
+# ⚠️ 它同时是段状态的**兜底判据**：电压红/绿只认 4 位小数的值 —— 温度值
+# （"1.22"，2 位小数）万一因为设备不发段标题/段标题迟到而落在电压段状态里，
+# 也不能按 mV 阈值去比，否则温度采集区会整片被标绿（用户报的
+# "标绿的区间不能到温度采集部分去"）。温度越界黄不受影响（温度段有自己的
+# 段边界，温度值本来就是 2 位小数）。
+VOLT_DECIMALS = 4
+
+
+def _is_volt_value(match: re.Match) -> bool:
+    """这个采样点是不是电压格式（小数位数 == VOLT_DECIMALS）。"""
+    return len(match.group(2)) - 1 == VOLT_DECIMALS
+
+
 def value_spans(text: str, low: int, high: int) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
     """电压采样值的分级区间 ``(超高, 超低)``，各自 ``[(起点, 长度), ...]``。
 
     区间是**整条**（序号+值，见 ``_entry_span``）；值取小数点后的整数部分
-    （"1.3820" 的 3820，单位 mV）。脱离控件可测。
+    （"1.3820" 的 3820，单位 mV）。只认 4 位小数的电压值（见 VOLT_DECIMALS）
+    —— 温度值混进来也不会被按 mV 阈值误判。脱离控件可测。
     """
     high_spans: list[tuple[int, int]] = []
     low_spans: list[tuple[int, int]] = []
     for m in SAMPLE_RE.finditer(text):
+        if not _is_volt_value(m):
+            continue
         value = int(m.group(2)[1:])
         if value > high:
             high_spans.append(_entry_span(m))
@@ -426,7 +467,8 @@ class RxHighlighter(QSyntaxHighlighter):
             # 这一条 m.group(1)+m.group(2)，同行的其它采样点一个都不碰。
             start = match.start(1)
             length = match.end(2) - match.start(1)
-            if self._section == SECTION_VOLT and volt_high > 0:
+            if self._section == SECTION_VOLT and volt_high > 0 \
+                    and _is_volt_value(match):
                 value = int(match.group(2)[1:])
                 if value > volt_high:
                     self.setFormat(start, length, self._high_fmt)

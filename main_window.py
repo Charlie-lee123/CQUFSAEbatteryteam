@@ -514,6 +514,49 @@ class MainWindow(QMainWindow):
         self._saved_cursors: dict = {}
         self._enable_edge_hover()
 
+        # 启动几秒后自动检查一次更新（不阻塞启动）：发现新版本才弹提示，
+        # 用户点过「暂不更新」后本次会话内不再自动弹（手动检查不受影响）。
+        # ⚠️ 必须放在 __init__ 的**最后**：上面这些实例属性都就位之后才行
+        # （方法插进 init 中间会把后半截 init 主体截断成孤儿语句，实例属性
+        # 全部丢失——本次 _cursor_host 就是这么丢的，实测踩过）。
+        self._update_dismissed = False
+        QTimer.singleShot(4000, self._auto_check_update)
+
+        # 历史接收数据：加载已有尾巴并启动批量落盘定时器（纯内存入队 +
+        # 1s 批量写，接收路径零 IO 开销；详见 rx_history 模块注释）。
+        import rx_history
+        rx_history.load()
+
+    def _auto_check_update(self) -> None:
+        """启动时的自动检查更新（静默失败，绝不打扰）。"""
+        from updater import UpdateChecker
+        from version import VERSION  # noqa: F401
+
+        self._update_dismissed = False
+        checker = UpdateChecker(self)
+        self._update_checker = checker     # 防止被 GC
+        checker.checked.connect(self._on_auto_update_checked)
+        checker.failed.connect(lambda _reason: None)
+        checker.start()
+
+    def _on_auto_update_checked(self, info: dict) -> None:
+        from updater import UpdateDialog, version_tuple
+        from version import VERSION
+        if version_tuple(info["version"]) <= version_tuple(VERSION):
+            return
+        if self._update_dismissed:
+            return
+        app_log.info(f"自动检查更新：发现新版本 v{info['version']}（源 {info.get('source')}）")
+        dialog = UpdateDialog(latest=info["version"], current=VERSION,
+                              sha256=info.get("sha256"),
+                              tag=f"v{info['version']}", auto=True, parent=self)
+        dialog.dismissed_session.connect(self._on_update_dismissed)
+        dialog.exec()
+
+    def _on_update_dismissed(self) -> None:
+        self._update_dismissed = True
+        app_log.info("用户选择暂不更新：本次会话内不再自动弹出")
+
     def _new_card(self, title: str) -> Card:
         card = Card(title)
         self._cards.append(card)
@@ -2000,6 +2043,10 @@ class MainWindow(QMainWindow):
     def _append_display(self, text: str, display: str) -> None:
         """正常显示一帧：追加、追底、记账。暂停恢复时批量刷帧也走这里。"""
         self.txt_rx.appendPlainText(display)
+        # 历史接收数据：display 里已含时间戳行，直接整帧喂给历史模块
+        # （纯内存入队，落盘由 1s 定时器批量做 —— 见 rx_history.feed）。
+        import rx_history
+        rx_history.feed(display)
         # appendPlainText 只在"视图本来就在底部"时才跟着走。暂停过又恢复时
         # 视图停在半路，新数据会静静地堆在下面看不见 —— 所以显式滚到底。
         # 搜索钉住时例外：用户正盯着某条命中看，不能把视图拽走。
