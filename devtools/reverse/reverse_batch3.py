@@ -11,6 +11,22 @@
     valuepad  值补零禁用               -> check_send_enter_and_stamp 挂
     orange    BMS ERROR 退回黄色       -> check_send_enter_and_stamp 挂
     nopad     设置面板滚动条空隙归零   -> check_customization 挂
+    hitbtn    开关命中区失效           -> check_customization 挂
+    hit_large 开关命中区过大（整矩形） -> check_customization 挂
+    pressflip 开关退回"松开才翻转"     -> check_customization 挂
+    sentoggle 发送区不按配置初始化     -> check_send_collapsed_startup 挂
+    titlebar  标题栏主题沿父链上溯     -> check_caption_bar 挂
+    stamp_round 时间戳不判轮首（每帧打）-> check_expand_and_copy_all 挂
+    higeat    越界只染值、不染序号     -> check_send_enter_and_stamp 挂
+    higoff    「高亮异常数据」开关失效 -> check_send_enter_and_stamp 挂
+    nofont    字号滑杆不实时回调       -> check_customization 挂
+    nocursor  边缘不给缩放光标         -> check_caption_bar 挂
+    cursoreat 边缘事件不吃掉（被父撤）-> check_caption_bar 挂
+    fontcolor 预览退回整条单色       -> check_customization 挂
+    noreset   复原按钮不回默认值     -> check_customization 挂
+    spinpad   输入框不做垂直补偿     -> check_customization 挂
+    combofit  非编辑下拉不做实测矫正 -> check_customization 挂
+    hitblank  开关按下不过命中区     -> check_customization 挂
 
 ⚠️ 补丁一律写成**文件**再执行 —— `python -c "...\n..."` 里的反斜杠会被
 Windows 的参数转换吃掉（踩过一次）。
@@ -148,6 +164,101 @@ elif MODE == "titlebar":
           "        hwnd = int(window.winId())\n",
           "        hwnd = ctypes.windll.user32.GetParent(int(window.winId())) "
           "or int(window.winId())   # REVERSE\n")
+
+elif MODE == "stamp_round":
+    # 时间戳退回"帧里含 Voltage1 就打"（不判轮首）—— 电压分包成多帧、每帧都带
+    # 标题时一轮打出多个时间戳，复制本轮会从轮内第二个起算、前半段丢失
+    patch("main_window.py",
+          "            if self._align_section != SECTION_VOLT and VOLT_HEADER_RE.match(line):\n"
+          "                new_round = True\n",
+          "            if self._contains_anchor(line):   # REVERSE: 帧含标题就算新轮\n"
+          "                new_round = True\n")
+
+elif MODE == "higeat":
+    # 越界条目退回"只染值、不染序号" —— 用户点名"高亮要包括序号"的回归
+    patch("ui_highlight.py",
+          "            start = match.start(1)\n"
+          "            length = match.end(2) - match.start(1)\n",
+          "            start = match.start(2) + 1      # REVERSE: 只染值，不染序号\n"
+          "            length = match.end(2) - match.start(2) - 1\n")
+
+elif MODE == "higoff":
+    # 「高亮异常数据」开关失效（永远当开着）—— 关掉后异常色还在
+    patch("ui_highlight.py",
+          '        self._errors_on = bool(customization.get("highlight_errors"))\n',
+          '        self._errors_on = True   # REVERSE: 开关失效\n')
+
+elif MODE == "nofont":
+    # 字号滑杆不实时回调主窗口 —— "拖动即时预览"失效
+    patch("ui_settings.py",
+          '        if self._on_custom is not None:\n'
+          '            self._on_custom(spec["key"], value)\n',
+          '        pass   # REVERSE: 不实时回调，预览只在确定后生效\n')
+
+elif MODE == "nocursor":
+    # 边缘不给缩放光标 —— 用户点名的"边框拖拽提示"整个没了
+    patch("main_window.py",
+          "        for want, shape in cls._EDGE_CURSORS:\n"
+          "            if edges == want:\n"
+          "                return shape\n"
+          "        return None\n",
+          "        return None   # REVERSE: 永远不给缩放光标\n")
+
+elif MODE == "cursoreat":
+    # 命中边缘时不吃掉 mouseMove —— 事件沿父链上传，第二次把光标撤掉
+    patch("main_window.py",
+          "                return True\n"
+          "            self._release_resize_cursor()\n",
+          "                return False   # REVERSE: 不拦住事件\n"
+          "            self._release_resize_cursor()\n")
+
+elif MODE == "fontcolor":
+    # 预览退回"整条单色" —— 逐字符彩虹配色没了（用户点名的红橙黄绿蓝紫+反色高亮）
+    patch("ui_settings.py",
+          '        high = qcolor("volt_high").name()      # 红\n',
+          '        return f\'<span style="color:{qcolor("ink").name()}">'
+          '{spec["preview"]}</span>\'   # REVERSE: 退回单色\n'
+          '        high = qcolor("volt_high").name()      # 红\n')
+
+elif MODE == "noreset":
+    # 「复原」按钮不回默认值（差 2 个半磅）—— 用户点名的复原失效
+    patch("ui_settings.py",
+          '                    lambda _=False, s=spec, sl=slider: '
+          'sl.setValue(int(s["default"])))\n',
+          '                    lambda _=False, s=spec, sl=slider: '
+          'sl.setValue(int(s["default"]) + 2))   # REVERSE: 复原不回默认\n')
+
+elif MODE == "spinpad":
+    # 输入框不做垂直处理 —— 「保留行数」等文字与上下边框间距不等。
+    # 现在的实现是"实测墨迹摆编辑框"，所以要双管齐下才骗得过去：
+    #   ① 两个调用点都改回 None（跳过实测）→ 走兜底分支；
+    #   ② 兜底里的字号补偿归零 → 朴素居中（y=7，明显偏上）。
+    patch("ui_controls.py",
+          "            offset = _edit_ink_offset(self._edit)\n",
+          "            offset = None   # REVERSE: 不实测\n")
+    patch("ui_controls.py",
+          "        offset = _edit_ink_offset(edit)\n",
+          "        offset = None   # REVERSE: 不实测\n")
+    patch("ui_controls.py",
+          "        pt = self.font().pointSizeF()\n"
+          "        return max(0, int(round((pt - self.VERT_PIVOT_PT) * self.VERT_GAIN)))\n",
+          "        return 0   # REVERSE: 不做垂直补偿\n")
+
+elif MODE == "combofit":
+    # 不可编辑下拉框不做实测矫正 —— 文字回到"行盒居中"的默认偏差
+    # （"1" 偏下 1px、"none" 偏下 2.75px，正好越过 1.5px 的断言线）
+    patch("ui_controls.py",
+          "        shift = int(round(-base_delta))        # 目标位移（正 = 下移）\n",
+          "        shift = 0   # REVERSE: 不做实测矫正\n")
+
+elif MODE == "hitblank":
+    # mousePressEvent 退回"不检查命中区"——控件内任意位置按下都翻转
+    # （v1.4 的 hitButton 修复就是栽在这上面：覆写绕开了它）
+    patch("ui_controls.py",
+          "        if (event.button() == Qt.MouseButton.LeftButton and self.isEnabled()\n"
+          "                and self.hitButton(event.position().toPoint())):\n",
+          "        if event.button() == Qt.MouseButton.LeftButton "
+          "and self.isEnabled():   # REVERSE: 不过命中区\n")
 
 else:
     raise SystemExit(f"未知模式 {MODE}")

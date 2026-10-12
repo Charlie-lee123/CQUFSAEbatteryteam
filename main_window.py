@@ -39,8 +39,9 @@ from ui_anim import Reveal
 from ui_backdrop import frost_tile, paint_backdrop
 from ui_brand import BrandHeader, CaptionBar
 from ui_highlight import (
-    SECTION_OTHER, SECTION_TEMP, SECTION_VOLT, RxHighlighter, align_indexes,
-    bms_error_spans, section_of, stamp_span, temp_spans, value_spans,
+    SECTION_OTHER, SECTION_TEMP, SECTION_VOLT, VOLT_HEADER_RE, RxHighlighter,
+    align_indexes, bms_error_spans, section_of, stamp_span, temp_spans,
+    value_spans,
 )
 from ui_controls import (
     AlertButton, ChevronComboBox, ChevronSpinBox, IconButton, IconLabel,
@@ -113,6 +114,12 @@ RX_HOLD_MAX_MS = 300
 # 用户只会以为功能坏了。
 RX_STAMP_ANCHOR = "Voltage1"
 
+# 兜底间隔：只发电压、**没有 Temperature/BMS 段**的设备，段状态一直停在电压段，
+# 判不出轮边界 —— 隔了这么久还见到轮首标记，就按"换了一轮"处理。
+# 取 400ms：明显大于轮内分包间隔（30ms 量级，半行缓发上限 300ms），又小于
+# 常见的轮间隔。有段落结构的设备走"段状态回退"那条主判据，用不到这个兜底。
+STAMP_ROUND_MIN_MS = 400.0
+
 # 「定位最近一次异常」（标题栏那枚三角按钮）：跳过去之后让那一行落在视口上方第
 # 几行 —— 顶格的话用户看不到上下文，不知道这个数是从哪冒出来的。
 ALERT_TOP_LINES = 3
@@ -146,6 +153,19 @@ BUTTON_SPECS: tuple[tuple[str, str, str], ...] = (
 
 
 class MainWindow(QMainWindow):
+    # 边缘带 → 系统缩放光标。**四个角（两条边的组合）必须排在单边前面**先比，
+    # 否则"左|上"会被单边"左"提前命中、给成左右箭头（见 _edge_cursor_shape）。
+    _EDGE_CURSORS = (
+        (Qt.Edge.LeftEdge | Qt.Edge.TopEdge, Qt.CursorShape.SizeFDiagCursor),
+        (Qt.Edge.RightEdge | Qt.Edge.BottomEdge, Qt.CursorShape.SizeFDiagCursor),
+        (Qt.Edge.RightEdge | Qt.Edge.TopEdge, Qt.CursorShape.SizeBDiagCursor),
+        (Qt.Edge.LeftEdge | Qt.Edge.BottomEdge, Qt.CursorShape.SizeBDiagCursor),
+        (Qt.Edge.LeftEdge, Qt.CursorShape.SizeHorCursor),
+        (Qt.Edge.RightEdge, Qt.CursorShape.SizeHorCursor),
+        (Qt.Edge.TopEdge, Qt.CursorShape.SizeVerCursor),
+        (Qt.Edge.BottomEdge, Qt.CursorShape.SizeVerCursor),
+    )
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("CQUFSAE串口调试助手")
@@ -177,6 +197,9 @@ class MainWindow(QMainWindow):
         # 数据里出现过"轮首标记"没有 —— 决定时间戳是"每轮一个"还是"每帧一个"，
         # 见 RX_STAMP_ANCHOR / _stamp_needed
         self._stamp_anchor_seen = False
+        # 上一次打时间戳的时刻（monotonic 秒）—— "只发电压、没有温度/BMS 段"的
+        # 设备靠轮间隔兜底打点，见 _stamp_needed
+        self._stamp_last_monotonic = 0.0
         # 滚动：默认自动滚到底，暂停键（或空格）点按切换暂停/继续。
         # 暂停是**冻结显示**：新帧进这个队列不显示，恢复时一次刷入。
         self._paused = False
@@ -481,6 +504,13 @@ class MainWindow(QMainWindow):
         self._set_send_collapsed(
             bool(customization.get("send_collapsed_startup")), remember=False)
 
+        # 窗口边缘的缩放提示：光标状态（见 _apply_resize_cursor）+ 给所有控件
+        # 开 mouseTracking（不开就收不到没按键时的 MouseMove，提示永远不会出现）。
+        # 放在最后 —— 这时界面上的控件已经全部建好。
+        self._cursor_host: QWidget | None = None
+        self._saved_cursors: dict = {}
+        self._enable_edge_hover()
+
     def _new_card(self, title: str) -> Card:
         card = Card(title)
         self._cards.append(card)
@@ -729,7 +759,8 @@ class MainWindow(QMainWindow):
 
         self.txt_rx = QPlainTextEdit()
         self.txt_rx.setReadOnly(True)
-        self.txt_rx.setFont(mono_font(10.5))
+        # 字号来自定制配置（设置面板里那根滑杆，见 _apply_rx_font_size）
+        self.txt_rx.setFont(mono_font(customization.display_value("rx_font_size")))
         self.txt_rx.setMaximumBlockCount(self._rx_blocks)
         self.txt_rx.setUndoRedoEnabled(False)
         self.txt_rx.setPlaceholderText("收到的数据会显示在这里")
@@ -1019,7 +1050,80 @@ class MainWindow(QMainWindow):
                 handle = self.windowHandle()
                 if handle is not None and handle.startSystemResize(edges):
                     return True
+
+        # 边缘/四角的**光标提示**：无边框窗口把系统的缩放边框去掉了，鼠标移到
+        # 边缘时没有任何提示，用户不会知道那里能拖（用户点名："需像其他 Windows
+        # 软件一样显示边框拖拽提示"）。这里按落在哪条边/哪个角换对应的缩放光标。
+        # ⚠️ 只在**普通态**给：_resize_edges 已经把全屏/最大化挡在外面（那时四边
+        # 都在屏幕外）—— 顺带也就满足了"从最大化退出后才出现"。
+        if (event.type() == QEvent.Type.MouseMove
+                and isinstance(obj, QWidget) and obj.window() is self):
+            edges = self._resize_edges(obj.mapTo(self, event.position().toPoint()))
+            if edges:
+                self._apply_resize_cursor(obj, edges)
+                # ⚠️ 命中边缘必须**吃掉**这个事件。QWidget 默认的 mouseMoveEvent
+                # 是 event->ignore()，不拦的话事件会继续往下投递、并沿父链上传，
+                # 同一个鼠标位置于是被处理两次 —— 第二次（父窗口）走的还是同一条
+                # 分支，把刚设在子控件上的缩放光标当成"换了个宿主"撤掉，光标
+                # 立刻变回箭头（真机实测：先 SizeHorCursor，随后就没了）。
+                return True
+            self._release_resize_cursor()
         return super().eventFilter(obj, event)
+
+    def _apply_resize_cursor(self, widget: QWidget, edges) -> None:
+        """按鼠标落在哪条边/哪个角，给**鼠标所在的那个控件**换上缩放光标。
+
+        两个坑：
+        - 光标只能设在鼠标当前所在的那个控件上（设在窗口本身上不生效）——
+          中央控件铺满整个客户区，鼠标其实一直在它（或它的 viewport）上面；
+        - 离开边缘必须把光标**还原成原来那个**，不能一律 unsetCursor：文本框
+          viewport 原本是 I 形光标，unset 之后会退回箭头形（真机踩过）。
+          所以进来时把控件自己的 cursor 存一份，换走时还回去。
+        """
+        shape = self._edge_cursor_shape(edges)
+        if shape is None:
+            self._release_resize_cursor()
+            return
+        if self._cursor_host is not None and self._cursor_host is not widget:
+            self._release_resize_cursor()
+        if widget not in self._saved_cursors:
+            self._saved_cursors[widget] = widget.cursor()
+        widget.setCursor(shape)
+        self._cursor_host = widget
+
+    def _release_resize_cursor(self) -> None:
+        """把缩放光标撤掉，恢复控件自己原本的光标。"""
+        host = self._cursor_host
+        if host is None:
+            return
+        original = self._saved_cursors.pop(host, None)
+        if original is not None:
+            host.setCursor(original)
+        else:
+            host.unsetCursor()
+        self._cursor_host = None
+
+    @classmethod
+    def _edge_cursor_shape(cls, edges):
+        """边缘组合 → 系统缩放光标形状（不是边缘就是 None）。
+
+        ⚠️ 四个角（两条边的组合）必须排在单边前面先比，否则永远匹配不到。
+        """
+        for want, shape in cls._EDGE_CURSORS:
+            if edges == want:
+                return shape
+        return None
+
+    def _enable_edge_hover(self) -> None:
+        """给窗口内所有控件开 mouseTracking —— 边缘光标提示的前提。
+
+        ⚠️ 不开的话，**没按住键时的鼠标移动根本不产生 MouseMove 事件**，
+        应用级过滤器也照样收不到，光标提示永远不会出现。中央控件铺满整个
+        客户区，边缘那圈事件其实发生在它（或它的 viewport）身上，所以得
+        逐个开。纯几何判断，开销可以忽略。
+        """
+        for widget in [self] + self.findChildren(QWidget):
+            widget.setMouseTracking(True)
 
     def _resize_edges(self, pos: QPoint):
         """窗口内坐标落在哪几条边上（不在边缘带里就是空）。
@@ -1709,6 +1813,7 @@ class MainWindow(QMainWindow):
         self._decoder.reset()
         # 换了个口就是换了套数据，"轮首标记见过没有"要重新判（见 _stamp_needed）
         self._stamp_anchor_seen = False
+        self._stamp_last_monotonic = 0.0
         self.btn_open.setChecked(True)
         for widget in self._config_widgets():
             widget.setEnabled(False)
@@ -1853,9 +1958,20 @@ class MainWindow(QMainWindow):
         # 补齐后的同一份文本。
         text = align_indexes(text, section=self._align_section,
                              max_row_chars=self._rx_max_row_chars())
+        # 逐行推进段状态，同时看这一帧里有没有"新一轮的开头"。
+        # ⚠️ 判据必须是**段状态从非电压段回到电压段**，不能只看"帧里有没有
+        # Voltage1:"：电压数据分包成多帧、每帧都带 "Voltage1:" 标题时（真机
+        # 实测），后者会在一轮里打出好几个时间戳 —— 用户报的"有不在开头的
+        # 时间戳"就是它；而且「复制本轮」会从轮内第二个时间戳起算，前半段
+        # 电压整段丢失（用户报的"复制读取的数据不完整"）。
+        # 一轮的数据布局是 电压 → Temperature1: → BMS…，所以段状态绕一圈回到
+        # 电压 = 新一轮开始；同一轮里电压续传时状态一直停在电压段，不会误判。
+        new_round = False
         for line in text.split("\n"):
+            if self._align_section != SECTION_VOLT and VOLT_HEADER_RE.match(line):
+                new_round = True
             self._align_section = section_of(line, self._align_section)
-        if self.chk_timestamp.isChecked() and self._stamp_needed(text):
+        if self.chk_timestamp.isChecked() and self._stamp_needed(text, new_round):
             # 时间戳独占一行、本轮首行（Voltage1:）紧贴在它**下面**；它与
             # 上方（上一轮）的内容之间空一行 —— 轮与轮的视觉分隔（用户点名）。
             # 文档还是空的时候不加前导空行（第一帧顶上不留白）。
@@ -1928,14 +2044,32 @@ class MainWindow(QMainWindow):
                     return True
         return False
 
-    def _stamp_needed(self, text: str) -> bool:
-        """这一帧要不要打时间戳。"""
-        if self._contains_anchor(text):
+    def _stamp_needed(self, text: str, new_round: bool) -> bool:
+        """这一帧要不要打时间戳（目标是**一轮一个**）。
+
+        ``new_round``：这一帧里出现了新一轮的开头（段状态从非电压段回到电压段，
+        由 ``_emit_block`` 逐行推进段状态得出）。**这才是轮首的正确判据** ——
+        只看"帧里有没有 Voltage1:"是不够的：电压数据分包成多帧、每帧都带标题时，
+        那样会一轮打出好几个时间戳，复制本轮就会从轮内第二个时间戳起算、
+        前半段数据整段丢失（用户报的两个现象）。
+        """
+        if new_round:
             self._stamp_anchor_seen = True
+            self._stamp_last_monotonic = time.monotonic()
             return True
         # 还没见过轮首标记：先按"每帧都打"来，见到之后自动收窄成"每轮一个" ——
         # 换台设备（数据里根本没有 Voltage1）时时间戳不会静默消失。
-        return not self._stamp_anchor_seen
+        if not self._stamp_anchor_seen:
+            return True
+        # 兜底：只发电压、没有温度/BMS 段的设备，段状态一直停在电压段，永远
+        # 等不到 new_round。这类设备的轮边界只能靠**轮间隔**认 —— 两轮之间必
+        # 有停顿，隔了 STAMP_ROUND_MIN_MS 以上就认为换了一轮。
+        if (self._contains_anchor(text)
+                and (time.monotonic() - self._stamp_last_monotonic) * 1000.0
+                >= STAMP_ROUND_MIN_MS):
+            self._stamp_last_monotonic = time.monotonic()
+            return True
+        return False
 
     def _round_span(self, from_block: int) -> tuple[int, int] | None:
         """找出 ``from_block`` 所在"读取轮"的块区间 ``[起始, 结束)``。
@@ -2073,6 +2207,7 @@ class MainWindow(QMainWindow):
         # 暂停队列里攒着的帧也作废（清空本身就是"不要之前的东西了"）
         self._paused_frames.clear()
         self._stamp_anchor_seen = False
+        self._stamp_last_monotonic = 0.0
         self._update_counters()
 
     # ---------------------------------------------------------- 最近一次异常
@@ -2314,19 +2449,22 @@ class MainWindow(QMainWindow):
     def _open_settings(self) -> None:
         """打开设置面板。确定后立刻生效并落盘；取消则把实时预览的效果回退。
 
-        面板里的改动是**实时预览**的（毛玻璃强度、按钮显隐），所以取消时必须把
-        两样都还原回去 —— 只还原毛玻璃的话，用户取消时按钮会停在预览状态里。
+        面板里的改动是**实时预览**的（毛玻璃强度、按钮显隐、接收区字号），所以
+        取消时必须都还原回去 —— 只还原一部分的话，用户取消时界面会停在预览状态里。
         """
         previous_glass = glass_strength()
         previous_hidden = set(self._hidden_buttons)
+        previous_font = customization.display_value("rx_font_size")
         dialog = SettingsDialog(self._theme_mode, previous_glass,
                                 BUTTON_SPECS, sorted(self._hidden_buttons),
                                 on_glass=self._apply_glass,
-                                on_buttons=self._preview_buttons, parent=self)
+                                on_buttons=self._preview_buttons,
+                                on_custom=self._preview_custom, parent=self)
         if dialog.exec() != SettingsDialog.DialogCode.Accepted:
             self._apply_glass(previous_glass)
             self._hidden_buttons = previous_hidden
             self._apply_button_visibility()
+            self._apply_rx_font_size(previous_font)
             return
         theme_mode, glass = dialog.values()
         # 「定制功能」由注册表统一管理：面板按 specs() 生成控件，这里统一落盘。
@@ -2358,8 +2496,14 @@ class MainWindow(QMainWindow):
             self._apply_theme(theme_mode)
         if any(k.startswith("clock_") for k in custom_changes):
             self._tick_clock()          # 时钟开关立即生效，不等下一秒的定时器
-        if any(k.startswith(("volt_limit", "temp_limit")) for k in custom_changes):
-            # 电压/温度范围变了：高亮器重读范围并重刷整篇着色
+        if "rx_font_size" in custom_changes:
+            # 字号在拖动时已实时预览过，这里按**落盘后的值**再应用一次
+            # （面板传的是显示值，落盘的是半磅存储值，换算口径统一走 display_value）
+            self._apply_rx_font_size(customization.display_value("rx_font_size"))
+        if any(k.startswith(("volt_limit", "temp_limit")) for k in custom_changes) \
+                or "highlight_errors" in custom_changes:
+            # 电压/温度范围变了、或「高亮异常数据」开关拨过：高亮器重读配置
+            # 并重刷整篇着色
             self._rx_highlighter.refresh()
         if "startup_maximized" in custom_changes:
             # 起手姿态当场摆一次（不然用户得重启才看得到自己改了什么）
@@ -2368,6 +2512,24 @@ class MainWindow(QMainWindow):
         app_log.info(f"设置已保存（主题={theme_mode}, 定制项 {len(custom_changes)} 个）")
 
     # ------------------------------------------------------------ 按钮显隐
+
+    def _apply_rx_font_size(self, point_size: float) -> None:
+        """设置接收区字号（用户点名：滑杆**无级**调节 + 拖动实时预览）。
+
+        只换字体 —— 文档里的文字一个字符都不动（前导补零与网格对齐按**字符
+        数**算，跟字号无关）；字号变大后一行能放的字符变少，软换行由
+        QPlainTextEdit 自己重排，不需要我们插手。
+        """
+        self.txt_rx.setFont(mono_font(float(point_size)))
+
+    def _preview_custom(self, key: str, value) -> None:
+        """设置面板里拖**滑杆**时的实时预览（不落盘）。
+
+        面板只把 ``key`` 与显示值丢过来 —— "要不要实时生效、怎么生效"由这里
+        决定，面板自己不认识任何具体配置项（它只按 customization 注册表生成控件）。
+        """
+        if key == "rx_font_size":
+            self._apply_rx_font_size(value)
 
     def _preview_buttons(self, hidden: list[str]) -> None:
         """设置面板拖动开关时的实时预览（不落盘）。"""

@@ -4,7 +4,7 @@
 避免入口模块被反向 import（main 一被 import 就会拉起 MainWindow）。
 """
 
-VERSION = "1.4"
+VERSION = "1.5"
 
 # 仓库地址（设置面板「检查更新」用）。
 REPO_URL = "https://github.com/Charlie-lee123/CQUFSAEbatteryteam"

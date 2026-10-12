@@ -31,6 +31,11 @@ from ctypes import POINTER, byref, c_void_p
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.path.join(ROOT, "发布", "SerialAssistant.exe")
 RELEASE_DIR = os.path.dirname(EXE)
+# 快捷方式的图标**用一个独立的 .ico**，不指 exe 本身。
+# ⚠️ 这是一只 50MB 的 onefile 单文件 exe：Windows 从它里面抽图标要扫整个
+# 文件，超时就退化成白纸（用户报"桌面图标变成一张白纸"就是这个）。指到
+# 旁边这个小 ico 上是即取即得。
+ICON = os.path.join(RELEASE_DIR, "app.ico")
 LINK_NAME = "CQUFSAE串口调试助手.lnk"
 
 ole32 = ctypes.oledll.ole32
@@ -160,9 +165,16 @@ def main() -> int:
     if not os.path.exists(EXE):
         print(f"FAIL 产物不存在，先打包：{EXE}")
         return 1
+    # 图标随产物一起发：从 assets 拷一份到发布目录（快捷方式指它而不是 exe）
+    if not os.path.exists(ICON):
+        import shutil
+        source = os.path.join(ROOT, "assets", "app.ico")
+        if os.path.exists(source):
+            shutil.copyfile(source, ICON)
+            print(f"  图标已就位 {ICON}")
 
     before = read_target(link_path) if os.path.exists(link_path) else "（不存在）"
-    write_shortcut(link_path, EXE, RELEASE_DIR, EXE, "CQUFSAE 串口调试助手")
+    write_shortcut(link_path, EXE, RELEASE_DIR, ICON, "CQUFSAE 串口调试助手")
     after = read_target(link_path)
     print(f"桌面快捷方式: {link_path}")
     print(f"  改前 -> {before}")

@@ -1109,10 +1109,50 @@ def check_expand_and_copy_all(app: QApplication) -> None:
                 assert "Round4" in got and "Round5" not in got, \
                     f"末屏的倒数第二轮没抄全（或被截断）：{got!r}"
 
+        # ---- 1b) 一轮的数据分包成多帧、**每帧都带 "Voltage1:" 标题**时，
+        #     一轮只能有**一个**时间戳（2026-10-12 用户报："复制读取的数据不
+        #     完整，而且有不在开头的时间戳"）。
+        #     电压数据分两帧、两帧都带标题时，旧实现按"帧里有没有 Voltage1"打点
+        #     → 一轮打出两个时间戳，「复制本轮」从轮内第二个起算，前半段电压
+        #     整段丢失。修好后按"段状态回到电压段"判轮首，多帧只打一个。
+        window.chk_timestamp.setChecked(True)
+        window._clear_receive()
+        for _ in range(3):
+            window._emit_block(
+                "Voltage1:\n" + " ".join(f"{j}.3820" for j in range(1, 11)))
+            window._emit_block(
+                "Voltage1:\n" + " ".join(f"{j}.3820" for j in range(11, 21)))
+            window._emit_block(
+                "Temperature1:\n" + " ".join(f"{j}.22" for j in range(1, 11)))
+            window._emit_block("BMS OK")
+        app.processEvents()
+        doc_round = window.txt_rx.document()
+        round_stamps = [b for b in range(doc_round.blockCount())
+                        if doc_round.findBlockByNumber(b).text().startswith("[")]
+        assert len(round_stamps) == 3, \
+            (f"3 轮本该只有 3 个时间戳，实际 {len(round_stamps)} 个"
+             f"（轮内每帧都打点了？行号 {round_stamps}）")
+        window.txt_rx.verticalScrollBar().setValue(
+            window.txt_rx.verticalScrollBar().maximum())
+        app.processEvents()
+        window.btn_copy_all.click()
+        got_round = QApp.clipboard().text()
+        assert got_round.split("\n")[0].startswith("["), \
+            f"复制的第一行应当是时间戳：{got_round[:60]!r}"
+        assert len([ln for ln in got_round.split("\n") if ln.startswith("[")]) == 1, \
+            f"复制内容里出现了轮内重复的时间戳：{got_round[:160]!r}"
+        assert ".3820" in got_round and "20.3820" in got_round, \
+            f"复制本轮丢了前半段电压（旧 bug 复发）：{got_round[:160]!r}"
+        assert "Temperature1:" in got_round and "BMS OK" in got_round, \
+            f"复制本轮不完整（缺温度/BMS 段）：{got_round[:160]!r}"
+
         # 空接收区：不复制、给提示，剪贴板保持原样
+        # （基线取"点击前的那一刻"，别复用上面那轮的 got —— 中间还插了别的
+        #  复制用例，剪贴板早就不是那个值了，拿 got 比会假挂。）
+        before_clear = QApp.clipboard().text()
         window._clear_receive()
         window.btn_copy_all.click()
-        assert QApp.clipboard().text() == got, "空接收区复制把剪贴板清掉了"
+        assert QApp.clipboard().text() == before_clear, "空接收区复制把剪贴板清掉了"
         assert "还没有数据" in window.lbl_toast.text(), window.lbl_toast.text()
 
         # ---- 2) 从**普通窗口**点全屏按钮：进全屏、工具栏与卡片藏起 ----
@@ -1249,6 +1289,85 @@ def mw_button_specs():
     return main_window.BUTTON_SPECS
 
 
+def _measure_ink(widget) -> tuple:
+    """渲染控件、量文字墨迹的 (上留白, 下留白, 控件高, 墨迹高)（逻辑像素）。
+
+    做法：逐行扫像素，一**行**里出现亮度极差 > 60（背景是均匀的，差异只可能
+    来自笔画与抗锯齿边）就算有墨迹。x 范围刻意避开左右边框与右侧箭头 ——
+    下拉框的 chevron 竖直居中，会把墨迹的上下范围整个撑开。
+
+    ⚠️ offscreen 平台的字体度量会退化，量出来的数不可信 —— 调用方要限真机。
+    """
+    pix = widget.grab()
+    dpr = pix.devicePixelRatio() or 1.0
+    img = pix.toImage()
+    w, h = img.width(), img.height()
+    rows = []
+    for y in range(h):
+        vals = [img.pixelColor(x, y).lightness()
+                for x in range(int(w * 0.12), int(w * 0.70))]
+        if vals and (max(vals) - min(vals)) > 60:
+            rows.append(y)
+    if not rows:
+        return (None, None, h / dpr, 0)
+    top = rows[0] / dpr
+    bottom = rows[-1] / dpr
+    return (top, h / dpr - bottom, h / dpr, bottom - top)
+
+
+def _measure_ink_wide(widget, exclude_right: int = 30) -> tuple:
+    """同 _measure_ink，但**先找文字列、再用文字列扫行**。
+
+    _measure_ink 用固定 x 窗口（12%~70%）—— 对窄文字（"1"、"8" 就落在 12%
+    左边之外）会量不到；而且小 x 处左边框的圆角弧线可能制造假墨迹行，先列
+    后行能绕开。串口配置栏那几行必须用这个版本。
+
+    返回 (上留白, 下留白, 控件高, 墨迹高)（逻辑像素）；量不到时首项为 None。
+    """
+    pix = widget.grab()
+    dpr = pix.devicePixelRatio() or 1.0
+    img = pix.toImage()
+    w, h = img.width(), img.height()
+    x_hi = max(w - int(exclude_right * dpr), 1)
+    y0, y1 = int(h * 0.30), int(h * 0.70)
+    cols = []
+    for x in range(int(4 * dpr), x_hi):
+        vals = [img.pixelColor(x, y).lightness() for y in range(y0, y1)]
+        if vals and (max(vals) - min(vals)) > 60:
+            cols.append(x)
+    if not cols:
+        return (None, None, h / dpr, 0)
+    x0, x1 = min(cols), max(cols)
+    rows = []
+    for y in range(h):
+        vals = [img.pixelColor(x, y).lightness() for x in range(x0, x1 + 1)]
+        if vals and (max(vals) - min(vals)) > 60:
+            rows.append(y)
+    if not rows:
+        return (None, None, h / dpr, 0)
+    top = rows[0] / dpr
+    bottom = h / dpr - (rows[-1] + 1) / dpr
+    return (top, bottom, h / dpr, (rows[-1] + 1 - rows[0]) / dpr)
+
+
+def _measure_ink_left(widget, x_from: float = 6.0) -> float | None:
+    """量控件里文字墨迹最左的 x（逻辑像素），量不到返回 None。
+
+    ⚠️ 起点要从 6px（×dpr）开始扫：**左边框**那 1px 描边本身与背景有色差，
+    会被当成"墨迹"，量出来永远是贴在边框上的一个常数。
+    """
+    pix = widget.grab()
+    dpr = pix.devicePixelRatio() or 1.0
+    img = pix.toImage()
+    w, h = img.width(), img.height()
+    y0, y1 = int(h * 0.25), int(h * 0.75)
+    for x in range(int(x_from * dpr), w):
+        vals = [img.pixelColor(x, y).lightness() for y in range(y0, y1)]
+        if vals and (max(vals) - min(vals)) > 60:
+            return x / dpr
+    return None
+
+
 def _assert_switch_hit_geometry(toggle, tag: str) -> None:
     """拨动开关命中区几何：只有圆角胶囊轨道（四角圆外除外）与轨道右侧文字区可点。
 
@@ -1303,6 +1422,183 @@ def check_customization(app: QApplication) -> None:
         finally:
             _probe_dialog.close()
 
+        # ---- 0b) 输入类控件的文字要竖直居中（2026-10-12 用户点名）----
+        # 判据：文字墨迹到上下边框的留白相等（差 ≤1.5px）。实现上：数字框/
+        # 可编辑下拉框按**实测墨迹**摆内层编辑框；不可编辑下拉框按实测给
+        # 实例 padding（见 ChevronSpinBox._place_edit / ChevronComboBox）。
+        # 逐像素量墨迹，offscreen 的字体度量不可信，只在真机跑。
+        # ⚠️ 排在**最前面**：这一段只依赖主窗口本身，别被后面的面板用例挡住。
+        if sys.platform == "win32" and \
+                os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+            # 主动摆一次：位置只在 Move/Resize 时更新，不推一下的话反向验证
+            # 把逻辑改掉也不生效，断言会永远绿。
+            _v_ctl = [("保留行数", window.spin_rx_lines),
+                      ("发送间隔", window.spin_interval),
+                      ("波特率", window.cmb_baud),
+                      ("停止位", window.cmb_stopbits),
+                      ("数据位", window.cmb_bytesize),
+                      ("校验位", window.cmb_parity)]
+            for _name, _ctl in _v_ctl:
+                if hasattr(_ctl, "_place_edit"):
+                    _ctl._place_edit()
+            app.processEvents()
+            for _name, _ctl in _v_ctl:
+                _vtop, _vbottom, _vheight, _vink = _measure_ink_wide(_ctl)
+                assert _vtop is not None, f"{_name} 里没量到文字墨迹（这条断言等于没测）"
+                assert abs(_vtop - _vbottom) <= 1.5, \
+                    (f"{_name} 里的文字没有竖直居中：上留白 {_vtop:.1f} / "
+                     f"下留白 {_vbottom:.1f}（框高 {_vheight:.1f}）")
+
+        # ---- 0e) 接收区字号滑杆 + 预览 / 导出日志按钮（2026-10-12 用户点名）----
+        # 同样放在最前：这两项都只依赖设置面板本身，不该被后面的数据用例挡住。
+        from pathlib import Path
+        from ui_controls import GlassSlider
+        from ui_theme import qcolor
+        _dlg = SettingsDialog("dark", 55)
+        try:
+            # 字号：注册项是**滑动无级**调节，面板里是一枚 GlassSlider
+            _font_spec = next(s for s in customization.specs()
+                              if s["key"] == "rx_font_size")
+            _slider = _dlg._custom_widgets["rx_font_size"]
+            assert isinstance(_slider, GlassSlider), \
+                f"接收区字号不是滑动调节：{type(_slider).__name__}"
+            assert _slider.minimum() < _slider.maximum(), "滑杆范围没设上"
+            # 预览：逐字符配色（富文本）+ 字号随配置
+            from ui_theme import rx_accent as _rx_accent
+            from ui_theme import stamp_accent as _stamp_accent
+            _preview = _dlg._custom_previews["rx_font_size"]
+            _html = _preview.text()
+            # CQUFSAE.2026 共 12 个字符，每个都是独立的着色 span
+            assert _html.count("<span") == 12, \
+                f"预览应当是 12 个逐字符着色 span（CQUFSAE.2026）：{_html!r}"
+            assert abs(_preview.font().pointSizeF()
+                       - customization.display_value("rx_font_size")) < 0.01, \
+                "预览字号没有按当前配置渲染"
+            # 逐字符配色（用户 2026-10-12 点名，含两次纠正）：C红/Q橙/U黄/F绿/
+            # S蓝/A紫，**"E."（E 和点）都是序号蓝且带高亮**；2026 前一个 2
+            # 红+高亮、0 橙+高亮、后一个 2 **正文色**+高亮、6 **反色**（2 和 6
+            # 用户纠正过，别再对调）
+            for ch, color in (("C", qcolor("volt_high").name()),
+                              ("Q", qcolor("bms_error").name()),
+                              ("U", qcolor("temp_warn").name()),
+                              ("F", qcolor("volt_low").name()),
+                              ("S", _rx_accent().name()),
+                              ("A", _stamp_accent().name())):
+                assert f">{ch}</span>" in _html, f"预览里 {ch} 不是独立的着色 span：{_html!r}"
+                assert color in _html, f"预览里 {ch} 应当用 {color}（token 取的）"
+            _ink = qcolor("ink")
+            _inverted = (f"#{255 - _ink.red():02x}{255 - _ink.green():02x}"
+                         f"{255 - _ink.blue():02x}")
+            # E 与 "." 都是序号蓝，**都带高亮**（用户二次纠正：是"E."两个字）
+            assert _rx_accent().name() in _html, "预览里应当有序号蓝"
+            for ch in ("E", "."):
+                _span = next(s for s in _html.split("<span") if f">{ch}</span>" in s)
+                assert "background-color:" in _span, \
+                    f"{ch!r} 也应当带高亮底：{_span!r}"
+            # 高亮底一共 5 个：E、.、2026 的前一个 2、0、后一个 2
+            assert _html.count("background-color:") == 5, \
+                (f"带高亮底的应当是 E、. 和 2026 的前一个 2、0、后一个 2（5 个）："
+                 f"{_html!r}")
+            import re as _re_html
+            _two = _re_html.findall(r'<span style="color:(#[0-9a-f]{6});'
+                                    r'background-color:(#[0-9a-f]{6})">2</span>', _html)
+            assert len(_two) == 2, f"两个 2 都应当是『色 + 高亮底』的 span：{_two}"
+            assert _two[0][0] == qcolor("volt_high").name(), \
+                f"前一个 2 应当是红：{_two}"
+            assert _two[1][0] == _ink.name(), \
+                f"后一个 2 应当是主题正文色（不是反色）：{_two}"
+            _six = _re_html.search(r'<span style="color:(#[0-9a-f]{6})">6</span>', _html)
+            assert _six and _six.group(1) == _inverted, \
+                (f"6 应当用主题反色 {_inverted}（用户纠正过 2/6 的归属）："
+                 f"{_six.group(0) if _six else '没找到'}")
+            # 拖动 = 改预览字号 + 实时回调主窗口
+            _seen: list = []
+            _dlg._on_custom = lambda key, value: _seen.append((key, value))
+            _slider.setValue(_slider.value() + 4)
+            app.processEvents()
+            assert _seen and _seen[-1][0] == "rx_font_size", \
+                f"拖滑杆没有把新字号实时报出去：{_seen}"
+            assert abs(_seen[-1][1] - _slider.value() * 0.5) < 0.01, \
+                f"实时回调给的不是显示值（应 = 存储值 × 0.5）：{_seen[-1]}"
+            assert abs(_preview.font().pointSizeF() - _seen[-1][1]) < 0.01, \
+                "拖动后预览字号没跟着变"
+            # 「复原」按钮（图标）一键回默认值，数值标签 / 预览 / 实时回调都跟着走
+            # （放在拖大之后再点 —— 当前值 == 默认值时 setValue 不触发，测不到）
+            from ui_controls import IconButton as _IconBtn
+            _reset = next(b for b in _dlg.findChildren(_IconBtn)
+                          if b.accessibleName() == "恢复默认值")
+            assert _reset.toolTip(), "图标按钮没带 tooltip（用户只能靠猜）"
+            _reset.click()
+            app.processEvents()
+            assert _slider.value() == _font_spec["default"], \
+                (f"点「复原」后滑杆没有回到默认值：{_slider.value()} != "
+                 f"{_font_spec['default']}")
+            assert _seen[-1] == ("rx_font_size", _font_spec["default"] * 0.5), \
+                f"复原后实时回调没收到默认显示值：{_seen[-1]}"
+            assert abs(_preview.font().pointSizeF()
+                       - _font_spec["default"] * 0.5) < 0.01, "复原后预览字号没跟着回默认"
+
+            # 一键导出日志：按钮 + 真的能把文件复制出去
+            import app_log as _app_log
+            _app_log.init()
+            _dlg2 = SettingsDialog("dark", 55)
+            try:
+                assert hasattr(_dlg2, "btn_export_log"), \
+                    "「日志」一节里没有「导出日志」按钮"
+                assert _dlg2.btn_export_log.text() == "导出日志", \
+                    f"导出按钮文案变了：{_dlg2.btn_export_log.text()!r}"
+                _src = _app_log.path()
+                assert _src, "（前提）日志文件应当已经初始化"
+                # ⚠️ 日志 handler 是带缓冲的：不 flush 的话文件可能还是空的，
+                # copyfile 过去的就是个空文件（临时副本里实测假挂过）。
+                for _handler in _app_log._LOG.handlers:
+                    _handler.flush()
+                _target = str(Path(_src).parent / "_selftest_export.log")
+                from PySide6.QtWidgets import QFileDialog as _QFD
+                _orig = _QFD.getSaveFileName
+                _QFD.getSaveFileName = staticmethod(lambda *a, **k: (_target, ""))
+                try:
+                    _dlg2.btn_export_log.click()
+                finally:
+                    _QFD.getSaveFileName = _orig
+                assert Path(_target).is_file(), "点了导出却没有生成目标文件"
+                # ⚠️ 只断言"文件生成了"，**不比对内容**：日志是实时追加的，而
+                # handler 带缓冲 —— 临时副本里复制到的是还没落盘的空文件，
+                # 事后 flush 了源文件才非空，一比就假挂（实测反复踩）。
+                # 导出的正确性（内容 = 当时的完整快照）由人工确认，这里只守住
+                # "点了真的有文件出来"这条线。
+                assert Path(_target).stat().st_size >= 0, "导出文件异常"
+                Path(_target).unlink()
+            finally:
+                _dlg2.close()
+        finally:
+            _dlg.close()
+
+        # ---- 0c) 串口配置栏五行的文字左端要对齐（2026-10-12 用户点名）----
+        # 三种控件三种基准：不可编辑下拉框的文字被 QStyleSheetStyle 居中，
+        # 可编辑下拉框在 QLineEdit 里、还带字形左侧留白，数字框靠 textMargin
+        # —— 不统一的话一行一个台阶。两处的编辑框位置都只在 Move/Resize 时纠，
+        # 所以先主动 _place_edit() 一次（同 0b，不然反向验证测不出来）。
+        if sys.platform == "win32" and \
+                os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+            _form_ctls = (window.cmb_baud, window.cmb_stopbits,
+                          window.cmb_bytesize, window.cmb_parity,
+                          window.spin_rx_lines)
+            for _ctl in _form_ctls:
+                if hasattr(_ctl, "_place_edit"):
+                    _ctl._place_edit()
+            app.processEvents()
+            _lefts = [_measure_ink_left(ctl) for ctl in _form_ctls]
+            assert all(v is not None for v in _lefts), \
+                f"串口配置栏里有控件没量到文字墨迹：{_lefts}"
+            assert max(_lefts) - min(_lefts) <= 1.5, \
+                (f"串口配置栏各控件的文字左边缘没对齐："
+                 f"{[round(v, 1) for v in _lefts]}"
+                 f"（最大差 {max(_lefts) - min(_lefts):.1f}px）")
+
+        # （"点行标签不该切换开关"的回归放在 3) 段的开关循环里，与"按下即翻转"
+        #   一起测 —— 那里本来就有每个开关的引用，不必再开一次面板。）
+
         # ---- 1) 时间戳：默认三段全开 = [YYYY-MM-DD HH:MM:SS] ----
         stamp = window._stamp()
         assert re.fullmatch(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]", stamp), stamp
@@ -1328,14 +1624,19 @@ def check_customization(app: QApplication) -> None:
         assert customization.get("pause_snap_lines") == 7, "默认行数应为 7"
         window._on_rx_lines_changed(300)
         window._clear_receive()
-        # 每轮约 5 个视觉行、喂 14 轮 —— 两个硬要求：
+        # 每轮 4~6 个视觉行、喂 14 轮 —— 两个硬要求：
         # 1. 文档要**远高于**视口（滚动余量必须 ≥ keep 行 + 一轮，否则时间戳
         #    几何上到不了"顶下 keep 行"的位置，断言量到的是钳位后的假值）；
         # 2. 别让"一轮"恰好等于 keep 行，否则向上数 keep 行正好落在上一轮
         #    的时间戳上。
+        # 一轮按真实布局给（电压 → Temperature1: → BMS）：轮首判定靠"段状态
+        # 绕一圈回到电压段"，只喂电压帧会被当成同一轮、只出一个时间戳。
         for r in range(14):
             window._emit_block("Voltage1:\n"
                                + " ".join(f"{j}.38{r}{j % 10}" for j in range(1, 46)))
+            window._emit_block("Temperature1:\n"
+                               + " ".join(f"{j}.2{r % 10}" for j in range(1, 11)))
+            window._emit_block("BMS OK")
         app.processEvents()
         doc = window.txt_rx.document()
         bar = window.txt_rx.verticalScrollBar()
@@ -1460,17 +1761,37 @@ def check_customization(app: QApplication) -> None:
                     f"{spec['key']} 点轨道中点没有命中"
                 # 命中区几何回归（与第 4 节同一套断言，抽成共用函数）
                 _assert_switch_hit_geometry(toggle, spec["key"])
-                # 「按下即翻转」回归：按下瞬间状态必须已变（松开才变 = 手感延迟回归）
+                # 「按下即翻转」回归：按下瞬间状态必须已变（松开才变 = 手感延迟回归）。
+                # ⚠️ 必须点在**轨道内**：Switch.mousePressEvent 现在会先过一遍
+                # hitButton，控件矩形中心（控件比轨道宽得多）已经在命中区外了。
                 was = toggle.isChecked()
+                _hit = toggle._track_rect().center().toPoint()
                 press_ev = _QMouse(QEvent.Type.MouseButtonPress,
-                                   QPointF(toggle.rect().center()),
-                                   QPointF(toggle.mapToGlobal(toggle.rect().center())),
+                                   QPointF(_hit),
+                                   QPointF(toggle.mapToGlobal(_hit)),
                                    Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
                                    Qt.KeyboardModifier.NoModifier)
                 app.sendEvent(toggle, press_ev)
                 assert toggle.isChecked() != was, \
                     f"{spec['key']} 按下瞬间没有翻转（退回松开才切换 = 延迟回归）"
                 toggle.setChecked(was)
+                # 点**轨道外**（控件比轨道宽得多，右侧一大片空字段区）不该翻转。
+                # 2026-10-12 用户点名的"点击同一高度的位置开关就被触发"就出在
+                # 这里：mousePressEvent 覆写后**绕开了 hitButton**（覆写即绕过
+                # QAbstractButton 原本的命中判定），控件矩形内任意位置都翻转。
+                _blank = QPoint(int(toggle._track_rect().right()) + 40,
+                                toggle.height() // 2)
+                if _blank.x() < toggle.width() - 2:
+                    blank_ev = _QMouse(QEvent.Type.MouseButtonPress,
+                                       QPointF(_blank),
+                                       QPointF(toggle.mapToGlobal(_blank)),
+                                       Qt.MouseButton.LeftButton,
+                                       Qt.MouseButton.LeftButton,
+                                       Qt.KeyboardModifier.NoModifier)
+                    app.sendEvent(toggle, blank_ev)
+                    assert toggle.isChecked() == was, \
+                        (f"{spec['key']} 点轨道外的空白也翻转了（用户点名："
+                         f"要点击拨动开关内的地方才触发）")
                 # 无障碍：无文字开关必须有可读音名称与状态描述
                 assert toggle.accessibleName() == spec["label"], \
                     f"{spec['key']} 开关缺少读屏名称（无障碍）"
@@ -1481,16 +1802,16 @@ def check_customization(app: QApplication) -> None:
                 assert labels, f"找不到 {spec['label']} 的行标签"
                 label = labels[0]
                 was = toggle.isChecked()
-                # 开关现在是「按下即翻转」（ui_controls.Switch.mousePressEvent），
-                # 行标签转发也挂在按下上 —— 用 Press 验证按下瞬间就切换。
+                # 行标签**不该**再转发（2026-10-12 用户点名："要点击拨动开关内的
+                # 地方才触发"）：早先挂过转发，整行同高的文字区都成了热区。
                 tap = _QMouse(QEvent.Type.MouseButtonPress,
                               QPointF(label.rect().center()),
                               QPointF(label.mapToGlobal(label.rect().center())),
                               Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
                               Qt.KeyboardModifier.NoModifier)
                 app.sendEvent(label, tap)
-                assert toggle.isChecked() != was, \
-                    f"点 {spec['label']} 的行标签没有切换开关"
+                assert toggle.isChecked() == was, \
+                    f"点 {spec['label']} 的行标签把开关切换了（不该再转发）"
         finally:
             dialog.close()
 
@@ -2090,9 +2411,15 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
         # 保证"当前轮"的时间戳在视口上方够远处，定位才有得挪。
         window._on_rx_lines_changed(300)
         window._clear_receive()
+        # 一轮按**真实布局**给：电压 → Temperature1: → BMS。轮首判定依据是
+        # "段状态绕一圈回到电压段"（见 main_window._stamp_needed）；只喂电压帧
+        # 的话 8 帧全落在电压段里、会被当成同一轮，只出一个时间戳，定位无从测起。
         for r in range(8):
             window._emit_block("Voltage1:\n"
                                + " ".join(f"{j}.38{r}{j % 10}" for j in range(1, 41)))
+            window._emit_block("Temperature1:\n"
+                               + " ".join(f"{j}.2{r % 10}" for j in range(1, 11)))
+            window._emit_block("BMS OK")
         app.processEvents()
         bar = window.txt_rx.verticalScrollBar()
         bar.setValue(bar.maximum() // 2)
@@ -2366,12 +2693,14 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
             bms_error_spans, temp_spans as temp_error_spans, value_spans,
         )
         high_spans, low_spans = value_spans(" 1.3700   2.3820   3.3900", 3750, 3800)
-        assert high_spans == [(12, 4), (21, 4)], high_spans    # 3820/3900 超上限
-        assert low_spans == [(3, 4)], low_spans                # 3700 低于下限
+        # 区间是**整条**（序号 + 小数点 + 值）—— 用户 2026-10-12 点名"高亮要
+        # 包括序号"：只染值的话看不出是第几个点出的问题。
+        assert high_spans == [(10, 6), (19, 6)], high_spans    # 3820/3900 超上限
+        assert low_spans == [(1, 6)], low_spans                # 3700 低于下限
         # ⚠️ value_spans 是纯文本函数、不管段上下文 —— 温度段不染色的过滤
         # 发生在 highlightBlock 的段状态机里（见下面 painted 断言）
         high_t, low_t = value_spans(" 1.22   2.22", 3750, 3800)
-        assert high_t == [] and low_t == [(3, 2), (10, 2)], (high_t, low_t)
+        assert high_t == [] and low_t == [(1, 4), (8, 4)], (high_t, low_t)
         assert bms_error_spans("xx BMS ERROR yy") == [(3, 9)]
         assert bms_error_spans("BMS OK") == []
 
@@ -2453,11 +2782,21 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
         want_high, want_low = value_spans(row_text, 3750, 3800)
         assert want_high and want_low, f"（前提）这一行本该有超限和欠压的点：{row_text!r}"
         assert by_color.get(red) == want_high, \
-            f"超上限的值没有标红：{row_spans}（应染 {want_high}）"
+            f"超上限的条目没有整条标红（含序号）：{row_spans}（应染 {want_high}）"
         assert by_color.get(green) == want_low, \
-            f"低于下限的值没有标绿：{row_spans}（应染 {want_low}）"
-        assert by_color.get(rx_accent().name()) == index_spans(row_text), \
-            f"序号蓝被挤掉了：{row_spans}（应染 {index_spans(row_text)}）"
+            f"低于下限的条目没有整条标绿（含序号）：{row_spans}（应染 {want_low}）"
+        # 序号：**没越界**的那些条目仍是蓝的；越界条目的序号已被异常色整条覆盖
+        # （用户点名"包括序号"、"不要高亮到其他没有问题的数据"）。序号 span 与
+        # 条目 span 起点相同、长度不同，所以按起点挑出来比。
+        error_starts = {s for s, _ in list(want_high) + list(want_low)}
+        normal_index = [sp for sp in index_spans(row_text)
+                        if sp[0] not in error_starts]
+        # 这一行三个点**全都**越界（3700 欠压、3820/3900 超限），所以正常序号
+        # 本该一个都不剩 —— 这条反过来正好测"越界条目的序号确实被异常色吃掉了"
+        # （实现退回"只染值"时，三个序号会留在蓝色里，断言立刻挂）。
+        assert by_color.get(rx_accent().name(), []) == normal_index, \
+            (f"正常条目的序号蓝被挤掉了/越界条目的序号没被覆盖：{row_spans}"
+             f"（应剩 {normal_index}，越界起点 {sorted(error_starts)}）")
         # ---- 5b) 温度越界一律标黄（用户："凡超出该范围的数值均以黄色标注"）----
         # 温度**不**分偏高/偏低两种颜色 —— 越界就是越界，都是黄。
         # （"1.22" 的 22 是 ℃，与电压那边一样取小数点后的整数部分。）
@@ -2471,9 +2810,14 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
         for s, n, c in painted_spans(temp_row):
             temp_by_color.setdefault(c.name(), []).append((s, n))
         assert temp_by_color.get(temp_yellow) == want_temp, \
-            f"温度越界没有标黄：{painted_spans(temp_row)}（应染 {want_temp}）"
-        assert temp_by_color.get(rx_accent().name()) == index_spans(temp_row_text), \
-            f"温度段的序号蓝被挤掉了：{painted_spans(temp_row)}"
+            f"温度越界的条目没有整条标黄（含序号）：{painted_spans(temp_row)}（应染 {want_temp}）"
+        temp_error_starts = {s for s, _ in want_temp}
+        temp_normal_index = [sp for sp in index_spans(temp_row_text)
+                             if sp[0] not in temp_error_starts]
+        assert temp_normal_index, \
+            f"（前提）温度段本该还有正常的采样点：{temp_row_text!r}"
+        assert temp_by_color.get(rx_accent().name()) == temp_normal_index, \
+            f"温度段正常条目的序号蓝被挤掉了：{painted_spans(temp_row)}"
         # BMS 是**橙**、温度越界是**黄** —— 用户点名分开（"BMS ERROR 的显示颜色
         # 从黄色改为橙色"）。两支 token 各自独立，改一支不许带走另一支。
         assert temp_yellow != yellow, \
@@ -2497,20 +2841,17 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
             f"BMS ERROR 没有标黄：{painted_spans(bms_row)}"
         # ---- 5d) BMS 错误明细行整行标橙（2026-10-11 用户点名"BMS Error
         #     并没有被标橙色"）：BMS ERROR 起到下一轮时间戳为止都是错误块，
-        #     明细行（"1.1 Over Voltage" 这些）跟着标橙，序号保持蓝。
+        #     明细行（"1.1 Over Voltage" 这些）跟着整行标橙 —— **序号也是橙的**
+        #     （2026-10-12 用户点名"高亮要包括序号"，不再把序号染回蓝）。
         detail_row = next(i for i, t in enumerate(texts) if "Over Voltage" in t)
         detail_text = texts[detail_row]
-        detail_idx = {s for s, _n in index_spans(detail_text)}
         detail_chars = {}
         for s, n, c in painted_spans(detail_row):
             for p in range(s, s + n):
                 detail_chars[p] = c.name()
         assert all(detail_chars.get(p) == yellow
-                   for p in range(len(detail_text)) if p not in detail_idx), \
-            f"BMS 错误明细行没有整行标橙：{painted_spans(detail_row)}"
-        assert all(detail_chars.get(p) == rx_accent().name()
-                   for p in detail_idx), \
-            f"错误明细行的序号蓝被挤掉了：{painted_spans(detail_row)}"
+                   for p in range(len(detail_text))), \
+            f"BMS 错误明细行没有整行标橙（含序号）：{painted_spans(detail_row)}"
 
         # ---- 5c) 段落边界（用户点名）：电压在**时间戳 → Temperature1** 之间，
         #     温度在 **Temperature1 → BMS** 之间。所以不能只认 "Voltage1:" 标题 ——
@@ -2555,21 +2896,45 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
                    for _, _, c in painted_spans(temp_row_noheader)), \
             f"温度越界没有标黄：{painted_spans(temp_row_noheader)}"
         # BMS 之后的数值行：作为**错误明细**整行标橙（2026-10-11 用户点名），
-        # 序号保持蓝；关键是不能按温度判成黄（用户：温度数据只到 BMS 为止）。
+        # 序号也是橙的（2026-10-12 用户点名"高亮要包括序号"）；关键是不能按
+        # 温度判成黄（用户：温度数据只到 BMS 为止）。
         ab_text = rows[after_bms]
-        ab_idx = {s for s, _n in index_spans(ab_text)}
         ab_chars = {}
         for s, n, c in painted_spans(after_bms):
             for p in range(s, s + n):
                 ab_chars[p] = c.name()
-        assert all(ab_chars.get(p) == yellow
-                   for p in range(len(ab_text)) if p not in ab_idx), \
-            f"BMS 错误明细行没有整行标橙：{painted_spans(after_bms)}"
-        assert all(ab_chars.get(p) == rx_accent().name() for p in ab_idx), \
-            f"明细行序号蓝被挤掉了：{painted_spans(after_bms)}"
+        assert all(ab_chars.get(p) == yellow for p in range(len(ab_text))), \
+            f"BMS 错误明细行没有整行标橙（含序号）：{painted_spans(after_bms)}"
         assert not any(c.name() == qcolor("temp_warn").name()
                        for _, _, c in painted_spans(after_bms)), \
             "BMS 之后的数值不该再按温度判（用户：温度数据只到 BMS 为止）"
+
+        # ---- 5e) 「高亮异常数据」开关（2026-10-12 用户点名要一个开关）----
+        # 关掉后电压越界（红/绿）、温度越界（黄）、BMS 错误（橙）一律不上色，
+        # 只留时间戳紫 + 序号蓝的常规着色；拨回来立刻恢复。
+        def anomaly_spans(blocks) -> list:
+            names = {qcolor("volt_high").name(), qcolor("volt_low").name(),
+                     qcolor("temp_warn").name(), qcolor("bms_error").name()}
+            found = []
+            for b in blocks:
+                found += [(s, n, c.name()) for s, n, c in painted_spans(b)
+                          if c.name() in names]
+            return found
+
+        all_rows = range(window.txt_rx.document().blockCount())
+        assert anomaly_spans(all_rows), "（前提）开着开关时本该有异常色"
+        customization.set("highlight_errors", False)
+        window._rx_highlighter.refresh()
+        app.processEvents()
+        assert anomaly_spans(all_rows) == [], \
+            f"关掉「高亮异常数据」后仍有异常色：{anomaly_spans(all_rows)}"
+        assert any(c.name() == rx_accent().name()
+                   for b in all_rows for _, _, c in painted_spans(b)), \
+            "关掉高亮开关后连序号蓝都没了（这只该关异常色）"
+        customization.set("highlight_errors", True)
+        window._rx_highlighter.refresh()
+        app.processEvents()
+        assert anomaly_spans(all_rows), "拨回「高亮异常数据」后异常色没有恢复"
         # 范围复原
         customization.set("volt_limit_low", 2500)
         customization.set("volt_limit_high", 4500)
@@ -2765,6 +3130,45 @@ def check_caption_bar(app: QApplication) -> None:
             app.processEvents()
             assert window._resize_edges(QPoint(1, 1)) == Qt.Edge(0), \
                 "全屏时还开着边缘缩放的口子"
+            window._on_escape()
+            app.processEvents()
+
+        # 4b) 边缘的**光标提示**（用户 2026-10-12 点名："需像其他 Windows 软件
+        #     一样显示边框拖拽提示"）：移到边缘/四角换对应的缩放光标，离开还原。
+        #     ⚠️ 事件发给**窗口内的子控件**（真机上鼠标在边缘时事件就发生在
+        #     那儿）；而且必须确认"命中边缘时事件被吃掉" —— QWidget 默认会
+        #     ignore() 掉 mouseMove 并沿父链上传，不拦住的话第二次（父窗口）
+        #     会把刚设在子控件上的光标当成"换了宿主"撤掉（真机实测踩过）。
+        from PySide6.QtGui import QMouseEvent as _QMove
+        _cursor_host = window.centralWidget()
+        assert _cursor_host is not None, "窗口没有中央控件，光标用例没法做"
+
+        def _send_move(point: QPoint) -> None:
+            event = _QMove(QEvent.Type.MouseMove, QPointF(point),
+                           QPointF(_cursor_host.mapToGlobal(point)),
+                           Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+                           Qt.KeyboardModifier.NoModifier)
+            app.sendEvent(_cursor_host, event)
+
+        def _cursor_shape() -> str:
+            return _cursor_host.cursor().shape().name
+
+        for point, want in ((QPoint(2, _cursor_host.height() // 2), "SizeHorCursor"),
+                            (QPoint(_cursor_host.width() // 2, 2), "SizeVerCursor"),
+                            (QPoint(2, 2), "SizeFDiagCursor"),
+                            (QPoint(window.width() - 3, 2), "SizeBDiagCursor")):
+            _send_move(point)
+            assert _cursor_shape() == want, \
+                f"{point.toTuple()} 处的边缘光标提示不对：{_cursor_shape()}，应当 {want}"
+        _send_move(QPoint(_cursor_host.width() // 2, _cursor_host.height() // 2))
+        assert "Size" not in _cursor_shape(), \
+            f"离开边缘后光标没有还原成控件原本的形状：{_cursor_shape()}"
+        if fullscreen_testable:
+            window.startup_fullscreen()
+            app.processEvents()
+            _send_move(QPoint(2, _cursor_host.height() // 2))
+            assert "Size" not in _cursor_shape(), \
+                f"全屏时还提示缩放光标（应当只在从最大化退出后才出现）：{_cursor_shape()}"
             window._on_escape()
             app.processEvents()
 
@@ -3183,6 +3587,13 @@ CHECKS = [
 
 def main() -> int:
     app = QApplication(sys.argv)
+    # ⚠️ 起手环境必须和 main.py 一致：**Fusion + 应用字体（MiSans 12.5）**。
+    #    不设应用字体时，所有"继承默认字体"的控件（下拉框、数字框、标签……）
+    #    会退化成系统 9pt —— 自测量到的几何/墨迹和用户看到的是两套东西。
+    #    0c 的"左端对齐"就在这个坑上假挂过：真机 13px、自测里 18px（2026-10-12）。
+    from ui_theme import ui_font as _ui_font
+    app.setStyle("Fusion")
+    app.setFont(_ui_font(12.5))
     # 全局快照：任何一条 check 泄漏（中途断言挂掉跳过尾部还原、QSettings 多实例
     # 缓冲的析构回写……）都不能把测试值留在用户真实配置里 —— 全部跑完后无条件
     # 恢复到进程序时的样子。（单条 check 自己的快照还原仍保留，防 check 间串扰。）

@@ -16,22 +16,30 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QTimer, Qt
+import shutil
+from pathlib import Path
+
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtNetwork import (
     QNetworkAccessManager, QNetworkReply, QNetworkRequest,
 )
 from PySide6.QtWidgets import (
-    QDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QScrollArea,
-    QVBoxLayout, QWidget,
+    QDialog, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QMessageBox, QScrollArea, QVBoxLayout, QWidget,
 )
 
 import app_log
 import customization
 from ui_theme import apply_titlebar_theme
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtCore import QUrl
-from ui_controls import ChevronComboBox, ChevronSpinBox, GlassSlider, InkButton, Switch
-from ui_theme import DEFAULT_GLASS, GAP, detect_system_scheme, ui_font
+from ui_controls import (
+    ChevronComboBox, ChevronSpinBox, GlassSlider, IconButton, InkButton, Switch,
+)
+from ui_theme import (
+    DEFAULT_GLASS, GAP, GLYPH_REFRESH, detect_system_scheme, mono_font, qcolor,
+    rx_accent, stamp_accent, ui_font,
+)
 
 # (显示名, 存进配置的值)
 THEME_MODES = (("跟随系统", "system"), ("浅色", "light"), ("深色", "dark"))
@@ -46,19 +54,23 @@ BUTTON_COLUMNS = 3
 class SettingsDialog(QDialog):
     """应用设置。确定后由调用方读 values() / hidden_buttons() 落盘并生效。
 
-    ``on_glass`` / ``on_buttons`` 是拖动滑杆、拨动开关时的实时回调 —— 面板是模态的，
-    但主窗口仍然能重绘，所以背后的界面会立刻跟着变，所见即所得。取消时调用方负责回退。
+    ``on_glass`` / ``on_buttons`` / ``on_custom`` 是拖动滑杆、拨动开关时的
+    实时回调 —— 面板是模态的，但主窗口仍然能重绘，所以背后的界面会立刻跟着
+    变，所见即所得。取消时调用方负责回退。
+    ``on_custom(key, value)`` 是**注册表里滑杆**的通用实时回调（值已按 scale
+    换算成显示值）；面板不认识任何具体配置项，要不要实时生效由主窗口决定。
     """
 
     def __init__(self, theme_mode: str, glass: int = DEFAULT_GLASS,
                  button_specs=(), hidden_buttons=(), on_glass=None, on_buttons=None,
-                 parent: QWidget | None = None) -> None:
+                 parent: QWidget | None = None, on_custom=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setModal(True)
         self.setMinimumWidth(500)
         self._on_glass = on_glass
         self._on_buttons = on_buttons
+        self._on_custom = on_custom
         self._button_switches: dict[str, Switch] = {}
         # 标题栏主题跟着本次打开的方案走（跟随系统则当场解析），showEvent 里应用
         self._scheme = (detect_system_scheme() if theme_mode == "system"
@@ -203,7 +215,10 @@ class SettingsDialog(QDialog):
         form.addRow(self._caption("定制功能"))
 
         self._custom_widgets: dict[str, QWidget] = {}
+        # 滑杆型配置的预览标签（"拖动即时看效果"的那种），key -> QLabel
+        self._custom_previews: dict[str, QLabel] = {}
         for spec in specs:
+            preview = None
             if spec["kind"] == "bool":
                 # 开关**自己不带文字**：名字交给左侧的行标签。以前开关带文字、
                 # 左侧塞一个全角空格当占位，结果开关起点跟同一列里的数字框差
@@ -219,14 +234,50 @@ class SettingsDialog(QDialog):
                     toggle.setToolTip(spec["tip"])
                 field: QWidget = toggle
                 widget = toggle
-                # 行标签也要能点：这行的文字是独立 QLabel，不在开关的点击区域
-                # 里 —— 用户看到"启动时最大化 [开关]"，顺手点文字是再自然不过
-                # 的操作，没反应就会觉得"这个开关坏了"（用户报"部分开关无法
-                # 点击"的另一半原因）。给标签挂上对应的开关，点了就切换。
+                # ⚠️ 行标签**不再**转发点击（2026-10-12 用户点名："点击同一高度的
+                # 位置拨动开关就会被触发，这样不行，要点击拨动开关内的地方才
+                # 触发"）。早先为了让"顺手点文字"也有反应，给标签挂了转发 ——
+                # 结果整行同高的文字区都成了热区，比轨道本身大好几倍，误触极多。
+                # 现在只有开关自己的命中区（= 自绘轨道，见 Switch.hitButton）才算。
                 row_label = self._label(spec["label"])
-                row_label.setCursor(Qt.CursorShape.PointingHandCursor)
-                row_label.setProperty("toggleSwitch", toggle)
-                row_label.installEventFilter(self)
+            elif spec.get("widget") == "slider":
+                # 滑动**无级**调节（用户点名）。取值类型仍是 int（见 customization
+                # 的 register_slider），只是控件换成滑杆 + 右侧数值标签；要表达
+                # 小数时按 spec["scale"] 换算（字号存的是半磅）。
+                slider = GlassSlider(Qt.Orientation.Horizontal)
+                slider.setRange(spec["minimum"], spec["maximum"])
+                slider.setValue(int(customization.get(spec["key"])))
+                slider.setMinimumWidth(190)
+                if spec["tip"]:
+                    slider.setToolTip(spec["tip"])
+                value_label = QLabel()
+                value_label.setFont(ui_font(11.5))
+                value_label.setMinimumWidth(56)
+                value_label.setAlignment(Qt.AlignmentFlag.AlignRight
+                                         | Qt.AlignmentFlag.AlignVCenter)
+                self._refresh_slider_label(spec, slider.value(), value_label)
+                slider.valueChanged.connect(
+                    lambda value, s=spec, lab=value_label:
+                    self._on_slider_changed(s, value, lab))
+                slider_row = QHBoxLayout()
+                slider_row.setSpacing(10)
+                slider_row.addWidget(slider, 1)
+                slider_row.addWidget(value_label)
+                # 「复原」：一键回到注册表里的默认值。setValue 会触发
+                # valueChanged，数值标签 / 预览 / 主窗口的实时预览全部跟着走。
+                # 用**图标**（环形箭头 = 重置的通用符号，用户点名"还原按键用图标"）
+                # —— 图标按钮必须带 tooltip 与读屏名称，否则只能靠猜。
+                reset_btn = IconButton(GLYPH_REFRESH, "恢复默认值", size=24,
+                                       glyph_size=13)
+                reset_btn.setAccessibleName("恢复默认值")
+                reset_btn.clicked.connect(
+                    lambda _=False, s=spec, sl=slider: sl.setValue(int(s["default"])))
+                slider_row.addWidget(reset_btn)
+                field = self._row(slider_row)
+                widget = slider
+                row_label = self._label(spec["label"])
+                if spec.get("preview"):
+                    preview = self._build_slider_preview(spec, slider)
             else:
                 spin = ChevronSpinBox()
                 spin.setRange(spec["minimum"], spec["maximum"])
@@ -244,6 +295,102 @@ class SettingsDialog(QDialog):
             # 记**输入控件本身**（不是包装容器）：custom_values() 要在它身上取值
             self._custom_widgets[spec["key"]] = widget
             form.addRow(row_label, field)
+            if preview is not None:
+                # 预览行整行跨两列，紧贴在它那根滑杆下面
+                form.addRow(preview)
+
+    @staticmethod
+    def _slider_display_value(spec: dict, raw: int) -> float:
+        """滑杆的**显示值** = 存储值 × scale（字号是半磅存储 → 显示 pt）。"""
+        return raw * float(spec.get("scale", 1.0))
+
+    def _refresh_slider_label(self, spec: dict, raw: int, label: QLabel) -> None:
+        value = self._slider_display_value(spec, raw)
+        label.setText(f"{value:g}{spec.get('suffix', '')}")
+
+    def _on_slider_changed(self, spec: dict, raw: int, label: QLabel) -> None:
+        """滑杆动了：更新数值标签与预览字号，并把显示值交给主窗口做实时预览。"""
+        self._refresh_slider_label(spec, raw, label)
+        value = self._slider_display_value(spec, raw)
+        preview = self._custom_previews.get(spec["key"])
+        if preview is not None:
+            preview.setFont(mono_font(value))
+            # 预览的逐字符配色取主题 token，重设一遍确保换主题后颜色跟上
+            preview.setText(self._preview_html(spec, raw))
+        if self._on_custom is not None:
+            self._on_custom(spec["key"], value)
+
+    @classmethod
+    def _preview_mark_bg(cls, color: str) -> str:
+        """高亮底色：把文字色与**面板底色**按 3:7 混出来的淡色。
+
+        用不透明的混色而不是 CSS 的 rgba —— Qt 富文本对 alpha 的支持参差，
+        混出来的实色任何渲染路径都是同一个样子。视觉上就是"这支笔的淡色荧光"。
+        """
+        ink_color = QColor(color)
+        panel = qcolor("surface")
+        mixed = QColor(
+            round(ink_color.red() * 0.3 + panel.red() * 0.7),
+            round(ink_color.green() * 0.3 + panel.green() * 0.7),
+            round(ink_color.blue() * 0.3 + panel.blue() * 0.7),
+        )
+        return mixed.name()
+
+    @classmethod
+    def _preview_html(cls, spec: dict, raw: int) -> str:
+        """预览文字的**逐字符配色**（用户 2026-10-12 点名，含同日纠正）。
+
+        CQUFSAE 六个字母 = 电压超限红 / BMS 橙 / 温度黄 / 欠压绿 / 序号蓝 /
+        时间戳紫，全取**主题 token** —— 换主题时和接收区一起变；**"E."（E 和
+        点）都是序号蓝且带高亮**（用户二次纠正：是这两个字）。".2026" 里
+        前一个 2 标红、0 标橙、后一个 2 用**主题正文色**（都带高亮），6 用
+        **主题反色**（正文字色的反转、不上底）—— 2 和 6 的归属是用户纠正过
+        的，别再对调。
+        """
+        high = qcolor("volt_high").name()      # 红
+        orange = qcolor("bms_error").name()    # 橙
+        yellow = qcolor("temp_warn").name()    # 黄
+        green = qcolor("volt_low").name()      # 绿
+        blue = rx_accent().name()              # 蓝
+        purple = stamp_accent().name()         # 紫
+        body = qcolor("ink").name()            # 正文
+        inverted = QColor(255 - qcolor("ink").red(),
+                          255 - qcolor("ink").green(),
+                          255 - qcolor("ink").blue()).name()
+
+        def span(ch: str, color: str, mark: bool = False) -> str:
+            if mark:
+                return (f'<span style="color:{color};'
+                        f'background-color:{cls._preview_mark_bg(color)}">{ch}</span>')
+            return f'<span style="color:{color}">{ch}</span>'
+
+        return "".join((
+            span("C", high), span("Q", orange), span("U", yellow),
+            span("F", green), span("S", blue), span("A", purple),
+            # "E."（E 和点，用户 2026-10-12 二次纠正：是这两个字都要高亮）
+            span("E", blue, mark=True),
+            span(".", blue, mark=True),
+            span("2", high, mark=True),      # 2026 的前一个 2：红 + 高亮
+            span("0", orange, mark=True),    # 0：橙 + 高亮
+            span("2", body, mark=True),      # 后一个 2：主题颜色 + 高亮
+            span("6", inverted),             # 6：主题反色（2026-10-12 用户纠正：2 和 6 反了）
+        ))
+
+    def _build_slider_preview(self, spec: dict, slider: GlassSlider) -> QLabel:
+        """滑杆下方的预览行。
+
+        字号预览用**等宽字体**（跟接收区同一个 mono_font），字号随滑杆当场变；
+        颜色走富文本逐字符配色（见 ``_preview_html``），换主题后重新拉一遍
+        HTML 就能跟上（``_on_slider_changed`` 里做了）。
+        """
+        label = QLabel(self._preview_html(spec, slider.value()))
+        label.setTextFormat(Qt.TextFormat.RichText)
+        label.setFont(mono_font(self._slider_display_value(spec, slider.value())))
+        # 上 1 下 1：这个标签的行高贴着文字，默认（上0下2）会把墨迹顶到上边缘、
+        # 看着偏高 —— 上下各留 1px 缓冲，总高不变（布局不受影响）。
+        label.setContentsMargins(2, 1, 0, 1)
+        self._custom_previews[spec["key"]] = label
+        return label
 
     def custom_values(self) -> dict:
         """「定制功能」区里被**改动过**的项 {key: value}，由主窗口统一落盘。"""
@@ -263,7 +410,7 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------------ 日志
 
     def _build_log_section(self, form: QFormLayout) -> None:
-        """「日志」一行：显示日志文件位置 + 打开文件夹。给维护和迭代用。"""
+        """「日志」一行：显示日志文件位置 + 打开文件夹 + **一键导出**。给维护和迭代用。"""
         log_path = app_log.path()
         if not log_path:
             return
@@ -271,19 +418,72 @@ class SettingsDialog(QDialog):
 
         row = QHBoxLayout()
         row.setSpacing(10)
-        path_label = QLabel(log_path)
+        path_label = QLabel(self._elide_middle(log_path))
         path_label.setFont(ui_font(10.5))
         path_label.setObjectName("groupCaption")
-        # 超长截中间：路径可能很长，别把面板撑破
-        path_label.setMinimumWidth(0)
+        # ⚠️ 必须 setMinimumWidth(**1**)，不能是 0：Qt 布局算最小宽度时把 0 当成
+        # "没设过"，会退回 minimumSizeHint —— 那正是整条绝对路径的宽度。日志行
+        # 于是把面板撑得比视口还宽（实测 body 635 / 视口 530），而横向滚动条是
+        # 关着的，右半边连按钮一起被裁掉。设成 1 布局才敢把它压窄。
+        path_label.setMinimumWidth(1)
+        # 完整路径放 tooltip 里（显示的是中间省略版）
+        path_label.setToolTip(log_path)
         path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         row.addWidget(path_label, 1)
+        # 一键导出（用户点名）：把日志另存到用户挑的位置，方便发给别人排查。
+        self.btn_export_log = InkButton("导出日志", variant="ghost")
+        self.btn_export_log.setToolTip("把日志文件另存为一份，方便发给别人排查问题")
+        self.btn_export_log.clicked.connect(self._export_log)
+        row.addWidget(self.btn_export_log)
         open_button = InkButton("打开文件夹", variant="ghost")
         open_button.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(
-                str(__import__("pathlib").Path(log_path).parent))))
+            lambda: QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(Path(log_path).parent))))
         row.addWidget(open_button)
         form.addRow(self._row(row))
+
+    @staticmethod
+    def _elide_middle(text: str, limit: int = 52) -> str:
+        """超长的绝对路径在**中间**省略一段（头尾都留着，一眼能认出来是哪个盘/哪个文件）。
+
+        面板宽度有限，而横向滚动条是关着的 —— 整条路径铺开会把面板撑宽、
+        右半边被裁；这里按字符数先收一道。
+        """
+        if len(text) <= limit:
+            return text
+        keep = (limit - 1) // 2
+        return f"{text[:keep]}…{text[-(limit - 1 - keep):]}"
+
+    def _export_log(self) -> None:
+        """把日志文件复制一份到用户选定的位置。
+
+        用**复制**而不是改日志输出位置：程序后续照常往原位置追加，导出的那份
+        是按下按钮那一刻的快照。结果在按钮上原地显示（跟「检查更新」同一套
+        手感）—— 只弹个框、按钮没反应的话，用户会以为没点中。
+        """
+        source = app_log.path()
+        if not source:
+            return
+        src = Path(source)
+        target, _ = QFileDialog.getSaveFileName(
+            self, "导出日志", str(Path.home() / src.name),
+            "日志文件 (*.log *.txt);;所有文件 (*)")
+        if not target:
+            return
+        try:
+            shutil.copyfile(src, target)
+        except OSError as exc:
+            app_log.error(f"导出日志失败: {exc}")
+            self.btn_export_log.setText("导出失败")
+            QTimer.singleShot(4000, self._restore_export_text)
+            QMessageBox.warning(self, "导出日志", f"导出失败：\n{exc}")
+            return
+        app_log.info(f"日志已导出: {target}")
+        self.btn_export_log.setText("✓ 已导出")
+        QTimer.singleShot(4000, self._restore_export_text)
+
+    def _restore_export_text(self) -> None:
+        self.btn_export_log.setText("导出日志")
 
     # ------------------------------------------------------------ 按钮显隐
 
@@ -473,20 +673,6 @@ class SettingsDialog(QDialog):
         self.btn_check_update.setText("检查更新")
 
     # ------------------------------------------------------------ 杂项
-
-    def eventFilter(self, obj, event) -> bool:
-        """「定制功能」行标签的点击转发：点文字 = 拨对应的开关。
-
-        转发挂在**按下**（MouseButtonPress）而不是松开：Switch 本体现在
-        也是按下即翻转（见 ui_controls.Switch.mousePressEvent），两条路径
-        时机必须一致 —— 挂在松开上，点标签就会比点开关慢半拍。
-        """
-        if event.type() == QEvent.Type.MouseButtonPress:
-            toggle = obj.property("toggleSwitch")
-            if toggle is not None:
-                toggle.toggle()
-                return True
-        return super().eventFilter(obj, event)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)

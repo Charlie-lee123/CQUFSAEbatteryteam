@@ -39,6 +39,28 @@ def register_int(key: str, label: str, default: int, minimum: int, maximum: int,
                    "suffix": suffix})
 
 
+def register_slider(key: str, label: str, default: int, minimum: int,
+                    maximum: int, tip: str = "", suffix: str = "",
+                    scale: float = 1.0, preview: str = "") -> None:
+    """注册一个**滑动无级调节**的整数配置（设置面板里是一根滑杆）。
+
+    取值类型与 ``register_int`` 完全一样（``kind`` 仍是 ``"int"``），只是面板
+    上换成一枚 ``GlassSlider`` —— 所以 ``get``/``set``/``custom_values`` 都不用
+    为它分情况。
+
+    ``scale``：滑块是整数控件，要表达小数时用"整数存储 × scale = 显示值"。
+    字号用它存**半磅**（21 → 10.5pt），既能保持原有观感又足够细腻；
+    面板上的数值标签与预览都按 scale 换算。
+
+    ``preview``：非空时在这一行**下方**再挂一行等宽字的预览（用当前字号渲染、
+    用接收区正文的颜色），拖滑块当场能看到字号变化。
+    """
+    _SPECS.append({"key": key, "kind": "int", "widget": "slider", "label": label,
+                   "default": default, "minimum": minimum, "maximum": maximum,
+                   "tip": tip, "suffix": suffix, "scale": scale,
+                   "preview": preview})
+
+
 def specs() -> tuple[dict, ...]:
     """全部注册项（设置面板按它生成界面，顺序即注册顺序）。"""
     return tuple(_SPECS)
@@ -61,6 +83,16 @@ def get(key: str):
         return int(value)
     except (TypeError, ValueError):
         return int(spec["default"])
+
+
+def display_value(key: str) -> float:
+    """取配置的**显示值**（滑杆型按 ``scale`` 换算，其它类型原样返回）。
+
+    字号这类小数用整数存储（半磅：21 → 10.5pt），面板上的标签与预览、以及
+    主窗口应用字号时都走这里，免得 scale 的知识散落在各处。
+    """
+    spec = next(s for s in _SPECS if s["key"] == key)
+    return get(key) * float(spec.get("scale", 1.0))
 
 
 def set(key: str, value) -> None:
@@ -162,3 +194,18 @@ register_int("temp_limit_low", "温度下限", 0, -50, 200, suffix=" ℃",
              tip="低于该值（摄氏度）的温度采样点显示为黄色")
 register_int("temp_limit_high", "温度上限", 60, -50, 200, suffix=" ℃",
              tip="高于该值（摄氏度）的温度采样点显示为黄色")
+
+# 是否高亮异常数据（用户点名要一个开关）。
+# 默认**开** = 保持现行为：电压越界标红/绿、温度越界标黄、BMS 错误标橙。
+# 关掉后异常一律不上色，只留时间戳紫、序号蓝的常规着色 —— 看榜单/截图给
+# 别人看时不想让满屏红绿时用。
+register_bool("highlight_errors", "高亮异常数据", True,
+              tip="电压/温度越界与 BMS 错误是否用红/绿/黄/橙色标出；"
+                  "关掉后所有数据都用普通字符色显示（时间戳与序号照常着色）")
+
+# 接收区字体大小（用户点名：滑动**无级**调节 + 实时预览）。
+# 存的是**半磅**（21 = 10.5pt）—— 滑杆是整数控件，用 0.5pt 步进既能保住现在
+# 10.5pt 的观感，又足够细腻。面板上的数值标签与预览文字都按 scale 换算。
+register_slider("rx_font_size", "接收区字体大小", 21, 16, 48, scale=0.5,
+                suffix=" pt", preview="CQUFSAE.2026",
+                tip="接收区数据显示的字号；拖动滑块即时预览，确定后生效")

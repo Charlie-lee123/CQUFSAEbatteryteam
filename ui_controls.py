@@ -17,7 +17,7 @@ from PySide6.QtCore import (
     QEvent, QLineF, QPoint, QPointF, QRectF, QSize, Qt, Signal,
 )
 from PySide6.QtGui import (
-    QColor, QFontMetrics, QPainter, QPainterPath, QPen,
+    QColor, QFontMetrics, QFontMetricsF, QImage, QPainter, QPainterPath, QPen,
 )
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider,
@@ -30,6 +30,146 @@ from ui_theme import (
     GLYPH_EXPAND_CHEVRON, SWITCH_KNOB, SWITCH_ON,
     icon_font, mix, qcolor, switch_off_color, ui_font,
 )
+
+
+# ------------------------------------------------------------ 文字墨迹测量
+
+# 「文字在框里到底偏上还是偏下」不做任何字体度量推算，**直接看渲染结果**。
+# 教训（2026-10-12）：QFontMetrics.tightBoundingRect 不认字体回退 ——
+# "5000 行" 的 "行" 由回退字体画出来，tight 报的下界比真实墨迹低 1.4px；
+# 而 QLineEdit 内部的行盒又按回退后的字号重新居中（基线整体上移 2px）。
+# 两处都不可推算。抓一次渲染按明暗差扫，两个问题一起消失。
+
+_EDIT_INK_CACHE: dict[tuple, float | None] = {}
+_TEXT_INK_CACHE: dict[tuple, tuple | None] = {}
+
+
+def _edit_ink_offset(edit: QLineEdit) -> float | None:
+    """行内编辑框里**文字墨迹**的竖直中心（相对编辑框顶部，逻辑像素）。
+
+    抓编辑框自己的渲染扫明暗差：背景是否透明、有没有边框、行盒多高、
+    用了哪个回退字体，全都自动包含在画面里。测不到就返回 None，调用方
+    回退到旧的字号线性近似。
+
+    ⚠️ 聚焦时光标、全选时的高亮块都会撑满整行、把测量整个污染掉 ——
+    这两种情况一律返回 None（宁可不摆，也好过照着错的目标摆）。
+    """
+    if not isinstance(edit, QLineEdit):
+        return None
+    text = edit.text()
+    height = edit.height()
+    if not text or height <= 0 or edit.hasFocus() or edit.hasSelectedText():
+        return None
+    dpr = edit.devicePixelRatioF() or 1.0
+    key = (edit.font().key(), text, height, round(dpr, 2))
+    if key in _EDIT_INK_CACHE:
+        return _EDIT_INK_CACHE[key]
+    gray = edit.grab().toImage().convertToFormat(
+        QImage.Format.Format_Grayscale8)
+    width, ih = gray.width(), gray.height()
+    data = gray.constBits().tobytes()
+    bpl = gray.bytesPerLine()
+    rows = []
+    for y in range(ih):
+        row = data[y * bpl:y * bpl + width]
+        if row and (max(row) - min(row)) > 60:
+            rows.append(y)
+    offset = None
+    if rows:
+        offset = ((rows[0] + rows[-1] + 1) / 2.0) / dpr
+    _EDIT_INK_CACHE[key] = offset
+    return offset
+
+
+def _combo_label_ink_offset(combo) -> float | None:
+    """不可编辑下拉框里**文字墨迹**的竖直中心（相对控件顶部，逻辑像素）。
+
+    和 _edit_ink_offset 同一思路（抓渲染扫明暗差），但文字由样式直接画、没有
+    可移动的内部编辑框 —— 扫的时候要避开右侧自绘的 chevron。
+    """
+    text = combo.currentText()
+    height = combo.height()
+    if not text or height <= 0:
+        return None
+    dpr = combo.devicePixelRatioF() or 1.0
+    gray = combo.grab().toImage().convertToFormat(
+        QImage.Format.Format_Grayscale8)
+    width, ih = gray.width(), gray.height()
+    data = gray.constBits().tobytes()
+    bpl = gray.bytesPerLine()
+    x_lo = int(4 * dpr)
+    x_hi = max(width - int(30 * dpr), x_lo + 1)     # 右边 30px 是 chevron 区
+    rows = []
+    for y in range(ih):
+        row = data[y * bpl:y * bpl + width]
+        segment = row[x_lo:x_hi]
+        if segment and (max(segment) - min(segment)) > 60:
+            rows.append(y)
+    if not rows:
+        return None
+    return ((rows[0] + rows[-1] + 1) / 2.0) / dpr
+
+
+def text_ink(font, text: str, dpr: float = 2.0) -> tuple | None:
+    """把文字渲染成小图量出墨迹盒 ``(左, 上, 右, 下)``——相对文本原点与基线。
+
+    给**自己画的**文字用（InkButton 的 drawText）：那里没有现成的渲染画面可抓，
+    就现画一张。含字体回退的真实墨迹，比任何 QFontMetrics 推算都准。
+    """
+    if not text:
+        return None
+    key = (font.key(), text, round(dpr, 2))
+    if key in _TEXT_INK_CACHE:
+        return _TEXT_INK_CACHE[key]
+    fm = QFontMetricsF(font)
+    pad = 6
+    width = int(fm.horizontalAdvance(text)) + pad * 2
+    height = int(fm.ascent() + fm.descent()) + pad * 2
+    # ⚠️ QImage 按**物理像素**建（×dpr）；setDevicePixelRatio 只是给坐标映射用，
+    # 不会把画布放大 —— 搞反的话 dpr=2 时画布只有一半大，文字直接被裁掉。
+    image = QImage(max(int(width * dpr), 4), max(int(height * dpr), 4),
+                   QImage.Format.Format_Grayscale8)
+    image.setDevicePixelRatio(dpr)
+    image.fill(0)
+    painter = QPainter(image)
+    painter.setFont(font)
+    painter.setPen(QColor(255, 255, 255))
+    painter.drawText(QPointF(pad, fm.ascent() + pad), text)
+    painter.end()
+    data = image.constBits().tobytes()
+    bpl = image.bytesPerLine()
+    width, height = image.width(), image.height()
+    left = right = top = bottom = None
+    for y in range(height):
+        row = data[y * bpl:y * bpl + width]
+        xs = [x for x, v in enumerate(row) if v > 60]
+        if xs:
+            if top is None:
+                top = y
+            bottom = y
+            left = xs[0] if left is None else min(left, xs[0])
+            right = xs[-1] if right is None else max(right, xs[-1])
+    if left is None:
+        result = None
+    else:
+        result = (left / dpr - pad, top / dpr - fm.ascent() - pad,
+                  (right + 1) / dpr - pad, (bottom + 1) / dpr - fm.ascent() - pad)
+    _TEXT_INK_CACHE[key] = result
+    return result
+
+
+def optical_text_shift(font, text: str, dpr: float = 2.0) -> float:
+    """文字块要**往下**挪多少才视觉居中（正 = 下移）。
+
+    Qt 画单行文字时按"行盒"垂直居中：基线落在 ``中心 + (ascent-descent)/2``，
+    而墨迹中心相对基线是 ``(top+bottom)/2`` —— 两者相加就是墨迹中心偏离
+    控件中心的量，取负即为修正量。
+    """
+    ink = text_ink(font, text, dpr)
+    if ink is None:
+        return 0.0
+    fm = QFontMetricsF(font)
+    return -((fm.ascent() - fm.descent()) / 2.0 + (ink[1] + ink[3]) / 2.0)
 
 
 # ------------------------------------------------------------------ 主按钮
@@ -125,7 +265,13 @@ class InkButton(QPushButton):
 
         painter.setPen(text_color)
         painter.setFont(self.font())
-        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.text())
+        # 文字在药丸里做**视觉**居中：Qt 的 AlignCenter 按"行盒"居中，而汉字/
+        # 数字的字形在行盒里天然偏下（用户点名"与上下边框距离不等"）。按实测
+        # 墨迹算一个修正量（optical_text_shift），只挪文字、不挪药丸。
+        dy = optical_text_shift(self.font(), self.text(),
+                                self.devicePixelRatioF() or 2.0)
+        painter.drawText(rect.adjusted(0.0, dy, 0.0, dy),
+                         Qt.AlignmentFlag.AlignCenter, self.text())
 
 
 # ------------------------------------------------------------------ 图标按钮
@@ -470,7 +616,7 @@ class Switch(QCheckBox):
         return False
 
     def mousePressEvent(self, event) -> None:
-        """按下即翻转，不等松开。
+        """按下即翻转，不等松开 —— **但只在命中区（自绘轨道）内才算**。
 
         以前跟着 QCheckBox 默认走「松开才切换」：用户从按下到松开通常
         100~200ms，再叠加 190ms 的滑块动画，手感就是"按下去半天没反应"
@@ -479,11 +625,19 @@ class Switch(QCheckBox):
         devtools/_probe_toggle_timing.py）。改成**按下瞬间**就翻转：
         反馈提前到指尖落下的那一刻，所有 Switch 一致跟手。
 
+        ⚠️⚠️ 这里必须自己过一遍 ``hitButton()``：覆写了 mousePressEvent 就
+        **绕开了 QAbstractButton 原本的命中判定**，不加这一句的话控件矩形内
+        任何位置按下都会翻转 —— 而开关控件比轨道宽得多（它横向占满整行的
+        字段列，实测 381px vs 轨道 40px），于是"停在开关同一高度随便点一下
+        就切换"（用户 2026-10-12 再次点名，就是这个原因：hitButton 写得再对
+        也没人调它）。
+
         注意这里不能调 super()：QAbstractButton 的按下处理会把 release
         记成一次"点击"，松开时会再翻转一次（等于翻回去）。自己翻转完
         直接 accept，release 落下来时 down 状态没置位，不会再触发切换。
         """
-        if event.button() == Qt.MouseButton.LeftButton and self.isEnabled():
+        if (event.button() == Qt.MouseButton.LeftButton and self.isEnabled()
+                and self.hitButton(event.position().toPoint())):
             self.setChecked(not self.isChecked())
             event.accept()
             return
@@ -711,6 +865,126 @@ class ChevronComboBox(QComboBox):
 
     ARROW_W = 24
     GLYPH_PX = 11
+    # 可编辑时内部那层 QLineEdit 的目标 x。Qt 的 QSS 不支持负 margin，样式表
+    # 挪不动它，只能像 ChevronSpinBox 那样在事件过滤器里摆。
+    # 目标是让**墨迹左边缘**和不可编辑的下拉框（由 QSS padding-left(12px)+边框
+    # 直接画、落在 13px）齐平。可编辑的文字在 QLineEdit 行盒里另带约 2px 的
+    # 内部左移，实测 edit.x=11 时墨迹正好落在 13px（2026-10-12 逐像素标定，
+    # 探针 devtools/_probe_ink_all.py）。⚠️ 改字号/字体后要重新量。
+    EDIT_TARGET_X = 11
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._placing_edit = False
+        # 非编辑态的文字垂直自适应（见 _fit_text_vertical）：
+        # _fit_shift = 当前实例 padding 造成的文字位移（正 = 下移，0 = 全局基准）；
+        # _fit_key = 已经量过并稳定的"字体+文字+尺寸+dpr"组合，避免重复抓图。
+        self._fit_shift = 0
+        self._fit_key = None
+        self.currentTextChanged.connect(lambda _text: self._place_edit())
+        edit = self.lineEdit()
+        if edit is not None:
+            edit.installEventFilter(self)
+
+    def setEditable(self, editable: bool) -> None:
+        """⚠️ 过滤器必须挂在**这里**再补一次。
+
+        ``lineEdit()`` 在构造时还不存在 —— 调用方是构造完才 ``setEditable(True)``
+        的，所以 __init__ 里那次 install 拿不到编辑框，后续 Move/Resize 全都收
+        不到，_place_edit 永远不会跑（实测：x 一直停在 13）。
+        另外把编辑框的 textChanged 也接上：换端口这类"文字变了但控件没动"的
+        情况不会有 Move/Resize，不接就永远摆不上（串口选择框踩过）。
+        """
+        super().setEditable(editable)
+        edit = self.lineEdit()
+        if editable and edit is not None:
+            edit.installEventFilter(self)
+            edit.textChanged.connect(lambda _text: self._place_edit())
+            self._place_edit()
+
+    def _place_edit(self) -> None:
+        """把文字摆到位 —— 编辑态摆内层编辑框，非编辑态调实例 padding。
+
+        编辑态：x 对齐左端（见 EDIT_TARGET_X）、y 按**实测墨迹**垂直居中
+        （见 _edit_ink_offset）；事件过滤器里每次 Move/Resize 纠一次，样式摆
+        回去就再纠回来。
+        非编辑态：文字由 QStyleSheetStyle 画，挪不动它 —— 改为**改本控件的
+        padding**把内容区整体推到位（见 _fit_text_vertical）。
+        ⚠️ 防重入同 ChevronSpinBox：量墨迹的 grab() 会激活布局、再触发本函数。
+        """
+        if self._placing_edit or self.height() <= 0:
+            return
+        self._placing_edit = True
+        try:
+            if self.isEditable():
+                self._place_editable()
+            else:
+                self._fit_text_vertical()
+        finally:
+            self._placing_edit = False
+
+    def _place_editable(self) -> None:
+        edit = self.lineEdit()
+        if edit is None:
+            return
+        x = self.EDIT_TARGET_X
+        y = edit.y()
+        offset = _edit_ink_offset(edit)
+        if offset is not None:
+            y = round(self.height() / 2.0 - offset)
+            y = max(0, min(self.height() - edit.height(), y))
+        if edit.x() != x or edit.y() != y:
+            edit.move(x, y)
+
+    def _fit_text_vertical(self) -> None:
+        """非编辑态：按**实测墨迹**给本控件算一条竖直居中的 padding。
+
+        不可编辑下拉框的文字由 QStyleSheetStyle 画在内容区正中 —— 行盒居中
+        不等于字形居中（下伸部空着，字看着偏下；x 高度的词如 "none" 偏得更多），
+        而且偏多少**逐条文字不同**，全局 QSS 给不出一个对所有人都对的值。
+        所以量一条、改一条：padding 上下各挪半格（和=12 不变、框高不变），
+        把内容区整体推到墨迹居中为止。
+
+        ⚠️ 必须把**当前 padding 已经造成的位移**（_fit_shift）从测量里扣掉再算
+        目标，否则下一次进来会把自己刚矫正过的结果当成"本来就居中"再改回去，
+        每轮 resize 来回抖（踩过）。
+        """
+        text = self.currentText()
+        dpr = self.devicePixelRatioF() or 1.0
+        key = (self.font().key(), text, self.width(), self.height(),
+               round(dpr, 2))
+        if key == self._fit_key:
+            return                    # 这个组合量过且已稳定，别再抓图
+        offset = _combo_label_ink_offset(self)
+        if offset is None:
+            return
+        base_delta = (offset - self.height() / 2.0) - self._fit_shift
+        shift = int(round(-base_delta))        # 目标位移（正 = 下移）
+        shift = max(-4, min(4, shift))
+        self._fit_key = key
+        if shift == self._fit_shift:
+            return
+        self._fit_shift = shift
+        # 基准（全局 QSS）是上下 6/6；位移 s 要把上下各挪 s：上 6+s、下 6-s
+        top = 6 + shift
+        bottom = 6 - shift
+        self.setStyleSheet(
+            f"QComboBox {{ padding: {top}px 10px {bottom}px 12px; }}")
+
+    def resizeEvent(self, event) -> None:
+        # 宿主先 resize，编辑框的坐标才是最终值 —— 这里再摆一次（缓存后很便宜）
+        super().resizeEvent(event)
+        self._place_edit()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._place_edit()
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.lineEdit() and self.isEditable() \
+                and event.type() in (QEvent.Type.Move, QEvent.Type.Resize):
+            self._place_edit()
+        return super().eventFilter(obj, event)
 
     def showPopup(self) -> None:
         # 弹出列表默认是一个**不透明的矩形顶层窗口**——QSS 给视图画的圆角会被
@@ -754,23 +1028,24 @@ class ChevronSpinBox(QSpinBox):
     ARROW_W = 22
     GLYPH_PX = 9
     # 左, 上, 右, 下 —— 只动**左右**（左让开边框，右避开箭头）。
-    # ⚠️ 上下必须是 0：数字在框里的竖直位置**只由 QSS 的对称 padding 管**
-    # （QLineEdit 会把行盒在内容区里居中），再叠一层 top textMargin 就是
-    # **双重修正**。原来这里写的是 top=4（"墨迹补偿"），真机逐像素量出来
-    # 数字上留白 11 / 下留白 6 —— 明显偏低，和下拉框（10.5 / 10）对不上，
-    # 用户报的"各输入框内文字与上下边框的间距不一致"就是它。归零之后
-    # 实测 9 / 8，与下拉框一致。
-    TEXT_MARGIN = (11, 0, 6, 0)
+    # ⚠️ 上下必须是 0：竖直位置由 _place_edit 按**实测墨迹**摆，再叠一层
+    # top textMargin 就是双重修正（早先 top=4 实测偏低 5px，就是用户报的
+    # "输入框内文字与上下边框间距不一致"）。
+    # ⚠️ 左边 10 是为了和下拉框的**墨迹左边缘**（13px）齐平：QSpinBox 的
+    # padding 对行内编辑框不生效、只能靠 textMargin 补，而墨迹又比笔位再右
+    # 偏 2~3px（字形左边距）—— 2026-10-12 逐像素标定（_probe_ink_all.py）。
+    TEXT_MARGIN = (10, 0, 6, 0)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._placing_edit = False
         self._edit = self.findChild(QLineEdit)
         if self._edit is not None:
             self._edit.setTextMargins(*self.TEXT_MARGIN)
             # 样式会把行内编辑框摆到偏上 1~2px 的位置（QSS padding 与缩放
             # 组合下的怪癖，用户点名"上下间距不相等"），而且**后续布局周期里
             # 还会再摆回去** —— 只在 resizeEvent 里挪一次压不住。给它挂一个
-            # 事件过滤器：样式每挪一次，立刻纠正回垂直居中（y 收敛后是空操作）。
+            # 事件过滤器：样式每挪一次，立刻纠正回来（y 收敛后是空操作）。
             self._edit.installEventFilter(self)
 
     def wheelEvent(self, event) -> None:
@@ -781,13 +1056,60 @@ class ChevronSpinBox(QSpinBox):
         """
         event.ignore()
 
+    # 兜底用的字号线性近似（实测墨迹拿不到时才走，见 _place_edit）。
+    # 基准/增益是逐像素标定出来的，不是拍的（9pt 为 0 点、11.5pt ≈ +2px）。
+    VERT_PIVOT_PT = 9.0
+    VERT_GAIN = 0.8
+
+    def _text_top_compensation(self) -> int:
+        """行内编辑框往下推多少（**兜底**；正常路径是实测墨迹，见 _place_edit）。
+
+        只在编辑框抓不到渲染（无文字 / 聚焦 / 全选）时用作近似：字号越大，
+        行盒下方多出来的空白越多，按字号线性补一半。9pt ≈ 0、11.5pt ≈ +2。
+        """
+        pt = self.font().pointSizeF()
+        return max(0, int(round((pt - self.VERT_PIVOT_PT) * self.VERT_GAIN)))
+
+    def _place_edit(self) -> None:
+        """把行内编辑框摆到让**文字墨迹**在控件里竖直居中的位置。
+
+        主路径按实测墨迹（_edit_ink_offset）：把墨迹中心对准控件中心，
+        上下留白就相等 —— 不推算行盒、不猜字体回退，改了字号/字体也自动对。
+        实测不可用时退回"朴素居中 + 字号线性近似"。
+
+        resize / 编辑框移动时由事件过滤器自动调用；测试与探针也可以主动调一次，
+        保证量到的是**按当前逻辑算出来的**位置（位置只在 Move/Resize 时更新 ——
+        不主动推一下的话，改了逻辑也不会生效，反向验证就永远绿）。
+
+        ⚠️ 必须防重入：量墨迹要 grab()，而 grab() 会激活内部布局把编辑框挪一下，
+        那一挪又触发本函数（实测递归到 RecursionError）。守卫拦住嵌套调用。
+        """
+        if self._edit is None or self._placing_edit \
+                or self.height() <= 0 or self._edit.height() <= 0:
+            return
+        self._placing_edit = True
+        try:
+            offset = _edit_ink_offset(self._edit)
+            if offset is None:
+                want_y = ((self.height() - self._edit.height()) // 2
+                          + self._text_top_compensation())
+            else:
+                want_y = round(self.height() / 2.0 - offset)
+                want_y = max(0, min(self.height() - self._edit.height(), want_y))
+            if self._edit.y() != want_y:
+                self._edit.move(self._edit.x(), want_y)
+        finally:
+            self._placing_edit = False
+
+    def resizeEvent(self, event) -> None:
+        # 宿主先 resize，编辑框的坐标才是最终值 —— 这里再摆一次（缓存后很便宜）
+        super().resizeEvent(event)
+        self._place_edit()
+
     def eventFilter(self, obj, event) -> bool:
         if obj is self._edit and event.type() in (QEvent.Type.Move,
                                                   QEvent.Type.Resize):
-            edit = self._edit
-            want_y = (self.height() - edit.height()) // 2
-            if edit.y() != want_y:
-                edit.move(edit.x(), want_y)
+            self._place_edit()
         return super().eventFilter(obj, event)
 
     def paintEvent(self, event) -> None:

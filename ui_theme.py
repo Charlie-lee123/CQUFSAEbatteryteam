@@ -517,9 +517,12 @@ QComboBox, QSpinBox {
     background: @surface_2@;
     border: 1px solid @line@;
     border-radius: @CONTROL_RADIUS@px;
-    /* 上下必须**对称**：QLineEdit 会把单行文字在内容区里垂直居中，对称的
-       内边距在任何缩放下都居中。之前试过 4/8 的不对称"视觉修正"—— 那是按
-       2x 缩放标定的，缩放一变（1.43x）就过校正成明显偏上（用户点名不对称）。
+    /* 上下**对称**，这是"基准"——谁都不要在这里做视觉偏心：
+       不可编辑下拉框的字形在行盒里天生偏下，且偏多少**逐条文字不同**
+       （"1" 偏 1px、"none" 偏 2.75px、CJK 偏 1.4px），全局给不出一刀切的值。
+       所以由 ChevronComboBox 在运行时按**实测墨迹**给每条算自己的实例
+       padding（_fit_text_vertical）；数字框/可编辑下拉框的行内编辑框则由
+       _place_edit 直接摆位。这一条只管外观与尺寸。
        ⚠️ 上下之和必须仍是 12 —— 框高 = min-height 20 + 12 + 边框 2 = 34，
        改了这个和就得连 min/max-height 一起动。 */
     padding: 6px 10px 6px 12px;
@@ -530,6 +533,25 @@ QComboBox, QSpinBox {
 
 QComboBox:hover, QSpinBox:hover {
     background: @surface_hover@;
+}
+
+/* 文字一律**左端对齐**（用户 2026-10-12 点名"这些地方需要左端对齐"）。
+   ⚠️ 只在有 QSS 规则时才会暴露这个坑：QStyleSheetStyle 接管 CE_ComboBoxLabel
+   之后，**不可编辑**的下拉框文字会改成**居中** —— 于是同一栏里"1""8""none"
+   居中、"115200"（可编辑，文字在 QLineEdit 里）和"5000 行"（QSpinBox，行内
+   编辑框）左对齐，五行的文字左边缘参差不齐。text-align 是 QSS 对下拉框生效
+   的属性，加这一条它们就都从 padding-left 的 12px 起排了。 */
+QComboBox {
+    text-align: left;
+}
+
+/* 可编辑下拉框内部那层 QLineEdit：Qt 的 QSS **不支持负 margin**（试过
+   margin-left:-6px，实测完全无效、编辑框还停在原处），所以不在样式表里挪，
+   改由 ChevronComboBox 在事件过滤器里摆（见 _place_edit）—— 和 ChevronSpinBox
+   同一套办法。这里只负责把它自身的底/描边去掉，免得覆盖下拉框的外观。 */
+QComboBox QLineEdit {
+    background: transparent;
+    border: none;
 }
 
 QComboBox:focus, QSpinBox:focus {

@@ -253,19 +253,30 @@ def _ordered(low, high) -> tuple[int, int]:
     return (high, low) if low > high else (low, high)
 
 
+def _entry_span(match: re.Match) -> tuple[int, int]:
+    """一个采样点的**整条**区间：序号 + 小数点 + 值。
+
+    染色和定位共用这一个口径 —— 用户 2026-10-12 点名两件事：高亮要**包括
+    序号**（只染值的话，看不出是第几个点出的问题），而且**不要高亮到其他没有
+    问题的数据**（区间严格止于这一条，不牵连同行的其它采样点）。
+    """
+    return match.start(1), match.end(2) - match.start(1)
+
+
 def value_spans(text: str, low: int, high: int) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
     """电压采样值的分级区间 ``(超高, 超低)``，各自 ``[(起点, 长度), ...]``。
 
-    值取小数点后的整数部分（"1.3820" 的 3820，单位 mV）。脱离控件可测。
+    区间是**整条**（序号+值，见 ``_entry_span``）；值取小数点后的整数部分
+    （"1.3820" 的 3820，单位 mV）。脱离控件可测。
     """
     high_spans: list[tuple[int, int]] = []
     low_spans: list[tuple[int, int]] = []
     for m in SAMPLE_RE.finditer(text):
         value = int(m.group(2)[1:])
         if value > high:
-            high_spans.append((m.start(2) + 1, m.end(2) - m.start(2) - 1))
+            high_spans.append(_entry_span(m))
         elif value < low:
-            low_spans.append((m.start(2) + 1, m.end(2) - m.start(2) - 1))
+            low_spans.append(_entry_span(m))
     return high_spans, low_spans
 
 
@@ -273,13 +284,14 @@ def temp_spans(text: str, low: int, high: int) -> list[tuple[int, int]]:
     """温度采样值里**越界**的那些区间 ``[(起点, 长度), ...]``。
 
     温度不分"偏高/偏低"两种颜色 —— 用户点名"凡超出该范围的数值均以黄色标注"，
-    所以越界就是一个列表。值同样取小数点后的整数部分（"1.22" 的 22，单位 ℃）。
+    所以越界就是一个列表。值同样取小数点后的整数部分（"1.22" 的 22，单位 ℃）；
+    区间同样是**整条**（序号+值，见 ``_entry_span``）。
     """
     spans: list[tuple[int, int]] = []
     for m in SAMPLE_RE.finditer(text):
         value = int(m.group(2)[1:])
         if value > high or value < low:
-            spans.append((m.start(2) + 1, m.end(2) - m.start(2) - 1))
+            spans.append(_entry_span(m))
     return spans
 
 
@@ -340,6 +352,9 @@ class RxHighlighter(QSyntaxHighlighter):
         # Voltage" 这些）也要跟着标橙（用户 2026-10-11 点名），直到下一轮
         # 时间戳 / 新段标题为止。
         self._in_bms_error = False
+        # 「高亮异常数据」开关（customization）。关掉只影响**上色**，段状态与
+        # BMS 块状态照常推进 —— 开关拨回来后 refresh() 立刻恢复。
+        self._errors_on = True
         self._recolor()
 
     def _recolor(self) -> None:
@@ -354,6 +369,10 @@ class RxHighlighter(QSyntaxHighlighter):
                                 customization.get("volt_limit_high"))
         self._temp_limits = _ordered(customization.get("temp_limit_low"),
                                      customization.get("temp_limit_high"))
+        # 「高亮异常数据」：关掉后电压越界（红/绿）、温度越界（黄）、BMS 错误
+        # （橙）一律不上色，只留时间戳紫、序号蓝的常规着色（用户点名要这个
+        # 开关）。色值照常取好，拨回来 refresh() 立刻生效。
+        self._errors_on = bool(customization.get("highlight_errors"))
 
     # 定位按钮（main_window）要按同一批阈值去找"有误"的位置，所以开两个读口
     def volt_limits(self) -> tuple[int, int]:
@@ -378,6 +397,8 @@ class RxHighlighter(QSyntaxHighlighter):
 
         # BMS 错误块：BMS ERROR 开块；下一轮时间戳（新的一轮开始）、温度/电压
         # 等新段标题、或 BMS OK（这轮没报错）关块。明细行因此整块标橙。
+        # 状态推进与"要不要真的上色"分开（后者看 _errors_on），这样关掉高亮
+        # 开关时状态机照常走，拨回来立刻是对的。
         if stamp or TEMP_HEADER_RE.match(text) or VOLT_HEADER_RE.match(text) \
                 or OTHER_HEADER_RE.match(text):
             self._in_bms_error = False
@@ -385,18 +406,26 @@ class RxHighlighter(QSyntaxHighlighter):
             self._in_bms_error = True
         elif BMS_LINE_RE.match(text):
             self._in_bms_error = False        # BMS OK：这轮没报错
-        if self._in_bms_error:
-            # 整行先铺橙 —— 序号由下面的采样循环再染回蓝，跟电压/温度行的
-            # 观感一致（序号蓝、正文按状态着色）。
+        bms_block_on = self._in_bms_error and self._errors_on
+        if bms_block_on:
+            # 整行铺橙，**序号也在内**（用户点名"高亮要包括序号"）—— 不再把
+            # 序号染回蓝，否则明细行的序号看着跟正常数据一样，认不出是第几点。
             self.setFormat(0, len(text), self._bms_fmt)
 
         volt_low, volt_high = self._limits
         temp_low, temp_high = self._temp_limits
         for match in SAMPLE_RE.finditer(text):
-            self.setFormat(match.start(1), match.end(1) - match.start(1),
-                           self._index_fmt)
-            start = match.start(2) + 1
-            length = match.end(2) - match.start(2) - 1
+            if not bms_block_on:
+                # 正常项：序号染蓝
+                self.setFormat(match.start(1), match.end(1) - match.start(1),
+                               self._index_fmt)
+            if not self._errors_on:
+                continue
+            # 有问题的那一条：把**序号 + 值**整条覆盖成异常色（用户点名
+            # "包括序号"、"不要高亮到了其他没有问题的数据"）—— 覆盖范围正好是
+            # 这一条 m.group(1)+m.group(2)，同行的其它采样点一个都不碰。
+            start = match.start(1)
+            length = match.end(2) - match.start(1)
             if self._section == SECTION_VOLT and volt_high > 0:
                 value = int(match.group(2)[1:])
                 if value > volt_high:
@@ -408,5 +437,6 @@ class RxHighlighter(QSyntaxHighlighter):
                 if value > temp_high or value < temp_low:
                     self.setFormat(start, length, self._temp_fmt)
 
-        for start, length in bms_error_spans(text):
-            self.setFormat(start, length, self._bms_fmt)
+        if self._errors_on:
+            for start, length in bms_error_spans(text):
+                self.setFormat(start, length, self._bms_fmt)
