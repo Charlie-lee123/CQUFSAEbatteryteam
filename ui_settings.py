@@ -460,8 +460,8 @@ class SettingsDialog(QDialog):
             hrow.addWidget(hpath_label, 1)
             hist_button = InkButton("打开记录", variant="ghost")
             hist_button.setToolTip(
-                f"打开历史接收数据（自动保存最近 {rx_history.MAX_LINES} 行，"
-                "含时间戳；到量自动滚动覆盖最早的数据）")
+                f"打开历史接收数据（自动保存最近 {rx_history.max_lines()} 行，"
+                "含时间戳；行数与接收区「保留行数」一致，到量自动滚动覆盖最早的数据）")
             hist_button.clicked.connect(
                 lambda: QDesktopServices.openUrl(
                     QUrl.fromLocalFile(history_path)))

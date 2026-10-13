@@ -764,7 +764,8 @@ def check_animation_engine(app: QApplication) -> None:
 
 
 def check_rx_history(app: QApplication) -> None:
-    """历史接收数据（rx_history.py）：入队、5000 行滚动、批量落盘、设置按钮。
+    """历史接收数据（rx_history.py）：入队、**行数跟随接收区**、批量落盘、
+    设置按钮、以及软件内回放。
 
     全程用临时文件，不碰真实的 接收历史.log —— 模块全局状态先存后还。
     """
@@ -772,13 +773,16 @@ def check_rx_history(app: QApplication) -> None:
 
     import rx_history
 
-    saved = (rx_history._path, rx_history._file_lines, tuple(rx_history._lines))
+    saved = (rx_history._path, rx_history._file_lines, tuple(rx_history._lines),
+             rx_history.max_lines())
     rx_history._pending.clear()
     try:
         tmp = Path(tempfile.mkdtemp(prefix="rxhist_")) / "接收历史.log"
         rx_history._path = tmp
         rx_history._lines.clear()
         rx_history._file_lines = 0
+        rx_history.set_max_lines(rx_history.DEFAULT_MAX_LINES)
+        cap = rx_history.max_lines()
 
         # 1) 空行不记、时间戳行照记
         rx_history.feed("")
@@ -787,27 +791,47 @@ def check_rx_history(app: QApplication) -> None:
         assert "[2026-10-12 22:00:00]" in rx_history.lines(), "时间戳行没进历史"
         assert len(rx_history.lines()) == 2, f"空行不该入队：{len(rx_history.lines())}"
 
-        # 2) 超过 5000 行：deque 滚动，最老的先被挤掉
-        for i in range(5200):
+        # 2) 超过上限：deque 滚动，最老的先被挤掉
+        for i in range(cap + 200):
             rx_history.feed(f"data {i}")
-        assert len(rx_history.lines()) == rx_history.MAX_LINES, "deque 没滚动"
+        assert len(rx_history.lines()) == cap, "deque 没滚动"
         assert rx_history.lines()[0] == "data 200", \
             f"最老行不对：{rx_history.lines()[0]}"
 
         # 3) 落盘：追加（pending 不封顶，文件暂时超一点没关系，下一步收回）；
-        # 超阈值（5000+500）才整体重写收回到 5000
+        # 超阈值（上限+COMPACT_EXTRA）才整体重写收回
+        rx_history._pending.clear()      # 前面 deque 滚动时挤掉的行不该再落盘
+        rx_history.feed("anchor")        # 造一个待写尾巴，保证首次落盘能建出文件
         rx_history.flush()
+        assert tmp.exists(), "flush 之后文件应该已建好"
         n1 = len(tmp.read_text(encoding="utf-8").splitlines())
-        assert n1 == 5202, f"第一次落盘行数不对：{n1}"
-        assert n1 <= rx_history.MAX_LINES + rx_history.COMPACT_EXTRA + 500
-        for i in range(400):
+        assert n1 == 1, f"首次落盘应只有待写那一行：{n1}"
+
+        # 再喂 上限+COMPACT_EXTRA+50 行：追加后文件 = 1 + 5550 = 5551 行，
+        # 跨过 上限+COMPACT_EXTRA=5500 阈值 → 本次 flush 里整体重写收回到上限。
+        for i in range(cap + rx_history.COMPACT_EXTRA + 50):
             rx_history.feed(f"more {i}")
-        rx_history.flush()          # 5602 > 5000+500 → 触发整体重写
+        rx_history.flush()
         rows = tmp.read_text(encoding="utf-8").splitlines()
-        assert len(rows) == rx_history.MAX_LINES, \
-            f"重写后应恰好 5000 行：{len(rows)}"
-        assert rows[0] == "data 600", f"重写后最老行不对：{rows[0]}"
+        assert len(rows) == cap, f"重写后应恰好 {cap} 行：{len(rows)}"
         assert "[2026-10-12 22:00:00]" not in rows, "时间戳行应已被滚动挤出"
+        assert "anchor" not in rows, "首次落盘那行应已被滚动挤出"
+
+        # 3b) 行数跟随接收区：调小立刻裁剪、调大不复活旧行
+        rx_history.set_max_lines(1000)
+        assert rx_history.max_lines() == 1000
+        assert len(rx_history.lines()) == 1000, \
+            f"调小后应立刻裁剪到 1000：{len(rx_history.lines())}"
+        # set_max_lines 已把 _file_lines 标脏（≥上限+COMPACT_EXTRA+1），
+        # 一次 flush 就该把 5000 行的文件收回到 1000 行。
+        rx_history.flush()
+        rows2 = tmp.read_text(encoding="utf-8").splitlines()
+        assert len(rows2) == 1000, f"文件没跟随上限收回：{len(rows2)}"
+        rx_history.set_max_lines(3000)   # 调大：deque 上限变 3000，但已有行仍是 1000
+        assert rx_history.max_lines() == 3000
+        assert len(rx_history.lines()) == 1000, "调大不该复活已被丢掉的行"
+        # 恢复默认，后续断言（文件行数）按默认上限算
+        rx_history.set_max_lines(cap)
 
         # 4) flush 后无积压；路径为 None 时静默不炸
         rx_history.feed("tail")
@@ -821,25 +845,154 @@ def check_rx_history(app: QApplication) -> None:
         rx_history._path = saved_path
 
         # 5) 设置面板有「打开记录」按钮（路径已指向临时文件）
+        # 日志大节在 app_log.path() 为 None 时整节跳过（接收历史行挂在它里面），
+        # 所以先初始化日志。
+        import app_log
+        app_log.init()
         from ui_settings import SettingsDialog
-        dlg = SettingsDialog(None)
+        dlg = SettingsDialog("dark", 55, None, [])
         btns = [b for b in dlg.findChildren(QPushButton)
                 if b.text() == "打开记录"]
         assert btns, "设置面板没有「打开记录」按钮"
+        tip = btns[0].toolTip()
+        assert str(rx_history.max_lines()) in tip, \
+            f"「打开记录」的提示没跟随当前上限行数：{tip}"
         dlg.deleteLater()
 
         # 6) 路径定位不到时整行隐藏（无按钮、也不崩）
         rx_history._path = None
-        dlg2 = SettingsDialog(None)
+        dlg2 = SettingsDialog("dark", 55, None, [])
         btns2 = [b for b in dlg2.findChildren(QPushButton)
                  if b.text() == "打开记录"]
         assert not btns2, "路径为 None 时不应显示打开记录按钮"
         dlg2.deleteLater()
+        rx_history._path = saved_path
+
     finally:
-        rx_history._path, rx_history._file_lines, _ = saved
+        rx_history._path, rx_history._file_lines, _lines_back, _cap_back = saved
+        rx_history.set_max_lines(_cap_back)
         rx_history._lines.clear()
         rx_history._lines.extend(saved[2])
         rx_history._pending.clear()
+
+
+def check_history_replay(app: QApplication) -> None:
+    """第 7 项：本地留存数据能在接收区内打开，格式/着色/功能与实时一致。
+
+    单独一个 check —— 它要新建一个主窗口，不能塞在 check_rx_history 里
+    （那会把窗口全局状态泄漏给后续用例，实测把「复制本轮」挤挂过）。
+    """
+    import tempfile
+
+    import customization
+    import rx_history
+    from main_window import MainWindow
+    from ui_theme import qcolor as _qc
+
+    # 隔离：MainWindow 构造时会调 rx_history.load()，**按 _path 所在目录**
+    # 重定位到真实日志目录并把真实文件读回内存。所以必须"先建窗、再种数据"，
+    # 否则种好的临时数据会被真实日志整个覆盖掉。
+    saved = (rx_history._path, rx_history._file_lines, tuple(rx_history._lines),
+             rx_history.max_lines())
+    saved_limits = (customization.get("volt_limit_low"),
+                    customization.get("volt_limit_high"))
+    rx_history._pending.clear()
+    rx_history._timer_stop()
+    window = None
+    try:
+        # 阈值钉死：这条用例要验的是"回放管线着色与实时一致"，不该被用户
+        # 配置里的自定义电压上下限左右（实测默认 2500~4500，但如果用户改过，
+        # 样例值的判定结果就跟着漂）。显式设成 2500~4500。
+        customization.set("volt_limit_low", 2500)
+        customization.set("volt_limit_high", 4500)
+
+        window = MainWindow()
+        window._clear_receive()
+        assert window.btn_open_history.text() == "打开历史数据", \
+            "串口配置栏没有「打开历史数据」按钮"
+        assert not window._replay_active, "刚开窗就进了回放模式"
+        assert window._replay_bar.isHidden(), "未回放时提示条不该显示"
+
+        # 建窗之后再接管路径与内容（load() 已经跑完，不会再来覆盖）
+        # 阈值口径：volt_limit 默认 2500~4500 mV（customization 默认值，实测）。
+        # 欠压样例必须**明确低于 2500**（01.2400 → 2400mV）；
+        # 01.3700 → 3700mV 落在正常区间内，不会标绿（早先就栽在这）。
+        tmpdir = Path(tempfile.mkdtemp(prefix="rxreplay_"))
+        tmp = tmpdir / rx_history.FILE_NAME
+        tmp.write_text(
+            "[2026-10-12 22:00:00]\n"
+            "Voltage1:\n"
+            "01.2400 02.3820 03.3900\n"
+            "Temperature1:\n"
+            "1.22 2.95 3.45\n"
+            "BMS ERROR\n"
+            "1.1 Over Voltage\n",
+            encoding="utf-8")
+        rx_history._path = tmp
+        rx_history._lines.clear()
+        rx_history._lines.extend(tmp.read_text(encoding="utf-8").splitlines())
+        rx_history._file_lines = len(rx_history._lines)
+
+        window._open_history()
+        app.processEvents()
+        assert window._replay_active, "打开历史后没进入回放模式"
+        # 窗口没 show()，子控件 isVisible() 恒为 False —— 断言"要求显示"
+        # （isHidden 为 False）而不是可见性。
+        assert not window._replay_bar.isHidden(), "回放提示条没有显示"
+        doc = window.txt_rx.document()
+        body = [doc.findBlockByNumber(b).text() for b in range(doc.blockCount())]
+        assert any("[2026-10-12 22:00:00]" in t for t in body), \
+            f"回放内容里没有时间戳行：{body}"
+        assert any(".2400" in t for t in body), f"回放内容里没有电压数据：{body}"
+
+        def _painted(number):
+            blk = doc.findBlockByNumber(number)
+            return [r.format.foreground().color().name()
+                    for r in (blk.layout().formats() if blk.layout() else [])]
+
+        volt_rows = [i for i, t in enumerate(body) if ".2400" in t]
+        assert volt_rows, f"回放里找不到电压数据行：{body}"
+        volt_colors = set()
+        for i in volt_rows:
+            volt_colors.update(_painted(i))
+        assert _qc("volt_low").name() in volt_colors, \
+            f"回放的欠压值没有标绿：{volt_colors}"
+        bms_rows = [i for i, t in enumerate(body) if "BMS ERROR" in t]
+        assert bms_rows and _qc("bms_error").name() in _painted(bms_rows[0]), \
+            "回放里的 BMS ERROR 没有标橙"
+
+        # 回放期间实时帧不覆盖画面，但照常进历史
+        rx_history._pending.clear()
+        window._on_received("Voltage1:\n9.9999\n".encode("utf-8"))
+        window._flush_rx()
+        app.processEvents()
+        doc2 = window.txt_rx.document()
+        body2 = [doc2.findBlockByNumber(b).text() for b in range(doc2.blockCount())]
+        assert not any("9.9999" in t for t in body2), \
+            "回放期间实时数据写进了画面（应只进历史）"
+        assert any("9.9999" in ln for ln in rx_history._pending), \
+            "回放期间实时数据没有进历史"
+
+        # 返回实时：回放标记清掉、提示条收起
+        window._exit_replay()
+        app.processEvents()
+        assert not window._replay_active, "返回实时后回放标记没清"
+        assert window._replay_bar.isHidden(), "返回实时后提示条没收起"
+    finally:
+        customization.set("volt_limit_low", saved_limits[0])
+        customization.set("volt_limit_high", saved_limits[1])
+        if window is not None:
+            window._exit_replay()
+            window.close()
+            window.deleteLater()
+            app.processEvents()
+        rx_history._path, rx_history._file_lines, _lines_back, _cap_back = saved
+        rx_history.set_max_lines(_cap_back)
+        rx_history._lines.clear()
+        rx_history._lines.extend(saved[2])
+        rx_history._pending.clear()
+        rx_history._file_lines = saved[1]
+        rx_history._resume_timer()
 
 
 def check_updater(app: QApplication) -> None:
@@ -928,8 +1081,107 @@ def check_updater(app: QApplication) -> None:
     finally:
         dlg.close()
 
+    # 7) 安装器接管更新（第 5 项）：安装包资产名 / 版本文件里的 setup 哈希 /
+    #    安装版判定 / 下载源链按需换成 setup
+    from updater import (installed_location, is_installed,
+                         setup_asset_name, update_asset_and_hash)
+    assert setup_asset_name("1.8") == "SerialAssistant-setup-1.8.exe", \
+        "安装包资产名不对"
+    sample2 = ('VERSION = "1.8"\n'
+               'LATEST_EXE_SHA256 = "' + "ab" * 32 + '"\n'
+               'LATEST_SETUP_SHA256 = "' + "cd" * 32 + '"\n')
+    info2 = parse_version_file(sample2)
+    assert info2["setup_sha256"] == "cd" * 32, "setup 哈希没解析出来"
+    # 版本文件没写 setup 哈希 → 不带这个键（退回大小/跳过校验）
+    assert "setup_sha256" not in parse_version_file('VERSION = "1.8"'), \
+        "空 setup 哈希不该出现在结果里"
+    # 下载源链：指定 setup 资产时，URL 里应当是 setup 而不是裸 exe
+    setup_urls = release_download_urls("v1.8", setup_asset_name("1.8"))
+    assert all("SerialAssistant-setup-1.8.exe" in u for u in setup_urls), \
+        f"安装版下载源链没指向安装包：{setup_urls}"
+    assert "releases/download/v1.8/" in setup_urls[-1]
+    # 开发环境不是安装版：目录里没有 unins000.exe
+    assert not is_installed(), "开发环境不该被判成安装版"
+    assert installed_location() is None or isinstance(installed_location(), str)
+    # 免安装版：资产/哈希走 exe 那一套
+    asset, _h = update_asset_and_hash({"version": "1.8"})
+    from version import ASSET_NAME
+    assert asset == ASSET_NAME, f"免安装版应当下 {ASSET_NAME}，实得 {asset}"
+
     # 8) 源链重试轮数（用户要求失败自动重试）
     assert CHECK_PASSES >= 2, "版本检测至少要整链重试一轮"
+
+
+def check_installer_script(app: QApplication) -> None:
+    """第 5 项：Inno Setup 安装脚本的关键约定必须齐全。
+
+    不依赖编译器在不在（没装 Inno Setup 的机器上也能跑），只静态校验脚本里
+    那些**一旦写错就会让用户装出问题的约定**：
+      - AppId 存在且是固定 GUID（升级识别靠它，改了会变成两个软件）；
+      - 支持自定义安装位置（DisableDirPage=no）且升级沿用上次位置；
+      - 有桌面快捷方式（受 Tasks 控制、默认勾选）与开始菜单项；
+      - 有卸载入口，卸载时可选保留/删除配置；
+      - 不强制管理员（per-user 安装，双击即装）。
+    若 `发布\\SerialAssistant-setup-<版本>.exe` 已编译出来，再顺带校验产物本身
+    （大小合理 + 应用名/版本号确实嵌进去了）。
+    """
+    from pathlib import Path as _P
+
+    root = _P(__file__).resolve().parent
+    iss = root / "installer" / "SerialAssistant.iss"
+    assert iss.exists(), f"安装脚本不存在：{iss}"
+    text = iss.read_text(encoding="utf-8")
+
+    def has(snippet: str, why: str) -> None:
+        assert snippet in text, f"安装脚本缺少「{why}」（找不到 {snippet!r}）"
+
+    # 升级识别的唯一依据
+    assert "AppId={{8F3C1B42-7A6E-4D91-9C15-2E7B4A0D5F31}" in text, \
+        "AppId 必须是固定 GUID（升级识别靠它）"
+    # 自定义安装位置 + 升级沿用上次
+    has("DisableDirPage=no", "允许用户自定义安装位置")
+    has("UsePreviousAppDir=yes", "升级时沿用上次的安装目录")
+    has("DefaultDirName={localappdata}", "默认装到用户目录（免管理员）")
+    # 免管理员
+    has("PrivilegesRequired=lowest", "per-user 安装、不要求管理员")
+    # 桌面快捷方式：Tasks 里默认勾上 + Icons 里落到 {autodesktop}
+    has('Name: "desktopicon"', "桌面快捷方式选项")
+    has("Flags: checkedonce", "桌面快捷方式默认勾选")
+    has("{autodesktop}", "桌面快捷方式的实际落点")
+    has("{group}", "开始菜单项")
+    # 卸载
+    has("[UninstallDelete]", "卸载清理段")
+    has("unins", "卸载程序引用")
+    # 版本号由构建脚本注入（不许硬编码）
+    has("#ifndef AppVersion", "版本号注入兜底")
+
+    # 构建脚本存在且能定位到 iss / exe
+    builder = root / "devtools" / "_build_installer.py"
+    assert builder.exists(), f"安装包构建脚本不存在：{builder}"
+    btext = builder.read_text(encoding="utf-8")
+    assert "version.py" in btext, "构建脚本应当从 version.py 现读版本号"
+    assert "iscc" in btext.lower(), "构建脚本应当调用 Inno Setup 编译器"
+    # 编译器查找必须覆盖"非标准安装路径"：本机就是手装在 F:\Inno Setup 6\
+    # （既不在 Program Files 也不在 PATH），只查那几个常规落点会漏。
+    assert "_drives" in btext, "构建脚本应当兜底扫描各盘根目录找 Inno Setup"
+
+    # ===== 有产物时：校验编译出来的 setup 包（编译器装了就顺带验一遍）=====
+    from version import VERSION as _VER
+    setup = root / "发布" / f"SerialAssistant-setup-{_VER}.exe"
+    if setup.exists():
+        size = setup.stat().st_size
+        # 安装包必须**大于**裸 exe（它把 exe 压进去了），否则说明打空了
+        bare = root / "发布" / "SerialAssistant.exe"
+        assert bare.exists(), "有 setup 包却没有裸 exe，产物目录状态异常"
+        assert size > 10 * 1024 * 1024, \
+            f"setup 包只有 {size:,} B，明显打空了"
+        raw = setup.read_bytes()
+        # 中文应用名与版本号应内嵌在 setup 头里（ASCII 或 UTF-16LE 任一命中）
+        for label, variants in (
+            ("应用名", (b"CQUFSAE", "CQUFSAE".encode("utf-16-le"))),
+            ("版本号", (_VER.encode("ascii"), _VER.encode("utf-16-le"))),
+        ):
+            assert any(v in raw for v in variants), f"setup 包里找不到{label}"
 
 
 def check_tooltip_and_buttons(app: QApplication) -> None:
@@ -1143,6 +1395,10 @@ def check_tooltip_and_buttons(app: QApplication) -> None:
         window._apply_theme("light")
         app.processEvents()
     finally:
+        # ⚠️ 这里**不要** deleteLater + processEvents：那会让窗口析构时的
+        # QSettings 回写发生在下面这套还原**之后**，把测试值重新写回用户真实
+        # 配置（hidden_buttons 被永久污染过，实测踩到）。窗口对象交给下面的
+        # 全局快照兜底 —— main() 跑完所有用例后无条件恢复。
         window.close()
         for key in settings.allKeys():
             if key not in snapshot:
@@ -1169,6 +1425,16 @@ def check_expand_and_copy_all(app: QApplication) -> None:
 
     fullscreen_testable = (_sys.platform == "win32"
                            and os.environ.get("QT_QPA_PLATFORM") != "offscreen")
+
+    # ⚠️ 剪贴板可用性探测：无交互桌面会话（CI、非交互 shell、剪贴板被别的
+    #    进程独占）里 setText 写进去也读不回来 —— 实测裸 setText('X') 后
+    #    text() 返回 ''。那种环境下"复制"这条链路根本没法验，直接跳过整条
+    #    用例，别报一个跟代码无关的假失败（本用例曾在 v1.7 基线上就假挂过）。
+    probe = QApp.clipboard()
+    probe.setText("__selftest_clipboard_probe__")
+    if probe.text() != "__selftest_clipboard_probe__":
+        print("        剪贴板不可用（非交互会话），跳过本用例")
+        return
 
     settings = QSettings("MimoWorks", "SerialAssistant")
     snapshot = {key: settings.value(key) for key in settings.allKeys()}
@@ -3822,7 +4088,9 @@ CHECKS = [
     ("定制功能注册表", check_customization),
     ("校验位/保留行数/时钟/发送区一排", check_config_parity_clock),
     ("自动更新模块", check_updater),
+    ("安装包脚本", check_installer_script),
     ("历史接收数据", check_rx_history),
+    ("历史数据回放", check_history_replay),
     ("收包合并与暂停继续", check_rx_merge_and_pause),
     ("动画引擎 120fps 与非线性", check_animation_engine),
     ("提示字号与按钮显隐", check_tooltip_and_buttons),
@@ -3831,6 +4099,49 @@ CHECKS = [
     ("默认折叠发送区开关", check_send_collapsed_startup),
     ("定位最近异常按钮", check_alert_locate),
 ]
+
+
+# 自测污染自愈名单：{键: 该键"干净时应有的默认值"}。
+#
+# 为什么需要它：自测的全局快照会把"进程序时的样子"原样存下来、跑完再写回 ——
+# 这个机制能防住"本次运行"的泄漏，但防不住**已经固化的历史污染**：上一轮若因
+# 某次事故（比如 check 里 deleteLater() 触发析构回写）把测试值留在了用户配置里，
+# 下一次运行就会把它当成"基线"忠实地保存和还原，污染于是永久化、且静默无声
+# —— 表现为几条依赖默认值的用例（发送区开局折叠等）稳定假挂，排查方向还容易
+# 跑偏到"时序/负载"上去（2026-10-13 实际踩到：custom/send_collapsed_startup
+# 被写成 false，导致「校验位/保留行数/时钟/发送区一排」「收包合并与暂停继续」
+# 连挂，而配置快照看起来"一直是 false、很稳定"）。
+#
+# 判据：只清理**与注册默认值不一致**的那些 —— 默认值本身由 customization
+# 注册表定义，用户真实改过的非默认值不该被误删……但自测**无权**区分"用户改的"
+# 与"上次测漏的"。折中：只对这份显式白名单里的键做自愈，且仅在值等于"已知的
+# 污染值"时清理。白名单要**短且专**，绝不放业务配置进去。
+_POLLUTION_GUARDS = {
+    # (键, 污染值, 干净默认值)
+    ("custom/send_collapsed_startup", "false", "true"),
+}
+
+
+def _heal_polluted_keys(settings: QSettings) -> None:
+    """清掉历史上被自测写坏、且已被当成基线固化下来的配置值。
+
+    必须在取 global_snapshot **之前**调用，否则快照会把污染值一起存下来，
+    还原时又原样写回去（这正是污染能自固化的原因）。
+    """
+    healed = []
+    for key, polluted, clean in _POLLUTION_GUARDS:
+        current = settings.value(key)
+        if current is None:
+            continue
+        if str(current).lower() == str(polluted).lower():
+            settings.setValue(key, clean)
+            healed.append(f"{key}={current} → {clean}")
+    if healed:
+        settings.sync()
+        print("  ⚠ 检测到历史自测污染，已自愈：")
+        for item in healed:
+            print(f"      {item}")
+        print("      （若这确是你手动改的配置，请到「设置 → 定制功能」重新设置一遍）")
 
 
 def main() -> int:
@@ -3846,6 +4157,7 @@ def main() -> int:
     # 缓冲的析构回写……）都不能把测试值留在用户真实配置里 —— 全部跑完后无条件
     # 恢复到进程序时的样子。（单条 check 自己的快照还原仍保留，防 check 间串扰。）
     global_settings = QSettings("MimoWorks", "SerialAssistant")
+    _heal_polluted_keys(global_settings)
     global_snapshot = {k: global_settings.value(k) for k in global_settings.allKeys()}
     failed = 0
     for name, func in CHECKS:
@@ -3857,6 +4169,23 @@ def main() -> int:
         else:
             print(f"  PASS  {name}")
 
+    for key in global_settings.allKeys():
+        if key not in global_snapshot:
+            global_settings.remove(key)
+    for key, value in global_snapshot.items():
+        global_settings.setValue(key, value)
+    global_settings.sync()
+
+    # ⚠️ 还原必须在**所有窗口都析构干净之后**做最后一次：各 check 里 close()
+    #    只是隐藏，对象还活着，它们的析构回写会在解释器退出时把测试值重新
+    #    写回用户真实配置（hidden_buttons 就这样被永久污染过）。这里显式清掉
+    #    所有顶层控件、跑一轮事件循环让析构落地，再无条件还原一次。
+    for widget in QApplication.topLevelWidgets():
+        widget.close()
+        widget.deleteLater()
+    app.processEvents()
+    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
     for key in global_settings.allKeys():
         if key not in global_snapshot:
             global_settings.remove(key)

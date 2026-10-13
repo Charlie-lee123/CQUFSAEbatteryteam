@@ -84,6 +84,81 @@ def release_download_urls(tag: str, asset: str | None = None) -> tuple:
     )
 
 
+def setup_asset_name(version: str) -> str:
+    """某版本安装包在 Release 里的资产名，如 ``SerialAssistant-setup-1.8.exe``。"""
+    from version import SETUP_ASSET_PREFIX, SETUP_ASSET_SUFFIX
+    return f"{SETUP_ASSET_PREFIX}{version}{SETUP_ASSET_SUFFIX}"
+
+
+def is_installed() -> bool:
+    """当前是不是"安装版"（第 5 项：安装器接管更新的判据）。
+
+    Inno Setup 会在安装目录写 `unins000.exe`，并在
+    ``HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\<AppId>_is1``
+    下登记 InstallLocation。装了安装版就走"下载 setup → 运行它 → 由安装向导
+    接管覆盖"，否则（免安装单文件版）走原来的静默替换 exe。
+    """
+    import os
+    import sys
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    for name in ("unins000.exe", "unins001.exe"):
+        if os.path.exists(os.path.join(exe_dir, name)):
+            return True
+    return False
+
+
+def installed_location() -> str | None:
+    """从注册表读安装版的安装目录（读不到返回 None）。"""
+    import winreg
+    key = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+    try:
+        root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key)
+    except OSError:
+        return None
+    try:
+        index = 0
+        while True:
+            try:
+                sub = winreg.EnumKey(root, index)
+            except OSError:
+                return None
+            index += 1
+            try:
+                with winreg.OpenKey(root, sub) as item:
+                    name = _reg_value(item, "DisplayName") or ""
+                    if "串口调试助手" in name or "SerialAssistant" in name:
+                        location = _reg_value(item, "InstallLocation")
+                        if location:
+                            return location
+            except OSError:
+                continue
+    finally:
+        root.Close()
+
+
+def _reg_value(key, name: str) -> str | None:
+    import winreg
+    try:
+        value, _kind = winreg.QueryValueEx(key, name)
+        return str(value) if value else None
+    except OSError:
+        return None
+
+
+def update_asset_and_hash(info: dict) -> tuple[str | None, str | None]:
+    """按"是否安装版"挑这次要下的资产与对应哈希。
+
+    安装版下安装包（``SerialAssistant-setup-x.y.exe``）、校验 ``LATEST_SETUP_SHA256``；
+    免安装版下 ``SerialAssistant.exe``、校验 ``LATEST_EXE_SHA256``。
+    返回 ``(asset, sha256)``，任何一项拿不到就回 None（由调用方退回默认）。
+    """
+    import version
+    if is_installed():
+        return (setup_asset_name(info.get("version", "")),
+                info.get("setup_sha256") or version.LATEST_SETUP_SHA256 or None)
+    return (version.ASSET_NAME, info.get("sha256") or None)
+
+
 # ------------------------------------------------------------------ 解析器
 
 def version_tuple(s: str) -> tuple:
@@ -92,7 +167,7 @@ def version_tuple(s: str) -> tuple:
 
 
 def parse_version_file(text: str) -> dict | None:
-    """仓库里 version.py 的内容 → {"version": "1.6", "sha256": "..."}。"""
+    """仓库里 version.py 的内容 → {"version", "sha256", "setup_sha256"}。"""
     import re
     m = re.search(r'^VERSION\s*=\s*"(\d+(?:\.\d+)*)"', text, re.M)
     if not m:
@@ -101,6 +176,9 @@ def parse_version_file(text: str) -> dict | None:
     m = re.search(r'^LATEST_EXE_SHA256\s*=\s*"([0-9a-fA-F]{64})"', text, re.M)
     if m:
         out["sha256"] = m.group(1).lower()
+    m = re.search(r'^LATEST_SETUP_SHA256\s*=\s*"([0-9a-fA-F]{64})"', text, re.M)
+    if m:
+        out["setup_sha256"] = m.group(1).lower()
     return out
 
 
@@ -258,11 +336,17 @@ class UpdateDialog(QDialog):
         self.setModal(True)
         self.setMinimumWidth(460)
         self._latest = latest
-        self._sha256 = sha256
         self._size = size
         self._tag = tag or f"v{latest}"
         self._auto = auto
         self._frozen = bool(getattr(sys_frozen(), "frozen", False))
+        # 安装版 → 下载安装包、交安装向导接管；免安装版 → 下载 exe 静默替换。
+        self._is_setup = self._frozen and is_installed()
+        # 校验口径跟着资产走：安装版比 setup 哈希，免安装版比 exe 哈希。
+        self._sha256 = sha256
+        if self._is_setup:
+            from version import LATEST_SETUP_SHA256
+            self._sha256 = LATEST_SETUP_SHA256 or None
         self._nam = QNetworkAccessManager(self)
         self._reply = None
         self._download_pass = 0
@@ -278,8 +362,12 @@ class UpdateDialog(QDialog):
         title.setObjectName("dialogTitle")
         root.addWidget(title)
 
-        info = QLabel(f"当前版本 v{current}　→　新版本 v{latest}\n"
-                      "更新只替换程序文件，你的所有设置都会保留。")
+        if self._is_setup:
+            note = ("将下载安装包并启动安装向导（可自选安装位置，"
+                    "自动创建桌面快捷方式）。你的设置与日志都会保留。")
+        else:
+            note = "更新只替换程序文件，你的所有设置都会保留。"
+        info = QLabel(f"当前版本 v{current}　→　新版本 v{latest}\n" + note)
         info.setFont(ui_font(11.0))
         info.setWordWrap(True)
         root.addWidget(info)
@@ -335,13 +423,15 @@ class UpdateDialog(QDialog):
         self._btn_repo.setEnabled(False)
         self._progress.show()
         self._progress.setValue(0)
-        self._status.setText("正在下载更新（镜像加速）…")
+        self._status.setText("正在下载更新包（镜像加速）…")
         self._try_download()
 
     # -- 下载 ------------------------------------------------------------
 
     def _try_download(self) -> None:
-        urls = release_download_urls(self._tag)
+        urls = release_download_urls(
+            self._tag,
+            setup_asset_name(self._latest) if self._is_setup else None)
         if self._url_idx >= len(urls):
             self._download_pass += 1
             self._url_idx = 0
@@ -399,9 +489,25 @@ class UpdateDialog(QDialog):
         self._btn_repo.setEnabled(True)
 
     def _apply(self, data: bytes) -> None:
-        """把校验通过的新 exe 落到临时目录，交给它自举替换，然后退出应用。"""
+        """装更新：安装版交给安装向导接管，免安装版静默替换 exe。
+
+        第 5 项（用户选择"安装器接管更新"）：装了安装版的用户下载的是
+        **安装包**，运行它由 Inno 向导完成覆盖 —— 能自选目录、自动建桌面
+        快捷方式、有卸载程序，且升级时沿用上次的安装位置。免安装单文件版
+        没有安装目录可接管，仍旧走原来的"自举替换 exe"。
+        """
         import os
         import sys
+        if self._is_setup:
+            setup = str(Path(tempfile.gettempdir()) /
+                        setup_asset_name(self._latest))
+            with open(setup, "wb") as f:
+                f.write(data)
+            self._status.setText("校验通过，正在启动安装向导…")
+            _launch_installer(setup, silent=not self._auto)
+            self.accept()
+            QApplication.instance().quit()
+            return
         tmp = str(Path(tempfile.gettempdir()) / "SerialAssistant_update.exe")
         with open(tmp, "wb") as f:
             f.write(data)
@@ -409,6 +515,23 @@ class UpdateDialog(QDialog):
         spawn_apply_update(tmp, target)
         self.accept()
         QApplication.instance().quit()
+
+
+def _launch_installer(setup_path: str, silent: bool = False) -> None:
+    """运行下载好的安装包。
+
+    ``silent`` ＝ 后台自动更新场景：用 ``/SILENT`` 走完安装（进度条可见），
+    不让用户一步步点 —— 但**保留向导 UI 的静默**（``/VERYSILENT`` 连进度条
+    都没有，用户会以为卡住了）。手动点「立即更新」时打开完整向导。
+    升级时 AppId 不变，Inno 自动沿用上次的安装目录与快捷方式选择。
+    """
+    import subprocess
+    args = [setup_path]
+    if silent:
+        args.append("/SILENT")
+    # /NORESTART：装完不自动重启机器（我们自己会重启软件）
+    args.append("/NORESTART")
+    subprocess.Popen(args, cwd=str(Path(setup_path).parent), close_fds=True)
 
 
 def sys_frozen():

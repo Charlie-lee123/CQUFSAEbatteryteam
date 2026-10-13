@@ -5,18 +5,26 @@
 针对车队电池管理系统的实际数据格式做了深度定制：一轮数据里时间戳、电压、温度、
 BMS 状态混在一起，这个工具负责把它们**按段正确着色、对齐、并能在出问题时一键定位**。
 
-当前版本：**v1.7**（2026-10-12）
+当前版本：**v1.8**（2026-10-13）
 
 ## 一键下载
 
-[![下载 SerialAssistant.exe](https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E4%B8%8B%E8%BD%BD-SerialAssistant.exe-2ea44f?logo=github&logoColor=white)](https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant.exe)
+**推荐：安装版**（可选安装位置、自动建桌面快捷方式、带卸载程序）
+
+[![下载安装包](https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E4%B8%8B%E8%BD%BD-%E5%AE%89%E8%A3%85%E7%89%88%20Setup-2ea44f?logo=github&logoColor=white)](https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant-setup-1.8.exe)
+
+**免安装版**（单文件，下载后双击即用）
+
+[![下载 SerialAssistant.exe](https://img.shields.io/badge/%E5%85%8D%E5%AE%89%E8%A3%85%E7%89%88-SerialAssistant.exe-0969da?logo=github&logoColor=white)](https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant.exe)
 
 也可以直接打开：
-<https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant.exe>
+- 安装版：<https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant-setup-1.8.exe>
+- 免安装版：<https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant.exe>
 
-> 链接始终指向**最新 Release** 里的 `SerialAssistant.exe`（单文件、免安装，
-> 下载后双击即用，日志写在 exe 旁的 `logs/` 里）。
-> 注：链接在仓库发布第一个 Release 并上传该 exe 后生效。
+> 两个链接都指向**最新 Release**。安装版适合日常使用（能自选目录、生成桌面
+> 与开始菜单快捷方式、卸载时可选保留设置）；免安装版是单文件，日志写在 exe
+> 旁的 `logs/` 里。
+> 注：链接在仓库发布对应 Release 并上传资产后生效。
 
 ## 界面
 
@@ -82,10 +90,14 @@ SerialAssistant/
 ├── ui_highlight.py       # 接收区着色（时间戳 / 序号 / 电压 / 温度 / BMS）与序号补齐
 ├── ui_settings.py        # 设置面板（按 customization 注册表动态生成）
 ├── customization.py      # 定制功能配置注册表（持久化 + 默认值迁移）
+├── rx_history.py         # 历史接收数据：跟随「保留行数」的滚动留存与回放读取
+├── updater.py            # 检查更新 / 下载校验 / 安装器或静默替换
+├── version.py            # 版本号唯一出处（含 Release 产物 SHA256）
 ├── app_log.py            # 分级日志
-├── selftest.py           # 19 项自测（offscreen 可跑）
+├── selftest.py           # 24 项自测（offscreen 可跑）
 ├── assets/               # 图标与车队 VIS 素材（打包必须带上）
-├── devtools/             # 开发工具：打包产物实测、渲染出图、探针、反向验证补丁
+├── installer/            # Inno Setup 安装脚本（SerialAssistant.iss）
+├── devtools/             # 开发工具：打包产物实测、渲染出图、探针、安装包构建
 │   └── archive/          # 历史诊断脚本（保留备查）
 ├── docs/images/          # README 截图
 ├── build.bat             # 一键打包（产物输出到 发布/）
@@ -95,13 +107,28 @@ SerialAssistant/
 
 ## 安装与使用
 
-### 方式一：直接运行打包好的 exe
+### 方式一：安装版（推荐，带安装向导）
+
+到 [Releases](https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases)
+下载 `SerialAssistant-setup-x.y.exe`，双击进入安装向导：
+
+- **可自定义安装位置**（默认 `%LOCALAPPDATA%\Programs\SerialAssistant`，免管理员权限）；
+- **自动创建桌面快捷方式**（默认勾选）与开始菜单项；
+- 升级时**沿用上次选的安装目录**，不再重复询问；
+- 「应用和功能」里有卸载入口，卸载时可选择保留或删除本地设置与日志。
+
+安装版收到新版本时，程序内「立即更新」会下载新版**安装包**并启动安装向导接管，
+不必手动去 GitHub。
+
+> 若本机没装 Inno Setup，可直接用下面的免安装版 —— 两者功能完全一致。
+
+### 方式二：免安装单文件版
 
 到 [Releases](https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases)
 下载 `SerialAssistant.exe`（单文件、免安装），双击即用。日志写在 exe 旁的
-`logs/serialassistant.log`。
+`logs/serialassistant.log`。这个形态的自动更新是**静默替换 exe**（不弹安装向导）。
 
-### 方式二：从源码运行
+### 方式三：从源码运行
 
 ```bat
 git clone https://github.com/Charlie-lee123/CQUFSAEbatteryteam.git
@@ -121,12 +148,27 @@ build.bat
 
 产物输出到 **`发布\SerialAssistant.exe`**（脚本会顺带把桌面快捷方式重新指到新产物）。
 
+### 制作安装包（可选）
+
+```bat
+.venv\Scripts\python.exe devtools\_build_installer.py --check   # 体检：查 exe / 编译器
+.venv\Scripts\python.exe devtools\_build_installer.py           # 编译安装包
+```
+
+需要先装 [Inno Setup 6](https://jrsoftware.org/isdl.php)。产物是
+`发布\SerialAssistant-setup-<版本>.exe`；脚本会从 `version.py` 现读版本号注入。
+安装脚本源码在 `installer\SerialAssistant.iss`（`AppId` 是固定 GUID，升级识别依赖它，
+**不可更改**）。
+
 ### 自测
 
 ```bat
 .venv\Scripts\python.exe selftest.py                    # offscreen，无界面
 set QT_QPA_PLATFORM=windows && .venv\Scripts\python.exe selftest.py   # 真机窗口
 ```
+
+> 说明：`全屏展开与复制全部` 一项会验证「复制」链路，需要可用的系统剪贴板；
+> 在非交互会话（无桌面剪贴板所有权）里这一项会自动跳过而非报错。
 
 ## 数据格式约定
 
@@ -155,6 +197,10 @@ BMS ERROR               ← BMS 状态（橙），到此为止：其后的数值
 | v1.5 | 2026-10-12 | 修复「复制本轮」数据不完整与时间戳出现在非开头位置（电压数据分包成多帧、每帧都带 `Voltage1:` 标题时，一轮会打出多个时间戳，复制时从轮内第二个起算导致前半段丢失；现在一轮只打一个）；新增「高亮异常数据」开关（关掉后不再标红/绿/黄/橙，只留时间戳与序号着色）；异常高亮改为精确覆盖有问题的**整条**采样点（序号+值），不再只染值、也不波及同行的正常数据；新增「接收区字体大小」滑动无级调节（带等宽 `CQUFSAE.2026` 实时预览，颜色与接收区正文一致）；设置面板新增「导出日志」一键另存；修复从最大化退出后窗口边缘没有拖拽光标提示（现在左/右/上/下与四角分别显示对应缩放光标，全屏时不提示）；串口配置栏五行控件的文字左端对齐、并让全部输入类控件的文字按**实测墨迹**竖直居中（数字框、可编辑/不可编辑下拉框、按钮统一处理，任意字号/DPI 下上下留白相等） |
 | v1.6 | 2026-10-12 | 下拉选择全面统一成波特率那套展开交互：**「保留行数」从数字框改为可编辑下拉**（预设 500～500000 行展开选，也可直接输入任意值）；**弹层宽度按最宽选项自适应**（修复编码弹层把 `latin-1` 截成 `l...1`）；**所有下拉弹层加 150ms 展开动画**（从锚点一侧展开到全高并淡入，朝下/朝上开各自锚定）；修复非编辑类下拉弹层底部残留黑条、四角被裁成直角的问题（现与波特率弹层完全同观感） |
 | v1.7 | 2026-10-12 | **检查更新重构**：版本检测走国内可直连多源链（jsDelivr → ghfast → gh-proxy → GitHub raw → API，每源 8 秒超时自动回退，开着代理走 GitHub 直连，整链失败还会经本机代理再试一遍）；发现新版本弹窗（立即更新 / 暂不更新 / 前往仓库）；应用内自动更新（镜像源下载 + SHA256 完整性校验 + 静默替换重启，配置完整保留）。**历史接收数据**：自动保存最近 5000 行接收数据（含时间戳）到与日志同目录的 `接收历史.log`，到量滚动覆盖最早数据，纯内存入队 + 定时批量落盘不影响接收性能；设置面板可一键打开记录文件。**修复欠压绿色高亮越界**：标绿区间严格限定在电压数据读取部分，不再染到温度采集区，且温度值不会被对齐补零篡改成假数据 |
+| v1.8 | 2026-10-13 | **安装程序与卸载程序**（Inno Setup）：可自定义安装位置、装完自动创建桌面快捷方式、升级沿用上次目录、卸载可选保留设置；安装版收到新版时由安装向导接替更新。**本地留存行数与接收区一致**：`接收历史.log` 的留存行数跟随「保留行数」设置实时同步，改小立即裁剪、改大不复活旧行。**软件内回放留存数据**：串口配置栏新增「打开历史数据」，把本地留存内容灌进同一个接收区，时间戳/序号/电压红绿/温度/BMS 着色与搜索、定位异常、复制全部等能力与实时完全一致。 |
+
+> v2.0 计划的第 5/6/7 项（安装器、留存行数同步、软件内回放）已在 **v1.8** 落地，
+> 故 1.8 即这三项的正式发布版。
 
 ## License
 

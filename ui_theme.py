@@ -503,6 +503,19 @@ QLabel#searchCount {
     color: @ink_3@;
 }
 
+/* ---- 历史回放提示条 ----
+   回放时出现在接收区上方：surface_2 底 + 主色左边条，一眼看出"这不是实时"。 */
+QWidget#replayBar {
+    background: @surface_2@;
+    border: 1px solid @line@;
+    border-left: 3px solid @fill_primary@;
+    border-radius: 8px;
+}
+
+QLabel#replayCaption {
+    color: @ink_2@;
+}
+
 /* ---- 接收区右上角的实时时钟 ----
    放在卡片标题栏右侧，属于"参数"性质，用 Bahnschrift。 */
 QLabel#rxClock {

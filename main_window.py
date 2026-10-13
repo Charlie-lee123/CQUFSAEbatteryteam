@@ -45,7 +45,7 @@ from ui_highlight import (
 )
 from ui_controls import (
     AlertButton, ChevronComboBox, ChevronSpinBox, IconButton, IconLabel,
-    LabeledField, PulseDot, SearchEdit, Switch,
+    InkButton, LabeledField, PulseDot, SearchEdit, Switch,
 )
 from ui_settings import SettingsDialog
 from ui_surface import Card, fade_in
@@ -207,6 +207,9 @@ class MainWindow(QMainWindow):
         # 暂停是**冻结显示**：新帧进这个队列不显示，恢复时一次刷入。
         self._paused = False
         self._paused_frames: list[tuple[str, str]] = []
+        # 历史回放模式：为真时接收区显示的是本地留存数据，实时帧不写进画面
+        # （但照常进 rx_history 与计数）。见 _open_history / _exit_replay。
+        self._replay_active = False
         # 退出窗口全屏时要还原的普通几何。⚠️ 不能在全屏状态下调 saveGeometry
         # （那存下来的是满屏矩形）—— 普通态时由 moveEvent/resizeEvent 持续记忆
         self._normal_geometry: QRect | None = None
@@ -769,6 +772,21 @@ class MainWindow(QMainWindow):
             row.addWidget(widget, 1)
             col.addLayout(row)
 
+        # 「打开历史数据」（用户 2026-10-13 点名）：在软件内打开本地留存的
+        # 接收数据，格式/风格/功能与实时接收一致。放在参数栏最下面 —— 它读的
+        # 正是上面"保留行数"落在本地的那份备份，挨着最顺。
+        self.btn_open_history = InkButton("打开历史数据", variant="ghost")
+        self.btn_open_history.setToolTip(
+            "在接收区打开本地留存的接收数据（格式与实时一致，可搜索 / 定位异常 / 复制）")
+        self.btn_open_history.clicked.connect(self._open_history)
+        hist_row = QHBoxLayout()
+        hist_row.setSpacing(10)
+        spacer = QWidget()
+        spacer.setFixedWidth(64)
+        hist_row.addWidget(spacer)
+        hist_row.addWidget(self.btn_open_history, 1)
+        col.addLayout(hist_row)
+
         col.addStretch(1)
 
         return col
@@ -816,6 +834,10 @@ class MainWindow(QMainWindow):
         # 时间戳和每个采样点的"序号"染蓝（见 ui_highlight）。纯装饰层：
         # 文档里的文字一个字符都没改，保存/搜索/复制走的仍是纯文本。
         self._rx_highlighter = RxHighlighter(self.txt_rx.document())
+        # 历史回放提示条（回放时才显示，见 _refresh_replay_ui）
+        self._replay_bar = self._build_replay_bar()
+        self._replay_bar.hide()
+        left.addWidget(self._replay_bar)
         self._search_bar = self._build_search_bar()
         # 展开/收起走连续过渡（高度 + 不透明度，120fps）。直接 show/hide 是一帧
         # 跳变，日志框会被猛地顶下去，在高刷屏上很扎眼。
@@ -863,6 +885,24 @@ class MainWindow(QMainWindow):
         self._rx_rail.setLayout(rail)
         area.addWidget(self._rx_rail)
         return area
+
+    def _build_replay_bar(self) -> QWidget:
+        """历史回放提示条：告诉用户"现在看的是本地留存数据"，并给一个返回实时的出口。"""
+        bar = QWidget()
+        bar.setObjectName("replayBar")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(10, 6, 6, 6)
+        row.setSpacing(8)
+        icon = IconLabel(GLYPH_SAVE, 13)
+        row.addWidget(icon)
+        label = QLabel("正在查看本地留存的接收数据（格式与实时一致，可搜索 / 定位异常 / 复制）")
+        label.setFont(ui_font(11))
+        label.setObjectName("replayCaption")
+        row.addWidget(label, 1)
+        back = InkButton("返回实时", variant="ghost")
+        back.clicked.connect(self._on_replay_close)
+        row.addWidget(back)
+        return bar
 
     def _build_search_bar(self) -> QWidget:
         """接收区搜索条。放在选项行和日志之间 —— 浏览器里那套 find bar 的位置，
@@ -2038,6 +2078,12 @@ class MainWindow(QMainWindow):
             # 和滚动条都是惰性且错位的，怎么补都稳不住，索性不追加。）
             self._paused_frames.append((text, display))
             return
+        # 历史回放中：实时数据照常记进本地留存（不丢），但不写进这块正在
+        # 展示历史数据的只读画面 —— 否则用户翻看的内容会被新帧冲走。
+        if self._replay_active:
+            import rx_history
+            rx_history.feed(display)
+            return
         self._append_display(text, display)
 
     def _append_display(self, text: str, display: str) -> None:
@@ -2410,6 +2456,61 @@ class MainWindow(QMainWindow):
             return
         self._toast(f"已保存到 {path}", 5000)
 
+    # -------------------------------------------------------------- 历史数据回放
+
+    def _open_history(self) -> None:
+        """在软件内打开本地留存的接收数据（用户 2026-10-13 点名）。
+
+        格式、风格、功能与实时接收**完全一致** —— 不复刻一套渲染，而是把文件
+        内容灌进同一个接收区、同一套着色器/排版管线，所以时间戳紫、序号蓝、
+        电压红/绿、温度黄、BMS 橙、搜索、定位异常、复制、保存全都照旧可用。
+        回放期间实时数据不覆盖画面（串口若开着，帧照样进历史文件，只是不往
+        这块只读画面里写）——顶部给一条返回实时的提示条。
+        """
+        import rx_history
+        rows = rx_history.all_lines()
+        if not rows:
+            self._toast("还没有本地留存的接收数据", 3000)
+            return
+        self._enter_replay(rows)
+        self._toast(f"已载入本地留存数据 {len(rows)} 行（可搜索/定位异常/复制；"
+                    "点右上角返回实时）", 5000)
+
+    def _enter_replay(self, rows) -> None:
+        """把给定行灌进接收区并进入回放模式。"""
+        self.txt_rx.clear()
+        self._reset_matches()
+        self._clear_alert_highlight()
+        # 回放内容走与实时相同的着色/排版管线：_align_section 从头推（历史文件
+        # 里每轮都带时间戳，段状态自洽），着色的段状态由 QSyntaxHighlighter
+        # 自己按块序推，这里只需要把文本塞进去。
+        self._align_section = SECTION_OTHER
+        self._stamp_anchor_seen = False
+        self._stamp_last_monotonic = 0.0
+        text = "\n".join(rows)
+        self.txt_rx.setPlainText(text)
+        self.txt_rx.moveCursor(QTextCursor.MoveOperation.Start)
+        self._replay_active = True
+        self._refresh_replay_ui()
+
+    def _exit_replay(self) -> None:
+        """返回实时：清掉回放画面，回到"等待实时数据"的姿态。"""
+        self._replay_active = False
+        self._refresh_replay_ui()
+        self._clear_receive()
+
+    def _refresh_replay_ui(self) -> None:
+        """回放模式下：显示返回实时的提示条，接收区改成回忆态提示。"""
+        if self._replay_active:
+            self._replay_bar.show()
+            self.txt_rx.setPlaceholderText("正在查看本地留存数据（点右上角返回实时）")
+        else:
+            self._replay_bar.hide()
+            self.txt_rx.setPlaceholderText("收到的数据会显示在这里")
+
+    def _on_replay_close(self) -> None:
+        self._exit_replay()
+
     # --------------------------------------------------------------------- 发送
 
     def _on_send(self) -> None:
@@ -2487,9 +2588,14 @@ class MainWindow(QMainWindow):
 
         MaximumBlockCount 会即时裁剪，所以缩小之后超出的旧行马上被丢掉 ——
         这是"保留行数"该有的语义，不需要额外确认。
+
+        同时把**本地留存行数**调到一致（用户 2026-10-13 点名"本地留存接收行数
+        备份改为与软件内接收区保留行数一致，并在用户修改后同步更新"）。
         """
         self._rx_blocks = max(RX_LINES_MIN, min(RX_LINES_MAX, int(value)))
         self.txt_rx.setMaximumBlockCount(self._rx_blocks)
+        import rx_history
+        rx_history.set_max_lines(self._rx_blocks)
 
     def _on_rx_lines_text_changed(self, text: str) -> None:
         """「保留行数」下拉框的文字变了（选预设或手动输入）：解析出整数生效。
@@ -2645,9 +2751,12 @@ class MainWindow(QMainWindow):
         self._rx_blocks = max(RX_LINES_MIN, min(RX_LINES_MAX,
                                                 int(settings.value("rx_blocks", DEFAULT_RX_BLOCKS))))
         # 写回下拉框：editTextChanged → _on_rx_lines_text_changed 会把 txt_rx
-        # 的上限一并定下来（下面的 setMaximumBlockCount 是无信号时的兜底）
+        # 的上限一并定下来（下面的 setMaximumBlockCount 是无信号时的兜底）。
+        # 本地留存行数也在 _on_rx_lines_changed 里同步（无信号时这里补一次）。
         self.cmb_rx_lines.setEditText(str(self._rx_blocks))
         self.txt_rx.setMaximumBlockCount(self._rx_blocks)
+        import rx_history
+        rx_history.set_max_lines(self._rx_blocks)
         # 毛玻璃：默认档现在是 0（不要磨砂）。历史默认值（68 / 100）几乎不可能是
         # 用户特意调的 —— 何况 glass 每次关窗都会把当前值写盘，"值等于旧默认"根本
         # 说明不了用户动没动过滑杆。所以判据是**用户有没有在设置面板里选过**：
