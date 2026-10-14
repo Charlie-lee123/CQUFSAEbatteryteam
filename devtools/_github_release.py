@@ -223,6 +223,10 @@ def main() -> int:
         print("Release 已存在，改用现有的")
         status, rel = with_retry(op, token, API + f"/releases/tags/{tag}",
                                  what="读取已有 Release")
+        # 复用时把说明也刷新成这次的（不然改了 notes 永远不会出现在页面上）
+        if rel.get("body") != body_text:
+            with_retry(op, token, API + f"/releases/{rel['id']}", method="PATCH",
+                       data={"body": body_text}, what="更新 Release 说明")
     if status not in (200, 201):
         print("创建失败:", status, rel)
         return 1
