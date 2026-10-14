@@ -352,17 +352,6 @@ def measure_error_spans(text: str, section: str, volt: tuple[int, int],
     return spans
 
 
-def error_spans(text: str, section: str, volt: tuple[int, int],
-                temp: tuple[int, int]) -> list[tuple[int, int]]:
-    """一行里所有"有误"的区间：电压/温度越界 **加上** BMS ERROR。
-
-    BMS 那行是"整包报错"的标记（用户要它标黄），所以也算有误；不过定位按钮
-    **优先**找电压/温度越界 —— 用户的说法是"定位到最近一次读取到的电压有误或
-    温度有误的位置"，BMS 只在前两者都没有时兜底（见 main_window._last_error_block）。
-    """
-    return measure_error_spans(text, section, volt, temp) + bms_error_spans(text)
-
-
 def bms_error_spans(text: str) -> list[tuple[int, int]]:
     """"BMS ERROR" 字样的染色区间。"""
     spans = []

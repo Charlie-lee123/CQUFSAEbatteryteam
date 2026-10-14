@@ -195,7 +195,6 @@ SWITCH_OFF = {"light": "#D5D9DE", "dark": "#3A3E44"}
 
 CARD_RADIUS = 26
 CONTROL_RADIUS = 16
-PILL_RADIUS = 999          # 药丸按钮由高度算出来，见 ui_controls
 CARD_PAD = 18
 # 卡片间距留得比较足，给圆角和阴影喘息的空间，也更接近小米那种疏朗的密度
 GAP = 18
@@ -209,7 +208,12 @@ SHADOW_BLUR = 18
 CAPTION_H = 34
 CAPTION_BTN_W = 46
 CAPTION_BTN_H = 30
-CAPTION_INSET = 6          # 关闭键右边缘离标题栏右端留一点，别贴着窗口边
+# 关闭键右边缘离**窗口右端**留一点（标题栏整条出血到窗口边缘，见
+# main_window._build_ui，所以这个数就是离窗口边的距离）。原来是 6，加上标题栏
+# 自己没有出血、被根布局又往里推了 12px，实际离窗口边 18px —— 用户点名"为什么
+# 距离界面最右上角仍有较大间隙"。现在 4px：贴着但不压窗口边（窗口化时 DWM 会在
+# 角上切一刀，留 4px 不至于被切到）。
+CAPTION_INSET = 4
 CAPTION_GAP = 2            # 三颗键之间
 
 # 字体族：MiSans 装了就优先（小米自家字体），否则退到 Windows 的系统 UI 字体
@@ -269,7 +273,6 @@ GLYPH_EXPAND = "\uE740"           # 箭头朝外（展开）
 GLYPH_RESTORE = "\uE73F"          # 箭头朝内（还原）
 GLYPH_SEND = "\uE724"             # 纸飞机
 GLYPH_SETTINGS = "\uE713"         # 齿轮
-GLYPH_POWER = "\uE7E8"            # 电源
 GLYPH_COLLAPSE = "\uE70D"         # 向下小箭头
 GLYPH_EXPAND_CHEVRON = "\uE70E"   # 向上小箭头
 # 上下 chevron 的通用名。搜索条拿它当"上一个 / 下一个"，比借 expand/collapse 那对名字好读
@@ -504,13 +507,13 @@ QLabel#searchCount {
 }
 
 /* ---- 历史回放提示条 ----
-   回放时出现在接收区上方：surface_2 底 + 主色左边条，一眼看出"这不是实时"。 */
-QWidget#replayBar {
-    background: @surface_2@;
-    border: 1px solid @line@;
-    border-left: 3px solid @fill_primary@;
-    border-radius: 8px;
-}
+   ⚠️ 这里**故意没有** `QWidget#replayBar { background/border/border-radius }`：
+   QSS 对普通 QWidget 的 border-radius 在真实主窗口里会被整条丢掉（渲染成直角，
+   2026-10-14 用户报"边框没有圆角"就是这个），所以那条面改由
+   ``main_window.ReplayBar.paintEvent`` 自绘（和卡片同一条路，圆角取 CARD_RADIUS，
+   描边取 line）。留着 QSS 那条只会和自绘打架。
+   原来还挂着一条 `border-left: 3px solid @fill_primary@`（深色主题下就是一根近白
+   竖条），用户点名"如非必要请一并移除" —— 文案本身已说明是回放数据，纯装饰，去掉。 */
 
 QLabel#replayCaption {
     color: @ink_2@;
@@ -820,6 +823,7 @@ def stylesheet() -> str:
         "@line@": token("line"), "@line_strong@": token("line_strong"),
         "@fill_primary@": token("fill_primary"),
         "@CONTROL_RADIUS@": str(CONTROL_RADIUS),
+        "@CARD_RADIUS@": str(CARD_RADIUS),
         "@sel_rgb@": rgb("sel"), "@ink3_rgb@": rgb("ink_3"),
         "@editor@": editor_rgba(),
     }

@@ -28,12 +28,12 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtNetwork import (
     QNetworkAccessManager, QNetworkReply, QNetworkRequest,
 )
-from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QProgressBar, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QHBoxLayout, QLabel, QProgressBar, QVBoxLayout, QWidget,
+)
 
-from ui_anim import Tween, out_cubic
 from ui_controls import InkButton
-from ui_theme import GAP, qcolor, ui_font
-
+from ui_theme import GAP, ui_font
 TRANSFER_TIMEOUT_MS = 20000      # 单请求超时（含镜像响应慢的余量）
 SOURCE_TIMEOUT_MS = 8000         # 版本检测单源超时
 CHECK_PASSES = 2                 # 整条源链的重试轮数

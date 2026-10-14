@@ -29,7 +29,7 @@ from PySide6.QtWidgets import QWidget
 
 from ui_controls import CaptionButton
 from ui_theme import (
-    CAPTION_GAP, CAPTION_H, CAPTION_INSET, CARD_PAD, GLYPH_WIN_CLOSE, GLYPH_WIN_MAX,
+    CAPTION_GAP, CAPTION_H, CAPTION_INSET, CARD_PAD, GAP, GLYPH_WIN_CLOSE, GLYPH_WIN_MAX,
     GLYPH_WIN_MIN, GLYPH_WIN_RESTORE, HEADER_PAD, LOCKUP_MIN_W, SHADOW_PAD,
     current_scheme, qcolor, ui_font,
 )
@@ -141,6 +141,12 @@ class CaptionBar(QWidget):
 
     ICON_PX = 16
     ICON_GAP = 8            # 图标与标题文字之间的留白（断言里要认这一段）
+    # 窗口图标 / 标题文字的左边距。
+    # 标题栏整条**出血**到窗口左右边缘（见 main_window._build_ui），所以这里要把
+    # 根布局原先那圈 ``GAP - SHADOW_PAD`` 的白边自己补回来，绝对值才和下面品牌
+    # 页头里队标的左边缘对齐（那是"窗口白边 + 卡片内衬"两段相加）。
+    # 抽成常量是给断言用的：自测按它量"图标画在哪一格"，写死字面量两边会漂。
+    TITLE_LEFT = GAP - SHADOW_PAD + CARD_PAD + SHADOW_PAD
 
     def __init__(self, title: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -194,14 +200,14 @@ class CaptionBar(QWidget):
 
         标题不是装饰：整条标题栏大部分是空的，光秃秃一条空白带在窗口顶部会像
         排版事故；写上窗口名既像系统标题栏，窗口化时被别的窗口压住也好认。
-        左边距取 ``CARD_PAD + SHADOW_PAD``，跟下面品牌页头里队标的左边缘对齐。
+        左边距见 ``TITLE_LEFT``（那儿的注释解释了它为什么不是 CARD_PAD 那一套）。
         """
         if not self._title:
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        left = float(CARD_PAD + SHADOW_PAD)
+        left = float(self.TITLE_LEFT)
 
         # 先画窗口图标（系统标题栏上那枚），再接着写字
         icon = self._icon.pixmap(QSize(self.ICON_PX, self.ICON_PX),

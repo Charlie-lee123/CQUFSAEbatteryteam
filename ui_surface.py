@@ -47,6 +47,31 @@ _shadows: dict[tuple[int, int, int, int], QPixmap] = {}
 _SHADOW_CACHE_LIMIT = 32
 
 
+def paint_surface(painter: QPainter, box: QRectF, radius: float,
+                  fill: QColor | None = None,
+                  border: QColor | None = None) -> QPainterPath:
+    """画一块「圆角实面 + 1px 描边」，返回这条圆角路径。
+
+    ⛔ 全 App 的"面"都要这样画，**别用 QSS 的 background/border-radius 画面**：
+    QSS 对**普通 QWidget** 的 border-radius 在真实主窗口里会被整条丢掉
+    （2026-10-14 实测：同一份样式表在隔离窗口里是圆的、在主窗口里却是直角，
+    连强制 unpolish/polish 都救不回来），而 QPlainTextEdit / QLineEdit 那类
+    原生控件才稳定 —— 一半圆一半方就是这么来的。卡片本来就是自绘的，
+    统一走这条路才不会再踩。
+
+    ``box`` 想要 1px 描边正好落在控件边界内的话，调用方自己先内缩 0.5。
+    """
+    path = QPainterPath()
+    path.addRoundedRect(box, radius, radius)
+    if fill is not None:
+        painter.fillPath(path, fill)
+    if border is not None:
+        pen = QPen(border)
+        pen.setWidthF(1.0)
+        painter.strokePath(path, pen)
+    return path
+
+
 def card_shadow(width: int, height: int, radius: int, alpha: int) -> QPixmap:
     """卡片阴影：圆角剪影模糊一次后缓存。按 (宽, 高, 圆角, 透明度) 取。"""
     key = (width, height, radius, alpha)
@@ -72,9 +97,6 @@ def card_shadow(width: int, height: int, radius: int, alpha: int) -> QPixmap:
     _shadows[key] = shadow
     return shadow
 
-
-def clear_shadow_cache() -> None:
-    _shadows.clear()
 
 
 # ---------------------------------------------------------------- 入场淡入

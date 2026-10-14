@@ -5,20 +5,20 @@
 针对车队电池管理系统的实际数据格式做了深度定制：一轮数据里时间戳、电压、温度、
 BMS 状态混在一起，这个工具负责把它们**按段正确着色、对齐、并能在出问题时一键定位**。
 
-当前版本：**v1.8**（2026-10-13）
+当前版本：**v2.0**（2026-10-15）
 
 ## 一键下载
 
 **推荐：安装版**（可选安装位置、自动建桌面快捷方式、带卸载程序）
 
-[![下载安装包](https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E4%B8%8B%E8%BD%BD-%E5%AE%89%E8%A3%85%E7%89%88%20Setup-2ea44f?logo=github&logoColor=white)](https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant-setup-1.8.exe)
+[![下载安装包](https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E4%B8%8B%E8%BD%BD-%E5%AE%89%E8%A3%85%E7%89%88%20Setup-2ea44f?logo=github&logoColor=white)](https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant-setup-2.0.exe)
 
 **免安装版**（单文件，下载后双击即用）
 
 [![下载 SerialAssistant.exe](https://img.shields.io/badge/%E5%85%8D%E5%AE%89%E8%A3%85%E7%89%88-SerialAssistant.exe-0969da?logo=github&logoColor=white)](https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant.exe)
 
 也可以直接打开：
-- 安装版：<https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant-setup-1.8.exe>
+- 安装版：<https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant-setup-2.0.exe>
 - 免安装版：<https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant.exe>
 
 > 两个链接都指向**最新 Release**。安装版适合日常使用（能自选目录、生成桌面
@@ -57,8 +57,16 @@ BMS 状态混在一起，这个工具负责把它们**按段正确着色、对�
 
 **连接**
 
+- 连接方式可选**串口**或**蓝牙广播**
 - 串口自动扫描、插拔自动识别；打不开串口只提示、绝不弹窗打扰
 - 串口开关、波特率 / 校验位 / 数据位 / 停止位 / 编码 / HEX 视图与发送、定时发送
+- 建链不卡界面：慢连接（如蓝牙虚拟串口）期间状态栏显示「正在连接 …」，
+  再拨一下开关即可取消
+- **蓝牙广播**（v2.0）：只被动扫描 BLE 广播包，**不配对、不连接、不绑定**，
+  开机就能读；设备把数据放进广播包（manufacturer / service data 都认）即可。
+  代价是单向且带宽低（BLE 4.x 单包 31 字节），所以广播模式下发送区禁用。
+  附命令行探针 `SerialAssistant.exe --ble-scan [秒数]`：不进界面扫一遍，
+  把设备名 / 地址 / 广播负载十六进制写到 `logs\蓝牙扫描结果.txt`，便于查自己的设备
 
 **界面**
 
@@ -71,8 +79,8 @@ BMS 状态混在一起，这个工具负责把它们**按段正确着色、对�
 
 - 全部定制项走注册表（`customization.py`），设置面板按注册表自动生成
 - 分级日志（`logs/serialassistant.log`，滚动 1MB × 3）
-- 自测框架 `selftest.py`：19 项用例，覆盖编码 / 收发 / 着色 / 全屏 / 标题栏等，
-  支持 offscreen 无界面运行
+- 自测框架 `selftest.py`：26 项用例，覆盖编码 / 收发 / 着色 / 全屏 / 标题栏 /
+  串口建链 / 蓝牙广播等，支持 offscreen 无界面运行
 
 ## 目录结构
 
@@ -198,6 +206,7 @@ BMS ERROR               ← BMS 状态（橙），到此为止：其后的数值
 | v1.6 | 2026-10-12 | 下拉选择全面统一成波特率那套展开交互：**「保留行数」从数字框改为可编辑下拉**（预设 500～500000 行展开选，也可直接输入任意值）；**弹层宽度按最宽选项自适应**（修复编码弹层把 `latin-1` 截成 `l...1`）；**所有下拉弹层加 150ms 展开动画**（从锚点一侧展开到全高并淡入，朝下/朝上开各自锚定）；修复非编辑类下拉弹层底部残留黑条、四角被裁成直角的问题（现与波特率弹层完全同观感） |
 | v1.7 | 2026-10-12 | **检查更新重构**：版本检测走国内可直连多源链（jsDelivr → ghfast → gh-proxy → GitHub raw → API，每源 8 秒超时自动回退，开着代理走 GitHub 直连，整链失败还会经本机代理再试一遍）；发现新版本弹窗（立即更新 / 暂不更新 / 前往仓库）；应用内自动更新（镜像源下载 + SHA256 完整性校验 + 静默替换重启，配置完整保留）。**历史接收数据**：自动保存最近 5000 行接收数据（含时间戳）到与日志同目录的 `接收历史.log`，到量滚动覆盖最早数据，纯内存入队 + 定时批量落盘不影响接收性能；设置面板可一键打开记录文件。**修复欠压绿色高亮越界**：标绿区间严格限定在电压数据读取部分，不再染到温度采集区，且温度值不会被对齐补零篡改成假数据 |
 | v1.8 | 2026-10-13 | **安装程序与卸载程序**（Inno Setup）：可自定义安装位置、装完自动创建桌面快捷方式、升级沿用上次目录、卸载可选保留设置；安装版收到新版时由安装向导接替更新。**本地留存行数与接收区一致**：`接收历史.log` 的留存行数跟随「保留行数」设置实时同步，改小立即裁剪、改大不复活旧行。**软件内回放留存数据**：串口配置栏新增「打开历史数据」，把本地留存内容灌进同一个接收区，时间戳/序号/电压红绿/温度/BMS 着色与搜索、定位异常、复制全部等能力与实时完全一致。 |
+| v2.0 | 2026-10-15 | **蓝牙广播接收**（只扫描、不配对、不绑定）：新增「连接方式」切换与蓝牙设备扫描列表，设备把数据放进 BLE 广播包即可随时读取（manufacturer / service data 都认），复用同一套接收与着色管线；广播为单向，广播模式下发送区禁用。附 `--ble-scan` 命令行探针用于自查设备广播。**建链不再卡界面**：串口/蓝牙建链挪到工作线程，慢连接期间显示「正在连接 …」，再拨一次开关即可取消（此前蓝牙虚拟串口建链的几秒钟界面是冻住的）。**整项目瘦身**：清理旧构建快照与一次性探针（体积 3.7GB → 0.9GB，devtools 48 → 14 个脚本），删除死代码并抽出 14 处重复的配置还原逻辑。**修复**：自动更新下载完成后的「退出并重启」因缺少导入会报错（手动更新的 exe 替换路径会卡在旧进程里）、更新超时分支的日志调用会 NameError、自测的配置还原漏处理 `None` 值（可能污染用户设置）。 |
 
 > v2.0 计划的第 5/6/7 项（安装器、留存行数同步、软件内回放）已在 **v1.8** 落地，
 > 故 1.8 即这三项的正式发布版。

@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import (
-    QEvent, QLineF, QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal,
+    QEvent, QLineF, QPoint, QPointF, QRectF, QSize, Qt, Signal,
 )
 from PySide6.QtGui import (
     QColor, QFontMetrics, QFontMetricsF, QImage, QPainter, QPainterPath, QPen,
@@ -26,8 +26,7 @@ from PySide6.QtWidgets import (
 
 from ui_anim import Tween, out_cubic, out_quint
 from ui_theme import (
-    CAPTION_BTN_H, CAPTION_BTN_W, GLYPH_COLLAPSE, GLYPH_COPY,
-    GLYPH_EXPAND_CHEVRON, SWITCH_KNOB, SWITCH_ON,
+    CAPTION_BTN_H, CAPTION_BTN_W, GLYPH_COLLAPSE, GLYPH_EXPAND_CHEVRON, SWITCH_KNOB, SWITCH_ON,
     icon_font, mix, qcolor, switch_off_color, ui_font,
 )
 
@@ -461,76 +460,6 @@ class AlertButton(IconButton):
         painter.setBrush(red)
         painter.drawEllipse(QPointF(cx, cy + 4.4), 1.5, 1.5)
 
-
-# ------------------------------------------------------------------ 行内复制图标
-
-class CopyChip(QWidget):
-    """接收区里悬停时浮出的小图标：复制这一条接收内容。
-
-    造型与 ``IconButton`` 同款 —— 同样只画一个字形、同样的圆角比例。**只有图标，
-    不带文字**：它跟着鼠标在日志里挪，占的横面积越小越不挡事，而"两张纸"这个
-    字形在"鼠标正悬在某条日志上"的语境里没有歧义。
-
-    与 IconButton 的唯一差别是**它给自己铺了一层近乎不透明的面色**：IconButton
-    底下是干净的卡面，透过去无所谓；它悬在日志文字上，透过去就是字叠字。
-
-    它**不接收鼠标事件**（``WA_TransparentForMouseEvents``），点击由接收区的事件
-    过滤器代为判定。这不是偷懒 —— 图标是浮在文本区 viewport 上的子控件，一旦它
-    接受鼠标事件，鼠标移上去时底下的文本区就会收到 Leave，图标会当场消失，
-    根本点不到。所以它只负责"被看见"（配合淡入与描边），"被点"交给宿主。
-
-    出现时走 ``ui_anim`` 的 120fps 非线性淡入：它跟着鼠标在日志里挪动，
-    一帧跳出来会很扎眼；已经在亮着时不重新点亮，否则高速移动中会不停闪。
-    """
-
-    SIZE = 24
-    GLYPH_PX = 13
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._lit = 0.0
-        # 图标压在日志文字上方，必须"穿过"它才能选中下面的文字
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._glyph_font = icon_font(self.GLYPH_PX)
-        self.setFixedSize(self.SIZE, self.SIZE)
-        self._lit_anim = Tween(150, out_cubic, self._on_lit, parent=self)
-
-    def appear(self) -> None:
-        """浮出来时点亮一下；已经亮着就保持不动。"""
-        if self._lit < 1.0:
-            self._lit_anim.start(self._lit, 1.0)
-
-    def reset(self) -> None:
-        """收起来后复位，下次浮出重新淡入。"""
-        self._lit_anim.stop()
-        self._lit = 0.0
-        self.update()
-
-    def _on_lit(self, value) -> None:
-        self._lit = float(value)
-        self.update()
-
-    def paintEvent(self, event) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        painter.setOpacity(self._lit)
-
-        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        radius = self.width() * 0.26                 # 与 IconButton 同一套圆角比例
-        path = QPainterPath()
-        path.addRoundedRect(rect, radius, radius)
-        # 面色必须近乎不透明：它悬在日志文字上，透过去就看不清了。
-        # 用 surface 而不是 surface_2 —— 浅色主题下前者是纯白，压在白底日志区上
-        # 靠描边分层，正好是 Windows 那种浮层的感觉。
-        painter.fillPath(path, qcolor("surface", 240))
-        pen = QPen(mix(qcolor("line"), qcolor("line_strong"), self._lit))
-        pen.setWidthF(1.0)
-        painter.strokePath(path, pen)
-
-        painter.setFont(self._glyph_font)
-        painter.setPen(qcolor("ink_2"))
-        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, GLYPH_COPY)
 
 
 # ------------------------------------------------------------------ 开关

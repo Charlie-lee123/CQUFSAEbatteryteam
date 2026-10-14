@@ -429,7 +429,11 @@ class SettingsDialog(QDialog):
         # 完整路径放 tooltip 里（显示的是中间省略版）
         path_label.setToolTip(log_path)
         path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        row.addWidget(path_label, 1)
+        # 按钮**紧跟**在路径文字后面，不要被推到行尾：标签不给拉伸因子，
+        # 按钮接在它后面，剩下的空白交给末尾那根 stretch（用户点名："打开记录的
+        # 按钮应该紧挨着相邻文字，去掉它们之间多余的空白间距"——原来标签吃 stretch
+        # 撑满整行，文字结束到按钮之间就会空出一大段）。
+        row.addWidget(path_label)
         # 一键导出（用户点名）：把日志另存到用户挑的位置，方便发给别人排查。
         self.btn_export_log = InkButton("导出日志", variant="ghost")
         self.btn_export_log.setToolTip("把日志文件另存为一份，方便发给别人排查问题")
@@ -440,6 +444,7 @@ class SettingsDialog(QDialog):
             lambda: QDesktopServices.openUrl(
                 QUrl.fromLocalFile(str(Path(log_path).parent))))
         row.addWidget(open_button)
+        row.addStretch(1)          # 同上：按钮串在文字后面，空白推到行尾
         form.addRow(self._row(row))
 
         # 接收历史行（自动保存的最近 5000 行接收数据，与日志同目录）：
@@ -457,7 +462,7 @@ class SettingsDialog(QDialog):
             hpath_label.setToolTip(history_path)
             hpath_label.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextSelectableByMouse)
-            hrow.addWidget(hpath_label, 1)
+            hrow.addWidget(hpath_label)          # 不拉伸，见上面日志行的说明
             hist_button = InkButton("打开记录", variant="ghost")
             hist_button.setToolTip(
                 f"打开历史接收数据（自动保存最近 {rx_history.max_lines()} 行，"
@@ -466,6 +471,7 @@ class SettingsDialog(QDialog):
                 lambda: QDesktopServices.openUrl(
                     QUrl.fromLocalFile(history_path)))
             hrow.addWidget(hist_button)
+            hrow.addStretch(1)         # 同上：按钮紧挨文字，空白推到行尾
             form.addRow(self._row(hrow))
 
     @staticmethod

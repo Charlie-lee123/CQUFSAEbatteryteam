@@ -1,2 +1,7 @@
 PySide6>=6.6
 pyserial>=3.5
+# 蓝牙广播接收（只扫描、不配对，见 ble_io.py）。Windows 上它底下走 WinRT，
+# 会连带装 winrt-runtime / winrt-Windows.* 那几个二进制轮子；打包时必须一起
+# 进去，否则界面里的"蓝牙广播"模式会起不来
+# （产物验证命令：SerialAssistant.exe --ble-scan 6，结果落在产物 logs\蓝牙扫描结果.txt）。
+bleak>=0.22

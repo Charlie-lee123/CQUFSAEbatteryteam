@@ -101,7 +101,7 @@ def capture(name):
 
 def main() -> None:
     from PySide6.QtWidgets import QApplication
-    app = QApplication(sys.argv)
+    _app = QApplication(sys.argv)      # 只要 QApplication 存在（拿屏幕信息用）
 
     proc = subprocess.Popen([EXE])
     print("started pid", proc.pid)

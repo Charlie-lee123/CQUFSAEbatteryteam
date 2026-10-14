@@ -116,9 +116,6 @@ class Tween(QObject):
     def running(self) -> bool:
         return self._running
 
-    def set_curve(self, curve) -> None:
-        self._curve = _resolve(curve)
-
     def start(self, start: float = 0.0, end: float = 1.0,
               duration: int | None = None) -> "Tween":
         """重新起一段。**可以随时打断**：起点就是当前值，不会跳一下再走。"""

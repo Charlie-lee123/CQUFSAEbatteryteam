@@ -19,11 +19,11 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QSettings, Qt
-from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QPushButton
 
 from pathlib import Path
 
+from ble_io import BleBroadcastWorker
 from serial_io import (
     SerialWorker, StreamDecoder, _port_sort_key, list_serial_ports, parse_hex, to_hex,
 )
@@ -60,6 +60,28 @@ def wait_for(app: QApplication, predicate, timeout: float = 3.0) -> bool:
     return predicate()
 
 
+def restore_settings(settings, snapshot) -> None:
+    """把 QSettings 还原到 ``snapshot``：多余的键删掉、记过的写回。
+
+    这段逻辑原本在本文件里重复了 14 遍，而它**写错一次就是永久污染用户配置**
+    （少删/漏还原都会被"snapshot 把脏值当基线"的自我固化放大，见本文件顶部那段
+    说明）。集中到这里，改一次全对。两条容易漏的：
+
+      · 快照里没有的键要 remove（不然测试留下的键会一直留着）；
+      · 快照里是 **None** 的键也要 remove，**不能** setValue(key, None) ——
+        那会往注册表写一个 null，customization.get 读到 None 就不再回落默认值。
+        这一条原先只有 14 处里的 1 处写了，其余 13 处都漏着。
+    """
+    for key in settings.allKeys():
+        if key not in snapshot:
+            settings.remove(key)
+    for key, value in snapshot.items():
+        if value is None:
+            settings.remove(key)
+        else:
+            settings.setValue(key, value)
+
+
 def window_click(app: QApplication, window, point: QPoint) -> None:
     """经 windowHandle 派发一次真实点击（press + release）。
 
@@ -94,11 +116,199 @@ def make_window():
     会把 loop:// 那条用例顶掉（串口已经开着，点"打开"反倒成了"关闭"）——
     所以除了专门验它的用例，其余一律先停表。
     """
-    from main_window import MainWindow
+    from main_window import LINK_SERIAL, MainWindow
 
     window = MainWindow()
     window._port_watch.stop()
+    # ⚠️ 连接方式**钉成串口**：本文件里绝大多数用例（收发、回环、建链、插拔…）
+    #    讲的都是串口那条路，而"连接方式"是用户配置（选过就落盘）。不钉的话，
+    #    用户上次用过蓝牙广播，一片串口用例会同时挂掉、现象还各不相同
+    #    （实测 5 条一起挂：状态栏文字不对、假句柄没关、发送路径报没有 write…）。
+    window.cmb_link.setCurrentText(LINK_SERIAL)
     return window
+
+
+def check_open_async(app: QApplication) -> None:
+    """建链必须**不阻塞界面**，而且能中途取消。
+
+    为什么专门有一条：蓝牙串口在 Windows 上要先建 RFCOMM 链路，慢的时候好几秒；
+    以前 ``open()`` 是在界面线程里同步做的，那几秒窗口是**冻住的**（用户 2026-10-14
+    点名优化）。改成"只发起、结果走信号"之后，这段行为必须钉住，否则哪天有人
+    图省事把它改回同步的，界面又会卡 —— 而那种卡在自测里是**看不出来**的。
+
+    手法：把 ``serial_for_url`` 换成一个 open 要睡 1.2 秒的假句柄，于是
+      · 发起调用必须**立刻返回**（界面没被占住）；
+      · 期间状态栏是"正在连接 …"（用户看得见反馈，而不是像卡死）；
+      · 中途取消要立刻回到"未打开"，不能等那 1.2 秒；
+      · 取消之后假句柄必须被**关掉**（没连上也不能把口留着）。
+    """
+    import serial_io
+
+    class _SlowPort:
+        """假串口句柄：open() 睡一会儿。"""
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def open(self) -> None:
+            time.sleep(1.2)
+
+        def close(self) -> None:
+            self.closed = True
+
+        # 读循环要用到的部分（本次只考建链，给最小可用实现）
+        @property
+        def in_waiting(self) -> int:
+            return 0
+
+        def read(self, count: int) -> bytes:
+            time.sleep(0.03)
+            return b""
+
+        def write(self, data: bytes) -> None:
+            pass
+
+    created: list[_SlowPort] = []
+    real_for_url = serial_io.serial.serial_for_url
+
+    def fake_for_url(port, **_kwargs):
+        made = _SlowPort()
+        created.append(made)
+        return made
+
+    settings = QSettings("MimoWorks", "SerialAssistant")
+    snapshot = {key: settings.value(key) for key in settings.allKeys()}
+    serial_io.serial.serial_for_url = fake_for_url
+    window = make_window()
+    try:
+        window._refresh_ports(announce=False)      # 名单是假的没关系：端口名直接传
+        start = time.perf_counter()
+        window._open_port("SLOW1")
+        took = time.perf_counter() - start
+        assert took < 0.3, \
+            f"发起建链把界面线程占住了 {took:.2f}s —— open() 又变回同步的了？"
+        assert window._worker is not None, "发起之后没有 worker（取消就无从谈起）"
+        assert not window._port_connected, "还没连上就标成已连接了"
+        assert window.lbl_state.text().startswith("正在连接"), window.lbl_state.text()
+        assert not window.cmb_port.isEnabled(), "建链期间配置项没锁住"
+
+        start = time.perf_counter()
+        window._close_port()                        # 取消
+        cancel_took = time.perf_counter() - start
+        assert cancel_took < 0.4, \
+            f"取消建链卡了 {cancel_took:.2f}s（不该等那 1.2 秒的建链）"
+        assert window._worker is None and not window._port_connected
+        assert window.lbl_state.text() == "未打开", window.lbl_state.text()
+        assert window.cmb_port.isEnabled(), "取消之后配置项没解锁"
+
+        # 让那个慢线程跑完：它应当发现"已被取消"→ 关掉句柄 → 自己退出
+        wait_for(app, lambda: bool(created) and created[0].closed, timeout=3.0)
+        assert created and created[0].closed, "取消之后假句柄没被关掉"
+    finally:
+        serial_io.serial.serial_for_url = real_for_url
+        window.close()
+        restore_settings(settings, snapshot)
+        settings.sync()
+
+
+def check_ble_broadcast(app: QApplication) -> None:
+    """蓝牙广播通道（ble_io）：只扫描、不连接、不配对，把广播负载当数据流送出来。
+
+    用**假扫描器**驱动（把 bleak.BleakScanner 换掉），不依赖本机有没有蓝牙、
+    周围有没有设备 —— 自测机上这两样都不一定有。真机验证走
+    `devtools/_probe_ble_worker.py` 和产物里的 `--ble-scan`。
+    """
+
+    class _FakeAdv:
+        def __init__(self, mfg=None, svc=None, rssi=-50, local_name=""):
+            self.manufacturer_data = mfg or {}
+            self.service_data = svc or {}
+            self.rssi = rssi
+            self.local_name = local_name
+
+    class _FakeDevice:
+        def __init__(self, address, name=""):
+            self.address = address
+            self.name = name
+
+    class _FakeScanner:
+        """假扫描器：start() 时把脚本里的包全喂一遍，stop() 什么也不做。"""
+
+        script: list = []
+        starts = 0
+
+        def __init__(self, detection_callback=None, scanning_mode="passive"):
+            self._cb = detection_callback
+            self.mode = scanning_mode
+
+        async def start(self):
+            _FakeScanner.starts += 1
+            assert self.mode == "passive", "广播接收必须是 passive 扫描"
+            for device, adv in _FakeScanner.script:
+                self._cb(device, adv)
+
+        async def stop(self):
+            return None
+
+    import bleak
+
+    real_scanner = bleak.BleakScanner
+    bleak.BleakScanner = _FakeScanner
+    try:
+        # 1) 只喂**目标设备**的负载：别人的包一概不要（这是"不绑定也能用"的前提）
+        _FakeScanner.script = [
+            (_FakeDevice("AA:BB:CC:DD:EE:01", "别的设备"),
+             _FakeAdv(mfg={65535: b"OTHER\n"})),
+            (_FakeDevice("AA:BB:CC:DD:EE:02", "我的BMS"),
+             _FakeAdv(mfg={65535: b"Voltage1: 01.3700\n"})),
+            (_FakeDevice("AA:BB:CC:DD:EE:03"),
+             _FakeAdv(svc={"0000fff0-0000-1000-8000-00805f9b34fb": b"SVC\n"})),
+        ]
+        worker = BleBroadcastWorker("AA:BB:CC:DD:EE:02")
+        got: list[bytes] = []
+        found: list[dict] = []
+        opened: list[bool] = []
+        worker.received.connect(got.append)
+        worker.found.connect(found.append)
+        worker.opened.connect(lambda: opened.append(True))
+        worker.open()
+        assert wait_for(app, lambda: bool(opened)), "广播通道没有发 opened"
+        wait_for(app, lambda: len(got) > 0)
+        worker.stop()
+        assert got == [b"Voltage1: 01.3700\n"], f"喂进来的负载不对：{got!r}"
+        assert len(found) == 3, f"设备列表没把扫到的都报出来：{len(found)}"
+        assert {f["address"] for f in found} == {
+            "AA:BB:CC:DD:EE:01", "AA:BB:CC:DD:EE:02", "AA:BB:CC:DD:EE:03"}
+
+        # 2) source="auto"：manufacturer 里没有就退到 service data
+        _FakeScanner.script = [
+            (_FakeDevice("AA:BB:CC:DD:EE:03"),
+             _FakeAdv(svc={"0000fff0-0000-1000-8000-00805f9b34fb": b"FROM_SVC\n"})),
+        ]
+        worker = BleBroadcastWorker("AA:BB:CC:DD:EE:03", source="auto")
+        got2: list[bytes] = []
+        worker.received.connect(got2.append)
+        worker.open()
+        wait_for(app, lambda: len(got2) > 0)
+        worker.stop()
+        assert got2 == [b"FROM_SVC\n"], f"auto 没有回退到 service data：{got2!r}"
+
+        # 3) 按**名字片段**匹配（设备地址会变 —— 手机开热点、模块换芯片都会变，
+        #    用名字选人更稳），以及指定公司 ID 的 key 过滤
+        _FakeScanner.script = [
+            (_FakeDevice("AA:BB:CC:DD:EE:04", "CQUFSAE-BMS"),
+             _FakeAdv(mfg={6: b"WRONG\n", 65535: b"RIGHT\n"})),
+        ]
+        worker = BleBroadcastWorker("cqufsae", source="manufacturer", key="0xFFFF")
+        got3: list[bytes] = []
+        worker.received.connect(got3.append)
+        worker.open()
+        wait_for(app, lambda: len(got3) > 0)
+        worker.stop()
+        assert got3 == [b"RIGHT\n"], \
+            f"名字匹配 / 公司 ID 过滤不对：{got3!r}（应只取 65535 那家公司的负载）"
+    finally:
+        bleak.BleakScanner = real_scanner
 
 
 def check_hex_codec() -> None:
@@ -145,9 +355,16 @@ def check_loopback(app: QApplication) -> None:
     """不开界面，单独验证通信层：写进去的字节应原样从 received 信号回来。"""
     worker = SerialWorker("loop://", baudrate=115200)
     chunks: list[bytes] = []
+    opened: list[bool] = []
     worker.received.connect(chunks.append)
+    # ⚠️ 监听必须在 open() **之前**挂上：建链是异步的，open() 之后才连信号
+    #    可能整个信号都错过（loop:// 毫秒级就连上了）。
+    worker.opened.connect(lambda: opened.append(True))
 
     worker.open()
+    # 建链是异步的（蓝牙口要等好几秒，所以 open() 只启动线程，真正的
+    # serial.open 在 run 里做）—— 不能像以前那样调完就当作已经连上。
+    assert wait_for(app, lambda: bool(opened)), "loop:// 没有发出 opened 信号"
     assert worker.isRunning(), "读线程没有起来"
     try:
         sent = b"\x01\x02\xa5hello"
@@ -241,8 +458,12 @@ def check_port_hotplug(app: QApplication) -> None:
                  "（Qt 的定义里这个属性连子控件一起掐）")
             ancestor = ancestor.parentWidget()
         window_click(app, window, button.mapTo(window, button.rect().center()))
-        assert wait_for(app, lambda: window._worker is not None), \
-            "点了电源开关，串口没有打开（按钮的鼠标事件被上层吃掉了）"
+        assert window._worker is not None, \
+            "点了电源开关，打开请求都没发出去（按钮的鼠标事件被上层吃掉了）"
+        # 建链是**异步**的（蓝牙口要几秒，见 SerialWorker 的说明）：先看到
+        # "正在连接 …"，连上之后才是"已打开 …"。
+        assert wait_for(app, lambda: window._port_connected), \
+            f"点了电源开关，串口没有连上：{window.lbl_state.text()!r}"
         assert window._worker.port == "loop://", window._worker.port
         assert window.lbl_state.text().startswith("已打开 loop://"), \
             window.lbl_state.text()
@@ -260,6 +481,7 @@ def check_port_hotplug(app: QApplication) -> None:
         # 5) 拔掉 → 自动断开、下拉框不再留着它
         window._open_port()
         assert window._worker is not None
+        assert wait_for(app, lambda: window._port_connected), "loop:// 没连上"
         fake[:] = []
         window._poll_ports()
         assert window._worker is None, "设备拔掉了串口还开着"
@@ -269,29 +491,27 @@ def check_port_hotplug(app: QApplication) -> None:
         #    不存在的 COM 口抛 SerialException；带冒号/未知协议的名字抛的是
         #    ValueError（serial_for_url 把它当 URL 解析）—— 只捕前一种的话，
         #    异常会一路冒到 Qt 的事件循环里。
+        #    ⚠️ 建链是异步的：这里要**等失败结果回来**，不能调完就断言（见
+        #    SerialWorker 的说明 —— 蓝牙口正是"慢"才改的异步）。
         for broken in ("COM199", "nosuch://x"):
             fake[:] = [(broken, "假装打不开的口")]
             window._refresh_ports(announce=False)
             window._select_port(broken)
             warnings.clear()
             window._open_port()
-            assert window._worker is None, f"{broken} 竟然打开了"
+            assert wait_for(app, lambda: window._worker is None), \
+                f"{broken} 竟然打开了（或失败结果没回来）"
             assert warnings and broken in warnings[-1], \
                 f"{broken} 打不开却没报错：{warnings!r}"
     finally:
         mw.list_serial_ports = real_ports
         window.close()
-        for key in settings.allKeys():
-            if key not in snapshot:
-                settings.remove(key)
-        for key, value in snapshot.items():
-            settings.setValue(key, value)
+        restore_settings(settings, snapshot)
         settings.sync()
 
 
 def check_ui_roundtrip(app: QApplication) -> None:
     """真实驱动主窗口：打开 loop:// → 文本发送 → 定时发送 → HEX 收发 → 关闭。"""
-    from main_window import MainWindow
 
     # 关窗口时会写 QSettings（Windows 上是注册表），先快照、结束后还原，
     # 免得跑一次自测就把真实配置改掉。
@@ -385,11 +605,7 @@ def check_ui_roundtrip(app: QApplication) -> None:
         assert len(dialogs) == 1, f"流程中出现了意外提示: {dialogs}"
     finally:
         window.close()
-        for key in settings.allKeys():
-            if key not in snapshot:
-                settings.remove(key)
-        for key, value in snapshot.items():
-            settings.setValue(key, value)
+        restore_settings(settings, snapshot)
         settings.sync()
 
 
@@ -599,7 +815,6 @@ def check_receive_search(app: QApplication) -> None:
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QKeyEvent
 
-    from main_window import MainWindow
     from ui_anim import QWIDGETSIZE_MAX
     from ui_controls import SearchEdit
 
@@ -702,18 +917,14 @@ def check_receive_search(app: QApplication) -> None:
         window._close_search()
     finally:
         window.close()
-        for key in settings.allKeys():
-            if key not in snapshot:
-                settings.remove(key)
-        for key, value in snapshot.items():
-            settings.setValue(key, value)
+        restore_settings(settings, snapshot)
         settings.sync()
 
 
 def check_animation_engine(app: QApplication) -> None:
     """动画引擎：节拍必须够 120fps、曲线必须非线性、静止时不留计时器。"""
     from ui_anim import (
-        EASINGS, FPS, FRAME_MS, Tween, linear, out_cubic, ticker_active,
+        EASINGS, FPS, FRAME_MS, Tween, out_cubic, ticker_active,
         ticker_interval,
     )
 
@@ -857,6 +1068,23 @@ def check_rx_history(app: QApplication) -> None:
         tip = btns[0].toolTip()
         assert str(rx_history.max_lines()) in tip, \
             f"「打开记录」的提示没跟随当前上限行数：{tip}"
+        # 5b) 按钮要**紧挨**路径文字（用户点名："应该紧挨着相邻文字，去掉它们
+        #     之间多余的空白间距"）。判据：按钮左缘 − 标签右缘 == 布局间距本身
+        #     （标签不再吃 stretch 撑满整行，剩下的空白交给末尾那根弹簧）。
+        dlg.show()                      # 要真实布局过一遍才有几何可比
+        app.processEvents()
+        from PySide6.QtWidgets import QLabel       # 本函数此前没用过这个名字
+        holder = btns[0].parentWidget()
+        hlabels = [lb for lb in holder.findChildren(QLabel)
+                   if lb.text().endswith(".log")]
+        assert hlabels, "接收历史行里找不到路径标签"
+        hlab = hlabels[0]
+        assert hlab.parentWidget() is holder, "路径标签与按钮不在同一个行容器里"
+        hgap = btns[0].geometry().x() - (hlab.geometry().x() + hlab.width())
+        assert hgap == holder.layout().spacing(), \
+            (f"「打开记录」没紧挨路径文字：中间空出 {hgap}px，"
+             f"应只有布局间距 {holder.layout().spacing()}px")
+        dlg.close()
         dlg.deleteLater()
 
         # 6) 路径定位不到时整行隐藏（无按钮、也不崩）
@@ -939,6 +1167,73 @@ def check_history_replay(app: QApplication) -> None:
         # 窗口没 show()，子控件 isVisible() 恒为 False —— 断言"要求显示"
         # （isHidden 为 False）而不是可见性。
         assert not window._replay_bar.isHidden(), "回放提示条没有显示"
+        # 提示条的**外观约定**（都是用户点名的）：
+        #  · 圆角必须跟卡片同一个尺度（CARD_RADIUS）；
+        #  · 这个面**不能交给 QSS 画** —— QSS 对普通 QWidget 的 border-radius 在
+        #    真实主窗口里会被整条丢掉（渲染成直角，用户第二遍报"边框没有圆角"
+        #    就是这个；同一份样式表在隔离窗口里却是圆的）。所以面由
+        #    ``main_window.ReplayBar.paintEvent`` 自绘（ui_surface.paint_surface）；
+        #  · 左侧那条竖向装饰条已去掉（原是 border-left: 3px solid @fill_primary@，
+        #    深色主题下就是一根近白竖杠；文案本身已说明是回放数据，纯装饰）。
+        import re as _re
+
+        from ui_theme import CARD_RADIUS as _CR
+        from ui_theme import stylesheet as _qss
+        _clean = _re.sub(r"/\*.*?\*/", "", _qss(), flags=_re.S)   # 去掉注释再找规则
+        assert not _re.search(r"#replayBar\s*\{", _clean), \
+            ("QSS 里又在给回放条画面了：那条 border-radius 对普通 QWidget 会被丢掉、"
+             "渲染成直角 —— 这个面必须自绘（见 ReplayBar.paintEvent）")
+        assert window._replay_bar.__class__.__name__ == "ReplayBar", \
+            "回放条不是自绘的 ReplayBar（又换回普通 QWidget + QSS 了？）"
+        assert _CR == window._replay_bar.RADIUS, \
+            f"自绘用的圆角 {window._replay_bar.RADIUS} 没跟卡片统一（{_CR}）"
+
+        # 渲染自证：把条单独渲染一张图 —— 左上角必须**没被画上**（alpha 0，圆角
+        # 让出了那个角），中间必须画上（面还在）。这条直接压住"圆角到底生没生效"，
+        # 比看 QSS 文本可靠得多（QSS 文本对但渲染成直角，就是这么漏过去的）。
+        from PySide6.QtGui import QImage, QRegion
+        from PySide6.QtWidgets import QWidget as _QW
+
+        _rb = window._replay_bar
+        _rb.resize(_rb.sizeHint())
+        _rb.layout().activate()
+        _dpr = _rb.devicePixelRatioF()
+        _im = QImage(max(2, int(_rb.width() * _dpr)),
+                     max(2, int(_rb.height() * _dpr)),
+                     QImage.Format.Format_ARGB32_Premultiplied)
+        _im.fill(0)
+        # ⚠️ 图必须**先声明自己的 devicePixelRatio**，否则 render 会按 1x 往这张
+        #    2x 的图里画，取样点全落在画布外 —— 角上 alpha=0 会让断言"假通过"，
+        #    中间 alpha=0 又让它"假挂"（实测就挂在这一步）。标题栏那段自测
+        #    也是这么写的（shot.setDevicePixelRatio）。
+        _im.setDevicePixelRatio(_dpr)
+        # ⚠️ 必须显式只给 DrawChildren：默认还带 DrawWindowBackground，会先拿调色板
+        #    铺一层窗底色，角上那点也被填上，断言直接假挂。
+        _rb.render(_im, QPoint(0, 0), QRegion(), _QW.RenderFlag.DrawChildren)
+        _corner = _im.pixelColor(int(1 * _dpr), int(1 * _dpr))
+        _mid = _im.pixelColor(int(_rb.width() * _dpr / 2),
+                              int(_rb.height() * _dpr / 2))
+        assert _corner.alpha() == 0, \
+            (f"回放条左上角被画上了（{_corner.name()} alpha={_corner.alpha()}）"
+             "：圆角没生效 —— 多半又改回用 QSS 画这个面了")
+        assert _mid.alpha() > 0, "回放条中间没画上底（自绘的面丢了）"
+
+        # 「返回实时」按钮的四角要落在两端半圆**之内**。条高 50、圆角取
+        # min(CARD_RADIUS, 条高/2) = 25 → 两端是半圆；按钮高 38，右内边距
+        # 不够时描边会戳出条的底色（6px 时实测戳出 1.9px，改成 12px）。
+        # 这里直接激活布局量真几何 —— 窗口没 show()，不能用 isVisible 那套。
+        _radius = min(float(_CR), _rb.height() / 2.0)
+        _cx, _cy = _rb.width() - _radius, _radius          # 右上角那个半圆的圆心
+        _btns = [b for b in _rb.findChildren(QPushButton) if b.text()]
+        assert _btns, "回放条里找不到「返回实时」按钮"
+        _bg = _btns[0].geometry()
+        for _px, _py in ((_bg.x() + _bg.width(), _bg.y()),
+                         (_bg.x() + _bg.width(), _bg.y() + _bg.height())):
+            _d = ((_px - _cx) ** 2 + (_py - _cy) ** 2) ** 0.5
+            assert _d <= _radius + 0.01, \
+                (f"「{_btns[0].text()}」的角戳出了回放条两端的半圆："
+                 f"到圆心 {_d:.1f}px > 半径 {_radius:.0f}px"
+                 f"（条 {_rb.width()}x{_rb.height()}，按钮 {_bg.x()},{_bg.y()}）")
         doc = window.txt_rx.document()
         body = [doc.findBlockByNumber(b).text() for b in range(doc.blockCount())]
         assert any("[2026-10-12 22:00:00]" in t for t in body), \
@@ -1195,7 +1490,7 @@ def check_tooltip_and_buttons(app: QApplication) -> None:
     from ui_settings import SettingsDialog
     from ui_theme import stylesheet
 
-    from main_window import BUTTON_SPECS, MainWindow
+    from main_window import BUTTON_SPECS
 
     # 1) tooltip 的字号必须写死在样式表里。不写就会退回应用字体（入口设的是
     #    12.5pt ≈ 16.7px），一行中文提示比旁边的正文还大 —— 这正是要修的问题。
@@ -1400,11 +1695,7 @@ def check_tooltip_and_buttons(app: QApplication) -> None:
         # 配置（hidden_buttons 被永久污染过，实测踩到）。窗口对象交给下面的
         # 全局快照兜底 —— main() 跑完所有用例后无条件恢复。
         window.close()
-        for key in settings.allKeys():
-            if key not in snapshot:
-                settings.remove(key)
-        for key, value in snapshot.items():
-            settings.setValue(key, value)
+        restore_settings(settings, snapshot)
         settings.sync()
 
 
@@ -1446,7 +1737,6 @@ def check_expand_and_copy_all(app: QApplication) -> None:
         app.processEvents()
         window.show()
         app.processEvents()
-        normal_size = window.size().toTuple()
 
         # ---- 1) 复制**正在查看的一轮**：从时间戳行开始，到下一个时间戳之前 ----
         window.chk_timestamp.setChecked(True)
@@ -1712,11 +2002,7 @@ def check_expand_and_copy_all(app: QApplication) -> None:
         if window._expanded:
             window._collapse_receive()
         window.close()
-        for key in settings.allKeys():
-            if key not in snapshot:
-                settings.remove(key)
-        for key, value in snapshot.items():
-            settings.setValue(key, value)
+        restore_settings(settings, snapshot)
         settings.sync()
 
 
@@ -1726,38 +2012,13 @@ def mw_button_specs():
     return main_window.BUTTON_SPECS
 
 
-def _measure_ink(widget) -> tuple:
-    """渲染控件、量文字墨迹的 (上留白, 下留白, 控件高, 墨迹高)（逻辑像素）。
-
-    做法：逐行扫像素，一**行**里出现亮度极差 > 60（背景是均匀的，差异只可能
-    来自笔画与抗锯齿边）就算有墨迹。x 范围刻意避开左右边框与右侧箭头 ——
-    下拉框的 chevron 竖直居中，会把墨迹的上下范围整个撑开。
-
-    ⚠️ offscreen 平台的字体度量会退化，量出来的数不可信 —— 调用方要限真机。
-    """
-    pix = widget.grab()
-    dpr = pix.devicePixelRatio() or 1.0
-    img = pix.toImage()
-    w, h = img.width(), img.height()
-    rows = []
-    for y in range(h):
-        vals = [img.pixelColor(x, y).lightness()
-                for x in range(int(w * 0.12), int(w * 0.70))]
-        if vals and (max(vals) - min(vals)) > 60:
-            rows.append(y)
-    if not rows:
-        return (None, None, h / dpr, 0)
-    top = rows[0] / dpr
-    bottom = rows[-1] / dpr
-    return (top, h / dpr - bottom, h / dpr, bottom - top)
-
 
 def _measure_ink_wide(widget, exclude_right: int = 30) -> tuple:
-    """同 _measure_ink，但**先找文字列、再用文字列扫行**。
+    """量控件的墨迹上下留白：**先找文字列、再用文字列扫行**。
 
-    _measure_ink 用固定 x 窗口（12%~70%）—— 对窄文字（"1"、"8" 就落在 12%
-    左边之外）会量不到；而且小 x 处左边框的圆角弧线可能制造假墨迹行，先列
-    后行能绕开。串口配置栏那几行必须用这个版本。
+    为什么不用固定 x 窗口：对窄文字（"1"、"8" 就落在固定窗口的左边之外）会量
+    不到；而且小 x 处左边框的圆角弧线可能制造假墨迹行，先列后行能绕开。
+    串口配置栏那几行必须用这个版本。
 
     返回 (上留白, 下留白, 控件高, 墨迹高)（逻辑像素）；量不到时首项为 None。
     """
@@ -2269,8 +2530,8 @@ def check_customization(app: QApplication) -> None:
             assert len(scrolls) == 1, \
                 f"设置面板应该只有一条统一滚动区，实际 {len(scrolls)} 条"
             def caption_y(text):
-                labels = [l for l in dialog.findChildren(QLabel)
-                          if l.text() == text]
+                labels = [lab for lab in dialog.findChildren(QLabel)
+                          if lab.text() == text]
                 assert labels, f"找不到「{text}」小标题"
                 return labels[0].mapTo(dialog, labels[0].rect().center()).y()
             assert caption_y("日志") > caption_y("界面按钮"), \
@@ -2390,16 +2651,7 @@ def check_customization(app: QApplication) -> None:
             dialog.close()
             app.processEvents()
     finally:
-        for key in settings.allKeys():
-            if key not in snapshot:
-                settings.remove(key)
-        for key, value in snapshot.items():
-            # 快照里是 None（键原本不存在）的必须 remove：setValue(key, None)
-            # 会写一个 null 进去，customization.get 读到 None 就不再走默认值了
-            if value is None:
-                settings.remove(key)
-            else:
-                settings.setValue(key, value)
+        restore_settings(settings, snapshot)
         settings.sync()
 
 
@@ -2414,7 +2666,7 @@ def check_config_parity_clock(app: QApplication) -> None:
     from serial_io import PARITY_CHOICES, PARITY_LETTERS
 
     from main_window import (
-        DEFAULT_RX_BLOCKS, TX_COLLAPSED_H, MainWindow,
+        DEFAULT_RX_BLOCKS, TX_COLLAPSED_H,
     )
     from ui_theme import DEFAULT_GLASS, LEGACY_GLASS, glass_strength
 
@@ -2700,11 +2952,7 @@ def check_config_parity_clock(app: QApplication) -> None:
              f"{after['btn_center']}（输入框顶 {before['editor_top']} -> {after['editor_top']}）")
     finally:
         window.close()
-        for key in settings.allKeys():
-            if key not in snapshot:
-                settings.remove(key)
-        for key, value in snapshot.items():
-            settings.setValue(key, value)
+        restore_settings(settings, snapshot)
         settings.sync()
 
 
@@ -2718,12 +2966,10 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
       —— 用户的原话正是"暂停没有起作用，空格键也不能控制"；
     - 电源开关要挂在页头产品名**正下方**，不在任何卡片里。
     """
-    from PySide6.QtGui import QFontMetricsF
 
     # ⚠️ 必须放在函数**最开头**：函数里任何一处 `from X import Y` 都会让 Y 变成
     # 整个函数的局部名，在导入语句之前用它就是 UnboundLocalError（这个坑踩过）。
     from ui_highlight import align_indexes, stamp_span
-    from ui_theme import CARD_PAD, SHADOW_PAD
 
     settings = QSettings("MimoWorks", "SerialAssistant")
     snapshot = {key: settings.value(key) for key in settings.allKeys()}
@@ -2812,7 +3058,6 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
 
         # ---- 1c) 带段标题的整帧：**值**也补零（用户点名"将单位数数值前方补零
         #     以对齐占位宽度"）—— 宽度按段内最宽的值算；BMS 之后的散值不动。
-        import re as _re_align
         frame_sample = ("Voltage1:\n1.3700 2.3820\n"
                         "Temperature1:\n1.5 2.22 10.3\n"
                         "BMS ERROR\n1.99")
@@ -3018,11 +3263,7 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
             ancestor = ancestor.parentWidget()
     finally:
         window.close()
-        for key in settings.allKeys():
-            if key not in snapshot:
-                settings.remove(key)
-        for key, value in snapshot.items():
-            settings.setValue(key, value)
+        restore_settings(settings, snapshot)
         settings.sync()
 
 
@@ -3038,7 +3279,7 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
     from PySide6.QtGui import QKeyEvent, QTextCursor
 
     from ui_highlight import index_spans, stamp_span
-    from ui_theme import rx_accent, stamp_accent
+    from ui_theme import rx_accent
 
     settings = QSettings("MimoWorks", "SerialAssistant")
     snapshot = {key: settings.value(key) for key in settings.allKeys()}
@@ -3051,7 +3292,8 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
         app.processEvents()
         window._refresh_ports(announce=False)
         window._open_port()
-        assert window._worker is not None, "loop:// 没打开，后面的收发用例没法跑"
+        assert wait_for(app, lambda: window._port_connected), \
+            "loop:// 没连上，后面的收发用例没法跑"
 
         def press(key, modifiers=Qt.KeyboardModifier.NoModifier, repeat=False) -> None:
             """往发送框发一次按键。走 sendEvent —— 应用级事件过滤器就在这条路上，
@@ -3097,6 +3339,7 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
         press(Qt.Key.Key_Return)
         assert not warned, f"空输入框按回车弹了提示：{warned!r}"
         window._open_port()
+        assert wait_for(app, lambda: window._port_connected), "重新打开 loop:// 没连上"
 
         # ---- 2) 时间戳：只打轮首、只到秒 ----
         window.chk_timestamp.setChecked(True)
@@ -3454,11 +3697,7 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
     finally:
         mw.list_serial_ports = real_ports
         window.close()
-        for key in settings.allKeys():
-            if key not in snapshot:
-                settings.remove(key)
-        for key, value in snapshot.items():
-            settings.setValue(key, value)
+        restore_settings(settings, snapshot)
         settings.sync()
 
 
@@ -3480,8 +3719,7 @@ def check_caption_bar(app: QApplication) -> None:
 
     from main_window import RESIZE_BAND
     from ui_theme import (
-        CAPTION_BTN_H, CAPTION_H, CARD_PAD, GLYPH_WIN_MAX, GLYPH_WIN_RESTORE,
-        SHADOW_PAD,
+        CAPTION_BTN_H, CAPTION_H, CAPTION_INSET, GLYPH_WIN_MAX, GLYPH_WIN_RESTORE,
     )
 
     fullscreen_testable = (_sys.platform == "win32"
@@ -3540,6 +3778,21 @@ def check_caption_bar(app: QApplication) -> None:
         top = next(iter(ys))
         assert 0 <= top and top + CAPTION_BTN_H <= CAPTION_H, \
             f"键跑到标题栏外面了：y={top}，栏高 {CAPTION_H}"
+
+        # 1b) 三颗键要**贴近窗口右上角**。用户点名："距离界面最右上角仍有较大
+        #     间隙，请调整为更贴近右上角的位置" —— 原来标题栏跟着内容一起被根布局
+        #     往里推了 GAP - SHADOW_PAD，三颗键离窗口右边其实有 18px。现在标题栏
+        #     整条出血到窗口左右边缘（见 main_window._build_ui），关闭键只剩
+        #     CAPTION_INSET。
+        assert bar.width() == window.width(), \
+            f"标题栏没有出血到窗口边缘：栏宽 {bar.width()}，窗口宽 {window.width()}"
+        bar_left = bar.mapTo(window, QPoint(0, 0)).x()
+        assert bar_left == 0, f"标题栏左端没贴住窗口左边（x={bar_left}）"
+        close_gap = window.width() - (
+            bar.btn_close.mapTo(window, QPoint(0, 0)).x() + bar.btn_close.width())
+        assert 0 < close_gap <= CAPTION_INSET + 1, \
+            (f"关闭键离窗口右边 {close_gap}px，太远（应 <= {CAPTION_INSET}px）"
+             "：标题栏没出血 / CAPTION_INSET 被改大了")
 
         windowed = layout_snapshot()
 
@@ -3697,7 +3950,7 @@ def check_caption_bar(app: QApplication) -> None:
         shot.fill(0)
         bar.render(shot)
         background = shot.pixelColor(shot.width() - 2, 2)       # 标题栏右端空白处
-        left_px = int((CARD_PAD + SHADOW_PAD) * dpr)
+        left_px = int(bar.TITLE_LEFT * dpr)     # 别写字面量：那个常量随出血布局变
         icon_px = int(bar.ICON_PX * dpr)
         gap_px = icon_px + int(bar.ICON_GAP * dpr)   # 图标之后、文字之前的留白宽度
 
@@ -3729,11 +3982,7 @@ def check_caption_bar(app: QApplication) -> None:
         assert not scratch.isVisible(), "点关闭键没有关窗"
     finally:
         window.close()
-        for key in settings.allKeys():
-            if key not in snapshot:
-                settings.remove(key)
-        for key, value in snapshot.items():
-            settings.setValue(key, value)
+        restore_settings(settings, snapshot)
         settings.sync()
 
 
@@ -3795,11 +4044,7 @@ def check_send_collapsed_startup(app: QApplication) -> None:
         finally:
             dialog.close()
     finally:
-        for key in settings.allKeys():
-            if key not in snapshot:
-                settings.remove(key)
-        for key, value in snapshot.items():
-            settings.setValue(key, value)
+        restore_settings(settings, snapshot)
         settings.sync()
 
 
@@ -3892,11 +4137,7 @@ def check_startup_state(app: QApplication) -> None:
             dialog.close()
     finally:
         window.close()
-        for key in settings.allKeys():
-            if key not in snapshot:
-                settings.remove(key)
-        for key, value in snapshot.items():
-            settings.setValue(key, value)
+        restore_settings(settings, snapshot)
         settings.sync()
 
 
@@ -3912,7 +4153,6 @@ def check_alert_locate(app: QApplication) -> None:
     from PySide6.QtGui import QImage
 
     from main_window import DEFAULT_RX_BLOCKS
-    from ui_theme import qcolor
 
     settings = QSettings("MimoWorks", "SerialAssistant")
     snapshot = {key: settings.value(key) for key in settings.allKeys()}
@@ -4065,11 +4305,7 @@ def check_alert_locate(app: QApplication) -> None:
             f"电压在前温度在后时仍应选电压行，实际定位到：{row!r}"
     finally:
         window.close()
-        for key in settings.allKeys():
-            if key not in snapshot:
-                settings.remove(key)
-        for key, value in snapshot.items():
-            settings.setValue(key, value)
+        restore_settings(settings, snapshot)
         settings.sync()
 
 
@@ -4078,6 +4314,8 @@ CHECKS = [
     ("增量文本解码", check_stream_decoder),
     ("串口枚举", check_port_enumeration),
     ("串口插拔扫描与电源开关按钮", check_port_hotplug),
+    ("串口建链异步化（不卡界面/可取消）", check_open_async),
+    ("蓝牙广播接收（只扫描不配对）", check_ble_broadcast),
     ("回车发送/时间戳轮首/序号染蓝", check_send_enter_and_stamp),
     ("loop:// 收发回环", check_loopback),
     ("界面端到端收发", check_ui_roundtrip),

@@ -17,8 +17,10 @@ import sys
 import time
 from datetime import datetime
 
-import serial
-from PySide6.QtCore import QEvent, QPoint, QRect, QSettings, Qt, QTimer
+# 建链挪进 SerialWorker 之后，界面层不再直接调 serial.* 了；这个 import 留着
+# 是因为串口异常的**语义**仍来自这个模块（后续在界面层写 except serial.SerialException
+# 时不必再想起来补 import）。
+from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSettings, Qt, QTimer
 from PySide6.QtGui import (
     QColor, QFontMetricsF, QGuiApplication, QKeySequence, QPainter, QShortcut,
     QTextCharFormat, QTextCursor,
@@ -35,6 +37,7 @@ from serial_io import (
 )
 import app_log
 import customization
+from ble_io import BleBroadcastWorker
 from ui_anim import Reveal
 from ui_backdrop import frost_tile, paint_backdrop
 from ui_brand import BrandHeader, CaptionBar
@@ -48,8 +51,9 @@ from ui_controls import (
     InkButton, LabeledField, PulseDot, SearchEdit, Switch,
 )
 from ui_settings import SettingsDialog
-from ui_surface import Card, fade_in
+from ui_surface import Card, fade_in, paint_surface
 from ui_theme import (
+    CARD_RADIUS,
     DEFAULT_GLASS, GAP, GLYPH_CHEVRON_DOWN, GLYPH_CHEVRON_UP, GLYPH_CLEAR,
     GLYPH_CLOSE, GLYPH_COLLAPSE, GLYPH_COPY, GLYPH_EXPAND, GLYPH_EXPAND_CHEVRON,
     GLYPH_PAUSE,
@@ -105,6 +109,16 @@ RX_MERGE_MAX_MS = 200
 # 300ms 覆盖 USB 读线程的调度抖动；不以换行收尾的设备最坏多等这一拍才见字。
 RX_HOLD_MAX_MS = 300
 
+# 连接方式：串口 / 蓝牙广播。
+# 蓝牙广播那条路**只被动扫描 advertisement**，不配对、不连接（用户 2026-10-14
+# 点名要的用法："只需要通过蓝牙广播随时读取数据，不需要绑定"）。代价是单向
+# （发不了指令）且带宽低，细节见 ble_io 的模块说明。
+LINK_CHOICES = ("串口", "蓝牙广播")
+LINK_SERIAL, LINK_BLE = LINK_CHOICES
+# 点刷新时扫多久（秒）。广播包密度不高（每个设备每秒几包），3.5 秒足够把周围
+# 设备列全；再长用户就要等得心急了。
+BLE_SCAN_SECONDS = 3.5
+
 # 时间戳打在哪儿：**只打在每一轮数据的轮首**，也就是用户要的"只放在 Voltage1 前面"。
 #
 # 一轮数据在传输层会被切成好几段（见 RX_MERGE_MS），"第一段"并不等于"轮首"，
@@ -155,6 +169,32 @@ BUTTON_SPECS: tuple[tuple[str, str, str], ...] = (
 )
 
 
+class ReplayBar(QWidget):
+    """历史回放提示条：**自绘**圆角面。
+
+    ⛔ 这个面不能用 QSS 画。2026-10-14 用户报"边框没有圆角"：QSS 里
+    `QWidget#replayBar { border-radius: 26px }` 对**普通 QWidget** 会被整条丢掉，
+    渲染成直角（主窗口里稳定复现；同一份样式表放进隔离窗口却是圆的，
+    强制 unpolish/polish 也救不回来）。卡片本来就是自绘的 —— 这里跟着卡片走
+    同一条路（``ui_surface.paint_surface`` + ``CARD_RADIUS``），圆角和描边才
+    真正和卡片一致，也不再受 QSS 那套脾气影响。
+
+    左边那条"主色竖条"是旧装饰，已按用户要求去掉：文案本身已经写明这是回放数据。
+    """
+
+    # 圆角半径：直接取卡片的常量 —— 这条的面和卡片是同一个视觉语言，
+    # 自测按它断言"圆角是否和卡片统一"，别在 paintEvent 里另写一个字面量。
+    RADIUS = CARD_RADIUS
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # 内缩 0.5：1px 描边正好落在控件边界之内（半像素压在边界上会被裁掉一半）
+        box = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        paint_surface(painter, box, self.RADIUS,
+                      fill=qcolor("surface_2"), border=qcolor("line"))
+
+
 class MainWindow(QMainWindow):
     # 边缘带 → 系统缩放光标。**四个角（两条边的组合）必须排在单边前面**先比，
     # 否则"左|上"会被单边"左"提前命中、给成左右箭头（见 _edge_cursor_shape）。
@@ -175,6 +215,17 @@ class MainWindow(QMainWindow):
         self.resize(1060, 920)
 
         self._worker: SerialWorker | None = None
+        # 建链是否**已经**完成（区别于"正在连接"）：_worker 一请求打开就有值，
+        # 但蓝牙口要等几秒才真正连上，这两件事必须分开记（见 _open_port）。
+        self._port_connected = False
+        # "建链中被取消"、线程还卡在 open() 里的 worker。**必须留强引用** ——
+        # PySide 的信号连接不保证对象存活，若 Python 先把它回收掉，QThread 的
+        # C++ 对象会在线程还在跑时被析构，Qt 直接 fail-fast（实测 0xC0000409）。
+        self._retiring: list[SerialWorker] = []
+        # 蓝牙广播：列表扫描器（只在"点刷新"时活几秒）、扫到的设备、上次选的目标
+        self._ble_scanner: BleBroadcastWorker | None = None
+        self._ble_seen: dict[str, dict] = {}
+        self._ble_target = ""
         self._decoder = StreamDecoder()
         # 自动扫描：只记"上次看到的端口名单"，名单一变就说明插了或拔了东西（见
         # _poll_ports）。**扫到什么都不自动打开** —— 用户明确要求"我自己有手"。
@@ -373,12 +424,13 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        # 卡片自己带了 SHADOW_PAD 的阴影空隙，所以外间距和卡片间距都要相应收小，
-        # 否则视觉上会比设定的 GAP 宽出一圈。
-        # ⚠️ 上边距是 0：自绘标题栏要像系统标题栏那样**贴着窗口上沿**，
-        # 留 12px 会看着像"标题栏浮在页面里"。
-        root.setContentsMargins(GAP - SHADOW_PAD, 0,
-                                GAP - SHADOW_PAD, GAP - SHADOW_PAD)
+        # ⚠️ 标题栏这一条要**出血**到窗口左右边缘：它是自绘的系统标题栏，三颗键
+        # 得贴着右上角（见 ui_theme.CAPTION_INSET），不能跟着内容一起往里缩。
+        # Qt 会把布局的**负外边距直接夹成 0**（实测：想要把子项往外顶 12px，
+        # 拿到的是 12px 的内缩，等于没写），所以这里换个方向做 —— 根布局自己
+        # 不留左右白边，把标题栏整条贴到窗口上/左/右，**其余内容**包一层带白边的
+        # 容器（下面那个 content）。白边值不变，仍是为了卡片自带的那圈阴影空隙。
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(GAP - SHADOW_PAD * 2)
 
         # 自绘标题栏：三颗窗口键 + 可拖拽区。**不进任何会被隐藏的分组**——
@@ -390,8 +442,18 @@ class MainWindow(QMainWindow):
         self._caption_bar.btn_max.clicked.connect(self._toggle_fullscreen)
         self._caption_bar.btn_close.clicked.connect(self.close)
 
+        # 标题栏以下的内容容器：左右/下边距还是原来的 GAP - SHADOW_PAD
+        # （卡片自己带了 SHADOW_PAD 的阴影空隙，所以外间距要相应收小，
+        # 否则视觉上会比设定的 GAP 宽出一圈）。
+        content = QWidget()
+        root.addWidget(content, 1)
+        inner = QVBoxLayout(content)
+        inner.setContentsMargins(GAP - SHADOW_PAD, 0,
+                                 GAP - SHADOW_PAD, GAP - SHADOW_PAD)
+        inner.setSpacing(GAP - SHADOW_PAD * 2)
+
         self.brand_header = BrandHeader("串口调试助手")
-        root.addWidget(self.brand_header)
+        inner.addWidget(self.brand_header)
 
         # 主体：左侧收发区 + 右侧串口配置栏（配置固定宽度，收发区吃掉剩余空间）
         body = QHBoxLayout()
@@ -460,7 +522,7 @@ class MainWindow(QMainWindow):
         self._config_card.body.addLayout(self._build_config_panel(), 1)
         body.addWidget(self._config_card)
 
-        root.addLayout(body, 1)
+        inner.addLayout(body, 1)
 
         # 底部信息条。不用 QStatusBar：它的 showMessage 临时提示会把普通控件隐藏掉，
         # 放在左下角的设置按钮会跟着闪没。自己排一行，各类信息各居其位。
@@ -498,7 +560,7 @@ class MainWindow(QMainWindow):
         bar_row.addWidget(self.pulse)
         bar_row.addWidget(self.lbl_state)
         bar_row.addWidget(self.lbl_count)
-        root.addWidget(bar)
+        inner.addWidget(bar)
 
         self._update_counters()
         # 发送区开局姿态由「定制功能 → 默认折叠发送区」决定。默认**开** =
@@ -704,7 +766,29 @@ class MainWindow(QMainWindow):
         self._open_row_home = col
         col.insertWidget(0, self._open_row)
 
-        # 串口选择独占一行，刷新按钮跟在右边
+        # 「连接方式」（用户 2026-10-14 点名要蓝牙广播）：串口 / 蓝牙广播。
+        # 广播那条路**不配对、不连接**，设备把数据放进广播包、这边被动扫描收；
+        # 代价是单向（只读）且带宽低（见 ble_io 的模块说明）。
+        self.cmb_link = ChevronComboBox()
+        self.cmb_link.addItems(list(LINK_CHOICES))
+        self.cmb_link.setCurrentText(LINK_SERIAL)
+        self.cmb_link.setToolTip(
+            "串口：普通有线/蓝牙虚拟串口，需要配对或插线\n"
+            "蓝牙广播：只被动扫描广播包，不配对不连接（只能读，发不了）")
+        self.cmb_link.currentTextChanged.connect(self._on_link_mode_changed)
+        link_row = QHBoxLayout()
+        link_row.setSpacing(10)
+        link_tag = self._field_label("连接方式")
+        link_tag.setFixedWidth(64)
+        link_row.addWidget(link_tag)
+        link_row.addWidget(self.cmb_link, 1)
+        col.addLayout(link_row)
+
+        # 串口选择独占一行，刷新按钮跟在右边。
+        # ⚠️ 这一行**两种模式共用**：串口模式下它是串口列表，蓝牙广播模式下换成
+        #    蓝牙设备列表（标签文字和刷新按钮的提示跟着换）—— "选目标"这件事
+        #    在两种模式下是一回事，没必要摆两套控件。
+        self._port_label = self._field_label("串口选择")
         self.cmb_port = ChevronComboBox()
         # 可编辑：没有物理串口时也能手输端口名，或直接输入 loop:// 做无硬件回环演示
         self.cmb_port.setEditable(True)
@@ -712,10 +796,11 @@ class MainWindow(QMainWindow):
         self.cmb_port.setMinimumWidth(140)
         self.btn_rescan = IconButton(GLYPH_REFRESH, "重新扫描串口", size=30, glyph_size=15)
         # 用 lambda 而不是直接连接：clicked 会带一个 checked=False 传进来，
-        # 会把 _refresh_ports 的 announce 形参顶掉。
-        self.btn_rescan.clicked.connect(lambda: self._refresh_ports())
+        # 会把 announce 形参顶掉。走 _refresh_targets：按当前连接方式刷对应列表
+        # （串口 or 蓝牙设备），两种模式共用这一颗按钮。
+        self.btn_rescan.clicked.connect(lambda: self._refresh_targets())
 
-        col.addWidget(self._field_label("串口选择"))
+        col.addWidget(self._port_label)
         port_row = QHBoxLayout()
         port_row.setSpacing(8)
         port_row.addWidget(self.cmb_port, 1)
@@ -760,17 +845,31 @@ class MainWindow(QMainWindow):
         self.cmb_rx_lines.editTextChanged.connect(self._on_rx_lines_text_changed)
 
         # 标签固定宽度，控件吃掉剩余宽度 —— 右侧表单的经典排法。
-        # 64px 放得下「保留行数」四字，三字标签也因此对齐
+        # 64px 放得下「保留行数」四字，三字标签也因此对齐。
+        # ⚠️ 前四行是**串口专有**的（蓝牙广播下没有波特率/校验位可言），包成一个
+        #    容器整体显隐；「保留行数」是显示侧的事，两种模式都要，留在外面。
+        self._serial_params = QWidget()
+        params_col = QVBoxLayout(self._serial_params)
+        params_col.setContentsMargins(0, 0, 0, 0)
+        params_col.setSpacing(12)
         for label, widget in (("波特率", self.cmb_baud), ("停止位", self.cmb_stopbits),
-                              ("数据位", self.cmb_bytesize), ("校验位", self.cmb_parity),
-                              ("保留行数", self.cmb_rx_lines)):
+                              ("数据位", self.cmb_bytesize), ("校验位", self.cmb_parity)):
             row = QHBoxLayout()
             row.setSpacing(10)
             tag = self._field_label(label)
             tag.setFixedWidth(64)
             row.addWidget(tag)
             row.addWidget(widget, 1)
-            col.addLayout(row)
+            params_col.addLayout(row)
+        col.addWidget(self._serial_params)
+
+        line_row = QHBoxLayout()
+        line_row.setSpacing(10)
+        line_tag = self._field_label("保留行数")
+        line_tag.setFixedWidth(64)
+        line_row.addWidget(line_tag)
+        line_row.addWidget(self.cmb_rx_lines, 1)
+        col.addLayout(line_row)
 
         # 「打开历史数据」（用户 2026-10-13 点名）：在软件内打开本地留存的
         # 接收数据，格式/风格/功能与实时接收一致。放在参数栏最下面 —— 它读的
@@ -887,11 +986,19 @@ class MainWindow(QMainWindow):
         return area
 
     def _build_replay_bar(self) -> QWidget:
-        """历史回放提示条：告诉用户"现在看的是本地留存数据"，并给一个返回实时的出口。"""
-        bar = QWidget()
+        """历史回放提示条：告诉用户"现在看的是本地留存数据"，并给一个返回实时的出口。
+
+        圆角/描边由 ``ReplayBar.paintEvent`` 自绘（不能用 QSS，见那个类的说明）。
+        """
+        bar = ReplayBar()
         bar.setObjectName("replayBar")
         row = QHBoxLayout(bar)
-        row.setContentsMargins(10, 6, 6, 6)
+        # 右内边距 12 不是随便取的：条的圆角是 CARD_RADIUS(26)，但条高只有
+        # 50 → 实际生效半径 = 25，两端成了**半圆**；里面这颗「返回实时」按钮
+        # 高 38，四角必须落在那个半圆之内，否则按钮描边会戳出条的底色。
+        # 反解：内边距 >= 25 - sqrt(25² - (25-6)²) ≈ 8.75（实测 6px 时戳出
+        # 1.9px），取 12 留余量。左侧那颗小图标（13px）离角远得多，10 够用。
+        row.setContentsMargins(10, 6, 12, 6)
         row.setSpacing(8)
         icon = IconLabel(GLYPH_SAVE, 13)
         row.addWidget(icon)
@@ -1086,21 +1193,6 @@ class MainWindow(QMainWindow):
         偏差带着跑（实测小滚动范围下能偏出两块）。
         """
         return self.txt_rx.firstVisibleBlock().blockNumber()
-
-    def _scroll_block_to_top(self, number: int) -> None:
-        """把第 ``number`` 块滚到视口顶部（**绝对**定位）。
-
-        锚点必须落在**块号**上而不是滚动条的像素值上：``maximumBlockCount``
-        裁掉开头的块之后，同一像素值对应的是别的内容，视图会自己往上漂。
-        滚动条的目标值就是块的**文档坐标 y** —— 别加 contentOffset（那是
-        视口相对坐标，叠加当前滚动位置后会把视图滚回最顶上）。
-        """
-        block = self.txt_rx.document().findBlockByNumber(number)
-        if not block.isValid():
-            return
-        y = self.txt_rx.blockBoundingGeometry(block).top()
-        bar = self.txt_rx.verticalScrollBar()
-        bar.setValue(max(0, int(round(y))))
 
     def eventFilter(self, obj, event) -> bool:
         if event.type() == QEvent.Type.KeyPress and obj is self.txt_tx:
@@ -1832,6 +1924,11 @@ class MainWindow(QMainWindow):
         if QApplication.activeModalWidget() is not None:
             # 弹着对话框（设置面板、文件框、报错框）时别在背后偷偷动界面
             return
+        if self._link_is_ble():
+            # 蓝牙广播模式：这一行轮的是**串口**，会把设备列表冲掉。广播模式下
+            # 设备列表由「刷新」按钮按需扫描，不走这个定时器。
+            return
+        self._reap_retired()      # 顺手给取消建链的 worker 收尸（见 _reap_retired）
         ports = list_serial_ports()
         if ports == self._known_ports:
             return
@@ -1860,57 +1957,90 @@ class MainWindow(QMainWindow):
             self._close_port()
 
     def _open_port(self, port: str = "") -> None:
-        """打开串口。"""
-        def reject(message: str) -> None:
-            # 开关多半已经被拨到"开"，失败要弹回去，不然开关是通的实际没连上。
-            # 这次 setChecked 触发的 toggled 里 worker 是 None，不会再打开。
-            self.btn_open.setChecked(False)
-            self._warn(message)
+        """打开串口。**建链是异步的**：这里只发起请求，结果由 worker 的
+        ``opened`` / ``open_failed`` 信号回来（见 _on_port_opened / _on_open_failed）。
 
+        为什么异步：蓝牙串口在 Windows 上要先建 RFCOMM 链路，同步 open 会把界面
+        卡死好几秒（用户 2026-10-14 点名优化）。发起时先把开关拨到"开"、状态栏
+        写"正在连接 …"，用户随时可以再按一下取消（走 _close_port）。
+        """
         port = port or self._selected_port()
         if not port:
-            reject("请先选择或输入串口名")
+            self._abort_open("请先选择或输入串口名" if not self._link_is_ble()
+                             else "请先点右边的刷新按钮扫描，再选一个蓝牙设备")
             return
         try:
             baudrate = int(self.cmb_baud.currentText())
         except ValueError:
-            reject("波特率必须是整数")
-            return
+            baudrate = 115200            # 蓝牙广播模式用不到波特率，别为它拦人
+            if not self._link_is_ble():
+                self._abort_open("波特率必须是整数")
+                return
 
-        worker = SerialWorker(
-            port,
-            baudrate=baudrate,
-            bytesize=BYTESIZE_CHOICES[self.cmb_bytesize.currentText()],
-            parity=PARITY_CHOICES[self.cmb_parity.currentText()],
-            stopbits=STOPBIT_CHOICES[self.cmb_stopbits.currentText()],
-        )
+        if self._link_is_ble():
+            # 广播模式：目标是设备地址，只扫描不连接（见 ble_io 的模块说明）。
+            # source="auto"：优先取 manufacturer data，没有就退到 service data ——
+            # 设备侧把数据放哪个表里都行，用户不用去配。
+            worker = BleBroadcastWorker(port, source="auto")
+        else:
+            worker = SerialWorker(
+                port,
+                baudrate=baudrate,
+                bytesize=BYTESIZE_CHOICES[self.cmb_bytesize.currentText()],
+                parity=PARITY_CHOICES[self.cmb_parity.currentText()],
+                stopbits=STOPBIT_CHOICES[self.cmb_stopbits.currentText()],
+            )
         worker.received.connect(self._on_received)
         worker.failed.connect(self._on_failed)
-
-        try:
-            worker.open()
-        except (serial.SerialException, ValueError) as exc:
-            # ValueError 也得接住：serial_for_url 会把带 ":" 的名字当 URL 解析，
-            # 手输一个 "COM3 abc" 或者未知协议（"nosuch://x"）时抛的是 ValueError，
-            # 只捕获 SerialException 的话它会一路冒到 Qt 的事件循环里。
-            worker.deleteLater()
-            app_log.error(f"串口打开失败 {port}: {exc}")
-            reject(f"打不开 {port}：\n{exc}\n\n端口可能被占用，或设备已拔出。")
-            return
-
+        worker.opened.connect(self._on_port_opened)
+        worker.open_failed.connect(self._on_open_failed)
+        # ⚠️ 现在就认它：建链期间用户再拨一次开关要走 _close_port 把它取消掉，
+        #    "正在连接"也必须有东西可指（不然第二下点击会以为没事发生）。
         self._worker = worker
+        self._port_connected = False
         self._decoder.reset()
         # 换了个口就是换了套数据，"轮首标记见过没有"要重新判（见 _stamp_needed）
         self._stamp_anchor_seen = False
         self._stamp_last_monotonic = 0.0
         self.btn_open.setChecked(True)
+        # 建链期间锁住配置项（和已打开时一致）：不然用户能在"半连着"的状态下
+        # 改串口/波特率，界面显示的和实际连的对不上。
         for widget in self._config_widgets():
             widget.setEnabled(False)
-        self.lbl_state.setText(f"已打开 {port} @ {baudrate} · "
+        self.lbl_state.setText(f"正在连接 {port} …")
+        self.pulse.pulse(0.35)
+        worker.open()
+
+    def _abort_open(self, message: str) -> None:
+        """打开请求还没发出去就被挡下来（没选口 / 波特率不是数字）。
+
+        开关多半已经被拨到"开"，要弹回去，不然开关是通的实际没连上。这次
+        setChecked 触发的 toggled 里 worker 是 None，不会再打开。
+        """
+        self.btn_open.setChecked(False)
+        self._warn(message)
+
+    def _on_port_opened(self) -> None:
+        """建链完成（可能是发起后的几秒，蓝牙口尤其慢）。"""
+        worker = self.sender()
+        if worker is not self._worker:
+            # 建链期间被取消 / 又换了口：这次结果作废（worker 会自己收尾退出）
+            return
+        self._port_connected = True
+        if isinstance(worker, BleBroadcastWorker):
+            # 广播模式没有波特率/校验位这回事，状态栏按"正在接收广播"来写
+            self._ble_target = worker.port
+            self._settings.setValue("ble_target", worker.port)
+            self.lbl_state.setText(f"正在接收蓝牙广播 · {worker.port}")
+            app_log.info(f"蓝牙广播接收中：{worker.port}")
+            self.pulse.pulse(1.0)
+            return
+        baudrate = self.cmb_baud.currentText()
+        self.lbl_state.setText(f"已打开 {worker.port} @ {baudrate} · "
                                f"{self.cmb_bytesize.currentText()}"
                                f"{PARITY_LETTERS[self.cmb_parity.currentText()]}"
                                f"{self.cmb_stopbits.currentText()}")
-        app_log.info(f"串口已打开 {port} @ {baudrate} "
+        app_log.info(f"串口已打开 {worker.port} @ {baudrate} "
                      f"{self.cmb_bytesize.currentText()}"
                      f"{PARITY_LETTERS[self.cmb_parity.currentText()]}"
                      f"{self.cmb_stopbits.currentText()}")
@@ -1918,18 +2048,47 @@ class MainWindow(QMainWindow):
         # 这里不弹临时提示：图标、状态标签和状态灯已经给了反馈，
         # 再弹一条内容相近的提示只会在状态栏里重复一遍。
 
+    def _on_open_failed(self, message: str) -> None:
+        """建链失败（端口不存在 / 被占用 / 蓝牙对端不在）。"""
+        worker = self.sender()
+        if worker is not self._worker:
+            return
+        port = worker.port
+        self._worker = None
+        self._port_connected = False
+        worker.deleteLater()
+        app_log.error(f"串口打开失败 {port}: {message}")
+        self.btn_open.setChecked(False)
+        for widget in self._config_widgets():
+            widget.setEnabled(True)
+        self.lbl_state.setText("未打开")
+        self._warn(f"打不开 {port}：\n{message}\n\n"
+                   "端口可能被占用，或设备已拔出、不在范围内。")
+
     def _close_port(self, message: str = "") -> None:
         # 先把关口里剩下的那一批吐出来，别丢掉设备最后发的那几个字节
         # （force：没有下一批了，没等到换行的半行也要显示出来）
         self._flush_rx(force=True)
         worker, self._worker = self._worker, None
+        self._port_connected = False
         self._send_timer.stop()
         self.chk_timer_send.setChecked(False)
         if worker is not None:
-            worker.received.disconnect()
-            worker.failed.disconnect()
+            for signal in (worker.received, worker.failed,
+                           worker.opened, worker.open_failed):
+                signal.disconnect()
             worker.stop()
-            worker.deleteLater()
+            if worker.isRunning():
+                # ⚠️ **建链中**被取消：线程还卡在 open() 里（蓝牙口可能等十几秒），
+                #    stop() 的短等待没等到它。这里绝不能撒手 —— Python 一旦回收掉
+                #    这个包装对象，QThread 的 C++ 对象会在**线程还在跑**的时候被
+                #    析构，Qt 直接 fail-fast（实测退出码 0xC0000409，什么都不打印，
+                #    极难查）。存进 _retiring 保住强引用，等它自己发现 _running
+                #    已置假、关完句柄退出之后，再由 _reap_retired 收尸。
+                self._retiring.append(worker)
+                worker.finished.connect(self._reap_retired)
+            else:
+                worker.deleteLater()
         # 开关弹回"断"。若它本来就被拨到断（多数路径如此），toggled 不会发；
         # 自动断开（设备拔掉）时它还在通，这次 setChecked 触发的 toggled 里
         # worker 已经是 None，不会再触发关闭。
@@ -1941,11 +2100,127 @@ class MainWindow(QMainWindow):
             self._toast(message, 4000)
         app_log.info("串口已关闭")
         # 关掉之后重扫一次：设备可能已经拔了，下拉框不该继续留着它
-        self._fill_port_combo(list_serial_ports(), self._selected_port())
+        # （蓝牙广播模式下不扫串口 —— 否则会把设备列表冲掉）
+        if not self._link_is_ble():
+            self._fill_port_combo(list_serial_ports(), self._selected_port())
+
+    def _reap_retired(self) -> None:
+        """给"建链中被取消"的 worker 收尸：**确认线程真的结束了**再销毁。
+
+        为什么要专门一道收尸：留强引用（见 _close_port）只保证对象不被 Python
+        提前回收；真正销毁得等线程跑完。finished 是从线程内部发出来的，那会儿
+        线程还差最后几步，所以这里以 isRunning() 为准，没退干净就留着，
+        下次 finished 或 _poll_ports 再来收（多留几毫秒引用毫无代价）。
+        """
+        for worker in list(self._retiring):
+            if worker.isRunning():
+                continue
+            self._retiring.remove(worker)
+            worker.deleteLater()
 
     def _config_widgets(self) -> list[QWidget]:
-        return [self.cmb_port, self.cmb_baud, self.cmb_bytesize,
+        return [self.cmb_link, self.cmb_port, self.cmb_baud, self.cmb_bytesize,
                 self.cmb_parity, self.cmb_stopbits, self.btn_rescan]
+
+    # ------------------------------------------------------------ 连接方式 / 蓝牙
+
+    def _link_is_ble(self) -> bool:
+        return self.cmb_link.currentText() == LINK_BLE
+
+    def _on_link_mode_changed(self, _text: str = "") -> None:
+        """连接方式切换：换标签与提示、显隐串口专有参数、刷一遍目标列表。
+
+        两种模式**共用「选目标」那一行**（串口列表 / 蓝牙设备列表）—— "选一个
+        要连的东西"在两种模式下是一回事，没必要摆两套控件。
+        """
+        ble = self._link_is_ble()
+        if not ble and self._ble_scanner is not None:
+            self._finish_ble_scan(fill=False)      # 离开广播模式就别接着扫了
+        self._port_label.setText("蓝牙设备" if ble else "串口选择")
+        self.btn_rescan.setToolTip("重新扫描蓝牙设备" if ble else "重新扫描串口")
+        self.cmb_port.setToolTip(
+            "只被动扫描广播，不需要配对；设备要把数据放进广播包才收得到"
+            if ble else "")
+        self._serial_params.setVisible(not ble)
+        # 广播是**单向**的（只能听，没有"发给设备"这条路，见 _on_send 的说明），
+        # 所以发送区在广播模式下直接禁用 —— 比"点了才弹报错"友好。
+        self.txt_tx.setEnabled(not ble)
+        self.txt_tx.setPlaceholderText(
+            "蓝牙广播只能接收，不能发送" if ble
+            else "要发送的内容，回车发送；HEX 模式下写 AA 01 FF")
+        self.btn_send.setEnabled(not ble)
+        self.btn_send.setToolTip(
+            "蓝牙广播只能接收，发不出去" if ble
+            else "发送（Enter，Ctrl+Enter 同效）")
+        if ble:
+            self.cmb_port.clear()
+            self.lbl_state.setText("蓝牙广播：未扫描")
+            self._scan_ble_devices()
+        else:
+            self.lbl_state.setText("未打开")
+            self._refresh_ports(announce=False)
+        self._settings.setValue("link_mode", "ble" if ble else "serial")
+
+    def _refresh_targets(self) -> None:
+        """刷新按钮：按当前连接方式刷对应的目标列表。"""
+        if self._link_is_ble():
+            self._scan_ble_devices()
+        else:
+            self._refresh_ports()
+
+    def _scan_ble_devices(self) -> None:
+        """扫一遍周围的 BLE 广播，把设备列进下拉框（只列表，不接收）。"""
+        if self._ble_scanner is not None:
+            return                                  # 已经在扫，别叠第二个
+        self._ble_seen.clear()
+        scanner = BleBroadcastWorker("")            # 空目标 = 只列设备
+        scanner.found.connect(self._on_ble_found)
+        scanner.open_failed.connect(self._on_ble_scan_failed)
+        scanner.opened.connect(lambda: self.lbl_state.setText("蓝牙广播：扫描中 …"))
+        self._ble_scanner = scanner
+        scanner.open()
+        QTimer.singleShot(int(BLE_SCAN_SECONDS * 1000), self._finish_ble_scan)
+
+    def _on_ble_found(self, info: dict) -> None:
+        self._ble_seen[info["address"]] = info
+
+    def _on_ble_scan_failed(self, message: str) -> None:
+        self._finish_ble_scan(fill=False)
+        self.lbl_state.setText("蓝牙广播：不可用")
+        self._warn(f"蓝牙扫描起不来：\n{message}")
+
+    def _finish_ble_scan(self, fill: bool = True) -> None:
+        scanner, self._ble_scanner = self._ble_scanner, None
+        if scanner is not None:
+            scanner.found.disconnect()
+            scanner.opened.disconnect()
+            scanner.open_failed.disconnect()
+            scanner.stop()
+            if scanner.isRunning():
+                scanner.finished.connect(scanner.deleteLater)
+            else:
+                scanner.deleteLater()
+        if fill:
+            self._fill_ble_combo()
+
+    def _fill_ble_combo(self) -> None:
+        """把扫到的设备填进下拉框（按信号强度排，强的在前）。"""
+        rows = sorted(self._ble_seen.values(), key=lambda i: -(i["rssi"] or -999))
+        self.cmb_port.blockSignals(True)
+        self.cmb_port.clear()
+        for info in rows:
+            name = info["name"] or "未命名"
+            note = "有广播负载" if info.get("payload") else "无负载"
+            self.cmb_port.addItem(
+                f"{info['address']} — {name} — {info['rssi']}dBm（{note}）",
+                info["address"])
+        self.cmb_port.blockSignals(False)
+        if self._ble_target:
+            self._select_port(self._ble_target)     # 尽量保持上次选的那台
+        self.lbl_state.setText(
+            f"蓝牙广播：扫到 {len(rows)} 个设备" if rows else "蓝牙广播：没扫到设备")
+        self._toast(f"扫到 {len(rows)} 个蓝牙设备" if rows else
+                    "没扫到蓝牙设备（确认蓝牙已打开、设备在广播）", 3500)
 
     def _on_failed(self, message: str) -> None:
         if self._worker is None:
@@ -2519,6 +2794,14 @@ class MainWindow(QMainWindow):
             self._send_timer.stop()
             self.chk_timer_send.setChecked(False)
             return
+        if isinstance(self._worker, BleBroadcastWorker):
+            # 广播是**单向**的：只扫描、不连接，压根没有"发给设备"这条路
+            #（BLE 的写操作必须建立在连接之上，而广播模式没有连接）。
+            self._warn("蓝牙广播只能接收，发不出去。\n"
+                       "要发指令给设备，请在「连接方式」里选串口（需要先配对）。")
+            self._send_timer.stop()
+            self.chk_timer_send.setChecked(False)
+            return
 
         raw = self.txt_tx.toPlainText()
         try:
@@ -2789,6 +3072,14 @@ class MainWindow(QMainWindow):
         if self._history:
             self.cmb_history.addItems(self._history)
 
+        # 连接方式（2026-10-14 加的蓝牙广播）。放在这里恢复：_build_ui 已经跑完，
+        # 切模式要用到的控件都在；设成广播模式会顺手扫一次设备，用户打开就能选。
+        self._ble_target = str(settings.value("ble_target", "") or "")
+        if str(settings.value("link_mode", "serial")) == "ble":
+            self.cmb_link.setCurrentText(LINK_BLE)
+        else:
+            self.cmb_link.setCurrentText(LINK_SERIAL)
+
         geometry = settings.value("geometry")
         if isinstance(geometry, QRect):
             # 现在存的是**客户区矩形**（见 _remember_normal_geometry 的说明）
@@ -2879,6 +3170,9 @@ class MainWindow(QMainWindow):
             app.removeEventFilter(self)
         # 关窗时先停掉自动扫描：否则收尾这几步里它可能又去开一个串口
         self._port_watch.stop()
+        # 蓝牙列表扫描器也停掉（它和"连接"无关，主开关管不到它）
+        if self._ble_scanner is not None:
+            self._finish_ble_scan(fill=False)
         self._save_settings()
         if self._worker is not None:
             worker, self._worker = self._worker, None
