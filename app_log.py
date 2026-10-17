@@ -3,7 +3,7 @@
 - **分级输出**：DEBUG（每帧收发细节，默认不落盘）/ INFO（关键操作：开关串口、
   发送、设置变更、主题切换）/ WARNING / ERROR（打开失败、剪贴板异常等）。
   文件 handler 默认收 INFO 及以上 —— 每帧一条 DEBUG 在数据流场景下会刷爆文件；
-  排查问题时把级别调到 DEBUG（见 ``set_level``）即可看到完整收发流。
+  排查问题时把 ``_FILE.setLevel(logging.DEBUG)`` 打开即可看到完整收发流。
 - **写入文件**：``logs/serialassistant.log``，滚动 1MB × 3 份，绝不可能把磁盘
   写满。目录优先放在程序旁边（开发时是项目目录、打包后是 exe 所在目录），
   只读（如 Program Files）就退回用户主目录。
@@ -65,12 +65,6 @@ def init() -> str | None:
         _FILE = None
         _PATH = None
         return None
-
-
-def set_level(level: str) -> None:
-    """调整文件记录级别（"DEBUG" / "INFO" / ...）。排查收发细节时用 DEBUG。"""
-    if _FILE is not None:
-        _FILE.setLevel(getattr(logging, level.upper(), logging.INFO))
 
 
 def path() -> str | None:

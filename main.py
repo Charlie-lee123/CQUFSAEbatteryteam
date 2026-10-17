@@ -143,6 +143,16 @@ def main() -> int:
     if "--ble-scan" in sys.argv:
         return _run_ble_scan(sys.argv)
 
+    # MCP 接入包导出：不进界面，把"交给 Agent 自动部署"的那段文本写成文件。
+    # console=False 打不出字，所以走文件（也是验证"源码真的进了包"的落地证据）。
+    if "--mcp-payload" in sys.argv:
+        import mcp_bridge
+        rest = [a for a in sys.argv[1:] if not a.startswith("--")]
+        target = rest[0] if rest else None
+        written = mcp_bridge.write_payload(target)
+        print(written)
+        return 0
+
     # 日志最先初始化：后面任何一步（含窗口构造）的异常都能留痕
     import app_log
     app_log.init()

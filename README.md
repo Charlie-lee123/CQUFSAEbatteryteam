@@ -6,13 +6,13 @@
 这个工具把它们**按段正确着色、对齐，出问题时一键定位**——车检和调试时
 打开就能读数，不用再肉眼在串口终端里找数字。
 
-当前版本：**v2.0**（2026-10-15）
+当前版本：**v2.1**（2026-10-17）
 
 ## 一键下载
 
 **推荐：安装版**（可选安装位置、自动建桌面快捷方式、带卸载程序、新版自动替换旧版）
 
-[![下载安装包](https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E4%B8%8B%E8%BD%BD-%E5%AE%89%E8%A3%85%E7%89%88%20Setup-2ea44f?logo=github&logoColor=white)](https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant-setup-2.0.exe)
+[![下载安装包](https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E4%B8%8B%E8%BD%BD-%E5%AE%89%E8%A3%85%E7%89%88%20Setup-2ea44f?logo=github&logoColor=white)](https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant-setup-2.1.exe)
 
 **免安装版**（单文件，下载后双击即用）
 
@@ -72,11 +72,59 @@
 
 ![设置](docs/images/settings.png)
 
+## 交给 AI 用：MCP 一键接入
+
+软件自带一个 **MCP（Model Context Protocol）服务**，装好之后，你的 Agent（WorkBuddy /
+Claude Desktop / Cursor…）就能**直接开关串口、收发数据、等回包**，不用你手抄数字。
+
+### 一键使用（推荐）
+
+1. 打开软件 → 右下角 **设置**
+2. 找到 **「AI 接入」** 一行 → 点 **「复制接入配置」**
+3. 把复制到的这一整段**直接粘给 Agent**，说一句"按这个部署"
+
+复制出来的内容**自包含**：装依赖的命令、MCP 服务的**全部源码**、客户端注册片段、
+三条自检标准、以及串口独占的注意事项。Agent 照着做就会装好：
+
+```text
+第 1 步  建独立 venv 并 pip install mcp pyserial
+第 2 步  把源码原样写成 serial_assistant_mcp.py
+第 3 步  把 serial-assistant 条目合并进客户端的 mcp.json
+第 4 步  自检：依赖 / 服务能起 / 客户端里列出 9 个工具
+```
+
+> 不用联网 clone 仓库，也不用你自己找路径 —— 源码是跟着 exe 一起发的。
+
+### 命令行一键导出
+
+不想开界面（或在别人的机器上），直接导出成文件：
+
+```bash
+SerialAssistant.exe --mcp-payload                 # 写到 exe 同级 mcp-接入配置.txt
+SerialAssistant.exe --mcp-payload D:\mcp.txt      # 指定路径
+```
+
+### 它能做什么（9 个工具）
+
+| 工具 | 作用 |
+| --- | --- |
+| `list_ports` | 列出串口，附带"是不是被别的程序占着"的提示 |
+| `open_port` / `close_port` | 开/关串口（波特率、校验位、停止位可给） |
+| `status` | 当前配置 + 收发字节数 + 还有多少行没被取走 |
+| `send` | 发文本或 HEX，可选补 `\r\n` |
+| `read` | **非阻塞**取走"上次之后"的新行（不阻塞、不重复） |
+| `send_and_wait` | 发一条等回包（可给正则），串口调试最常用 |
+| `send_repl` | 一串命令逐条发送并逐条收（初始化寄存器） |
+| `clear_buffer` | 清空接收缓冲 |
+
+⚠️ **串口是独占资源**：MCP 打开某个口期间，本软件的界面不能同时连同一个口
+（反过来也一样）。让 Agent 先 `list_ports` 看一眼再动手就行。
+
 ## 快速上手
 
 ### 安装
 
-双击 `SerialAssistant-setup-2.0.exe`，选好目录一路下一步即可（免管理员权限）。
+双击 `SerialAssistant-setup-2.1.exe`，选好目录一路下一步即可（免管理员权限）。
 装完自动建桌面快捷方式；以后有新版本，重新跑一遍新安装包会**自动移除旧版本**，
 你的配置原封不动。
 
@@ -93,13 +141,16 @@
 
 ## 给开发者的
 
-- **自测**：`selftest.py` 26 项用例（收发 / 着色 / 全屏 / 标题栏 / 建链 / 蓝牙广播 /
-  安装卸载流程），`QT_QPA_PLATFORM=windows .venv/Scripts/python.exe selftest.py`
+- **自测**：`selftest.py` 27 项用例（收发 / 着色 / 全屏 / 标题栏 / 建链 / 蓝牙广播 /
+  MCP 接入包 / 安装卸载流程），`QT_QPA_PLATFORM=windows .venv/Scripts/python.exe selftest.py`
 - **打包**：`build.bat`（PyInstaller）→ 产物在 `dist/`，复制到 `发布/`
 - **安装包**：`python devtools/_build_installer.py`（Inno Setup，版本号从 version.py 现读；
   向导图先跑 `python devtools/_make_installer_art.py` 生成）
 - **安装/卸载体检**：`python devtools/_installer_check.py`（隔离目录全流程，不动真实安装）
 - **静态检查**：`ruff check --select F,E7,E9 *.py devtools/*.py` + `vulture *.py`（基线零告警）
+- **MCP 服务**：`mcp/serial_assistant_mcp.py`（stdio，独立于 GUI 进程）；接入包文案在
+  `mcp_bridge.py`，源码由 `SerialAssistant.spec` 打进 exe（`datas` 里的 `mcp/`），
+  改完服务记得重打包 —— 否则设置面板复制出来的还是旧源码
 
 ## 数据格式约定
 
@@ -132,6 +183,7 @@ BMS ERROR               ← BMS 状态（橙），到此为止：其后的数值
 | v1.7 | 2026-10-12 | 检查更新重构（多源回退 + 自动更新 + SHA256 校验）；历史接收数据自动留存；修复欠压绿色高亮越界 |
 | v1.8 | 2026-10-13 | 安装程序与卸载程序（Inno Setup）；本地留存行数与接收区一致；软件内回放留存数据 |
 | v2.0 | 2026-10-15 | **蓝牙广播接收**（只扫描、不配对、不绑定）+「连接方式」切换 + `--ble-scan` 探针；**建链不卡界面**（可取消）；整项目瘦身（3.7GB→0.9GB）；安装器主题化 + 自动移除旧版本；修复自动更新「退出并重启」报错等 3 处问题 |
+| v2.1 | 2026-10-17 | **MCP 接入**（9 个工具的串口服务，源码随包走；设置面板「AI 接入」一键复制部署包，粘给 Agent 即自动装好；`--mcp-payload` 命令行导出）；**包体 52.6MB → 35.2MB（−33%）**（剔除 QML/Pdf/软件 OpenGL 等 41MB 无用运行时）；**冷启动导入 −23%**（蓝牙模块改为惰性加载）；清理死代码与孤儿通道；修复普通窗口几何被写成无效值 |
 
 ## License
 

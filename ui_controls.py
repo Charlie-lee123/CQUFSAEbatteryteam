@@ -14,17 +14,18 @@
 from __future__ import annotations
 
 from PySide6.QtCore import (
-    QEvent, QLineF, QPoint, QPointF, QRectF, QSize, Qt, Signal,
+    QEvent, QLineF, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal,
 )
 from PySide6.QtGui import (
     QColor, QFontMetrics, QFontMetricsF, QImage, QPainter, QPainterPath, QPen,
 )
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider,
-    QSpinBox, QWidget,
+    QSpinBox, QStyle, QStyledItemDelegate, QWidget,
 )
 
-from ui_anim import Tween, out_cubic, out_quint
+from ui_anim import (STANDARD, Tween, in_out_quint, linear, out_cubic, out_expo,
+                     out_quint)
 from ui_theme import (
     CAPTION_BTN_H, CAPTION_BTN_W, GLYPH_COLLAPSE, GLYPH_EXPAND_CHEVRON, SWITCH_KNOB, SWITCH_ON,
     icon_font, mix, qcolor, switch_off_color, ui_font,
@@ -90,11 +91,21 @@ def _combo_label_ink_offset(combo) -> float | None:
     height = combo.height()
     if not text or height <= 0:
         return None
+    # ⚠️ 控件被压得很窄时（比如右侧栏正在做"向右折叠"动画）抓出来的是无效图像，
+    #    `constBits()` 返回 None，下面一行就崩（实测：折叠时 QComboBox 0 宽）。
+    #    这种尺寸下本来也量不出墨迹，直接给 None（调用方会退回默认偏移）。
+    if combo.width() < 24 or combo.height() < 8:
+        return None
     dpr = combo.devicePixelRatioF() or 1.0
     gray = combo.grab().toImage().convertToFormat(
         QImage.Format.Format_Grayscale8)
     width, ih = gray.width(), gray.height()
-    data = gray.constBits().tobytes()
+    if gray.isNull() or width < 8 or ih < 4:
+        return None
+    bits = gray.constBits()
+    if bits is None:
+        return None
+    data = bits.tobytes()
     bpl = gray.bytesPerLine()
     x_lo = int(4 * dpr)
     x_hi = max(width - int(30 * dpr), x_lo + 1)     # 右边 30px 是 chevron 区
@@ -182,6 +193,8 @@ class InkButton(QPushButton):
         self._variant = variant
         self._hover = 0.0
         self._press = 0.0
+        # 可用度 0~1（禁用态过渡用）。初值按当前状态，避免首帧闪一下。
+        self._enabled_t = 1.0 if self.isEnabled() else 0.0
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFont(ui_font(12.5, ui_font().weight()))
         # 让全局 QPushButton 规则整块放过：不排除的话会在自绘圆角外再描一圈轮廓
@@ -193,6 +206,11 @@ class InkButton(QPushButton):
         # 悬停是一进一出两段，时长不同（进入略快、退出略缓），所以时长在
         # enter/leave 里各自给；补间本身复用同一个，随时打断也不会跳。
         self._hover_anim = Tween(160, out_cubic, self._on_hover, parent=self)
+        # 按下反馈走一段 110ms 的短补间：苹果 §1 要"按下即时反馈"，但颜色的
+        # 0→1 **硬切**在高刷屏上是一次跳变 —— 110ms 感知上仍是"即刻"，又平滑。
+        self._press_anim = Tween(120, out_cubic, self._on_press, parent=self)
+        # 禁用/启用之间的过渡（灰化不是"啪"一下，而是很快地淡过去）。
+        self._enabled_anim = Tween(160, out_cubic, self._on_enabled, parent=self)
 
     def _apply_size_hint(self) -> None:
         metrics = QFontMetrics(self.font())
@@ -214,13 +232,11 @@ class InkButton(QPushButton):
         super().leaveEvent(event)
 
     def mousePressEvent(self, event) -> None:
-        self._press = 1.0
-        self.update()
+        self._press_anim.start(self._press, 1.0, 110)
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
-        self._press = 0.0
-        self.update()
+        self._press_anim.start(self._press, 0.0, 160)
         super().mouseReleaseEvent(event)
 
     def _animate_to(self, target: float, duration: int) -> None:
@@ -230,6 +246,21 @@ class InkButton(QPushButton):
         self._hover = float(value)
         self.update()
 
+    def _on_press(self, value) -> None:
+        self._press = float(value)
+        self.update()
+
+    def _on_enabled(self, value) -> None:
+        self._enabled_t = float(value)
+        self.update()
+
+    def changeEvent(self, event) -> None:
+        # 启用/禁用之间补一段过渡（调用方 setEnabled 很频繁，硬切会显脏）。
+        if event.type() == QEvent.Type.EnabledChange:
+            self._enabled_anim.start(
+                self._enabled_t, 1.0 if self.isEnabled() else 0.0, 160)
+        super().changeEvent(event)
+
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -238,7 +269,6 @@ class InkButton(QPushButton):
         path = QPainterPath()
         path.addRoundedRect(rect, radius, radius)
 
-        enabled = self.isEnabled()
         if self._variant == "primary":
             base = qcolor("fill_primary")
             hot = qcolor("fill_primary_hover")
@@ -249,18 +279,23 @@ class InkButton(QPushButton):
             text_color = qcolor("ink")
 
         lit = max(self._hover, self._press)
-        if not enabled:
-            painter.fillPath(path, QColor(0, 0, 0, 0))
-            pen = QPen(qcolor("line"))
+        # 先把**可用态**画法定出来，再按 (1 - _enabled_t) 朝禁用态混合 ——
+        # 这样启用/禁用之间是"淡过去"，不是硬切。
+        fill = mix(base, hot, lit)
+        border = (mix(qcolor("line"), qcolor("line_strong"), lit)
+                  if self._variant == "ghost" else None)
+        dim = 1.0 - self._enabled_t
+        if dim > 0.0:
+            transparent = QColor(0, 0, 0, 0)
+            fill = mix(fill, transparent, dim)
+            text_color = mix(text_color, qcolor("ink_disabled"), dim)
+            border = mix(border if border is not None else transparent,
+                         qcolor("line"), dim)
+        painter.fillPath(path, fill)
+        if border is not None and border.alpha() > 0:
+            pen = QPen(border)
             pen.setWidthF(1.0)
             painter.strokePath(path, pen)
-            text_color = qcolor("ink_disabled")
-        else:
-            painter.fillPath(path, mix(base, hot, lit))
-            if self._variant == "ghost":
-                pen = QPen(mix(qcolor("line"), qcolor("line_strong"), lit))
-                pen.setWidthF(1.0)
-                painter.strokePath(path, pen)
 
         painter.setPen(text_color)
         painter.setFont(self.font())
@@ -302,6 +337,8 @@ class IconButton(QPushButton):
         self._hover = 0.0
         self._press = 0.0
         self._active = False
+        # 可用度 0~1（禁用态过渡用，见 changeEvent / paintEvent）
+        self._enabled_t = 1.0 if self.isEnabled() else 0.0
         # width 给了就是**矩形**按钮（标题栏那三颗），不给就是正方形
         self.setFixedSize(width or size, size)
         # 光标形状可挑：绝大多数按钮用"手"暗示可点；复制这类"指着眼前的数据"
@@ -313,6 +350,10 @@ class IconButton(QPushButton):
         self.setObjectName("iconButton")
         self._glyph_font = icon_font(glyph_size)
         self._hover_anim = Tween(150, out_cubic, self._on_hover, parent=self)
+        # 按下即时反馈走短补间（同 InkButton）：0→1 硬切在高刷屏上是一次跳变。
+        self._press_anim = Tween(120, out_cubic, self._on_press, parent=self)
+        # 启用/禁用过渡
+        self._enabled_anim = Tween(160, out_cubic, self._on_enabled, parent=self)
 
     def _radius(self) -> float:
         """悬停色块的圆角半径。正方形按钮按宽度取一个比例上的"方中带圆"，
@@ -344,13 +385,11 @@ class IconButton(QPushButton):
         super().leaveEvent(event)
 
     def mousePressEvent(self, event) -> None:
-        self._press = 1.0
-        self.update()
+        self._press_anim.start(self._press, 1.0, 110)
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
-        self._press = 0.0
-        self.update()
+        self._press_anim.start(self._press, 0.0, 160)
         super().mouseReleaseEvent(event)
 
     def _animate_to(self, target: float, duration: int) -> None:
@@ -359,6 +398,22 @@ class IconButton(QPushButton):
     def _on_hover(self, value) -> None:
         self._hover = float(value)
         self.update()
+
+    def _on_press(self, value) -> None:
+        self._press = float(value)
+        self.update()
+
+    def _on_enabled(self, value) -> None:
+        self._enabled_t = float(value)
+        self.update()
+
+    def changeEvent(self, event) -> None:
+        # 一部分图标按钮会被 show/hide 或可用性切换（例如"保存"在一无数据时禁用），
+        # 硬切灰色同样是一次跳变 —— 补一段很快的过渡。
+        if event.type() == QEvent.Type.EnabledChange:
+            self._enabled_anim.start(
+                self._enabled_t, 1.0 if self.isEnabled() else 0.0, 160)
+        super().changeEvent(event)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
@@ -369,31 +424,46 @@ class IconButton(QPushButton):
         path = QPainterPath()
         path.addRoundedRect(rect, radius, radius)
 
-        enabled = self.isEnabled()
         lit = max(self._hover, self._press)
-        if not enabled:
-            glyph_color = qcolor("ink_disabled")
-        elif self._active:
+        # 先算**可用态**的外观，再按 (1 - _enabled_t) 朝禁用态混 —— 见 InkButton。
+        fill = QColor(0, 0, 0, 0)
+        border = None
+        if self._active:
             # 激活态：淡蓝圆角底 + 细蓝描边 + 蓝字形 —— 压过悬停/按下的灰阶反馈，
             # 状态一眼可见（两竖换三角太小，用户反馈过"按了没反应"）
-            tint = QColor(SWITCH_ON)
-            tint.setAlpha(38)                 # 淡淡一层底，不做成实心色块
-            painter.fillPath(path, tint)
-            painter.setPen(QPen(QColor(SWITCH_ON), 1.0))
-            painter.drawPath(path)
+            fill = QColor(SWITCH_ON)
+            fill.setAlpha(38)                 # 淡淡一层底，不做成实心色块
+            border = QColor(SWITCH_ON)
             glyph_color = QColor(SWITCH_ON)
         elif self._variant == "filled":
             base = qcolor("fill_primary")
-            painter.fillPath(path, mix(base, qcolor("fill_primary_hover"), lit))
+            fill = mix(base, qcolor("fill_primary_hover"), lit)
             glyph_color = qcolor("on_primary")
         else:
             # 平时完全透明，只有悬停/按下才浮出底色；
             # hover_fill=False 的（底栏齿轮）连这一层也不画，永远只留字形
             if self._hover_fill:
-                resting = qcolor("surface_hover", 0)
-                painter.fillPath(path, mix(resting, qcolor("surface_hover"),
-                                           max(lit, 0.0) if lit > 0.01 else 0.0))
-            glyph_color = mix(qcolor("ink_2"), qcolor("ink"), lit)
+                fill = mix(qcolor("surface_hover", 0), qcolor("surface_hover"),
+                           max(lit, 0.0) if lit > 0.01 else 0.0)
+            # ⚠️ 静止态直接用 ink（243，与卡片标题同亮）。图标是**细笔画**，经
+            #    抗锯齿后峰值比同色文字低一大截，之前"往 ink 混 35%/55%"每档只差
+            #    10-15%，肉眼看不出来（用户连说两轮"改了个寂寞"）。悬停反馈本来就
+            #    靠背景药丸（hover_fill），不靠提亮。
+            glyph_color = qcolor("ink")
+
+        dim = 1.0 - self._enabled_t
+        if dim > 0.0:
+            transparent = QColor(0, 0, 0, 0)
+            fill = mix(fill, transparent, dim)
+            glyph_color = mix(glyph_color, qcolor("ink_disabled"), dim)
+            if border is not None:
+                border = mix(border, transparent, dim)
+
+        if fill.alpha() > 0:
+            painter.fillPath(path, fill)
+        if border is not None and border.alpha() > 0:
+            painter.setPen(QPen(border, 1.0))
+            painter.drawPath(path)
 
         self._draw_glyph(painter, rect, glyph_color)
 
@@ -784,12 +854,64 @@ def _draw_chevron(painter: QPainter, rect: QRectF, glyph: str, px: int,
     painter.restore()
 
 
+class _PopupItemDelegate(QStyledItemDelegate):
+    """弹层条目的绘制：圆角内嵌色块 + 内缩文字。
+
+    **为什么要自己画**（2026-10-15 用户截图点名"这种难看的 UI"）：
+    QComboBox 弹层里 ``QComboBox QAbstractItemView::item`` 那套 QSS 规则在
+    Fusion 上是**失效**的 —— 逐项试过 9 个开关（resizeMode / sizeAdjustPolicy /
+    uniformItemSizes / 视图级样式表…）都不动，去掉 ``selection-background-color``
+    也没用：选中态始终由样式引擎画成"顶到两边、方角、比行还高"的矩形，
+    正是截图里那条丑东西。所以条目绘制改由这里接管：色块自己画成圆角 + 内缩，
+    和界面其它圆角元素同一套语言（半径、内边距都取自 ui_theme 的 token）。
+    """
+
+    # 条目左右内边距：文字与色块左缘的距离（和卡片内边距一脉相承）
+    PAD_X = 10
+    # 色块相对条目四周的内缩：留出这一圈，色块才是"嵌在列表里"而不是"铺满一行"
+    CHIP_INSET_X = 4
+    CHIP_INSET_Y = 3
+    CHIP_RADIUS = 8
+    # 行高（逻辑像素）。比原先 QSS 撑出来的 30 略收一点，列表更紧凑。
+    ROW_H = 28
+
+    def sizeHint(self, option, index) -> QSize:      # noqa: N802 (Qt 命名)
+        height = max(self.ROW_H, option.fontMetrics.height() + 12)
+        return QSize(0, height)
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        if selected or hovered:
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(Qt.PenStyle.NoPen)
+            # 选中比悬停重一点：两者会同时为真（鼠标就在选中项上），取更亮的那个
+            painter.setBrush(qcolor("sel", 30 if selected else 18))
+            box = option.rect.adjusted(self.CHIP_INSET_X, self.CHIP_INSET_Y,
+                                       -self.CHIP_INSET_X, -self.CHIP_INSET_Y)
+            painter.drawRoundedRect(QRectF(box), self.CHIP_RADIUS, self.CHIP_RADIUS)
+            painter.restore()
+
+        painter.save()
+        painter.setPen(qcolor("ink"))
+        painter.setFont(option.font)
+        text_rect = option.rect.adjusted(self.PAD_X, 0, -self.PAD_X, 0)
+        painter.drawText(text_rect,
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                         str(index.data() or ""))
+        painter.restore()
+
+
 class ChevronComboBox(QComboBox):
     """下拉框。箭头用系统图标字体自绘的 chevron，不用 QSS 的三角。
 
     原因见 ui_theme 里 ``QComboBox::down-arrow`` 的注释：QSS 靠"零尺寸 + 彩色边框"
     拼三角，Fusion 下常被挤成一个小方块，看着毛糙。自绘 chevron 与界面其它图标同源，
     主题跟随、高 DPI 下也锐利。原生箭头已在 QSS 里关掉，这里只补画一个。
+
+    弹层条目由 :class:`_PopupItemDelegate` 接管绘制（QSS 的 ``::item`` 在 Fusion
+    上失效，见那边的说明）。
     """
 
     ARROW_W = 24
@@ -807,6 +929,11 @@ class ChevronComboBox(QComboBox):
         self._placing_edit = False
         # 弹层展开动画（见 _animate_popup_open）；用到时才建 Tween
         self._popup_tween: Tween | None = None
+        # 条目绘制的 delegate **惰性**创建（见 _ensure_popup_delegate）：
+        # 在 __init__ 里碰 self.view() 会提前把弹层容器窗口建出来，凭空多出
+        # 一堆隐藏顶层窗口 —— 实测会改变窗口管理器对主窗口的行为（全屏往返后
+        # 位置被夹到 (0,0)），所以第一次弹出时才装。
+        self._item_delegate: _PopupItemDelegate | None = None
         self._popup_target = None
         self._popup_below = True
         # 非编辑态的文字垂直自适应（见 _fit_text_vertical）：
@@ -929,6 +1056,7 @@ class ChevronComboBox(QComboBox):
                                  | Qt.WindowType.FramelessWindowHint
                                  | Qt.WindowType.NoDropShadowWindowHint)
         container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._ensure_popup_delegate()
         self._fit_popup_width()
         super().showPopup()
         # ⚠️ 非编辑下拉的弹层容器布局里带「上下弹簧 + 底部箭头指示条」
@@ -949,7 +1077,22 @@ class ChevronComboBox(QComboBox):
                     it.spacerItem().changeSize(0, 0)
             lay.invalidate()
             lay.activate()
+        # ⚠️ **立刻**摆到我们算的位置：Qt 上面那一下已经把弹层显示在它自己的
+        #    位置上了（默认对齐当前项），不马上搬走的话，用户会看到"先出现在
+        #    下方、再跳到上方"（保留行数那个下拉就这么被点名过）。
+        #    动画仍延后一拍起跑（要等 Qt 定完位），但那时位置已经是对的。
+        target, below = self._popup_place()
+        self._popup_target = target
+        self._popup_below = below
+        container.setGeometry(target)
         self._animate_popup_open()
+
+    def _ensure_popup_delegate(self) -> None:
+        """首次弹出时装上条目 delegate（惰性：别在构造期惊动弹层窗口）。"""
+        if self._item_delegate is None:
+            view = self.view()
+            self._item_delegate = _PopupItemDelegate(view)
+            view.setItemDelegate(self._item_delegate)
 
     def _fit_popup_width(self) -> None:
         """弹层宽度按**最宽的选项**自适应（下限是控件自身宽度）。
@@ -962,23 +1105,64 @@ class ChevronComboBox(QComboBox):
         fm = view.fontMetrics()
         widest = max((fm.horizontalAdvance(self.itemText(i))
                       for i in range(self.count())), default=0)
-        # 视图左右 QSS margin(24) + 内 padding(12) + item 自身 padding(16)
-        # + 竖直滚动条(~22) + 弹层边框/余量(~10)：少了 item 的 16 就会把
-        # 最宽项截成 "la...-1"（编码框实测）。
-        need = widest + 84
+        # 弹层**只按需要变宽**：够放下"最宽选项 + 委托左右的文字内边距"就行。
+        # 这里原来写死 +84（那还是条目由 QSS 画、外边距 12px 时的旧余量），
+        # 条目改由 _PopupItemDelegate 画、QSS margin 归零之后它就明显偏宽了
+        # —— 编码框只有 92 宽，弹层却撑到 121（用户点名"这里宽了"）。
+        # 视口两侧内缩 + 竖直滚动条 + 边框的余量按 28 给，实测够用。
+        need = widest + _PopupItemDelegate.PAD_X * 2 + 28
         view.setMinimumWidth(max(self.width(), need))
 
     def _animate_popup_open(self) -> None:
-        """弹层展开动画：从锚点一侧"展开"到完整高度，同时淡入。
+        """起展开动画 —— **推迟到下一轮事件循环**再真正开跑。
 
-        朝下开就从顶端往下长、朝上开就从底端往上长（Qt 会按屏幕空间自动
-        选一边）。150ms out_cubic，和界面其它动效同一套节拍（ui_anim 的
-        共享计时器，不另起 timer）。中途被关掉就立刻还原，不再推帧。
+        为什么必须延后一拍：``super().showPopup()`` 返回时 Qt 还没把弹层放到最终
+        位置 —— 空间不够要翻到控件上方、当前项要跟控件对齐，这些都是随后才调整的。
+        此刻读到的 geometry 是旧位置，据此既会判错朝上/朝下，动画推的分帧几何又会
+        和 Qt 的定位互相打架（实测数据位那个下拉：动画按朝下长、Qt 同时把它往上方
+        挪，看着就是"打开方向跟别的下拉不一样"）。延后一个事件循环，读到的就是
+        最终位置，方向判断与动画就都对齐了。
+        """
+        QTimer.singleShot(0, self._start_popup_anim)
+
+    def _popup_place(self) -> tuple[QRect, bool]:
+        """算出弹层**该在哪**（尺寸沿用 Qt 算好的，只改位置）。
+
+        规则只有一条：**贴控件下方展开**；下方实在放不下（底栏那几个）才翻到
+        控件上方。Qt 默认则会把"当前项"对齐到控件上（弹层压在控件头顶），
+        于是有的下拉压在控件上、有的落在下方 —— 用户拿两张图对比说"明显不一样"。
         """
         container = self.view().window()
-        target = container.geometry()
-        anchor_y = self.mapToGlobal(QPoint(0, self.height())).y()
-        below = target.y() >= anchor_y - 6          # 弹层在控件下方 = 朝下展开
+        geo = container.geometry()
+        anchor = self.mapToGlobal(QPoint(0, 0))
+        gap = 4
+        below_top = self.mapToGlobal(QPoint(0, self.height())).y() + gap
+        screen_area = self.screen().availableGeometry()
+        # 一律贴控件下方展开。下方空间不够时**压矮弹层**（列表自己滚），
+        # 而不是翻到控件上方 —— 翻上去动画方向就反了，跟别的下拉不一致
+        # （用户点名"保留行数那里打开方向有点问题"就是这个）。只有连两三行
+        # 都放不下（底栏最下面那几个），才真的翻到上方。
+        room = screen_area.bottom() - gap - below_top
+        if room >= min(geo.height(), 120):
+            return (QRect(anchor.x(), below_top, geo.width(),
+                          min(geo.height(), room)), True)
+        return QRect(anchor.x(), anchor.y() - gap - geo.height(),
+                     geo.width(), geo.height()), False            # 翻到上方
+
+    def _start_popup_anim(self) -> None:
+        """弹层展开动画：从锚点一侧"展开"到完整高度，同时淡入。
+
+        朝下开就从顶端往下长、朝上开就从底端往上长。150ms STANDARD 曲线，
+        和界面其它动效同一套节拍（ui_anim 的共享计时器，不另起 timer）。
+        中途被关掉就立刻还原，不再推帧。
+        """
+        # ⚠️ 这里**不做"弹层还在不在"的守卫**：延后一拍时窗口还没被标成可见，
+        #    拿 isVisible() 当开关会把动画整个跳过（实测：七个下拉全都一帧到位）。
+        #    弹层真被关了的话，往隐藏窗口推几何也无害，收尾统一交给 hidePopup。
+        container = self.view().window()
+        # 位置再算一遍：延后这一拍里 Qt 可能又调过尺寸（比如按屏幕高度收了），
+        # 用最新尺寸重算，顺便把位置再按一次（showPopup 里已摆过一次）。
+        target, below = self._popup_place()
         self._popup_target = target
         self._popup_below = below
         start_h = max(14, int(target.height() * 0.25))
@@ -989,7 +1173,7 @@ class ChevronComboBox(QComboBox):
                                   target.width(), start_h)
         container.setWindowOpacity(0.0)
         if self._popup_tween is None:
-            self._popup_tween = Tween(150, out_cubic, self._on_popup_anim,
+            self._popup_tween = Tween(150, STANDARD, self._on_popup_anim,
                                       parent=self)
         self._popup_tween.start(0.0, 1.0, 150)
 
@@ -1147,34 +1331,131 @@ class ChevronSpinBox(QSpinBox):
                       GLYPH_COLLAPSE, self.GLYPH_PX, color)
 
 
+# ------------------------------------------------------------------ 会闪的数字/文字标签
+
+class FlashLabel(QLabel):
+    """会"亮一下"的标签 —— 底栏统计数字、接收区时钟用它。
+
+    用户要的是"数字变化要有动效"。数字**滚动**（逐位插值）会有一个副作用：
+    任何读 ``.text()`` 的地方都会拿到中间值（自测里就有"接收 4 字节"这条断言）
+    —— 统计口径必须始终是**真值**。所以这里改成苹果 §1 的另一种做法：
+    数字**立刻**更新为真值，同时让整行来一次很短的**高光衰减**（颜色从 ink_2
+    提亮到 ink 再落回），变化瞬间被一眼看到，又不会让数值失真。
+
+    衰减走 out_expo（瞬间亮起、余晖拖长），和卡片的描边闪烁同一套曲线语言。
+    """
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self._flash = 0.0
+        self._flash_anim = Tween(420, out_expo, self._on_flash, parent=self)
+
+    def flash(self, strength: float = 1.0, duration: int | None = None) -> None:
+        """亮一下。起点取**当前亮度**，连着闪是"接着亮"而不是"重新亮一下"。
+
+        ``duration``：每次高光的时长（不给用默认 420ms）。时钟那种**每秒**都会
+        触发的场合要短一点 —— 不然高光会一直挂着，既看不到"变化"又白白占用节拍。
+
+        ⚠️ **不可见时不起动画**：关掉的窗口其时钟定时器仍在跑，若还去闪就会让
+        动画节拍器一直转（自测里那条"补间都跑完了，调度器还在转"就是这么挂的）。
+        看不到的控件本来也没必要动画 —— 这条同时是"静止时零开销"的一部分。
+        """
+        if not self.isVisible():
+            return
+        self._flash_anim.start(min(1.0, max(self._flash, strength)), 0.0,
+                               duration=duration)
+
+    def _on_flash(self, value) -> None:
+        self._flash = float(value)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        text = self.text()
+        if not text:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        # 常态色取标签自身的调色板前景色（这样"灰调"仍由主题控制），
+        # 闪的时候往 ink（主文字色）提亮 —— 提亮方向与"变化=值得注意"一致。
+        base = self.palette().color(self.foregroundRole())
+        color = mix(base, qcolor("ink"), self._flash)
+        painter.setPen(color)
+        painter.setFont(self.font())
+        margins = self.contentsMargins()
+        rect = QRectF(self.rect()).adjusted(margins.left(), margins.top(),
+                                            -margins.right(), -margins.bottom())
+        painter.drawText(rect, self.alignment(), text)
+
+
 # ------------------------------------------------------------------ 活动指示
 
 class PulseDot(QWidget):
-    """状态灯：有数据流过时亮起并按非线性曲线衰减，让「正在通信」看得见。
+    """状态灯，两种模式：
 
-    黑白主题下用「亮度 + 尺寸」表达强度，不靠颜色。衰减给到 560ms、125Hz —— 
-    数据一密就不断被重新点亮，看着是连续在闪，而不是一格一格地跳。
+    · **活动**（默认）：有数据流过时亮起并按非线性曲线衰减，让「正在通信」看得见。
+      黑白主题下用「亮度 + 尺寸」表达强度，不靠颜色。衰减给到 560ms、125Hz ——
+      数据一密就不断被重新点亮，看着是连续在闪，而不是一格一格地跳。
+    · **忙碌**（``set_busy(True)``）：连接中，画一支**矢量弧** —— 角度匀速转、
+      弧长按非线性曲线呼吸（长→短→长）。这是"正在干活"最标准的矢量表达，
+      而且用的是同一颗灯：它就在状态文字左边，连接时本来就闲着，
+      切个模式即可，底栏布局一个字节都不用动。
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._level = 0.0
+        self._busy = False
+        self._spin_t = 0.0
         self.setFixedSize(18, 18)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._pulse_anim = Tween(560, out_cubic, self._on_value, parent=self)
+        # 数据脉冲的衰减用指数曲线（out_expo）：亮得快、余晖长，数据一密
+        # 就叠成"一直在微微亮"的呼吸感，而不是每次都被硬切成方波。
+        self._pulse_anim = Tween(560, out_expo, self._on_value, parent=self)
+        # 旋转：**线性**一圈 1 秒（转速必须匀，转了才知道"在转"），重复无限。
+        # 弧长的呼吸感由绘制那边用非线性曲线叠上去。
+        self._spin_anim = Tween(1000, linear, self._on_spin, parent=self, repeat=-1)
 
     def pulse(self, strength: float = 1.0) -> None:
+        if self._busy:
+            return                       # 连接中由弧表达，别再叠脉冲
         self._level = min(1.0, self._level + strength)
         self._pulse_anim.start(self._level, 0.0)
 
+    def set_busy(self, busy: bool) -> None:
+        """连接中 = True。切进/切出都立即重绘，不留残影。"""
+        busy = bool(busy)
+        if busy == self._busy:
+            return
+        self._busy = busy
+        if busy:
+            self._spin_t = 0.0
+            self._spin_anim.start(0.0, 1.0)
+        else:
+            self._spin_anim.stop()
+            self._spin_t = 0.0
+            self._level = 0.0           # 忙碌期间没收过脉冲，退出时从静息起
+        self.update()
+
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
     def _on_value(self, value) -> None:
         self._level = float(value)
+        self.update()
+
+    def _on_spin(self, value) -> None:
+        self._spin_t = float(value)
         self.update()
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         center = QRectF(self.rect()).center()
+        if self._busy:
+            self._paint_busy(painter, center)
+            return
         painter.setPen(Qt.PenStyle.NoPen)
 
         # 静息时是个淡灰点，有数据时变亮变大，够看得出「在通信」就行
@@ -1188,3 +1469,28 @@ class PulseDot(QWidget):
         dot_r = 3.2 + 1.8 * self._level
         painter.setBrush(mix(rest, peak, self._level))
         painter.drawEllipse(center, dot_r, dot_r)
+
+    def _paint_busy(self, painter: QPainter, center: QRectF) -> None:
+        """矢量弧：淡轨迹环 + 亮弧段。角度匀速、弧长非线性呼吸。"""
+        radius = 5.6
+        box = QRectF(center.x() - radius, center.y() - radius,
+                     radius * 2.0, radius * 2.0)
+
+        track = QPen(qcolor("ink_3", 80), 1.5)
+        track.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(track)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(box)
+
+        # 弧长：40° → 250° → 40°，三角波上再套一层 in_out_quint，
+        # 所以"长得快、收得慢"，不是匀速伸缩（匀速伸缩像机械指针）。
+        phase = (self._spin_t * 2.0) % 1.0
+        tri = phase * 2.0 if phase < 0.5 else (1.0 - phase) * 2.0
+        sweep = 40.0 + 210.0 * in_out_quint(tri)
+        start = -90.0 + 360.0 * self._spin_t
+
+        arc = QPen(qcolor("ink"), 1.8)
+        arc.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(arc)
+        # drawArc 的角度单位是 1/16 度
+        painter.drawArc(box, int(start * 16), int(sweep * 16))

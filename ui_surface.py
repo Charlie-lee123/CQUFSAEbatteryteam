@@ -16,18 +16,20 @@ from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import (
-    QBrush, QColor, QFontMetricsF, QImage, QLinearGradient, QPainter, QPainterPath,
-    QPen, QPixmap,
+    QBrush, QColor, QCursor, QFontMetricsF, QImage, QLinearGradient, QPainter,
+    QPainterPath, QPen, QPixmap, QRadialGradient,
 )
 from PySide6.QtWidgets import (
     QFrame, QGraphicsOpacityEffect, QVBoxLayout, QWidget,
 )
 
-from ui_anim import Tween, out_cubic
+from ui_anim import STANDARD, Tween, out_cubic, out_expo
 from ui_backdrop import frost_tile, gaussian_blur
 from ui_theme import (
-    CARD_PAD, CARD_RADIUS, SHADOW_BLUR, SHADOW_PAD, TITLE_H, current_scheme,
-    frost_gain, glass_alpha, mix, qcolor, shadow_alpha, ui_font,
+    CARD_PAD, CARD_RADIUS, MATERIAL_LIQUID, SHADOW_BLUR, SHADOW_PAD, TITLE_H,
+    current_scheme, frost_gain, glass_alpha,
+    liquid_alpha, liquid_core_alpha, liquid_inner_alpha, liquid_spec_alpha,
+    material, mix, qcolor, shadow_alpha, ui_font,
 )
 
 # ---------------------------------------------------------------- 高斯模糊
@@ -40,6 +42,10 @@ from ui_theme import (
 RIM_ALPHA = 84
 RIM_FADE = 0.6
 
+# 液态玻璃的内发光内缩量（相对卡片高度的比例上限，逻辑像素封顶）：
+# 边缘往里收多少像素再画那圈亮线 —— 收太多就不是"壁内发光"而是画了两个框。
+LIQUID_INNER_INSET = 2.0
+
 
 # ---------------------------------------------------------------- 阴影缓存
 
@@ -47,29 +53,188 @@ _shadows: dict[tuple[int, int, int, int], QPixmap] = {}
 _SHADOW_CACHE_LIMIT = 32
 
 
-def paint_surface(painter: QPainter, box: QRectF, radius: float,
-                  fill: QColor | None = None,
-                  border: QColor | None = None) -> QPainterPath:
-    """画一块「圆角实面 + 1px 描边」，返回这条圆角路径。
+# ---------------------------------------------------------------- 材质面
+#
+# ``paint_glass`` 是**材质感知**的"面"绘制入口：卡片、页头、回放条都走它，
+# 按 ``ui_theme.material()`` 分派到毛玻璃或液态玻璃两条渲染路径。
+# 两者共享同一根强度（``glass_strength``），各自映射到自己的视觉参数。
+#
+# ⛔ 一切"面"都必须**自绘**（走 ``paint_glass``），别用 QSS 的 background /
+#    border-radius 画面：QSS 对普通 QWidget 的 border-radius 在真实主窗口里会
+#    被整条丢掉（2026-10-14 实测：同一份样式表在隔离窗口里是圆的、在主窗口里
+#    却是直角，连强制 unpolish/polish 都救不回来），QPlainTextEdit / QLineEdit
+#    那类原生控件才稳定 —— "一半圆一半方"就是这么来的。
+#
+#    （历史上这里还有个不感知材质的 ``paint_surface``，已随 paint_glass 统一而删除。）
 
-    ⛔ 全 App 的"面"都要这样画，**别用 QSS 的 background/border-radius 画面**：
-    QSS 对**普通 QWidget** 的 border-radius 在真实主窗口里会被整条丢掉
-    （2026-10-14 实测：同一份样式表在隔离窗口里是圆的、在主窗口里却是直角，
-    连强制 unpolish/polish 都救不回来），而 QPlainTextEdit / QLineEdit 那类
-    原生控件才稳定 —— 一半圆一半方就是这么来的。卡片本来就是自绘的，
-    统一走这条路才不会再踩。
+def paint_glass(painter: QPainter, box: QRectF, radius: float, *,
+                flash: float = 0.0, material_name: str | None = None,
+                dpr: float = 1.0,
+                fill_override: QColor | None = None,
+                border_override: QColor | None = None) -> QPainterPath:
+    """按当前材质画一块玻璃面，返回它的圆角路径。
 
-    ``box`` 想要 1px 描边正好落在控件边界内的话，调用方自己先内缩 0.5。
+    ``flash``：数据流过时的描边闪烁（0~1，和卡片同一套语义），两种材质都支持。
+    ``fill_override``：把主体底色换成别的（回放条那种"次要面"用它）。
+    ``border_override``：把描边直接指定（不传就按材质自己算）。
     """
+    name = material_name or material()
     path = QPainterPath()
     path.addRoundedRect(box, radius, radius)
-    if fill is not None:
-        painter.fillPath(path, fill)
-    if border is not None:
-        pen = QPen(border)
+    if fill_override is not None:
+        painter.fillPath(path, fill_override)
+        _paint_glass_overlay(painter, box, radius, path, name, dpr)
+    elif name == MATERIAL_LIQUID:
+        _paint_liquid(painter, box, radius, path, dpr)
+    else:
+        _paint_frosted(painter, box, radius, path, dpr)
+
+    # 描边（数据闪一下）。指定了 border_override 就用它，否则按材质算。
+    if border_override is not None:
+        pen = QPen(border_override)
         pen.setWidthF(1.0)
         painter.strokePath(path, pen)
+    else:
+        _paint_glass_border(painter, path, name, flash)
+
+    # ⚠️ 上缘高光必须**最后**画：它是一条压在路径上的半透明描边，而上面的"描边"
+    #    是不透明的（mix(line, ink, flash)）—— 先画 rim 再画描边的话，描边会把
+    #    兜到的那道光整条盖掉（自测"磨砂开着时上缘没兜到光"就是这么挂的：
+    #    顶边亮度差只剩 0.58 < 阈值 1.0）。旧 Card.paintEvent 的顺序也是
+    #    颗粒 → 面色 → 描边 → rim，这里保持一致。
+    if name != MATERIAL_LIQUID:
+        _paint_frost_rim(painter, box, path)
     return path
+
+
+def _paint_frosted(painter: QPainter, box: QRectF, radius: float,
+                   path: QPainterPath, dpr: float) -> None:
+    """毛玻璃：半透明面色 + 糊过的散射颗粒 + 上缘兜到的光。
+
+    这是项目原有的表现（见模块说明）—— 提高强度 = 越透 + 越毛。颗粒每帧重铺，
+    **不能在动画期间跳过**（表面纹理中途消失又回来本身就是一次跳变，2026-10-16
+    三次返工换来的结论）。
+    """
+    alpha = glass_alpha()
+    painter.fillPath(path, qcolor("surface", alpha))
+
+    gain = frost_gain()
+    if gain > 0.0:
+        tile = frost_tile(current_scheme(), dpr)
+        if tile is not None:
+            painter.save()
+            painter.setClipPath(path)
+            painter.setOpacity(gain)
+            painter.drawTiledPixmap(box, tile)
+            painter.restore()
+    # 上缘高光不在这里画了 —— 挪到 ``_paint_frost_rim``，由 ``paint_glass``
+    # 在描边**之后**统一调用（见那里的说明：先画 rim 再画不透明描边会把光盖掉）。
+
+
+def _paint_frost_rim(painter: QPainter, box: QRectF, path: QPainterPath) -> None:
+    """毛玻璃上缘高光：光从上面来，玻璃的顶边把光兜住。
+
+    幅度跟磨砂强度走 —— 0 档是清玻璃、没有散射，光边也该一起消失。
+    ⚠️ 必须在 ``paint_glass`` 的描边**之后**画：它是一条压在路径上的半透明
+    描边，而描边是不透明的 —— 先画 rim 再画描边的话，描边会把兜到的那道光
+    整条盖掉（自测"磨砂开着时上缘没兜到光"就是这么挂的：顶边亮度差只剩
+    0.58 < 阈值 1.0）。
+    """
+    rim_alpha = int(round(RIM_ALPHA * frost_gain()))
+    if rim_alpha > 0:
+        rim = QLinearGradient(
+            box.topLeft(),
+            QPointF(box.left(), box.top() + box.height() * RIM_FADE))
+        rim.setColorAt(0.0, qcolor("rim", rim_alpha))
+        rim.setColorAt(1.0, qcolor("rim", 0))
+        painter.strokePath(path, QPen(QBrush(rim), 1.0))
+
+
+def _paint_liquid(painter: QPainter, box: QRectF, radius: float,
+                  path: QPainterPath, dpr: float) -> None:
+    """液态玻璃（Apple Liquid Glass 的桌面近似）—— 苹果 §12「Materials & depth」。
+
+    四件套，从下往上叠：
+      ① 半透明主体（强度越高越"实"，才兜得住下面的高光）；
+      ② 主体中心提亮（径向渐变）—— 模拟玻璃的厚度 / 折光，"中间那点光"；
+      ③ 边缘内发光 —— 让主体边缘亮一圈，像光被收在玻璃壁里；
+      ④ 镜面双色调描边 —— 左上一条亮边、右下一条暗边（见 _paint_glass_border）。
+    ①②③ 在本函数里画，④ 由共享的描边步骤画（这样 flash 也能落在它上面）。
+    """
+    alpha = liquid_alpha()
+    painter.fillPath(path, qcolor("surface", alpha))
+
+    # ② 中心提亮：以卡面中心为圆心的径向渐变。裁到路径里，只作用在面上。
+    core = liquid_core_alpha()
+    if core > 0:
+        painter.save()
+        painter.setClipPath(path)
+        center = box.center()
+        gradient = QRadialGradient(
+            center, max(box.width(), box.height()) * 0.62)
+        gradient.setColorAt(0.0, qcolor("glass_hi", core))
+        gradient.setColorAt(0.65, qcolor("glass_hi", int(core * 0.35)))
+        gradient.setColorAt(1.0, qcolor("glass_hi", 0))
+        painter.fillPath(path, QBrush(gradient))
+        painter.restore()
+
+    # ③ 边缘内发光：往内收 2px 再描一圈很淡的亮线。
+    inner = liquid_inner_alpha()
+    if inner > 0:
+        inset = QRectF(box).adjusted(LIQUID_INNER_INSET, LIQUID_INNER_INSET,
+                                     -LIQUID_INNER_INSET, -LIQUID_INNER_INSET)
+        inner_path = QPainterPath()
+        inner_path.addRoundedRect(inset, max(1.0, radius - LIQUID_INNER_INSET),
+                                  max(1.0, radius - LIQUID_INNER_INSET))
+        top_glow = QLinearGradient(
+            box.topLeft(), QPointF(box.right(), box.bottom()))
+        top_glow.setColorAt(0.0, qcolor("glass_hi", inner))
+        top_glow.setColorAt(1.0, qcolor("glass_hi", 0))
+        painter.strokePath(inner_path, QPen(QBrush(top_glow), 1.0))
+
+
+def _paint_glass_overlay(painter: QPainter, box: QRectF, radius: float,
+                         path: QPainterPath, name: str, dpr: float) -> None:
+    """``fill_override`` 时的轻量叠加（回放条这种次要面）：只补材质特征，不铺主体色。"""
+    if name != MATERIAL_LIQUID:
+        return
+    core = liquid_core_alpha()
+    if core > 0:
+        painter.save()
+        painter.setClipPath(path)
+        gradient = QRadialGradient(
+            box.center(), max(box.width(), box.height()) * 0.62)
+        gradient.setColorAt(0.0, qcolor("glass_hi", int(core * 0.6)))
+        gradient.setColorAt(1.0, qcolor("glass_hi", 0))
+        painter.fillPath(path, QBrush(gradient))
+        painter.restore()
+
+
+def _paint_glass_border(painter: QPainter, path: QPainterPath, name: str,
+                        flash: float) -> None:
+    """描边。
+
+    · 毛玻璃：常态是 line，数据流过时按 flash 往 ink 压（做出"亮了一下"）。
+    · 液态玻璃：**镜面双色调**描边 —— 沿路径走一道从左上（亮）到右下（暗）的
+      渐变，就是苹果那句 "bright top edge = light catching the material" 的桌面版；
+      再叠一层很轻的 ink 描边表达 flash。
+    """
+    if name == MATERIAL_LIQUID:
+        spec = liquid_spec_alpha()
+        if spec > 0:
+            gradient = QLinearGradient(path.boundingRect().topLeft(),
+                                       path.boundingRect().bottomRight())
+            gradient.setColorAt(0.0, qcolor("glass_hi", spec))
+            gradient.setColorAt(0.5, qcolor("glass_hi", int(spec * 0.20)))
+            gradient.setColorAt(1.0, qcolor("glass_lo", int(spec * 0.85)))
+            painter.strokePath(path, QPen(QBrush(gradient), 1.0))
+        if flash > 0.0:
+            painter.strokePath(path, QPen(qcolor("ink", int(120 * flash)), 1.0))
+        return
+    border = mix(qcolor("line"), qcolor("ink", 110), flash)
+    pen = QPen(border)
+    pen.setWidthF(1.0)
+    painter.strokePath(path, pen)
 
 
 def card_shadow(width: int, height: int, radius: int, alpha: int) -> QPixmap:
@@ -102,7 +267,10 @@ def card_shadow(width: int, height: int, radius: int, alpha: int) -> QPixmap:
 # ---------------------------------------------------------------- 入场淡入
 
 def fade_in(widget: QWidget, delay_ms: int = 0, duration_ms: int = 240) -> None:
-    """入场淡入。小米那套动效是短、快、收得住，不做过冲也不做扫光。
+    """入场淡入。短、快、收得住，不做过冲也不做扫光。
+
+    曲线用设计系统的 STANDARD（起步略缓、收尾极稳）：``out_cubic`` 起步就是最大
+    速度，用在"内容出现"上像被甩进来；出现类动效该是"被放上去"的。
 
     走 ``ui_anim`` 的 120fps 补间 —— 200ms 这种短过渡在 60fps 下只有十来帧，
     高刷屏上会觉得"一顿一顿"，帧率提上去才是连续的淡入。
@@ -124,8 +292,18 @@ def fade_in(widget: QWidget, delay_ms: int = 0, duration_ms: int = 240) -> None:
                 pass
         QTimer.singleShot(0, remove_effect)
 
+    def apply(value: float) -> None:
+        # ⚠️ 效果会**随控件一起析构**，而补间是延后 delay_ms 才起跑的：
+        # 控件（或整个窗口）在这之前被销毁的话，这一帧就会踩到已删除的
+        # QGraphicsOpacityEffect（实测收尾必现 RuntimeError）。踩到就停表 ——
+        # 效果都没了，这波动画本来也没什么可做的了。
+        try:
+            effect.setOpacity(value)
+        except RuntimeError:
+            tween.stop()
+
     # 补间挂在控件上，由控件持有它的生命周期
-    tween = Tween(duration_ms, out_cubic, effect.setOpacity, finish, parent=widget)
+    tween = Tween(duration_ms, STANDARD, apply, finish, parent=widget)
     QTimer.singleShot(delay_ms, lambda: tween.start(0.0, 1.0))
 
 
@@ -142,10 +320,17 @@ class Card(QFrame):
         super().__init__(parent)
         self._title = title
         self._flash = 0.0
+        # 悬停微抬升（0~1）。苹果 §1「即时反馈」的延伸：鼠标进到卡面上，卡片自己
+        # 抬一下，说明"这块能交互"。只挪**绘制的 box**，不动几何（布局一个字节不碰）。
+        self._lift = 0.0
         self._header_buttons: list[QWidget] = []
         self._title_font = ui_font(13.5, ui_font().weight())
         # 描边闪一下用的补间：复用同一个，数据一密也不会叠出多个动画互相打架
-        self._flash_anim = Tween(380, out_cubic, self._on_flash, parent=self)
+        # 描边闪烁走指数衰减（out_expo）：瞬间亮起、余晖拖长，比 cubic 更像
+        # "被注意到一眼就散掉"，而不是被拉长成一段亮边。
+        self._flash_anim = Tween(380, out_expo, self._on_flash, parent=self)
+        # 悬停抬升的补间：进入略快、退出略缓（和按钮同一套手感）。
+        self._lift_anim = Tween(180, out_cubic, self._on_lift, parent=self)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
 
         pad = SHADOW_PAD
@@ -210,27 +395,38 @@ class Card(QFrame):
         self._flash = float(value)
         self.update()
 
-    def _paint_frost(self, painter: QPainter, path: QPainterPath) -> None:
-        """在玻璃面上铺一层散射颗粒。当前主题 / 强度不需要时是空操作。"""
-        gain = frost_gain()
-        if gain <= 0.0:
+    def enterEvent(self, event) -> None:
+        self._animate_lift(1.0, 170)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        # ⚠️ 光标从卡片移到它的**子控件**上时，Qt 也会给卡片发 Leave —— 卡面被
+        #    子控件铺满，不判断的话悬停会不停"抬起-落下"地抖。用鼠标实际位置
+        #    判断是否还在卡里：还在就忽略这次 Leave。
+        if self.rect().contains(self.mapFromGlobal(QCursor.pos())):
             return
-        tile = frost_tile(current_scheme(), self.devicePixelRatioF())
-        if tile is None:
-            return
-        painter.save()
-        painter.setClipPath(path)
-        painter.setOpacity(gain)
-        painter.drawTiledPixmap(self.box(), tile)
-        painter.restore()
+        self._animate_lift(0.0, 200)
+        super().leaveEvent(event)
+
+    def _animate_lift(self, target: float, duration: int) -> None:
+        self._lift_anim.start(self._lift, target, duration)
+
+    def _on_lift(self, value) -> None:
+        self._lift = float(value)
+        self.update()
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         box = self.box()
+        # 悬停时整块**绘制面**上移最多 2px（不动几何）—— 苹果 §1 的"即时反馈"。
+        lift = self._lift * 2.0
+        if lift > 0.05:
+            box = box.translated(0.0, -lift)
         radius = CARD_RADIUS
 
-        # 1) 阴影。深色主题下 alpha 为 0，直接跳过，省掉一次贴图
+        # 1) 阴影。深色主题下 alpha 为 0，直接跳过，省掉一次贴图。
+        #    抬升时把阴影也带上去一点、略微加大，抬升才"有影可依"。
         alpha = shadow_alpha()
         if alpha > 0:
             shadow = card_shadow(int(box.width()), int(box.height()), radius, alpha)
@@ -239,39 +435,12 @@ class Card(QFrame):
                        shadow.width(), shadow.height()),
                 shadow, QRectF(shadow.rect()))
 
-        # 2) 卡面：一层半透明面色。页面是纯色，透出来的是那片底色，用来分层次。
-        #    面色不能太透，否则上面的文字会跟背景混在一起。
-        path = QPainterPath()
-        path.addRoundedRect(box, radius, radius)
-        painter.fillPath(path, qcolor("surface", glass_alpha()))
+        # 2) 材质面：按当前材质（毛玻璃 / 液态玻璃）画主体、颗粒 / 镜面高光、描边。
+        #    flash 仍由材质描边表达（"亮了一下"）。
+        paint_glass(painter, box, radius, flash=self._flash,
+                    dpr=self.devicePixelRatioF())
 
-        # 3) 磨砂颗粒。背景是纯色、背后没有东西可糊，磨砂感全靠这一层 ——
-        #    它是"玻璃自身"的散射，不是背景纹理，所以压在面色**之上**：
-        #    画在下面会被半透明的面色盖掉。幅度跟着强度滑杆走（setOpacity 缩放，
-        #    不重算贴图），0 是清玻璃，100 是明确的磨砂。
-        self._paint_frost(painter, path)
-
-        # 4) 描边。数据流过时按 flash 往 ink 那边压，做出「亮了一下」的感觉
-        border = mix(qcolor("line"), qcolor("ink", 110), self._flash)
-        pen = QPen(border)
-        pen.setWidthF(1.0)
-        painter.strokePath(path, pen)
-
-        # 5) 上缘高光：光从上面来，玻璃的顶边会把光兜住 —— 这是"这是一块玻璃板"
-        #    最省也最准的一个暗示。做法是沿边缘走一道**自上而下渐隐**的浅色描边，
-        #    而不是给整个面板铺渐变（用户否掉的是页面背景的渐变，玻璃自己兜到的光
-        #    是另一回事，而且它只落在边缘这一圈上）。
-        #    幅度跟磨砂强度走：0 档是清玻璃、没有散射，光边也该一起消失。
-        rim_alpha = int(round(RIM_ALPHA * frost_gain()))
-        if rim_alpha > 0:
-            rim = QLinearGradient(
-                box.topLeft(),
-                QPointF(box.left(), box.top() + box.height() * RIM_FADE))
-            rim.setColorAt(0.0, qcolor("rim", rim_alpha))
-            rim.setColorAt(1.0, qcolor("rim", 0))
-            painter.strokePath(path, QPen(QBrush(rim), 1.0))
-
-        # 6) 标题行：标题 + 一条细线。小米的卡片头就是靠这条线分层的
+        # 3) 标题行：标题 + 一条细线。小米的卡片头就是靠这条线分层的
         if self._title:
             metrics = QFontMetricsF(self._title_font)
             row_center = box.top() + SHADOW_PAD + TITLE_H * 0.5

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QSyntaxHighlighter, QTextCharFormat
 
 import customization
@@ -163,17 +164,59 @@ def _pad_line(line: str, section: str, widths: dict[str, int],
     return SAMPLE_RE.sub(pad, line)
 
 
+def grid_row_sizes(count: int, rows_hint: int = 0, cols_hint: int = 0) -> list[int]:
+    """把 ``count`` 个采样点分成若干排，**每排该放几个**。
+
+    用户点名的规则（原话）："若为奇数个数据，那么就让最后一排数据比前一排数据
+    多一个，别的排数据个数保持一致且对齐。"
+
+    算法：
+      1) 先定行数 ``rows``：给了 ``rows_hint``（模组个数）就用它；否则按
+         ``cols_hint``（每排目标个数）推算 ceil(count / cols_hint)；
+      2) 再定列数 ``cols``：给了 ``cols_hint`` 就用它，否则 ceil(count / rows)。
+         ⚠️ **两者都给了但 rows×cols 装不下 count 时，以 count 为准按 cols 重算
+         行数** —— 宁可多排一行，也绝不丢掉任何一个采样点；
+      3) 均分：``base, rem = divmod(count, rows)``，前 ``rows - rem`` 排各 base 个，
+         最后 ``rem`` 排各 base+1 个。
+         · 各排相差 ≤ 1（base 或 base+1）；
+         · 最后一排**只多不少**（rem ≥ 1 时它就是 base+1 —— 正是"末排多一"）；
+         · rem == 1 时（奇数个的典型情况）除末排外**全部一致**，即用户要的效果。
+         · 对齐不由本函数保证：调用方把每个单元格 ``ljust`` 到同一宽度、
+           用同一个 CELL_GAP 拼接，列起点自然齐（见 _grid_rows）。
+    """
+    count = max(0, int(count))
+    if count == 0:
+        return []
+    rows = int(rows_hint) if rows_hint and rows_hint > 0 else 0
+    cols = int(cols_hint) if cols_hint and cols_hint > 0 else 0
+    if rows <= 0:
+        rows = max(1, -(-count // cols)) if cols > 0 else 1
+    rows = max(1, min(rows, count))
+    if cols <= 0:
+        cols = max(1, -(-count // rows))
+    if rows * cols < count:                     # 装不下 → 以数据量为准加行
+        rows = max(1, -(-count // cols))
+    base, rem = divmod(count, rows)
+    return [base] * (rows - rem) + [base + 1] * rem
+
+
 def _grid_rows(tokens: list[tuple[str, str]], section: str,
                widths: dict[str, int], index_width: int, cols: int,
-               max_row_chars: int = 0) -> list[str]:
+               max_row_chars: int = 0, rows_hint: int = 0,
+               cols_hint: int = 0) -> list[str]:
     """把一组采样点排成等宽网格：值补零到段内最宽；电压段序号补零到
-    index_width（0 号点、温度段都不补）；单元格补空格到等宽后以 CELL_GAP 拼接，
-    按.cols 个一列折行（cols 取这组数据里最宽一行的列数 —— 设备的排版意图）。
-    短行（分包劈出来的孤行）因此被并回网格，不再单独占一行。
+    index_width（0 号点、温度段都不补）；单元格补空格到等宽后以 CELL_GAP 拼接。
+
+    折行口径见 ``grid_row_sizes`` —— 不再用 ``range(0, n, cols)`` 那种"前排填满、
+    末排捡剩下的"（那样末排会比别排**少**，正是用户点名不要的效果）。
+
+    ``cols``：设备自己发来的每行点数（这组里最宽一行的列数 —— 设备的排版意图）。
+    ``rows_hint`` / ``cols_hint``：设置里的「模组个数」「每模组电芯数/温度采集数」
+    （0 = 自动，跟随设备）。短行（分包劈出来的孤行）被并回网格，不单独占一行。
 
     ``max_row_chars``：视口一行能放下的字符数（主窗口量出来传入）。行宽超过
     视口的话软换行会在行尾甩出一个孤零零的单元格（用户截图里"13.6553"单独
-    占一行），所以列数取 min(设备列数, 视口装得下的列数)。0 = 不设上限。
+    占一行），所以列数取 min(目标列数, 视口装得下的列数)。0 = 不设上限。
     """
     cells: list[str] = []
     for index, value in tokens:
@@ -186,16 +229,23 @@ def _grid_rows(tokens: list[tuple[str, str]], section: str,
         pitch = cell_w + len(CELL_GAP)
         fit = max(1, (max_row_chars + len(CELL_GAP)) // pitch)
         cols = min(cols, fit)
-    rows = []
-    for start in range(0, len(cells), cols):
-        row = cells[start:start + cols]
+        if cols_hint > 0:
+            cols_hint = min(cols_hint, fit)
+    # 没给"模组网格"就用设备自己的列数当目标列数（rows_hint=0 → 行数由列数推）
+    sizes = grid_row_sizes(len(cells), rows_hint, cols_hint if cols_hint > 0 else cols)
+    rows: list[str] = []
+    start = 0
+    for size in sizes:
+        row = cells[start:start + size]
         rows.append(CELL_GAP.join(cell.ljust(cell_w) for cell in row).rstrip())
+        start += size
     return rows
 
 
 def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
                   section: str = SECTION_OTHER,
-                  max_row_chars: int = 0) -> str:
+                  max_row_chars: int = 0, rows_hint: int = 0,
+                  volt_cols_hint: int = 0, temp_cols_hint: int = 0) -> str:
     """采样点排版对齐：电压/温度段的连续数据行按**等宽网格**重排。
 
     - 序号：**只有电压段**补 —— `"1.3820"` -> `"01.3820"`（0 号点除外）；
@@ -217,6 +267,10 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
 
     ``section`` 是这块文本**之前**所处的段（``section_of`` 的状态，由调用方在块间
     维护）。值宽按"帧内该段的最大值宽"算 —— 一帧数据各点位数一致，跨帧各自对齐。
+
+    ``rows_hint`` / ``volt_cols_hint`` / ``temp_cols_hint``：设置里的「模组个数」
+    与「每模组电芯数 / 每模组温度采集数」（见 customization）。**0 = 自动**，
+    完全沿用设备发来的每行点数（这也是默认值，保证老行为不变）。
 
     ⚠️ 数字本身一个都不动：只在前导位置补数字 0（用户："在前方补零"）、重排
     空白 —— 自测用"摘掉前导 0、压平空白后逐字等于原文"兜底。
@@ -265,8 +319,9 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
             cols = max(cols, len(found))
             tokens.extend(found)
             j += 1
+        hint = volt_cols_hint if sec == SECTION_VOLT else temp_cols_hint
         out.extend(_grid_rows(tokens, sec, widths, index_width, cols,
-                              max_row_chars))
+                              max_row_chars, rows_hint, hint))
         i = j
     return "\n".join(out)
 
@@ -336,22 +391,6 @@ def temp_spans(text: str, low: int, high: int) -> list[tuple[int, int]]:
     return spans
 
 
-def measure_error_spans(text: str, section: str, volt: tuple[int, int],
-                        temp: tuple[int, int]) -> list[tuple[int, int]]:
-    """一行里**电压/温度越界**的区间（不含 BMS ERROR）。
-
-    与 ``RxHighlighter`` 的着色口径共用同一批判定函数，免得"染成红/绿/黄的那行"
-    和"点按钮跳过去的那行"对不上。
-    """
-    spans: list[tuple[int, int]] = []
-    if section == SECTION_VOLT:
-        high, low = value_spans(text, volt[0], volt[1])
-        spans += high + low
-    elif section == SECTION_TEMP:
-        spans += temp_spans(text, temp[0], temp[1])
-    return spans
-
-
 def bms_error_spans(text: str) -> list[tuple[int, int]]:
     """"BMS ERROR" 字样的染色区间。"""
     spans = []
@@ -377,6 +416,9 @@ class RxHighlighter(QSyntaxHighlighter):
         self._temp_fmt = QTextCharFormat()
         self._limits = (0, 0)
         self._temp_limits = (0, 0)
+        # 推迟着色的开关与节流计时器（见 defer()）
+        self._deferred = False
+        self._defer_timer: QTimer | None = None
         self._section = SECTION_OTHER
         # BMS 错误块状态：BMS ERROR 那行起，**后面的错误明细行**（"1.1 Over
         # Voltage" 这些）也要跟着标橙（用户 2026-10-11 点名），直到下一轮
@@ -416,7 +458,36 @@ class RxHighlighter(QSyntaxHighlighter):
         self._recolor()
         self.rehighlight()
 
+    def defer(self, ms: int) -> None:
+        """**推迟着色** ``ms`` 毫秒：这期间 ``highlightBlock`` 直接返回（不上色），
+        到期统一 ``rehighlight()`` 一次。
+
+        为什么（决策-2：要"接收区不消失"又要降本，只能另找路径）：250 行/秒的
+        流式数据下，每追加一块都触发高亮器逐块重算 + 重绘，和接收区最大化那类
+        "大布局 + 大面积重绘"的动画**抢帧**（QA 实测展开时 P50 掉到 42fps、
+        >20ms 帧 42 个）。⛔ 不用"冻结编辑器重绘"那条老路换帧率 —— 那正是用户
+        报的"接收区信息接收部分消失了一段时间"的根因。
+
+        推迟期间数据照常显示，只是这几百毫秒不带颜色；反复调用会**续期**
+        （合并相邻请求），所以数据一直不停的场景也只会按 ``ms`` 的间隔批量刷
+        一次，而不是每块刷一次。
+        """
+        self._deferred = True
+        if self._defer_timer is None:
+            self._defer_timer = QTimer(self)
+            self._defer_timer.setSingleShot(True)
+            self._defer_timer.timeout.connect(self._resume)
+        self._defer_timer.start(max(0, int(ms)))
+
+    def _resume(self) -> None:
+        self._deferred = False
+        self.rehighlight()
+
     def highlightBlock(self, text: str) -> None:
+        if self._deferred:
+            # 推迟期内**什么都不做**（连段状态也不推进）：到期时 rehighlight()
+            # 会从头逐块重跑，状态机自然重建，不会留下错乱的段状态。
+            return
         # 段状态机：Voltage 标题开电压段、Temperature 标题开温度段，其它段标题关掉。
         # 数据行不动状态 —— 一个段里的多行数据都按同一套阈值处理。
         self._section = section_of(text, self._section)

@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 import app_log
 import customization
 from ui_theme import apply_titlebar_theme
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication
 from PySide6.QtCore import QUrl
 from ui_controls import (
     ChevronComboBox, ChevronSpinBox, GlassSlider, IconButton, InkButton, Switch,
@@ -117,12 +117,15 @@ class SettingsDialog(QDialog):
         self.cmb_theme.setCurrentIndex(index if index >= 0 else 0)
         form.addRow(self._label("主题"), self.cmb_theme)
 
-        # 毛玻璃强度：0~100 无级。左端几乎不透明、不糊；右端最糊、最透。
+        # 材质强度：0~100 无级，**两种材质共用**这一根滑杆。
+        # 0 = 清玻璃（几乎只剩一层很淡的底色），100 = 材质拉满（各自特征最明确）。
+        # 毛玻璃动的是颗粒与透明度，液态玻璃动的是镜面高光 / 内发光 / 中心提亮。
         self.slider_glass = GlassSlider(Qt.Orientation.Horizontal)
         self.slider_glass.setRange(0, 100)
         self.slider_glass.setValue(max(0, min(100, int(glass))))
         self.slider_glass.setMinimumWidth(190)
-        self.slider_glass.setToolTip("拖动即可实时调整整个界面的磨砂玻璃强度")
+        self.slider_glass.setToolTip(
+            "拖动即可实时调整整个界面材质的强度（毛玻璃与液态玻璃共用）")
         self.lbl_glass = QLabel()
         self.lbl_glass.setFont(ui_font(11.5))
         self.lbl_glass.setMinimumWidth(40)
@@ -134,7 +137,7 @@ class SettingsDialog(QDialog):
         glass_row.setSpacing(10)
         glass_row.addWidget(self.slider_glass, 1)
         glass_row.addWidget(self.lbl_glass)
-        form.addRow(self._label("毛玻璃强度"), self._row(glass_row))
+        form.addRow(self._label("材质强度"), self._row(glass_row))
 
         # 「定制功能」：BMS 专用配置的统一管理入口。控件**按注册表动态生成**
         # （customization.specs()），以后加定制配置这里一行都不用改。
@@ -145,6 +148,9 @@ class SettingsDialog(QDialog):
 
         # 日志一节放在**界面按钮的下方**（用户点名），整段一起随面板滚动
         self._build_log_section(form)
+
+        # 「AI 接入」：把 MCP 服务交给 Agent 的入口（2.1 新增）
+        self._build_mcp_section(form)
 
         body_layout.addStretch(1)
 
@@ -190,13 +196,38 @@ class SettingsDialog(QDialog):
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         cancel = InkButton("取消", variant="ghost")
-        cancel.clicked.connect(self.reject)
+        # ⛔ 不直接接 reject/accept：QDialog.done() 会**当场 hide()**，收场动画
+        #    （面板缩回设置按钮）就跑在已经隐藏的窗口上 —— 用户看到的是"面板突然
+        #    消失"，根本没有"回按钮去"这一段。统一走 done()，由它决定是否延后
+        #    真正关闭（见本类末尾的 done()）。
+        cancel.clicked.connect(self._request_close)
         confirm = InkButton("确定", variant="primary")
-        confirm.clicked.connect(self.accept)
+        confirm.clicked.connect(self._request_close)
         confirm.setDefault(True)
+        self.btn_confirm = confirm
         buttons.addWidget(cancel)
         buttons.addWidget(confirm)
         root.addLayout(buttons)
+
+    def _request_close(self) -> None:
+        """按钮要求关闭：确定/取消按发起者区分，其余（Esc / 窗口 X）算取消。"""
+        sender = self.sender()
+        accepted = sender is self.btn_confirm
+        self.done(self.DialogCode.Accepted if accepted
+                  else self.DialogCode.Rejected)
+
+    def done(self, result: int) -> None:
+        """关闭钩子：``_finish_hook`` 在场时**延后**真正关闭。
+
+        主窗口（``_close_settings_dialog``）要先把面板缩回设置按钮再关，所以这里
+        不直接调 ``super().done()``（那会立刻 hide）；只把结果转交出去。
+        没有钩子时（自测直接构造面板）照旧立刻关闭。
+        """
+        hook = getattr(self, "_finish_hook", None)
+        if hook is not None and self.isVisible():
+            hook(bool(result))
+            return
+        super().done(result)
 
     # ------------------------------------------------------------ 定制功能
 
@@ -278,6 +309,22 @@ class SettingsDialog(QDialog):
                 row_label = self._label(spec["label"])
                 if spec.get("preview"):
                     preview = self._build_slider_preview(spec, slider)
+            elif spec["kind"] == "choice":
+                # 枚举（二选一起步）：下拉框。选中即回调 on_custom 做实时预览 ——
+                # 换材质要**当场**看到，不能等按确定（用户点名"实时生效"）。
+                combo = ChevronComboBox()
+                for label, stored in spec["options"]:
+                    combo.addItem(label, stored)
+                index = combo.findData(customization.get(spec["key"]))
+                combo.setCurrentIndex(index if index >= 0 else 0)
+                if spec.get("tip"):
+                    combo.setToolTip(spec["tip"])
+                combo.setMinimumWidth(190)
+                combo.currentIndexChanged.connect(
+                    lambda _idx, s=spec, c=combo: self._on_choice_changed(s, c))
+                field = combo
+                widget = combo
+                row_label = self._label(spec["label"])
             else:
                 spin = ChevronSpinBox()
                 spin.setRange(spec["minimum"], spec["maximum"])
@@ -319,6 +366,11 @@ class SettingsDialog(QDialog):
             preview.setText(self._preview_html(spec, raw))
         if self._on_custom is not None:
             self._on_custom(spec["key"], value)
+
+    def _on_choice_changed(self, spec: dict, combo) -> None:
+        """下拉框（枚举配置）改了：把**存储值**交给主窗口做实时预览。"""
+        if self._on_custom is not None:
+            self._on_custom(spec["key"], combo.currentData())
 
     @classmethod
     def _preview_mark_bg(cls, color: str) -> str:
@@ -401,6 +453,8 @@ class SettingsDialog(QDialog):
                 continue
             if spec["kind"] == "bool":
                 value = widget.isChecked()
+            elif spec["kind"] == "choice":
+                value = widget.currentData()
             else:
                 value = int(widget.value())
             if value != customization.get(spec["key"]):
@@ -473,6 +527,77 @@ class SettingsDialog(QDialog):
             hrow.addWidget(hist_button)
             hrow.addStretch(1)         # 同上：按钮紧挨文字，空白推到行尾
             form.addRow(self._row(hrow))
+
+    # ------------------------------------------------------------ AI 接入（MCP）
+
+    def _build_mcp_section(self, form: QFormLayout) -> None:
+        """「AI 接入」一行：一键复制自包含的 MCP 部署包。
+
+        为什么是"复制一段话"而不是"帮我装好"：装 MCP 要在**用户自己的**机器上
+        建 venv、写文件、改客户端的 mcp.json —— 这些都是 Agent 擅长且被沙箱授权的
+        事，软件自己去改别人的配置文件反而是越界。所以这里只负责把**完整上下文**
+        （依赖、源码、注册片段、自检三条）一次性交出去，复制 → 粘给 Agent 即可。
+        """
+        form.addRow(self._caption("AI 接入"))
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        # ⚠️ 提示文字必须短：这行给按钮留位之后，剩余宽度有限，长文案会被
+        #   裁在按钮底下（实测"直接读写串口"半个字压进按钮）。全句放 tooltip。
+        hint = QLabel("让 AI Agent 直接读写串口")
+        hint.setFont(ui_font(10.5))
+        hint.setObjectName("groupCaption")
+        # 同日志行：必须给 1 而不是 0，否则 minimumSizeHint 会把面板撑宽
+        hint.setMinimumWidth(1)
+        hint.setToolTip(
+            "复制的内容自包含：装依赖的命令、MCP 服务全部源码、客户端注册片段、"
+            "三条自检。粘给任意 Agent（WorkBuddy / Claude / Cursor…），"
+            "它就能自动装好并把串口接到自己手上")
+        row.addWidget(hint)
+        self.btn_mcp_copy = InkButton("复制接入配置", variant="ghost")
+        self.btn_mcp_copy.setToolTip(
+            "复制一整段（含 MCP 服务源码与注册片段）—— 直接粘给任意 Agent，"
+            "它会自动装依赖、写服务、注册 MCP 并自检")
+        self.btn_mcp_copy.clicked.connect(self._copy_mcp_payload)
+        row.addWidget(self.btn_mcp_copy)
+        row.addStretch(1)          # 按钮紧挨文字，空白推到行尾（同日志行）
+        form.addRow(self._row(row))
+
+    def _copy_mcp_payload(self) -> None:
+        """把接入包塞进剪贴板；剪贴板不可用时落到文件并告诉用户路径。
+
+        ⚠️ 非交互/远程会话里 ``clipboard().text()`` 会读回空串（写过再读一次是
+        唯一可靠的探测方式）。这时不能假装"已复制"——用户粘出来是空的，
+        所以退回"写文件 + 在按钮上显示文件名"。
+        """
+        import mcp_bridge
+        text = mcp_bridge.deploy_payload()
+        clipboard = QGuiApplication.clipboard()
+        clipboard.setText(text)
+        if clipboard.text() == text:
+            self._flash_button(self.btn_mcp_copy, "已复制，粘给 Agent 即可",
+                               "复制接入配置", 4000)
+            app_log.info("MCP 接入包已复制到剪贴板")
+            return
+        try:
+            path = mcp_bridge.write_payload()
+        except OSError as exc:
+            app_log.warning(f"MCP 接入包保存失败：{exc}")
+            self._flash_button(self.btn_mcp_copy, "复制失败", "复制接入配置", 4000)
+            return
+        self._flash_button(self.btn_mcp_copy, Path(path).name, "复制接入配置", 6000)
+        app_log.info(f"MCP 接入包已保存：{path}")
+
+    def _flash_button(self, button, text: str, restore: str, ms: int = 4000) -> None:
+        """在按钮上原地显示结果，几秒后复原（同「检查更新」的反馈方式）。"""
+        button.setText(text)
+
+        def _restore() -> None:
+            try:
+                button.setText(restore)
+            except RuntimeError:      # 面板已析构，别再碰 C++ 对象
+                pass
+
+        QTimer.singleShot(ms, _restore)
 
     @staticmethod
     def _elide_middle(text: str, limit: int = 52) -> str:

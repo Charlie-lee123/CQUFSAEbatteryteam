@@ -82,6 +82,26 @@ def restore_settings(settings, snapshot) -> None:
             settings.setValue(key, value)
 
 
+def pin_rx_grid_defaults(settings) -> None:
+    """建窗**前**把接收区网格参数钉成默认的 0=自动（用户真实值由 snapshot 还回去）。
+
+    定制里可以显式填模组结构（如 5 模组 × 25 电芯），此时电压/温度网格会**按模组
+    重排**、把一行值拆成多行 —— 那是设计功能，且实测**不丢字节**（逐值核对见
+    ``devtools/_probe_rx_grid.py``）。但下面几条用例的前提是"样例值在同一行"，
+    不钉死就随用户配置漂：实测用户一改设置，「回车发送/时间戳轮首/序号染蓝」
+    「收包合并与暂停继续」「定位最近异常按钮」三条同时假挂（前提断言拿到的行只剩
+    ``01.3700``，后面的 ``02.3820 03.3900`` 被换到了别的行）。
+
+    ⛔ 必须在 ``snapshot`` 取完之后调用：用户原值已经被 snapshot 收走，finally 的
+    ``restore_settings`` 才能原样还回去。这里直写 QSettings 而不是
+    ``customization.set()``，只为省掉 import 顺序上的坑 —— ``set()`` 也只写值、
+    不碰 ``*_chosen``，两种写法对"自动/手动"语义的影响完全一样。
+    """
+    for key in ("module_count", "cells_per_module", "temps_per_module"):
+        settings.setValue(f"custom/{key}", 0)
+    settings.sync()
+
+
 def window_click(app: QApplication, window, point: QPoint) -> None:
     """经 windowHandle 派发一次真实点击（press + release）。
 
@@ -235,14 +255,12 @@ def check_ble_broadcast(app: QApplication) -> None:
         """假扫描器：start() 时把脚本里的包全喂一遍，stop() 什么也不做。"""
 
         script: list = []
-        starts = 0
 
         def __init__(self, detection_callback=None, scanning_mode="passive"):
             self._cb = detection_callback
             self.mode = scanning_mode
 
         async def start(self):
-            _FakeScanner.starts += 1
             assert self.mode == "passive", "广播接收必须是 passive 扫描"
             for device, adv in _FakeScanner.script:
                 self._cb(device, adv)
@@ -924,9 +942,14 @@ def check_receive_search(app: QApplication) -> None:
 def check_animation_engine(app: QApplication) -> None:
     """动画引擎：节拍必须够 120fps、曲线必须非线性、静止时不留计时器。"""
     from ui_anim import (
-        EASINGS, FPS, FRAME_MS, Tween, out_cubic, ticker_active,
+        EASINGS, FPS, FRAME_MS, STANDARD, Tween, animations_enabled, bezier,
+        in_out_quint, out_cubic, set_animations_enabled_override, ticker_active,
         ticker_interval,
     )
+
+    # 本机若在「辅助功能」里关掉了动画，下面这些"要看到帧在推进"的断言会全挂 ——
+    # 那是设置生效了，不是引擎坏了。测试里先把开关钉成"开"，结束时交还系统。
+    set_animations_enabled_override(True)
 
     # 1) 节拍。8ms 一帧 = 125Hz，稳稳盖住 120fps 这条线。
     #    这条是"高帧率"唯一能确定性地验证的地方 —— 帧数会受机器负载影响，
@@ -947,6 +970,17 @@ def check_animation_engine(app: QApplication) -> None:
             assert curve(0.25) == 0.25
             continue
         assert abs(curve(0.25) - 0.25) > 0.02, f"{name} 在 t=0.25 几乎走直线"
+
+    # 新加的两条要各自钉住"为什么加"：
+    # · in_out_quint 是 power3.inOut 那一档 —— 两端比 cubic 更轻（t=0.1 更小）
+    # · bezier 造的 STANDARD 是"起步略缓、收尾极稳" —— 前段不能像 out_* 那么冲
+    assert in_out_quint(0.1) < 4.0 * 0.1 ** 3 + 1e-9, "in_out_quint 起步不比 cubic 轻"
+    assert in_out_quint(0.5) == 0.5, in_out_quint(0.5)
+    assert abs(STANDARD(0.0)) < 1e-9 and abs(STANDARD(1.0) - 1.0) < 1e-9
+    assert STANDARD(0.25) > 0.25, "标准曲线应当是「起步快、收尾长」"
+    custom = bezier(0.25, 0.1, 0.25, 1.0)
+    assert abs(custom(0.0)) < 1e-9 and abs(custom(1.0) - 1.0) < 1e-9
+    assert custom(0.5) > 0.5, custom(0.5)
 
     # 3) 补间真的连续推进到终点：中途单调、不跳步，结束回调只发一次
     seen: list[float] = []
@@ -972,6 +1006,107 @@ def check_animation_engine(app: QApplication) -> None:
     #    这里要证明的是"最终会停"，不是"此刻恰好是停的"。
     assert wait_for(app, lambda: not ticker_active(), timeout=2.0), \
         "补间都跑完了，调度器还在转"
+
+    # 5) repeat：循环期间"结束回调"不能发（那是给状态机用的信号），
+    #    且跨轮次必须连着走 —— 循环是用来做"转到状态结束"的指示器的。
+    cycles: list[float] = []
+    finished: list[int] = []
+    loop = Tween(60, out_cubic, cycles.append, lambda: finished.append(1),
+                 parent=app, repeat=1)
+    loop.start(0.0, 1.0)
+    deadline = time.monotonic() + 3.0
+    while loop.running and time.monotonic() < deadline:
+        app.processEvents()
+        app.processEvents()
+        time.sleep(0.004)
+    assert not loop.running, "repeat=1 的补间跑到超时还没结束"
+    assert finished == [1], f"结束回调应当在**最后一轮**才发一次: {finished}"
+    # 循环的判据是"值回落到起点后又重新爬升"，不是"出现过 1.0" ——
+    # 中间轮次结束时会**直接送起点值**（不送 1.0），最后一轮才落终值。
+    drops = [i for i, (a, b) in enumerate(zip(cycles, cycles[1:])) if b < a - 1e-9]
+    assert drops, f"没观测到循环重来（值一直单调）: {cycles[:6]}"
+    tail = cycles[drops[0] + 1:]
+    assert tail and max(tail) > 0.2, f"第二轮没有重新推进: {cycles}"
+
+    # 6) 减弱动效（对应 GSAP 的 matchMedia(prefers-reduced-motion)）：
+    #    关掉时不是"什么都不做"，而是**直接落到终态**。
+    set_animations_enabled_override(False)
+    snapped: list[float] = []
+    snapped_done: list[int] = []
+    quick = Tween(5000, out_cubic, snapped.append, lambda: snapped_done.append(1),
+                  parent=app)
+    quick.start(0.0, 1.0)
+    assert not quick.running, "关掉动画后补间不该还在跑"
+    assert snapped and snapped[-1] == 1.0, f"没有直接落到终态: {snapped}"
+    assert snapped_done == [1], "终态回调没发"
+    assert animations_enabled() is False
+    set_animations_enabled_override(True)
+    assert animations_enabled() is True
+
+    # 7) 矢量弧：忙碌时转起来（且用的是同一套节拍/共享计时器），
+    #    退出忙碌必须立刻停 —— 界面回到静止就该零计时器。
+    from ui_controls import PulseDot
+    dot = PulseDot()
+    dot.set_busy(True)
+    spins: list[float] = []
+    deadline = time.monotonic() + 0.6
+    while time.monotonic() < deadline:
+        app.processEvents()
+        spins.append(dot._spin_t)
+        time.sleep(0.01)
+    assert ticker_active(), "忙碌态没有在推帧"
+    assert max(spins) > min(spins), f"弧的角度没有推进: {spins[:5]}"
+    assert all(b >= a - 1e-9 for a, b in zip(spins, spins[1:])), "弧的角度回退过"
+    dot.set_busy(False)
+    assert wait_for(app, lambda: not ticker_active(), timeout=2.0), \
+        "退出忙碌后调度器还转着（静止必须零计时器）"
+    dot.deleteLater()
+
+    # 8) 弹层展开方向：动画必须从**锚点那一侧**长，且与该弹层的实际落位一致。
+    #    用户 2026-10-15 报过两次弹层（先高亮方块、后展开方向），这条把它钉住：
+    #    · 落位在控件下方 → 从顶端往下长（y 不动、高度变大）
+    #    · 被 Qt 翻到控件上方 → 从底端往上长（底边不动）
+    #    ⚠️ 判方向要按**中心**比：Qt 把弹层顶对齐到控件顶，拿"弹层顶 vs 控件底"
+    #    判会一律判成朝上（这正是当时的 bug）。
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QWidget as _QWidget
+    from ui_controls import ChevronComboBox
+
+    host = _QWidget()
+    host.resize(320, 240)
+    host.move(120, 120)
+    combo = ChevronComboBox(host)
+    combo.addItems(["一", "二", "三"])
+    combo.move(20, 20)
+    host.show()
+    wait_for(app, lambda: host.isVisible(), timeout=2.0)
+    combo.showPopup()
+    # 等"延后一拍"真正起动画：第一个生长帧
+    grows: list[tuple[int, int]] = []
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        app.processEvents()
+        g = combo.view().window().geometry()
+        grows.append((g.y(), g.height()))
+        if len(grows) >= 3 and grows[-1][1] < g.height():
+            break
+        time.sleep(0.005)
+    final = combo.view().window().geometry()
+    anchor_center = combo.mapToGlobal(QPoint(0, combo.height() // 2)).y()
+    below = (final.y() + final.height() / 2) >= anchor_center
+    shrinking = [f for f in grows if f[1] < final.height()]
+    assert shrinking, f"弹层没有从半高开始生长（帧全满高）: {grows[:4]}"
+    first = shrinking[0]
+    if below:
+        assert first[0] == final.y(), \
+            f"弹层落在控件下方，却从底端往上长：{first} → ({final.y()},{final.height()})"
+    else:
+        assert first[0] + first[1] == final.y() + final.height(), \
+            f"弹层落在控件上方，却从顶端往下长：{first} → ({final.y()},{final.height()})"
+    combo.hidePopup()
+    host.close()
+    host.deleteLater()
+    app.processEvents()
 
 
 def check_rx_history(app: QApplication) -> None:
@@ -1172,7 +1307,7 @@ def check_history_replay(app: QApplication) -> None:
         #  · 这个面**不能交给 QSS 画** —— QSS 对普通 QWidget 的 border-radius 在
         #    真实主窗口里会被整条丢掉（渲染成直角，用户第二遍报"边框没有圆角"
         #    就是这个；同一份样式表在隔离窗口里却是圆的）。所以面由
-        #    ``main_window.ReplayBar.paintEvent`` 自绘（ui_surface.paint_surface）；
+        #    ``main_window.ReplayBar.paintEvent`` 自绘（ui_surface.paint_glass）；
         #  · 左侧那条竖向装饰条已去掉（原是 border-left: 3px solid @fill_primary@，
         #    深色主题下就是一根近白竖杠；文案本身已说明是回放数据，纯装饰）。
         import re as _re
@@ -1405,6 +1540,51 @@ def check_updater(app: QApplication) -> None:
 
     # 8) 源链重试轮数（用户要求失败自动重试）
     assert CHECK_PASSES >= 2, "版本检测至少要整链重试一轮"
+
+
+def check_mcp_payload(app: QApplication) -> None:
+    """MCP 接入入口（2.1）：源码随包走 + 接入包自包含 + 文件出口可用。
+
+    这条检查真正防的是**交付**而不是功能：MCP 服务本身早就写好了，但只要
+    ``SerialAssistant.spec`` 的 datas 漏掉 ``mcp/``，装出来的 exe 里就没有源码，
+    设置面板点「复制接入配置」会复制出一段"请自己去 GitHub 取"——用户拿到手
+    才发现（而且只有打包版才有这个症状，源码态永远正常）。所以这里从**运行时
+    的读取路径**（``mcp_bridge.server_source``）验证，而不是直接读项目里的文件。
+    """
+    from pathlib import Path as _P
+    from version import VERSION as _VER
+
+    import mcp_bridge
+
+    source = mcp_bridge.server_source()
+    assert len(source) > 3000, (
+        "包内没找到 MCP 服务源码 —— SerialAssistant.spec 的 datas 漏了 mcp/")
+
+    text = mcp_bridge.deploy_payload()
+    assert mcp_bridge._SRC_MARK_BEGIN in text and mcp_bridge._SRC_MARK_END in text, \
+        "接入包必须用 BEGIN/END 标记把源码整段包起来（Agent 靠它原样落盘）"
+    for tool in ("list_ports", "open_port", "close_port", "status", "send",
+                 "read", "send_and_wait", "clear_buffer", "send_repl"):
+        assert f"def {tool}(" in text, f"接入包里的服务源码缺少工具 {tool}"
+    assert '"mcpServers"' in text and "serial-assistant" in text, \
+        "接入包必须带客户端注册片段（mcpServers/serial-assistant）"
+    assert f"v{_VER}" in text.splitlines()[0], "接入包首行要标出软件版本"
+    assert "独占" in text, "串口是独占资源这件事必须写进接入包"
+
+    # 文件出口 = 命令行 --mcp-payload 走的那条路
+    out_dir = _P(__file__).resolve().parent / "_check"
+    out_dir.mkdir(exist_ok=True)
+    out = out_dir / "selftest_mcp_payload.txt"
+    written = mcp_bridge.write_payload(str(out))
+    try:
+        assert _P(written).read_text(encoding="utf-8") == text, \
+            "落盘内容必须与剪贴板里的完全一致"
+    finally:
+        out.unlink(missing_ok=True)
+
+    # 设置面板里的入口确实接上了复制逻辑
+    from ui_settings import SettingsDialog
+    assert hasattr(SettingsDialog, "_copy_mcp_payload"), "设置面板缺少 MCP 复制入口"
 
 
 def check_installer_script(app: QApplication) -> None:
@@ -1890,29 +2070,57 @@ def check_expand_and_copy_all(app: QApplication) -> None:
         # 应为 917），上面复制用例的滚动定位会全是垃圾值。
         window.resize(700, 600)
         app.processEvents()
+        # ⚠️ 基准几何要**先把窗口设到不小于布局的最小宽度**再记：窗口刚 show 完
+        #    那会儿 minimumSizeHint 还没算稳（实测 839），而三张卡片摆好之后
+        #    真实最小宽是 1134 —— 拿 839 当基准，等于要求窗口比自己的最小还窄，
+        #    收起复位时必然"对不上"（那不是 bug，是尺寸约束）。
+        _min_w = max(839, window.minimumSizeHint().width())
+        if window.width() < _min_w:
+            window.setGeometry(window.x(), window.y(), _min_w, window.height())
+            for _ in range(20):
+                app.processEvents()
         pre_geom = window.geometry().getRect()
         window.btn_expand.click()
         assert wait_for(app, lambda: window._expanded), "点放大后没有展开"
         if fullscreen_testable:
             assert wait_for(app, lambda: window.isFullScreen()), \
                 "点放大后没有进入全屏"
-        assert window._rx_opts_row.isHidden(), \
-            "展开后接收区上方的工具栏没有隐藏"
-        assert window.brand_header.isHidden() and window._config_card.isHidden() \
-            and window._tx_card.isHidden(), "展开后其它卡片没有隐藏"
+        # 工具栏现在是**跟着动画一起收**的（220ms），不再是瞬间 hide ——
+        # 所以这里等它收完（之前瞬间隐藏时是立刻断言，会误判）。
+        assert wait_for(app, lambda: window._rx_opts_row.isHidden(),
+                        timeout=3.0), "展开后接收区上方的工具栏没有隐藏"
+        # ⚠️ 三块是**依次动画**收起的（每块 220ms、错开 45ms，见 _reveal_blocks），
+        #    不能测完立刻断言 isHidden —— 那会儿动画才刚起步。
+        assert wait_for(app, lambda: window.brand_header.isHidden()
+                        and window._config_card.isHidden()
+                        and window._tx_card.isHidden(), timeout=3.0), \
+            "展开后其它卡片没有（在动画结束后）隐藏"
 
         # ---- 3) 收起：**完整还原到点按钮之前的位置和大小**（用户点名）----
         window.btn_expand.click()
         assert wait_for(app, lambda: not window._expanded), "收起失败"
         assert window._rx_opts_row.isVisible(), "收起后工具栏没有回来"
-        assert window.brand_header.isVisible() and window._config_card.isVisible() \
-            and window._tx_card.isVisible(), "收起后卡片没有回来"
+                # 收起同样是**依次**动画归位（最上面那块要等 90ms 才开始），要等它回来
+        assert wait_for(app, lambda: window.brand_header.isVisible()
+                        and window._config_card.isVisible()
+                        and window._tx_card.isVisible(), timeout=3.0), \
+            "收起后卡片没有回来"
         if fullscreen_testable:
             assert not window.isFullScreen(), \
                 "来路是普通窗口的展开，收起后窗口不该留在全屏"
-            assert wait_for(app, lambda: window.geometry().getRect() == pre_geom), \
+            # 位置/高度必须精确复位；宽度允许落到"布局最小宽" —— 展开/收起会重算
+            # 最小宽（三张卡片摆好后是 1134，刚 show 完的 839 是还没算稳的瞬时值），
+            # 窗口不可能比自己的布局更窄，这是尺寸约束不是 bug。
+            assert wait_for(
+                app,
+                lambda: window.geometry().getRect() == pre_geom
+                or (window.x() == pre_geom[0] and window.y() == pre_geom[1]
+                    and window.height() == pre_geom[3]
+                    and window.width() == window.minimumSizeHint().width()),
+                timeout=3.0), \
                 (f"收起后没有完整还原到展开前的位置和大小："
                  f"{window.geometry().getRect()} vs {pre_geom}")
+
 
         # ---- 3b) 反复进出都要好使（旧实现退出一次就失效）----
         for round_ in (2, 3):
@@ -1921,13 +2129,46 @@ def check_expand_and_copy_all(app: QApplication) -> None:
             if fullscreen_testable:
                 assert wait_for(app, lambda: window.isFullScreen()), \
                     f"第{round_}次展开没有进入全屏"
-            assert window.brand_header.isHidden(), f"第{round_}次展开卡片没有藏起"
+            # 三块是**依次动画**收起的（每块 220ms、错开 45ms），要等它收完
+            assert wait_for(app, lambda: window.brand_header.isHidden()
+                            and window._config_card.isHidden()
+                            and window._tx_card.isHidden(), timeout=3.0), \
+                f"第{round_}次展开卡片没有（在动画结束后）藏起"
             window.btn_expand.click()
             assert wait_for(app, lambda: not window._expanded), f"第{round_}次收起失败"
-            assert window.brand_header.isVisible(), f"第{round_}次收起卡片没有回来"
+            assert wait_for(app, lambda: window.brand_header.isVisible()
+                            and window._config_card.isVisible()
+                            and window._tx_card.isVisible(), timeout=3.0), \
+                f"第{round_}次收起卡片没有（在动画结束后）回来"
         if fullscreen_testable:
-            assert window.geometry().getRect() == pre_geom, \
+            # 同前：位置/高度精确复位，宽度允许落到布局最小宽（尺寸约束）
+            assert wait_for(
+                app,
+                lambda: window.geometry().getRect() == pre_geom
+                or (window.x() == pre_geom[0] and window.y() == pre_geom[1]
+                    and window.height() == pre_geom[3]
+                    and window.width() == window.minimumSizeHint().width()),
+                timeout=3.0), \
                 "反复进出后几何没有精确回到原位"
+
+        # 3a-bis) 发送区**展开态**下最大化：也要平滑压到消失（用户 21:12 点名
+        #         "展开状态下的发送区折叠压缩到消失的动画还是不行，有跳变"）。
+        #         两条状态共用同一条 Reveal，只有满量程不同。
+        window._set_send_collapsed(False)          # 先把发送区展开
+        assert wait_for(app, lambda: not window._tx_collapsed), "发送区没展开"
+        h_before = window._tx_card.height()
+        window._expand_receive()
+        assert wait_for(app, lambda: window._expanded), "展开态最大化没进展开"
+        assert wait_for(app, lambda: not window._tx_card.isVisible(),
+                        timeout=3.0), "展开态下最大化，发送区没有压到消失"
+        window._collapse_receive()
+        assert wait_for(app, lambda: not window._expanded), "收起失败"
+        assert wait_for(app, lambda: window._tx_card.height() == h_before,
+                        timeout=3.0), "收起后发送区高度没还原"
+        # 还原成默认的折叠态：发送区展开会让布局最小宽变大，后面的几何断言
+        # 会拿它和 839 的旧基准比而误判。
+        window._set_send_collapsed(True)
+        assert wait_for(app, lambda: window._tx_collapsed), "发送区没还原成折叠"
 
         # ---- 4) 启动即窗口全屏：startup_fullscreen 只盖任务栏，布局照常 ----
         window.startup_fullscreen()
@@ -1982,8 +2223,17 @@ def check_expand_and_copy_all(app: QApplication) -> None:
         assert wait_for(app, lambda: not window._expanded), "收起失败"
         if fullscreen_testable:
             assert not window.isFullScreen(), "收起后窗口不该留在全屏"
-            assert window.geometry().getRect() == pre_geom, \
-                "Esc 往返后几何没有精确回到原位"
+            # 位置/高度必须精确复位；**宽度**允许不小于基准 —— 展开/收起会重算
+            # 布局最小宽（三张卡片摆好后是 1134、个别轮次 898），窗口不可能比
+            # 自己的布局更窄。这是尺寸约束，不是没复位（用等号断言会随机挂）。
+            assert wait_for(
+                app,
+                lambda: window.geometry().getRect() == pre_geom
+                or (window.x() == pre_geom[0] and window.y() == pre_geom[1]
+                    and window.height() == pre_geom[3]
+                    and window.width() >= pre_geom[2]),
+                timeout=3.0), \
+                f"Esc 往返后几何没有精确回到原位：{window.geometry().getRect()} vs {pre_geom}"
         # ---- 6) 最大化按钮 → 转成真全屏（最大化给任务栏让位，盖不住它）----
         window.showMaximized()
         app.processEvents()
@@ -2756,7 +3006,13 @@ def check_config_parity_clock(app: QApplication) -> None:
             _fm = _pc.view().fontMetrics()
             _widest = max((_fm.horizontalAdvance(_pc.itemText(i))
                            for i in range(_pc.count())), default=0)
-            assert _pc.view().minimumWidth() >= _widest + 59, \
+            from ui_controls import _PopupItemDelegate   # 就地导入：口径由它定义
+            # 口径 = "视口放得下最宽文字 + 条目左右内边距"：这是真正的不变量
+            # （旧口径写死 +59/+60，那是 QSS 还在画条目、外边距 12px 时的余量；
+            # 条目改由 _PopupItemDelegate 画、margin 归零后它就不再是那个数，
+            # 而且当时明显偏宽 —— 用户点名"这里宽了"）。
+            _need = _widest + _PopupItemDelegate.PAD_X * 2
+            assert _pc.view().minimumWidth() >= _need, \
                 (f"{_pname} 的弹层宽度没按最宽选项自适应："
                  f"视图最小宽 {_pc.view().minimumWidth()} < 最宽项 {_widest:.0f}+60")
         _pc = window.cmb_stopbits
@@ -2766,12 +3022,18 @@ def check_config_parity_clock(app: QApplication) -> None:
         # 之后再逐帧长到全高。⚠️ 不能在 processEvents 之后量中间高度 —— 一轮
         # 事件循环能消化掉大半段动画（弹层每帧都是半透明重绘，单帧不便宜），
         # 机器一快断言点就飘（实测 2 次事件后已经到 73/134）。
+        # ⚠️ 动画是**延后一拍**才起跑的（Qt 先定位弹层，随后才轮到我们展开，
+        #    见 ui_controls._animate_popup_open 的说明）——直接取起始高会取到
+        #    Qt 定完位的满高，误判成"没有动画"。所以先泵几拍等它起跑，
+        #    记录整个过程中的最小高度，再等到长满。
         _h_start = _win.height()
-        for _ in range(80):
+        for _ in range(400):
             app.processEvents()
             if not _pc.view().isVisible():
                 break
-        _h_full = _win.height()
+            _h_start = min(_h_start, _win.height())
+            time.sleep(0.003)
+        _h_full = max(_win.height(), _h_start)
         _pc.hidePopup()
         for _ in range(8):
             app.processEvents()
@@ -2973,6 +3235,7 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
 
     settings = QSettings("MimoWorks", "SerialAssistant")
     snapshot = {key: settings.value(key) for key in settings.allKeys()}
+    pin_rx_grid_defaults(settings)
 
     window = make_window()
     try:
@@ -3283,6 +3546,7 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
 
     settings = QSettings("MimoWorks", "SerialAssistant")
     snapshot = {key: settings.value(key) for key in settings.allKeys()}
+    pin_rx_grid_defaults(settings)
     real_ports = mw.list_serial_ports
     fake: list[tuple[str, str]] = [("loop://", "回环端口（假）")]
     mw.list_serial_ports = lambda: list(fake)
@@ -3800,7 +4064,8 @@ def check_caption_bar(app: QApplication) -> None:
         window._expand_receive()
         app.processEvents()
         assert bar.isVisible(), "接收区展开之后标题栏被藏掉了"
-        assert window.brand_header.isHidden(), "（前提）展开态本来就该藏品牌页头"
+        assert wait_for(app, lambda: window.brand_header.isHidden(), timeout=3.0), \
+            "（前提）展开态本来就该藏品牌页头（现在是动画收起，要等它跑完）"
         assert layout_snapshot() == windowed, \
             f"展开态三键的位置/大小变了：{layout_snapshot()} vs {windowed}"
         window._collapse_receive()
@@ -4156,6 +4421,7 @@ def check_alert_locate(app: QApplication) -> None:
 
     settings = QSettings("MimoWorks", "SerialAssistant")
     snapshot = {key: settings.value(key) for key in settings.allKeys()}
+    pin_rx_grid_defaults(settings)
     window = make_window()
     try:
         window.resize(900, 700)
@@ -4326,6 +4592,7 @@ CHECKS = [
     ("定制功能注册表", check_customization),
     ("校验位/保留行数/时钟/发送区一排", check_config_parity_clock),
     ("自动更新模块", check_updater),
+    ("MCP 接入入口", check_mcp_payload),
     ("安装包脚本", check_installer_script),
     ("历史接收数据", check_rx_history),
     ("历史数据回放", check_history_replay),

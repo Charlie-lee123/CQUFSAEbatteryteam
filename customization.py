@@ -61,6 +61,17 @@ def register_slider(key: str, label: str, default: int, minimum: int,
                    "preview": preview})
 
 
+def register_choice(key: str, label: str, default: str, options, tip: str = "") -> None:
+    """注册一个**枚举**型定制配置（设置面板里是一个下拉框，二选一起步）。
+
+    ``options``：``((显示名, 存储值), ...)``。存储值必须是字符串 —— 它进 QSettings
+    之后要能原样读回来（见 ``get`` 的归一：不在 options 里的值一律退回默认）。
+    取值类型与其它类型一样走 ``get``/``set``，所以面板/主窗口都无需为它分情况。
+    """
+    _SPECS.append({"key": key, "kind": "choice", "label": label,
+                   "default": default, "options": tuple(options), "tip": tip})
+
+
 def specs() -> tuple[dict, ...]:
     """全部注册项（设置面板按它生成界面，顺序即注册顺序）。"""
     return tuple(_SPECS)
@@ -79,6 +90,11 @@ def get(key: str):
         if isinstance(value, bool):
             return value
         return str(value).lower() in ("1", "true", "yes")
+    if spec["kind"] == "choice":
+        # 不在选项里的值（老配置 / 手改注册表 / 版本回退）一律退回默认 ——
+        # 下拉框拿到一个不存在的值会一片空白，宁可回默认。
+        valid = {stored for _label, stored in spec["options"]}
+        return str(value) if str(value) in valid else spec["default"]
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -147,6 +163,15 @@ def migrate_defaults() -> None:
 
 
 # ---------------------------------------------------------------- 现有定制功能
+# 界面材质：**二选一**（毛玻璃 / 液态玻璃）。两者**共用同一根强度滑杆**
+# （设置面板顶部那根「材质强度」），强度 0~100 无级、拖动实时预览。
+# 存储值是字符串（"frosted" / "liquid"），见 register_choice 的说明。
+register_choice("material", "界面材质", "frosted",
+                (("毛玻璃", "frosted"), ("液态玻璃", "liquid")),
+                tip="毛玻璃：磨砂颗粒 + 玻璃底色（现有表现）；"
+                    "液态玻璃：半透明主体 + 镜面双色调描边 + 边缘内发光 + 中心提亮"
+                    "（苹果 Liquid Glass 的桌面近似）。两者共用下面的强度滑杆")
+
 # 打开软件时的起手姿态。
 # ⚠️ 本软件里的"最大化"是**整窗全屏**：铺满整台显示器并把任务栏一起盖掉
 # （见 main_window.startup_fullscreen）。默认**开** = 保持老行为，用户升级
@@ -209,3 +234,24 @@ register_bool("highlight_errors", "高亮异常数据", True,
 register_slider("rx_font_size", "接收区字体大小", 21, 16, 48, scale=0.5,
                 suffix=" pt", preview="CQUFSAE.2026",
                 tip="接收区数据显示的字号；拖动滑块即时预览，确定后生效")
+
+# ---- 电池数据网格排版 ----
+# 三者都用来决定"采样点网格该排成什么样"（展示层，解析逻辑不动）：
+#   · 模组个数       → 网格**行数**（一排一个模组）
+#   · 每模组电芯数   → 电压段每排的目标个数
+#   · 每模组温度采集数 → 温度段每排的目标个数
+# ⚠️ 如实说明：**默认 0 时"每排个数"跟随设备发来的每行点数**（这是 0 = 自动的含义），
+#    但"**末排多一、其余各排一致**"的分配规则**始终生效**，不是缺陷、也不是只有
+#    配了正数才生效 —— 用户点名要的就是这个（原话见 ui_highlight.grid_row_sizes）。
+#    所以默认档下只要设备一行发不完（N 不是每行点数的整数倍），末排就会比别排多
+#    一个；N 正好整除时各排全等，与旧行为一致。排不下时以**实际数据个数**为准
+#    （绝不丢点）。
+register_int("module_count", "模组个数", 0, 0, 64,
+             tip="电池模组个数 → 数据网格的行数（一排一个模组）；"
+                 "0 = 每排个数跟随设备发来的每行点数")
+register_int("cells_per_module", "每模组电芯数", 0, 0, 32,
+             tip="每个模组的电芯数 → 电压段每排放几个点；"
+                 "0 = 跟随设备发来的每行点数")
+register_int("temps_per_module", "每模组温度采集数", 0, 0, 64,
+             tip="每个模组的温度采集点数 → 温度段每排放几个点；"
+                 "0 = 跟随设备发来的每行点数")

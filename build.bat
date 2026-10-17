@@ -1,27 +1,12 @@
 @echo off
-rem 打包成免安装单文件 exe。
-rem 产物落在「发布」文件夹里：发布\SerialAssistant.exe —— 名字一眼能认，
-rem 要发给别人时整个文件夹拖过去，或只把那个 exe 发出去都行（单文件免安装）。
-rem 注意 --add-data：车队队标等素材必须打进去，否则换台机器上就只剩文字没有品牌元素
+rem 打包成免安装单文件 exe（构建配方在 SerialAssistant.spec）。
+rem ⛔ 别再用 pyinstaller 命令行参数现拼：spec 里有 2026-10-17 的运行时裁剪
+rem    （剔除 opengl32sw / Qt6Quick+Qml / Qt6Pdf 等，52.6MB→35.2MB），
+rem    命令行打法会把它们全带回来，包体直接翻倍。
+rem 产物落在 dist\，再复制进「发布」文件夹（发布脚本 / 安装包都从这里取）。
 cd /d "%~dp0"
-".venv\Scripts\python.exe" -m pip install pyinstaller || exit /b 1
-".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean ^
-    --onefile --windowed ^
-    --distpath "发布" ^
-    --name "SerialAssistant" ^
-    --icon "assets\app.ico" ^
-    --add-data "assets;assets" ^
-    --exclude-module PySide6.QtWebEngineCore ^
-    --exclude-module PySide6.QtWebEngineWidgets ^
-    --exclude-module PySide6.QtWebEngineQuick ^
-    --exclude-module PySide6.Qt3DCore ^
-    --exclude-module PySide6.QtMultimedia ^
-    --exclude-module PySide6.QtCharts ^
-    --exclude-module PySide6.QtDataVisualization ^
-    --exclude-module tkinter ^
-    main.py || exit /b 1
-rem 旧版默认输出目录（dist）已经不用了，留着会让人分不清哪份是新的
-if exist "dist" rmdir /s /q "dist"
+".venv\Scripts\python.exe" -m PyInstaller SerialAssistant.spec --noconfirm || exit /b 1
+copy /y "dist\SerialAssistant.exe" "发布\SerialAssistant.exe" || exit /b 1
 rem 桌面快捷方式跟着产物走：产物一挪目录，老快捷方式就静默失效（双击打不开），
 rem 而 Windows 不会自愈它。这一步把它重新指到刚打出来的 exe 上（名字/位置不变，
 rem 没有就创建一条）。

@@ -41,6 +41,11 @@ LIGHT = {
     "shadow": "#0B0F14",
     "pulse": "#111214",
     "rim": "#FFFFFF",             # 玻璃上缘兜住的光（见 ui_surface 的描边）
+    # 液态玻璃的"镜面高光"：左上亮边（hi）/ 右下暗边（lo）构成的双色调描边 ——
+    # 苹果 §12 的 "bright top edge = light catching the material"。
+    # 浅色主题下暗边不能纯黑（会像描了一圈墨线），用冷灰才像玻璃的折光。
+    "glass_hi": "#FFFFFF",
+    "glass_lo": "#8A94A2",
     "volt_high": "#C42B1C",       # 电压超上限（红）—— 浅底用深红才够对比
     "volt_low": "#0E7B3D",        # 电压低于下限（绿）
     "bms_error": "#C2410C",       # BMS ERROR（橙）—— 浅底用深橙才够对比（用户：黄改橙）
@@ -59,9 +64,12 @@ DARK = {
     "surface_2": "#141518",
     "surface_hover": "#26282C",
     "ink": "#F2F3F5",
-    "ink_2": "#9CA1A8",
-    "ink_3": "#6E737A",
-    "ink_disabled": "#4A4E54",
+    "ink_2": "#D2D6DC",
+    "ink_3": "#A6ACB5",
+    # 禁用态图标/文字：原 #4A4E54 在"最大化后整屏只剩一列图标"时像坏了
+    # （用户连续多轮反馈"灰色/暗淡"）。抬到 ink_3(#6E737A) 同级：看得清，
+    # 但仍明显低于可用态，"不可用"的语义不变。
+    "ink_disabled": "#8E949C",
     "line": "#272A2E",
     "line_strong": "#383C42",
     "fill_primary": "#F2F3F5",
@@ -72,6 +80,9 @@ DARK = {
     "shadow": "#000000",
     "pulse": "#F2F3F5",
     "rim": "#FFFFFF",             # 玻璃上缘兜住的光（见 ui_surface 的描边）
+    # 液态玻璃的镜面高光：深色主题下"亮边近白、暗边纯黑"对比最强，最像玻璃的折光
+    "glass_hi": "#FFFFFF",
+    "glass_lo": "#000000",
     "volt_high": "#FF6B6B",       # 电压超上限（红）
     "volt_low": "#51CF66",        # 电压低于下限（绿）
     "bms_error": "#FB923C",       # BMS ERROR（橙）
@@ -128,6 +139,63 @@ def glass_alpha() -> int:
     """面板面色不透明度：强度越高越透，背景才透得上来。"""
     low, high = GLASS_ALPHA_RANGE.get(_SCHEME, GLASS_ALPHA_RANGE["dark"])
     return int(round(low + _glass_t() * (high - low)))
+
+
+# ---------------------------------------------------------------- 界面材质
+#
+# **两种材质二选一**（设置 → 定制功能 → 界面材质），两者**共用同一根强度滑杆**：
+#   · ``frosted``  毛玻璃 —— 现有表现（散射颗粒 + 玻璃底色 + 上缘兜到的光）；
+#   · ``liquid``   液态玻璃 —— 苹果 Liquid Glass 的桌面近似（半透明主体 +
+#                  镜面双色调描边 + 边缘内发光 + 主体中心提亮）。
+#
+# 强度 0 = 清玻璃（几乎只剩一层很淡的底色），100 = 材质拉满（各自特征最明确）。
+# 同一个 0~100 由两种材质**各自映射**到自己的视觉参数上 —— 毛玻璃动的是颗粒幅度
+# 与不透明度（见上面两条曲线），液态玻璃动的是镜面高光、内发光与中心提亮。
+MATERIAL_FROSTED = "frosted"
+MATERIAL_LIQUID = "liquid"
+MATERIALS = (MATERIAL_FROSTED, MATERIAL_LIQUID)
+
+_MATERIAL = MATERIAL_FROSTED
+
+
+def set_material(name: str) -> None:
+    """切换界面材质。非法值一律退回毛玻璃（默认档）。"""
+    global _MATERIAL
+    _MATERIAL = name if name in MATERIALS else MATERIAL_FROSTED
+
+
+def material() -> str:
+    return _MATERIAL
+
+
+# 液态玻璃：不透明度范围（低 → 高）与三处高光的幅度上限。
+# 与毛玻璃**方向相反**：强度越高，材质越"实"、镜面越亮 ——
+# 苹果那套玻璃是**越厚越亮**，这里把"厚度"直接绑在强度上。
+LIQUID_ALPHA_RANGE = {"light": (124, 206), "dark": (150, 210)}
+LIQUID_SPEC_MAX = 214        # 左上镜面高光（亮边）的峰值 alpha
+LIQUID_CORE_MAX = 46         # 主体中心提亮的峰值 alpha（模拟厚度 / 折射）
+LIQUID_INNER_MAX = 62        # 边缘内发光的峰值 alpha
+
+
+def liquid_alpha() -> int:
+    """液态玻璃主体不透明度：强度越高越实（能兜住更多镜面高光）。"""
+    low, high = LIQUID_ALPHA_RANGE.get(_SCHEME, LIQUID_ALPHA_RANGE["dark"])
+    return int(round(low + _glass_t() * (high - low)))
+
+
+def liquid_spec_alpha() -> int:
+    """镜面双色调描边的峰值不透明度。强度 0 也留 ~30%，清玻璃仍有那道折光。"""
+    return int(round(LIQUID_SPEC_MAX * (0.30 + 0.70 * _glass_t())))
+
+
+def liquid_core_alpha() -> int:
+    """主体中心提亮（"厚度"）的不透明度：清玻璃几乎没有，拉满才明显。"""
+    return int(round(LIQUID_CORE_MAX * _glass_t()))
+
+
+def liquid_inner_alpha() -> int:
+    """边缘内发光的不透明度：让主体边缘"亮一圈"，像玻璃把光收在壁里。"""
+    return int(round(LIQUID_INNER_MAX * (0.25 + 0.75 * _glass_t())))
 
 
 # ---------------------------------------------------------------- 磨砂颗粒
@@ -336,6 +404,30 @@ def set_scheme(scheme: str) -> None:
     _TOKENS.update(_PALETTES[_SCHEME])
 
 
+def set_scheme_mix(first: str, second: str, t: float) -> None:
+    """主题**过渡**：把 token 设成两套主题之间的插值色（t=0 → first，t=1 → second）。
+
+    苹果 §14：避免明暗突变 —— 换主题不该是"啪一下全黑/全白"。Qt 里 QSS 驱动的
+    控件层没法逐帧插值（那要每帧重刷整张样式表并 re-polish 所有控件，125Hz 下
+    直接卡死），所以过渡只做在**自绘的大色块**上（页面背景、卡片、页头、回放条）——
+    屏幕上占面积最大的就是这几块，渐变它们就能消掉硬切感；QSS 那层由调用方
+    一次性切到目标主题。
+
+    只动已经存在的 token（两套主题的键必须一致，缺键时以目标主题为准）。
+    """
+    a = _PALETTES.get(first, DARK)
+    b = _PALETTES.get(second, DARK)
+    t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+    for key, target in b.items():
+        ca = QColor(a.get(key, target))
+        cb = QColor(target)
+        _TOKENS[key] = QColor(
+            round(ca.red() + (cb.red() - ca.red()) * t),
+            round(ca.green() + (cb.green() - ca.green()) * t),
+            round(ca.blue() + (cb.blue() - ca.blue()) * t),
+        ).name()
+
+
 def token(name: str) -> str:
     try:
         return _TOKENS[name]
@@ -448,10 +540,15 @@ QToolTip {
 
 QLabel {
     background: transparent;
+    /* 苹果 §12「vibrancy」：毛玻璃表面上的文字不要用平面灰，要**更高对比 +
+       略重字重**。此前全应用统一 400，是"看着灰/没层级"的最大原因 —— 500 立见。 */
+    font-weight: 500;
     color: @ink_2@;
 }
 
 QLabel#title {
+    /* 卡片标题：苹果式"提一级"—— Semibold + 主文字色 */
+    font-weight: 600;
     color: @ink@;
 }
 
@@ -503,7 +600,7 @@ QLineEdit#searchEdit:focus {
 }
 
 QLabel#searchCount {
-    color: @ink_3@;
+    color: @ink_2@;
 }
 
 /* ---- 历史回放提示条 ----
@@ -624,27 +721,26 @@ QComboBox QAbstractItemView {
     border: 1px solid @line@;
     border-radius: 12px;
     padding: 6px;
-    margin: 10px 12px;
+    /* ⚠️ margin 必须是 0：弹层容器窗口是**半透明**的（见 ChevronComboBox.showPopup），
+       留了外边距的话，那一圈会把**背后的界面**透出来 —— 弹层压在卡片上时看着就是
+       "里面还套了一层框"（用户 2026-10-15 截图点名的编码弹层）。
+       圆角不靠外边距让位：容器是 WA_TranslucentBackground，圆角外的像素本来就是
+       透明的，贴到窗口边也不会被裁。 */
+    margin: 0;
     color: @ink@;
     outline: none;
-    selection-background-color: rgba(@sel_rgb@,0.12);
-    selection-color: @ink@;
+    /* ⚠️ 这里**不要**写 selection-background-color / selection-color：
+       它们会让选中态走样式引擎的"原始矩形"（方角、顶到边），::item 的
+       border-radius / margin 全部被绕过 —— 用户点名"难看的矩形高亮"就是它。
+       选中底色交给下面的 ::item:selected 画（实测：去掉之后圆角块生效）。*/
 }
 
-QComboBox QAbstractItemView::item {
-    border-radius: 8px;
-    padding: 4px 8px;
-    margin: 2px 4px;
-    min-height: 20px;
-}
-
-QComboBox QAbstractItemView::item:hover {
-    background: rgba(@sel_rgb@,0.12);
-}
-
-QComboBox QAbstractItemView::item:selected {
-    background: rgba(@sel_rgb@,0.12);
-}
+/* ⚠️ 这里**曾经**有 QComboBox QAbstractItemView::item / :hover / :selected
+   三条规则（圆角 + 内边距 + 选中底色）。2026-10-15 逐项验证后确认：在 Fusion 上
+   它们**完全不生效** —— 选中块始终由样式引擎画成"方角、顶到两边"的矩形（用户
+   截图点名的丑东西），试过 9 个开关（resizeMode / sizeAdjustPolicy /
+   uniformItemSizes / 视图级样式表…）都不动。条目绘制已改由
+   ui_controls._PopupItemDelegate 接管，这里不再留无效规则。 */
 
 QSpinBox::up-button, QSpinBox::down-button {
     background: transparent;
@@ -676,6 +772,7 @@ QPushButton {
     border: 1px solid @line@;
     border-radius: @CONTROL_RADIUS@px;
     padding: 7px 16px;
+    font-weight: 500;
     color: @ink@;
 }
 
@@ -781,7 +878,10 @@ QWidget#bottomBar {
 }
 
 QWidget#bottomBar QLabel {
-    color: @ink_3@;
+    /* 状态栏是**常读**信息（连接态、收发字节数），原来用最弱的 ink_3(173)
+       显得发灰 —— 用户点名"底栏统计变暗淡"就是这里。提到 ink_2(214) + 500 字重。 */
+    font-weight: 500;
+    color: @ink_2@;
 }
 
 QDialog {
@@ -790,7 +890,8 @@ QDialog {
 
 /* 设置面板里的分组小标题（"接收区""发送区"这类） */
 QLabel#groupCaption {
-    color: @ink_3@;
+    font-weight: 600;      /* 分组小标题：苹果式的"提一级"靠字重 */
+    color: @ink_2@;
 }
 
 /* 设置面板里按钮开关那段是放在滚动区里的。滚动区默认会按调色板的 Base
@@ -850,6 +951,11 @@ def apply_scheme(scheme: str) -> None:
     palette.setColor(QPalette.ColorRole.WindowText, qcolor("ink"))
     palette.setColor(QPalette.ColorRole.ButtonText, qcolor("ink"))
     palette.setColor(QPalette.ColorRole.Button, qcolor("surface_2"))
+    # 占位提示（"收到的数据会显示在这里"）在**接收区最大化**之后就是屏幕上唯一
+    # 的文字，用 Qt 默认的灰色显得整屏发灰（用户连续多轮反馈）。
+    # 提亮到 ink/ink_2 的中间调 #C8CCD1：仍然是"未输入"的层级，但不再是灰蒙蒙一片。
+    palette.setColor(QPalette.ColorRole.PlaceholderText,
+                     mix(qcolor("ink"), qcolor("ink_2"), 0.5))
     palette.setColor(QPalette.ColorRole.Highlight, qcolor("sel"))
     palette.setColor(QPalette.ColorRole.HighlightedText, qcolor("on_sel"))
     palette.setColor(QPalette.ColorRole.ToolTipBase, qcolor("surface"))

@@ -167,10 +167,6 @@ class CaptionBar(QWidget):
 
     # -- 对外 ------------------------------------------------------------
 
-    def set_title(self, text: str) -> None:
-        self._title = text
-        self.update()
-
     def set_maximized(self, maximized: bool) -> None:
         """中间那颗键在"最大化 / 还原"两副面孔之间切换（与系统标题栏同规矩）。"""
         self.btn_max.set_glyph(GLYPH_WIN_RESTORE if maximized else GLYPH_WIN_MAX)
@@ -201,6 +197,10 @@ class CaptionBar(QWidget):
         标题不是装饰：整条标题栏大部分是空的，光秃秃一条空白带在窗口顶部会像
         排版事故；写上窗口名既像系统标题栏，窗口化时被别的窗口压住也好认。
         左边距见 ``TITLE_LEFT``（那儿的注释解释了它为什么不是 CARD_PAD 那一套）。
+
+        ⚠️ 这条整条**出血到窗口左右边缘**，但**不画任何材质底** —— 标题栏直接
+        坐在页面背景上（页面背景是纯色，见 ``ui_backdrop``）：用户明确要过"这里
+        背景透明的"，chrome 层不再跟卡片一起铺毛玻璃/液态玻璃。
         """
         if not self._title:
             return
@@ -218,7 +218,9 @@ class CaptionBar(QWidget):
             left += self.ICON_PX + self.ICON_GAP
 
         painter.setFont(self._title_face)
-        painter.setPen(qcolor("ink_3"))
+        # ⚠️ 这里原本是 ink_3（**最弱**的一档，实测亮度 145）—— 窗口标题却比卡片标题
+        #    （ink，243）暗一大截，用户反复反馈"字暗淡"就包含它。提到 ink_2。
+        painter.setPen(qcolor("ink_2"))
         painter.drawText(QRectF(left, 0.0, float(self.width()) - left,
                                 float(self.height())),
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
@@ -255,7 +257,6 @@ class BrandHeader(QWidget):
         self._product = product
         self._product_face = ui_font(13.5)
         self._lockup: QPixmap | None = None
-        self._aspect = FALLBACK_ASPECT
         self._dpr = 1.0
         self._load()
         # ⚠️ **不要**给页头设 WA_TransparentForMouseEvents。
@@ -271,7 +272,7 @@ class BrandHeader(QWidget):
 
     def _load(self) -> None:
         self._dpr = self._screen_ratio()
-        self._lockup, self._aspect = lockup_pixmap(current_scheme(), LOCKUP_MIN_W, self._dpr)
+        self._lockup, _ = lockup_pixmap(current_scheme(), LOCKUP_MIN_W, self._dpr)
         self.updateGeometry()
 
     @property
@@ -306,7 +307,9 @@ class BrandHeader(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-
+        # ⚠️ 页头**不画材质底**，直接坐在页面背景上（页面背景是纯色，见
+        # ``ui_backdrop``）—— 用户明确要过"这里背景透明的"：只有卡片们保留
+        # 毛玻璃 / 液态玻璃，页头这层不跟。
         height = float(self.height())
         left = float(CARD_PAD + SHADOW_PAD)
         right = float(self.width()) - left
