@@ -1,12 +1,14 @@
-"""统一动画引擎：固定 120fps、一律非线性缓动、所有补间共用一条计时器。
+"""统一动画引擎：帧率可调（默认 120fps，上限跟显示器刷新率）、一律非线性缓动、
+所有补间共用一条计时器。
 
 为什么自己写这一层，而不是继续用 ``QVariantAnimation`` / ``QPropertyAnimation``：
 Qt 的动画节拍由它内部的统一计时器决定，不由我们定（Qt6 默认约 60fps）。在
 120Hz 屏幕上，60fps 的过渡一眼能看出"两帧才动一次"的台阶。而这个界面里的动效
 全是几十毫秒的短过渡，帧率不够就显脏 —— 所以节拍必须自己拿住。
 
-- **节拍**：``FRAME_MS = 8ms``（125Hz），稳稳盖住 120fps。用 ``PreciseTimer``，
-  普通精度的计时器会被系统拉到 15ms 左右，那就掉回 60fps 了。
+- **节拍**：默认 120fps（``frame_interval_ms()`` = 8ms），可在设置里无级调到
+  显示器刷新率上限。用 ``PreciseTimer``，普通精度的计时器会被系统拉到 15ms 左右，
+  那就掉回 60fps 了。**改帧率不改时长**（进度按真实时间算，见上）。
 - **曲线**：一律非线性（见 ``EASINGS``）。线性运动在 UI 上发死；短过渡必须
   "起步快、落地慢"才收得住。
 - **进度**用 ``perf_counter`` 自己算，不信"计时器回调了几次"：某一帧被拖长时
@@ -25,10 +27,73 @@ from typing import Callable
 from PySide6.QtCore import QObject, Qt, QTimer
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
 
-# 目标帧率。120fps 是"高刷屏上看不出台阶"的门槛。
-FPS = 120
-# 节拍取 8ms（125Hz）。round(1000/120) = 8，所以实际刷新率 ≥ 目标帧率。
-FRAME_MS = max(1, round(1000 / FPS))
+# ---------------------------------------------------------------- 帧率
+#
+# 帧率**可在设置里无级调节**（2026-10-17 用户点名：上限跟着显示器刷新率走，
+# 他那台笔记本是 165Hz）。默认 120 —— "高刷屏上看不出台阶"的门槛。
+#
+# ⛔ 帧率只改"每帧隔多久推一次"，**绝不改动画时长**：``Tween.advance()`` 的进度
+#    按 ``perf_counter`` 算，不数回调次数。所以 60Hz 和 165Hz 播同一段 240ms 动画，
+#    墙钟时长完全一致，只是采样密度不同 —— 这就是用户要的"速度同步"。
+#    改节拍时正在跑的补间也不会跳：下一帧按真实流逝时间重新算进度。
+FPS_DEFAULT = 120
+FPS_MIN = 24              # 再低就明显一卡一卡了
+FPS_MAX_CAP = 240         # 防呆上限；真实上限还会被显示器刷新率再压一次
+
+_frame_hz = FPS_DEFAULT
+_screen_hz_cache: int | None = None
+
+
+def display_max_hz() -> int:
+    """主屏的最高刷新率（Hz）。取不到（远程桌面 / 虚拟屏）就退回 120。
+
+    这是设置面板滑杆的右端，也是 ``set_frame_hz`` 的硬上限 —— 超过显示器
+    刷新率没有任何意义（只会白烧 CPU）。
+    """
+    global _screen_hz_cache
+    if _screen_hz_cache is not None:
+        return _screen_hz_cache
+    hz = 0.0
+    try:
+        from PySide6.QtGui import QGuiApplication
+        app = QGuiApplication.instance()
+        screen = app.primaryScreen() if app is not None else None
+        if screen is not None:
+            hz = float(screen.refreshRate())
+    except (AttributeError, RuntimeError, TypeError):
+        hz = 0.0
+    if hz < 20.0:                       # 0 / 异常值都不可信
+        hz = float(FPS_DEFAULT)
+    _screen_hz_cache = int(min(FPS_MAX_CAP, round(hz)))
+    return _screen_hz_cache
+
+
+def forget_screen_hz() -> None:
+    """丢掉显示器刷新率缓存（换屏 / 分辨率变更后调用）。"""
+    global _screen_hz_cache
+    _screen_hz_cache = None
+
+
+def frame_hz() -> int:
+    """当前生效的动画帧率。"""
+    return _frame_hz
+
+
+def set_frame_hz(hz: int | float) -> int:
+    """设置动画帧率，返回**实际生效值**（已夹到 [FPS_MIN, 显示器上限]）。"""
+    global _frame_hz
+    cap = min(FPS_MAX_CAP, display_max_hz())
+    value = int(round(float(hz)))
+    value = max(FPS_MIN, min(cap, value))
+    _frame_hz = value
+    if _ticker_instance is not None:
+        _ticker_instance.set_frame_hz(value)
+    return value
+
+
+def frame_interval_ms() -> int:
+    """节拍间隔（毫秒）—— ``round(1000/Hz)``，保证实际刷新率 ≥ 目标帧率。"""
+    return max(1, round(1000.0 / _frame_hz))
 
 # Qt 里 maximumHeight 的"无上限"取值。动画结束后要把上限放开，
 # 否则控件会被永久钉在动画结束那一刻的高度上。
@@ -118,6 +183,24 @@ def bezier(x1: float, y1: float, x2: float, y2: float,
 # 用在"出现"上会显得东西是被甩进来的，不是被放上去的。
 STANDARD = bezier(0.2, 0.0, 0.0, 1.0)
 
+# CSS 的 ``ease`` = ``cubic-bezier(0.25, 0.1, 0.25, 1)``：入段比 STANDARD 长一点
+# （起步不至于"甩"），但比 in_out_cubic 短得多（不会"顿一下再开始"）。「两头都轻、
+# 但每一帧都在动」这条需求下它是最平衡的一档。
+#
+# 什么时候用它：动的是**版式占位**（高度/宽度，会把别的内容顶走）而非透明度/缩放。
+# 这类动画的验收口径是"看得见在动"—— 拿 220ms 展开 50px 那条提示条举例，同一个
+# 补间引擎 + ``min_interval_ms=16`` + ``max(1, round(v))`` 量化地板，逐帧高度是：
+#   STANDARD      : 1,10,23,31,36,40,43,45,47,48,49,50   首帧就窜 10px（太冲）
+#   in_out_quint  : 1, 3, 8,19,34,44,48,49,50            前 72ms 全在 3px 以内
+#   in_out_cubic  : 1, 3, 7,13,21,31,39,44,47,49,50      前 56ms 只到 3px（"顿一下"）
+#   EASE          : 1, 5,13,21,28,34,39,42,45,47,48,49,50  13 个台阶、单步 ≤8px、
+#                                                           首个 ≥2px 在 24ms
+# 即：台阶最多、单步最小、起步既不像 out_* 那样"被甩进来"也不像 in_out_* 那样"先
+# 停一拍"。用户对提示条的反馈就是"顿一下再开始"，量化到数字上就是 56ms 才动第二格。
+#
+# ⛔ 别在业务代码里直接 ``bezier(...)`` 造曲线：这里是**调参单点**，改一处全体生效。
+EASE = bezier(0.25, 0.1, 0.25, 1.0)
+
 EASINGS: dict[str, Callable[[float], float]] = {
     "linear": linear,
     "out_cubic": out_cubic,
@@ -126,6 +209,7 @@ EASINGS: dict[str, Callable[[float], float]] = {
     "in_out_quint": in_out_quint,
     "out_expo": out_expo,
     "standard": STANDARD,
+    "ease": EASE,
 }
 
 
@@ -294,9 +378,17 @@ class _Ticker(QObject):
         super().__init__()
         self._timer = QTimer(self)
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._timer.setInterval(FRAME_MS)
+        self._timer.setInterval(frame_interval_ms())
         self._timer.timeout.connect(self._tick)
         self._pending: list[Tween] = []
+
+    def set_frame_hz(self, hz: int) -> None:
+        """改节拍。正在跑的话直接换间隔 —— 补间按真实时间算进度，不会跳。"""
+        interval = max(1, round(1000.0 / max(1, int(hz))))
+        if interval != self._timer.interval():
+            self._timer.setInterval(interval)
+            if self._timer.isActive():
+                self._timer.start(interval)     # 立刻按新节拍重排
 
     def add(self, tween: Tween) -> None:
         if tween not in self._pending:
@@ -349,7 +441,7 @@ def ticker_active() -> bool:
 
 def ticker_interval() -> int:
     """调度器实际使用的帧间隔（毫秒）。测试用 —— 帧数会受机器负载影响，
-    节拍不会，所以"够不够 120fps"要断言在这里。"""
+    节拍不会，所以"够不够 120fps"要断言在这里。**它随设置的帧率变**。"""
     return _ticker()._timer.interval()
 
 
@@ -393,25 +485,26 @@ class Reveal(QObject):
     def progress(self) -> float:
         return self._t
 
-    def mark_expanded(self, size: int | None = None) -> None:
-        """把动画器的内部状态**对齐到"已展开"**。
-
-        新建的 Reveal 默认 `_t = 0`（以为是收起态）。给一个**本来就可见**的控件
-        新建时不对齐的话，第一次"收起"会变成 0→0 的空补间 —— 观感上就是
-        "啪一下没了"，一点动画都没有（实测踩到）。
-
-        ``size``：这一段动画的**满量程**。不给就用 sizeHint —— 对被 setFixed*
-        钉死的控件（比如发送区那条 54px 的标题栏）sizeHint 是它的**展开态**尺寸，
-        拿它当满量程，第一帧会把高度顶到比现在还高，观感就是"鼓一下再缩"的跳变。
-        """
-        self._t = 1.0
-        if size is not None and size > 0:
-            if self._horizontal:
-                self._full_w = int(size)
-            else:
-                self._full_h = int(size)
-
     def to(self, expanded: bool) -> None:
+        # ⛔ 折叠时满量程要取**当前真实尺寸**，不能只看 sizeHint：BrandHeader 的
+        #    sizeHint 是 350，布局实际只给它 164 —— 按 350 缩的话前 40% 的时间
+        #    视觉上什么都没发生（maxHeight 还没压到实际高度以下），然后突然从
+        #    164 开始掉，而且在 0.125×350 = 44px 就被 hide（一帧消失 44px）。
+        #    取真实高度后：164→0 全程匀速可感，hide 阈值也落在 20px 上。
+        if not expanded:
+            actual = (self._widget.width() if self._horizontal
+                      else self._widget.height())
+            if actual > 0 and actual < (self._full_w if self._horizontal
+                                        else self._full_h):
+                if self._horizontal:
+                    self._full_w = actual
+                    # `_min_w` 是"展开时钉回去的原宽"，同样可能比现在的实际宽度大
+                    # （复用的 Reveal 在卡片更宽时记过数）—— 不一起夹小，收尾钉回
+                    # 去的那一下会多出一截。
+                    if self._min_w is None or self._min_w > actual:
+                        self._min_w = actual
+                else:
+                    self._full_h = actual
         if expanded:
             # 每次展开都重新量一次：换主题、换字号尺寸都会变
             self._full_h = max(1, self._widget.sizeHint().height())
@@ -471,7 +564,12 @@ class Reveal(QObject):
             #      （实测 constBits() 返回 None）；
             #   ③ 横向折叠的配置卡与竖向收掉的发送区会在**同一时刻**消失
             #      （同一条曲线、同一个阈值、同样的时长）—— 用户点名要同步。
-            if self._collapsing and value <= 0.125:
+            # ⛔ 阈值不能大：0.125 意味着 164px 的页头在**还剩 20px** 时被整块
+            #    hide，布局随即把这一截一次性抽走 —— 逐帧实测 4 块同时隐藏那一帧
+            #    整体位移 80~91px，用户看到的就是"结尾跳一下"。收到 0.04（页头约
+            #    6px）再隐藏，这一帧只剩几像素的变化，肉眼看不出；也仍然避开
+            #    "尺寸归 0 时磨砂/阴影建出无效 QImage"那条老坑。
+            if self._collapsing and value <= 0.04:
                 self._widget.setVisible(False)
                 return
             if not self._widget.isVisible():

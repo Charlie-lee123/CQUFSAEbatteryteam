@@ -57,12 +57,6 @@ def server_source() -> str:
         return ""
 
 
-def server_path() -> str | None:
-    """包内那份源码的实际位置（存在才返回），给排查用。"""
-    path = os.path.join(_bundle_base(), SERVER_REL)
-    return path if os.path.exists(path) else None
-
-
 def _config_json() -> str:
     """客户端要的那段 ``mcpServers`` 条目（路径留成占位符，由 Agent 替换）。"""
     return (

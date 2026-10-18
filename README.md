@@ -6,13 +6,13 @@
 这个工具把它们**按段正确着色、对齐，出问题时一键定位**——车检和调试时
 打开就能读数，不用再肉眼在串口终端里找数字。
 
-当前版本：**v2.1**（2026-10-17）
+当前版本：**v2.2**（2026-10-18）
 
 ## 一键下载
 
 **推荐：安装版**（可选安装位置、自动建桌面快捷方式、带卸载程序、新版自动替换旧版）
 
-[![下载安装包](https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E4%B8%8B%E8%BD%BD-%E5%AE%89%E8%A3%85%E7%89%88%20Setup-2ea44f?logo=github&logoColor=white)](https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant-setup-2.1.exe)
+[![下载安装包](https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E4%B8%8B%E8%BD%BD-%E5%AE%89%E8%A3%85%E7%89%88%20Setup-2ea44f?logo=github&logoColor=white)](https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant-setup-2.2.exe)
 
 **免安装版**（单文件，下载后双击即用）
 
@@ -124,7 +124,7 @@ SerialAssistant.exe --mcp-payload D:\mcp.txt      # 指定路径
 
 ### 安装
 
-双击 `SerialAssistant-setup-2.1.exe`，选好目录一路下一步即可（免管理员权限）。
+双击 `SerialAssistant-setup-2.2.exe`，选好目录一路下一步即可（免管理员权限）。
 装完自动建桌面快捷方式；以后有新版本，重新跑一遍新安装包会**自动移除旧版本**，
 你的配置原封不动。
 
@@ -184,6 +184,7 @@ BMS ERROR               ← BMS 状态（橙），到此为止：其后的数值
 | v1.8 | 2026-10-13 | 安装程序与卸载程序（Inno Setup）；本地留存行数与接收区一致；软件内回放留存数据 |
 | v2.0 | 2026-10-15 | **蓝牙广播接收**（只扫描、不配对、不绑定）+「连接方式」切换 + `--ble-scan` 探针；**建链不卡界面**（可取消）；整项目瘦身（3.7GB→0.9GB）；安装器主题化 + 自动移除旧版本；修复自动更新「退出并重启」报错等 3 处问题 |
 | v2.1 | 2026-10-17 | **MCP 接入**（9 个工具的串口服务，源码随包走；设置面板「AI 接入」一键复制部署包，粘给 Agent 即自动装好；`--mcp-payload` 命令行导出）；**包体 52.6MB → 35.2MB（−33%）**（剔除 QML/Pdf/软件 OpenGL 等 41MB 无用运行时）；**冷启动导入 −23%**（蓝牙模块改为惰性加载）；清理死代码与孤儿通道；修复普通窗口几何被写成无效值 |
+| v2.2 | 2026-10-18 | **动画逐帧审计与修复**：设置面板打开/关闭「最后一帧闪/往左跳」真根因（DWM 扩展边框裁剪符号写反，快照位图右偏 7px）与换帧白帧竞态；退出最大化时发送区「死开关」（整段不参与动画，最后一帧整块弹出）；串口开关展开回抽；搜索条改 220ms EASE；接收区转场改为单补间驱动。**升级保留用户数据**（日志与接收历史迁到 `%LOCALAPPDATA%`，安装器拆旧版前备份再搬回）。历史数据改「打开/关闭」toggle + 提示条动画。代码净化（定制配置 O(1) 索引、去死代码、静态检查零告警） |
 
 ## License
 

@@ -942,8 +942,9 @@ def check_receive_search(app: QApplication) -> None:
 def check_animation_engine(app: QApplication) -> None:
     """动画引擎：节拍必须够 120fps、曲线必须非线性、静止时不留计时器。"""
     from ui_anim import (
-        EASINGS, FPS, FRAME_MS, STANDARD, Tween, animations_enabled, bezier,
-        in_out_quint, out_cubic, set_animations_enabled_override, ticker_active,
+        EASINGS, STANDARD, Tween, animations_enabled, bezier, display_max_hz,
+        frame_hz, frame_interval_ms, in_out_quint, out_cubic,
+        set_animations_enabled_override, set_frame_hz, ticker_active,
         ticker_interval,
     )
 
@@ -951,12 +952,45 @@ def check_animation_engine(app: QApplication) -> None:
     # 那是设置生效了，不是引擎坏了。测试里先把开关钉成"开"，结束时交还系统。
     set_animations_enabled_override(True)
 
-    # 1) 节拍。8ms 一帧 = 125Hz，稳稳盖住 120fps 这条线。
-    #    这条是"高帧率"唯一能确定性地验证的地方 —— 帧数会受机器负载影响，
-    #    节拍不会。所以两个都断：常量对，调度器实际用的间隔也对。
-    assert FPS == 120, FPS
-    assert FRAME_MS <= 1000 / FPS, f"节拍 {FRAME_MS}ms 到不了 {FPS}fps"
-    assert ticker_interval() == FRAME_MS, ticker_interval()
+    # 1) 节拍：默认 120fps，且**帧率可无级调**（2026-10-17 用户点名）。
+    #    节拍是"高帧率"唯一能确定性验证的地方 —— 帧数会受机器负载影响，节拍不会。
+    original_hz = frame_hz()
+    try:
+        set_frame_hz(120)
+        assert frame_hz() == 120, frame_hz()
+        assert frame_interval_ms() == 8, frame_interval_ms()
+        assert ticker_interval() == frame_interval_ms(), ticker_interval()
+        # 显示器上限：不会超过防呆的 240，也不会低于下限 24
+        assert 24 <= display_max_hz() <= 240, display_max_hz()
+        # 超出范围一律夹住（设置里存了 1000 也不能真按 1000 跑）
+        assert set_frame_hz(1000) == min(240, display_max_hz()), "上限没夹住"
+        assert set_frame_hz(1) == 24, "下限没夹住"
+        set_frame_hz(120)
+
+        # 1b) **速度同步**：帧率只改采样密度，**不改动画时长**。
+        #     同一段 160ms 动画在 60fps 与最高帧率下，墙钟时长必须基本一致，
+        #     只是帧数不同 —— 这是用户点名要的那条。
+        def _measure(hz: int, ms: int = 160):
+            set_frame_hz(hz)
+            samples: list[float] = []
+            tw = Tween(ms, out_cubic, samples.append, parent=app)
+            started = time.perf_counter()
+            tw.start(0.0, 1.0)
+            deadline = time.monotonic() + 3.0
+            while tw.running and time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(0.002)
+            return (time.perf_counter() - started) * 1000.0, len(samples)
+
+        slow_ms, slow_n = _measure(60)
+        fast_ms, fast_n = _measure(max(120, display_max_hz()))
+        assert abs(fast_ms - slow_ms) <= max(60.0, slow_ms * 0.35), \
+            (f"改帧率把动画时长也改了：60fps {slow_ms:.0f}ms / "
+             f"高帧率 {fast_ms:.0f}ms")
+        assert fast_n > slow_n, \
+            f"高帧率没有采到更多帧：{slow_n} -> {fast_n}（帧率没生效？）"
+    finally:
+        set_frame_hz(original_hz)
 
     # 2) 曲线一律非线性。线性运动在 UI 上发死，短过渡必须"起步快、落地慢"。
     #    判据取 t=0.25：线性曲线在那里必然等于 0.25，减速曲线明显大于它，
@@ -1299,9 +1333,21 @@ def check_history_replay(app: QApplication) -> None:
         window._open_history()
         app.processEvents()
         assert window._replay_active, "打开历史后没进入回放模式"
+        # 「打开历史数据」是一颗**开关**（用户点名"再点一次就关掉"）：进回放后
+        # 文案必须跟着变，否则用户看不出这一下会退出回放。
+        assert window.btn_open_history.text() == "关闭历史数据", \
+            f"回放态下按钮文案没跟着状态变（还是「{window.btn_open_history.text()}」）"
         # 窗口没 show()，子控件 isVisible() 恒为 False —— 断言"要求显示"
         # （isHidden 为 False）而不是可见性。
         assert not window._replay_bar.isHidden(), "回放提示条没有显示"
+        # 提示条是**补间展开**的（0 → 50px，220ms）：展开一开始 max 就该放开，
+        # 否则布局永远只给它 0 高、条长不出来（这条专压那个坑）。
+        assert window._replay_bar.maximumHeight() > 0, \
+            "提示条展开补间把 maximumHeight 钉在 0 了（条长不出来）"
+        # 后面要用 render() 验这张条的圆角，必须拿到**展开后**的真实几何 ——
+        # 先等 220ms 的补间收尾。
+        assert wait_for(app, lambda: window._replay_tween is None, 2.0), \
+            "提示条展开补间没在 2s 内收尾"
         # 提示条的**外观约定**（都是用户点名的）：
         #  · 圆角必须跟卡片同一个尺度（CARD_RADIUS）；
         #  · 这个面**不能交给 QSS 画** —— QSS 对普通 QWidget 的 border-radius 在
@@ -1407,7 +1453,26 @@ def check_history_replay(app: QApplication) -> None:
         window._exit_replay()
         app.processEvents()
         assert not window._replay_active, "返回实时后回放标记没清"
+        assert window.btn_open_history.text() == "打开历史数据", \
+            "返回实时后按钮文案没变回「打开历史数据」"
+        # 收起也是 220ms 补间（从当前高度落到 0 才 hide、才把 max 归零）——
+        # 直接断 isHidden() 会撞在补间中间（那时条还在收）。
+        assert wait_for(app, lambda: window._replay_tween is None, 2.0), \
+            "提示条收起补间没在 2s 内收尾"
+        assert window._replay_bar.maximumHeight() == 0, \
+            ("返回实时后提示条没有真正收起（maximumHeight="
+             f"{window._replay_bar.maximumHeight()}）")
         assert window._replay_bar.isHidden(), "返回实时后提示条没收起"
+
+        # 「打开历史数据」= 开关：回放态下再点一次必须**退出回放**，而不是再灌
+        # 一遍同一个文件。连点两次 → 打开又关闭，最终必须回到实时态。
+        window._open_history()
+        app.processEvents()
+        assert window._replay_active, "再点「打开历史数据」没进回放（开关失效）"
+        window._open_history()
+        app.processEvents()
+        assert not window._replay_active, \
+            "回放态下再点「打开历史数据」没有关闭回放（开关失效）"
     finally:
         customization.set("volt_limit_low", saved_limits[0])
         customization.set("volt_limit_high", saved_limits[1])
@@ -1457,18 +1522,33 @@ def check_updater(app: QApplication) -> None:
     assert version_tuple("1.2") <= version_tuple("1.2.0"), \
         "元组前缀语义：同版本不得误判为新版"
 
-    # 3) 源链形态：≥3 级、首源是 jsDelivr（国内直连）、都走 https
+    # 3) 源链形态：首源是 jsDelivr（国内直连）、都走 https、镜像 ≥4 条
     sources = version_sources()
-    assert len(sources) >= 3, f"版本源太少：{[s[0] for s in sources]}"
+    assert len(sources) >= 6, f"版本源太少：{[s[0] for s in sources]}"
     assert sources[0][1].startswith("https://cdn.jsdelivr.net/"), \
         f"首源应当是 jsDelivr（无代理直连）：{sources[0][1]}"
-    assert all(url.startswith("https://") for _n, url, _p in sources), \
+    assert all(len(src) == 4 for src in sources), "版本源必须带镜像前缀（第 4 项）"
+    assert all(src[1].startswith("https://") for src in sources), \
         "版本源必须都是 https"
-    # 下载源链：镜像在前、GitHub 直连兜底；tag 要出现在 URL 里
+    mirrors = [src for src in sources if src[3]]
+    assert len(mirrors) >= 4, f"镜像源太少：{[m[0] for m in mirrors]}"
+
+    # 下载源链：镜像在前（≥4 条）、GitHub 直连兜底；tag 要出现在 URL 里
     urls = release_download_urls("v1.6")
-    assert len(urls) >= 2 and "releases/download/v1.6/SerialAssistant.exe" in urls[-1], \
-        f"下载源链不对：{urls}"
-    assert "gh" in urls[0] and "github.com/Charlie-lee123" in urls[-1]
+    direct = "https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/download/v1.6/SerialAssistant.exe"
+    assert len(urls) >= 5, f"下载源太少：{urls}"
+    assert urls[-1] == direct, f"末源必须是直连：{urls[-1]}"
+    assert all(url.endswith(direct) for url in urls[:-1]), \
+        f"镜像源必须是「前缀 + 直连地址」的形式：{urls[:3]}"
+
+    # 测速胜出的镜像会被提到最前面（下载从它起跑）
+    from updater import best_prefix, note_best_prefix
+    note_best_prefix("https://hub.gitmirror.com/")
+    assert release_download_urls("v1.6")[0] == "https://hub.gitmirror.com/" + direct, \
+        "最快镜像没有被排到第一位"
+    note_best_prefix(None)          # 空值不得覆盖已有选择
+    assert best_prefix() == "https://hub.gitmirror.com/", \
+        "note_best_prefix(None) 不该清掉已知的最快镜像"
 
     # 4) 完整性校验：哈希/大小/无信息 三条路径
     data = b"SerialAssistant-exe-bytes"
@@ -2156,6 +2236,11 @@ def check_expand_and_copy_all(app: QApplication) -> None:
         #         两条状态共用同一条 Reveal，只有满量程不同。
         window._set_send_collapsed(False)          # 先把发送区展开
         assert wait_for(app, lambda: not window._tx_collapsed), "发送区没展开"
+        # ⚠️ 展开现在是 300ms 真动画（2026-10-17 之前 start==target 会一步跳完），
+        #    必须等分割器补间跑完再取基准高度，否则拿到的是半路高度。
+        assert wait_for(app, lambda: not (window._split_tween
+                                          and window._split_tween.running),
+                        timeout=2.0), "发送区展开动画没有跑完"
         h_before = window._tx_card.height()
         window._expand_receive()
         assert wait_for(app, lambda: window._expanded), "展开态最大化没进展开"
@@ -2169,6 +2254,34 @@ def check_expand_and_copy_all(app: QApplication) -> None:
         # 会拿它和 839 的旧基准比而误判。
         window._set_send_collapsed(True)
         assert wait_for(app, lambda: window._tx_collapsed), "发送区没还原成折叠"
+
+        # ---- 3c) 可打断：展开到约 40% 时再次点击，必须**从当前进度反向**，
+        #          不跳回起点、不跑完再反向（用户："中途再点一下"）。 ----
+        if window._expanded:
+            window.btn_expand.click()
+            assert wait_for(app, lambda: not window._expanded, timeout=3.0), "复位失败"
+        assert wait_for(app, lambda: window._rx_t <= 0.05, timeout=2.0), "不在普通态起点"
+        window.btn_expand.click()                       # 开始展开
+        assert wait_for(app, lambda: 0.30 <= window._rx_t <= 0.75, timeout=2.0), \
+            f"展开没有到中段（_rx_t={window._rx_t:.2f}）"
+        t_mid = window._rx_t
+        h_mid = window._rx_card.height()
+        window.btn_expand.click()                       # 中途反向 → 收起
+        app.processEvents()
+        # 目标翻转成收起，**进度连续**（既没跳回 1.0 重来，也没跳到 0）
+        assert window._rx_target == 0.0, "中途再点没有转成收起"
+        assert abs(window._rx_t - t_mid) <= 0.25, \
+            f"打断后进度跳变：{t_mid:.2f} → {window._rx_t:.2f}（不是从当前值反向）"
+        # 反向一帧内几何不能跳回普通态满高/满屏（那正是"跳回起点"的表现）
+        assert window._rx_card.height() <= h_mid + 260, \
+            "打断后几何跳回起点（没有从当前呈现值反向）"
+        # 收尾必须干净落到普通态、卡片都回来
+        assert wait_for(app, lambda: not window._expanded and window._rx_t <= 0.02,
+                        timeout=3.0), "打断收起后没有到普通态"
+        assert wait_for(app, lambda: window.brand_header.isVisible()
+                        and window._config_card.isVisible()
+                        and window._tx_card.isVisible(), timeout=3.0), \
+            "打断收起后卡片没有全部回来"
 
         # ---- 4) 启动即窗口全屏：startup_fullscreen 只盖任务栏，布局照常 ----
         window.startup_fullscreen()
@@ -2857,8 +2970,15 @@ def check_customization(app: QApplication) -> None:
                         (image.height() - border - 1 - rows[-1]) / dpr)
 
             boxes = [("主题下拉框", dialog.cmb_theme)]
+            # ⚠️ 滑杆要排除：它内部没有文字（数值在**同行右侧的独立标签**里），
+            #    vertical_gaps 量的是"控件内部墨迹"，对滑杆只会量到把手 ——
+            #    把手位置随取值跑（帧率 120/24..165 时在右侧 45% 之外），
+            #    于是量不到任何东西而假挂。旧的字号滑杆之所以"过"了，是把手
+            #    恰好落在左侧 45% 内被当成了文字，属侥幸。
+            from ui_controls import GlassSlider as _GlassSlider
             boxes += [(key, widget) for key, widget in dialog._custom_widgets.items()
-                      if hasattr(widget, "value")]
+                      if hasattr(widget, "value")
+                      and not isinstance(widget, _GlassSlider)]
             for name, widget in boxes:
                 gaps = vertical_gaps(widget)
                 assert gaps is not None, f"{name} 里没量到文字墨迹（这条断言等于没测）"
@@ -2946,7 +3066,10 @@ def check_config_parity_clock(app: QApplication) -> None:
         app.processEvents()
         assert not window._tx_collapsed and not window._tx_content.isHidden(), \
             "点展开之后发送区没回来"
-        assert window._tx_card.height() > collapsed_card_h, \
+        # ⚠️ 展开现在是**真动画**（2026-10-17 之前 start==target 会一步跳到终态，
+        #    这里改完立刻断言还能过；现在是 300ms 的连续动画，必须等它长完）。
+        assert wait_for(app, lambda: window._tx_card.height() > collapsed_card_h,
+                        timeout=1.5), \
             (f"展开后发送区没有变高：{collapsed_card_h} -> {window._tx_card.height()}")
         assert window._rx_card.height() < collapsed_rx_h, \
             "展开发送区没有把高度从接收区还回来"
@@ -3309,6 +3432,14 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
             f"序号 0 不应补占位：{align_indexes('Voltage1:\n0.3820 1.3820')!r}"
         assert align_indexes("Voltage1:\n0.38").split("\n")[1] == "0.38", \
             "单独一个 0 号点也不该被补"
+        # 三位序号：补位宽度要跟着帧内**最大序号**走，否则 "100." 会多占一格，
+        # 小数点不在一条竖线上（用户："用序号的个位数字上下对齐"）。
+        wide = " ".join(f"{j}.3820" for j in (1, 9, 10, 99, 100, 120))
+        wide_row = align_indexes("Voltage1:\n" + wide).split("\n")[1]
+        wide_dots = [i for i, ch in enumerate(wide_row) if ch == "."]
+        assert len({b - a for a, b in zip(wide_dots, wide_dots[1:])}) == 1, \
+            f"三位序号时小数点没对齐：{wide_row[:70]!r}"
+        assert wide_row.startswith("001.3820"), f"补位宽度没按最大序号走：{wide_row[:20]!r}"
         # BMS ERROR 之后的错误明细行：序号保持设备原样（2026-10-11 用户点名
         # "BMSERROR后面的序号只有一位数，就不需要在前面加一个0"）
         bms_aligned = align_indexes(
@@ -3477,7 +3608,10 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
         assert "PIN-1" in shown and "PIN-2" in shown, \
             "恢复后暂停期间的数据没有刷进来"
         assert not window._paused_frames, "恢复后队列没清空"
-        assert bar.value() >= bar.maximum() - 1, \
+        # ⚠️ 追底是**动画**（180ms 的滚动补间，见 _rx_scroll_tween），而且恢复时
+        #    发送区可能还在展开（视口高度在变）—— 等它追上，别用一次性断言。
+        assert wait_for(app, lambda: bar.value() >= bar.maximum() - 1,
+                        timeout=2.0), \
             (f"按了继续却没有追上最新数据：{bar.value()} / {bar.maximum()}"
              "（视图停在暂停那一刻，新数据堆在下面看不见）")
 
@@ -4664,6 +4798,16 @@ def main() -> int:
     global_settings = QSettings("MimoWorks", "SerialAssistant")
     _heal_polluted_keys(global_settings)
     global_snapshot = {k: global_settings.value(k) for k in global_settings.allKeys()}
+    # 自测全程用**默认网格排版**（module_count / cells_per_module / temps_per_module
+    # 全 0）：收发/时间戳/定位这几条用例都假设"一段数据在一行里"。若机器上残留了
+    # 非零网格配置（例如 module_count=5），电压/温度点会被拆成每行一个 → "整行"
+    # 前提不成立，三条用例假挂（2026-10-18 实测：01.3700 与 02.3820 被拆成两行，
+    # "最近一次异常"定位到不含 1.3700 的那行）。
+    # ⚠️ 必须在 global_snapshot **之后**清零：收尾那段无条件还原会把用户真实值
+    #    写回，绝不污染用户配置。
+    for _grid_key in ("module_count", "cells_per_module", "temps_per_module"):
+        global_settings.setValue(_grid_key, 0)
+    global_settings.sync()
     failed = 0
     for name, func in CHECKS:
         try:

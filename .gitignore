@@ -13,6 +13,10 @@ dist/
 _check/
 logs/
 .temp_crop_*.png
+# 探针逐帧截图（每轮几 MB，没版本意义）与旧实现副本、临时提取物
+devtools/_frames*/
+devtools/_qa_old_impl/
+devtools/_tmp_*
 
 # ---- 本机助手数据（不进仓库）----
 .workbuddy/

@@ -191,42 +191,35 @@ def _max_step(seq) -> float:
 
 
 def adversarial_maximize_reverse(app, window) -> tuple[bool, str]:
-    """最大化动画跑到一半时反向 —— 逐帧记**动画量**（Reveal.progress），要求无阶跃。
+    """最大化动画跑到一半时反向 —— 逐帧记**应用自己的进度** ``window._rx_t``。
 
-    ⚠️ 窗口本身从普通态跳到全屏是 OS 的瞬时行为（既定的），这里量的是
-    **被动画的块**（页头 / 配置卡）的连续位移。
+    ⚠️ 2.1 起接收区转场是**一条时间线**（``_rx_transition`` / ``_rx_t``）：老的
+    Reveal 版块补间接口与其 progress 已随重构删除，这里改为直接读 ``_rx_t``
+    （0=普通态，1=最大化态），与 ``_qa_anim_verdict.py`` 的判据同源。
+    ⚠️ 窗口本身从普通态跳到全屏是 OS 的瞬时行为（既定的），这里量的是时间线本身。
     """
-    # 回到"普通窗口 + 两块都展开"的干净起点（否则头可能是隐藏态、progress 停在 0）
+    # 回到**普通态**的干净起点（_rx_t≈0）
     if window._expanded:
         window._collapse_receive()
+        pump(app, 1.0)
     window._want_fullscreen = False
     window._expect_normal = True
-    if window.isFullScreen():
-        window.showNormal()
-    window.setGeometry(60, 40, 1180, 860)
-    pump(app, 0.8)
-    window.brand_header.show()
-    window._config_card.show()
-    rev_h = window._block_reveal(window.brand_header, False)     # 页头：竖向
-    rev_w = window._block_reveal(window._config_card, True)      # 配置卡：横向
-    rev_h.mark_expanded()
-    rev_w.mark_expanded()
-    pump(app, 0.3)
-    start_ok = rev_h.progress > 0.99 and rev_w.progress > 0.99
+    pump(app, 0.2)
+    start_ok = abs(float(getattr(window, "_rx_t", 1.0))) <= 0.02
 
-    # ⚠️ 逐**引擎帧**采样（挂在 ticker 上），而不是每 3ms 轮询 —— 后者会一次跳过
-    #    多个帧、把真实逐帧位移虚报成"阶跃"（曾报 0.40，实为采样的混叠）。
+    # 逐**引擎帧**采样（挂在 ticker 上）—— 轮询会把多帧并成一帧，看不出真实逐帧位移
     from ui_anim import _ticker
 
     hs, ws, ts = [], [], []
     state = {"reversed": False}
 
     def on_tick() -> None:
-        hs.append(rev_h.progress)
-        ws.append(rev_w.progress)
+        t = float(getattr(window, "_rx_t", 0.0))
+        hs.append(t)
+        ws.append(t)
         ts.append(time.perf_counter())
-        if not state["reversed"] and rev_h.progress < 0.5:   # 跑到一半
-            window._collapse_receive()                       # 中途反向
+        if not state["reversed"] and t >= 0.5:      # 跑到一半（展开：0→1）
+            window._collapse_receive()              # 中途反向
             state["reversed"] = True
 
     _ticker()._timer.timeout.connect(on_tick)
@@ -236,8 +229,7 @@ def adversarial_maximize_reverse(app, window) -> tuple[bool, str]:
         while time.perf_counter() < end:
             app.processEvents()
             time.sleep(0)
-            if (state["reversed"] and rev_h.progress >= 0.999
-                    and rev_w.progress >= 0.999):
+            if state["reversed"] and float(getattr(window, "_rx_t", 1.0)) <= 0.001:
                 break
     finally:
         _ticker()._timer.timeout.disconnect(on_tick)
@@ -246,12 +238,13 @@ def adversarial_maximize_reverse(app, window) -> tuple[bool, str]:
     h_step, w_step = _max_step(hs), _max_step(ws)
 
     def p95_slope(seq):
-        """归一化速度的 95 分位（抗单次调度抖动）：位移 /（该帧真实时长/220ms）。
+        """归一化速度的 95 分位（抗单次调度抖动）：Δ进度 /（该帧真实时长/260ms）。
 
-        in_out_quint 的理论最大斜率是 5.0（progress / 归一化时间）；真正的一次性
-        几何跳变（未插值的 setGeometry/setMaximumHeight）会给出几十上百的值。
+        ``STANDARD`` = cubic-bezier(.2,0,0,1) 的**峰值斜率实测约 4.04**（进度/归一化
+        时间；数值微分 2000 点），所以判据放到 6（≈1.5×峰值）只是给帧抖动留余量；
+        真正的一次性跳变（补间被重启/回绕）会给出十几甚至几十的值。
         """
-        speeds = sorted(abs(b - a) / ((tb - ta) / 0.220)
+        speeds = sorted(abs(b - a) / ((tb - ta) / 0.260)
                         for a, b, ta, tb in zip(seq, seq[1:], ts, ts[1:]) if tb > ta)
         if not speeds:
             return 0.0
@@ -264,11 +257,11 @@ def adversarial_maximize_reverse(app, window) -> tuple[bool, str]:
     flips = sum(1 for a, b in zip(signs, signs[1:])
                 if a != 0 and b != 0 and a != b)
     # 判据：起手是展开态、中途确实反向、逐帧位移 ≤0.45×满量程（真跳变会 ≥0.5）、
-    # 归一化速度 p95 ≤ 6（≈曲线理论上限 5）、方向只翻转一次。
+    # 归一化速度 p95 ≤ 6（≈STANDARD 实测峰值 4.04 的 1.5 倍）、方向只翻转一次。
     ok = (start_ok and reversed_ and max(h_step, w_step) <= 0.45
           and h_slope <= 6.0 and w_slope <= 6.0 and flips <= 2)
     detail = (f"起手展开={start_ok} 中途反向={reversed_}；单帧位移≤{max(h_step, w_step):.3f}；"
-              f"归一化速度 p95 页头={h_slope:.2f} 配置卡={w_slope:.2f}（理论上限 5）；"
+              f"归一化速度 p95={h_slope:.2f}（STANDARD 实测峰值≈4.04，判据 6）；"
               f"方向翻转 {flips} 次；采样 {len(hs)}")
     return ok, detail
 

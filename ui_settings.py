@@ -276,8 +276,21 @@ class SettingsDialog(QDialog):
                 # 的 register_slider），只是控件换成滑杆 + 右侧数值标签；要表达
                 # 小数时按 spec["scale"] 换算（字号存的是半磅）。
                 slider = GlassSlider(Qt.Orientation.Horizontal)
-                slider.setRange(spec["minimum"], spec["maximum"])
-                slider.setValue(int(customization.get(spec["key"])))
+                # 右端可以按运行环境现算（``maximum_fn``）：动画帧率的上限就是
+                # **当前显示器的最高刷新率** —— 每开一次面板都重算，换屏不用重启。
+                maximum = int(spec["maximum"])
+                maximum_fn = spec.get("maximum_fn")
+                if callable(maximum_fn):
+                    try:
+                        maximum = int(maximum_fn())
+                    except Exception:      # noqa: BLE001 - 取不到就用注册表里的上限
+                        maximum = int(spec["maximum"])
+                maximum = max(int(spec["minimum"]), min(int(spec["maximum"]), maximum))
+                slider.setRange(int(spec["minimum"]), maximum)
+                # 老配置里存过 240、而当前屏幕只有 165 → 夹进量程，别让滑杆
+                # 显示一个够不着的值（真正生效值也会被 ui_anim 再夹一次）。
+                slider.setValue(max(int(spec["minimum"]),
+                                    min(maximum, int(customization.get(spec["key"])))))
                 slider.setMinimumWidth(190)
                 if spec["tip"]:
                     slider.setToolTip(spec["tip"])

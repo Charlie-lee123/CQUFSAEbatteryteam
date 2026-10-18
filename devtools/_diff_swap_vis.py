@@ -1,0 +1,23 @@
+"""把换帧帧 vs 稳态帧的差异画成红色叠加图，直观看闪烁区域。"""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from PySide6.QtGui import QImage, QColor
+from PySide6.QtWidgets import QApplication
+app = QApplication([])
+R = _ROOT + "/devtools"
+a = QImage(R + "/_frames_open_sync_run1/f007_swap.png").convertToFormat(QImage.Format_RGB888)
+b = QImage(R + "/_frames_swap_instant/2_settled.png").convertToFormat(QImage.Format_RGB888)
+out = QImage(b.width(), b.height(), QImage.Format_RGB888)
+out.fill(QColor(30, 30, 30))
+for y in range(b.height()):
+    for x in range(b.width()):
+        pa, pb = a.pixelColor(x, y), b.pixelColor(x, y)
+        d = abs(pa.red()-pb.red())+abs(pa.green()-pb.green())+abs(pa.blue()-pb.blue())
+        if d > 60:
+            out.setPixelColor(x, y, QColor(255, 40, 40))
+        else:
+            g = (pb.red()+pb.green()+pb.blue())//4
+            out.setPixelColor(x, y, QColor(g, g, g))
+out.scaledToWidth(520).save(R + "/_diff_swap_vis.png")
+print("saved _diff_swap_vis.png")

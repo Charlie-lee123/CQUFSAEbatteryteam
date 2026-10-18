@@ -37,8 +37,9 @@ from serial_io import (
 )
 import app_log
 import customization
-from ui_anim import (STANDARD, Reveal, Tween, animations_enabled, in_out_quint,
-                     out_cubic)
+from ui_anim import (EASE, STANDARD, Reveal, Tween, animations_enabled,
+                     in_out_quint, out_cubic)
+import ui_anim
 from ui_backdrop import frost_tile, paint_backdrop
 from ui_brand import BrandHeader, CaptionBar
 from ui_highlight import (
@@ -53,7 +54,7 @@ from ui_controls import (
 from ui_settings import SettingsDialog
 from ui_surface import Card, fade_in, paint_glass
 from ui_theme import (
-    CARD_RADIUS,
+    CARD_PAD, CARD_RADIUS,
     DEFAULT_GLASS, GAP, GLYPH_CHEVRON_DOWN, GLYPH_CHEVRON_UP, GLYPH_CLEAR,
     GLYPH_CLOSE, GLYPH_COLLAPSE, GLYPH_COPY, GLYPH_EXPAND, GLYPH_EXPAND_CHEVRON,
     GLYPH_PAUSE,
@@ -199,6 +200,21 @@ BUTTON_SPECS: tuple[tuple[str, str, str], ...] = (
 # "可见"状态（PrintWindow 要靠 DWM 重定向才有内容，见 _capture_native_window）。
 _SETTINGS_OFFSCREEN = -4000
 
+# 历史回放提示条展开/收起的高度补间时长（ms）。和搜索条那套（Reveal 200ms）
+# 同一量级：一帧里凭空多出 50px 会把下面的日志框猛地顶下去，必须有一条坡。
+_REPLAY_BAR_MS = 220
+# 补间的最高发值频率（ms/帧）。日志区每改一次高度要整块重绘（实测 7~14ms），
+# 125Hz 送值等于连环重排 —— 一帧只渲染最后一次，条就成台阶了。
+# 锁到 60fps：220ms / 16ms ≈ 13 个台阶，肉眼就是坡。
+_REPLAY_BAR_MIN_MS = 16
+# 回放 ←→ 实时切换时接收区文字的交叉淡入时长（ms）。只做"旧内容淡出"，
+# 新内容一开始就是完全不透明的（它已经在底下了）。
+_RX_XFADE_MS = 160
+# Qt 里"没有上限"的那个值（qwidget.h 的 QWIDGETSIZE_MAX）。用来把动画期间
+# 钉死的 maximumHeight 还原回去 —— 写 16777215 而不是留个 0/50，是为了之后
+# 换字体、换主题时条能重新按新的 sizeHint 长。
+_WIDGET_MAX = 16777215
+
 
 def _window_rect_physical(hwnd: int) -> tuple[int, int, int, int] | None:
     """``GetWindowRect``：窗口**扩展边框**的物理像素矩形（含 DWM 那圈不可见边框）。"""
@@ -289,6 +305,7 @@ class _SettingsShot(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._shot: QPixmap | None = None
+        self._alpha = 1.0
         self.setWindowFlags(Qt.WindowType.ToolTip)      # 无框、不抢焦点
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
@@ -298,12 +315,102 @@ class _SettingsShot(QWidget):
         self._shot = shot
         self.update()
 
+    def set_alpha(self, value: float) -> None:
+        """整块快照的不透明度（0~1）—— 换帧收尾时**渐隐**用。
+
+        ⚠️ 走 **``setWindowOpacity``**（窗口级合成），**不是** ``painter.setOpacity``
+        （控件级绘制）—— 后者在实测里是"把整块调暗成黑"，不是"透出底下的真面板"：
+
+            devtools/_probe_settings_zorder.py 实测（360x240 物理区域）
+            alpha 1.000 → 0.461 → 0.067 → 0.017 → 0.000
+            均亮  45.1  → 20.8  →  3.0  →  0.2  →  0.0     ← 线性趋黑
+            撤掉快照那一帧：均亮 0.0 → 45.1（一整块黑 → 真面板）
+
+        原因：这个窗口**不带 ``WS_EX_LAYERED``**（实测 exstyle=0x88 = TOPMOST+
+        TOOLWINDOW）。Qt 把内容按**预乘 alpha** 写进重定向表面，而 DWM 对非分层
+        窗口**忽略 alpha 通道**、当不透明来合 —— 于是屏幕上就是 ``alpha × 内容``
+        压在**黑底**上。``painter.setOpacity`` 只改了预乘系数，改不了"底下是谁"。
+        要让 DWM 按 alpha 去和桌面混合，窗口必须是 layered —— 而
+        ``setWindowOpacity(<1)`` 正是 Qt 把它变成 layered 的那条路。
+
+        ⛔ 铁律禁的是 **``dialog``（真面板）** 调 setWindowOpacity：它一变 layered，
+           DWM 就停画它的阴影，回到 1.0 时阴影"啪"地出现。快照是 ToolTip、
+           没有系统阴影，用它不涉及那条坑（真面板始终是 opacity 1.0 不透明上屏）。
+        ⛔ 不是 ``QGraphicsOpacityEffect``（控件级离屏合成，项目铁律禁）。
+        """
+        value = max(0.0, min(1.0, float(value)))
+        if abs(value - self._alpha) > 1e-3:
+            self._alpha = value
+            # 回到 1.0 要**显式**置一次：Qt 只在 <1 时维持 WS_EX_LAYERED，
+            # 不置的话 layered 摘掉的那一帧可能和"撤快照"错开，多一处闪。
+            self.setWindowOpacity(max(0.0, min(1.0, value)))
+            self.update()
+
     def paintEvent(self, event) -> None:
-        if self._shot is None or self._shot.isNull():
+        if self._shot is None or self._shot.isNull() or self._alpha <= 0.0:
             return
         painter = QPainter(self)
         # 缩放质量必须开：不开的话放大过程全是马赛克阶跃（那也是"跳变"）
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        # ⚠️ 这里**不再** setOpacity：透明度已经由窗口级合成负责（见 set_alpha）。
+        #    两处都做的话会被乘两次（alpha²），淡出比曲线快得多。
+        painter.drawPixmap(self.rect(), self._shot)
+
+
+class _RxShot(QWidget):
+    """接收区文字切换（回放 ⇄ 实时）时，垫在**新内容上面**的那张旧内容快照。
+
+    为什么需要它：``txt_rx.clear() + setPlainText(...)`` 是在**一帧之内**把整块
+    文字换掉 —— 长文档上肉眼就是"啪"地硬切一下。这里把切换前 viewport 的当前
+    画面抓成一张图盖上去，然后让这张旧图在 160ms 里淡出：视觉上是旧内容**溶进**
+    新内容，而不是突然替换。
+
+    ⛔ 不用 ``QGraphicsOpacityEffect``：控件级离屏合成 = 掉帧抽搐（项目铁律）。
+    这里直接在 ``paintEvent`` 里 ``painter.setOpacity()`` 后 ``drawPixmap`` ——
+    每帧一次带透明度的贴图，不建离屏 surface。
+
+    挂在 ``txt_rx.viewport()`` 下面（子控件画在父控件 paintEvent 之后，天然盖住
+    正文），并 ``WA_TransparentForMouseEvents`` —— 淡出期间用户点选 / 滚动 / 搜索
+    跳转一律不受影响，事件直接穿过去落到编辑器上。
+    """
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self._shot: QPixmap | None = None
+        self._alpha = 1.0
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.hide()
+
+    def set_shot(self, shot: QPixmap | None) -> None:
+        self._shot = shot
+        self.update()
+
+    def get_shot(self) -> QPixmap | None:
+        """当前挂着的那张图（None = 没有）。淡出前用它判"还有没有东西可淡"。"""
+        return self._shot
+
+    def set_alpha(self, value: float) -> None:
+        value = max(0.0, min(1.0, float(value)))
+        if abs(value - self._alpha) > 1e-3:
+            self._alpha = value
+            self.update()
+
+    def alpha(self) -> float:
+        """当前不透明度（0~1）—— 淡出中途被打断时从这里接着走。"""
+        return self._alpha
+
+    def sync_geometry(self) -> None:
+        """铺满父控件（viewport 会随窗口尺寸/滚动条显隐变化，每帧同步一次）。"""
+        parent = self.parentWidget()
+        if parent is not None:
+            self.setGeometry(parent.rect())
+
+    def paintEvent(self, event) -> None:
+        if self._shot is None or self._shot.isNull() or self._alpha <= 0.0:
+            return
+        painter = QPainter(self)
+        if self._alpha < 1.0:
+            painter.setOpacity(self._alpha)
         painter.drawPixmap(self.rect(), self._shot)
 
 
@@ -396,24 +503,57 @@ class MainWindow(QMainWindow):
         self._settings_previous = (0, "frosted", set(), 21)
         # 设置面板"整块放大/缩小"动画里的那张内容快照（见 _SettingsShot）
         self._settings_shot = _SettingsShot(self)
-        # 入场落定时"真面板透明渐入、完了撤快照"的临时目标（见
-        # _start_settings_swap_fade）。None 表示当前没有挂着的交换。
+        # 入场落定时"同一拍真面板上屏、撤快照"的临时目标。硬切是**同步**的
+        # （落定即清），正常不会停在非空；保留它只是给诊断探针一个可读状态。
         self._settings_swap_target = None
+        # 面板**静止态**的最小尺寸（尺寸对象，见 _open_settings / A3）。
+        # 入场动画期间必须把 min 放开成 (0, 0) 才缩得到按钮那一小块；落定时要
+        # 把整份 minimumSize 还回去 —— 只还宽度会留下高度那一半的坑（面板内容
+        # 撑出来的最小高没恢复，之后任何一次重排都会按"能缩到很矮"算）。
+        self._settings_min_size = None
         # 动画期间的日志追加合并（见 _set_rx_coalesce）：0 = 不合并（常态）
         self._rx_coalesce_ms = 0
         self._rx_coalesce_buffer: list[tuple[str, str]] = []
         self._rx_coalesce_timer = QTimer(self)
         self._rx_coalesce_timer.setSingleShot(True)
         self._rx_coalesce_timer.timeout.connect(self._flush_rx_coalesced)
-        # 各块展开/收起动画器（按控件缓存，见 _block_reveal）
-        self._block_reveals: dict = {}
         # 分割器尺寸动画（发送区收展 / 接收区最大化共用，见 _animate_splitter）
         # 展开前本来就隐藏的块（收起时不要把它们显回来）
         self._pre_hidden_blocks: list = []
         # 展开前发送区是不是折叠的（收起时原样还原）
         self._pre_send_collapsed = False
-        # 最大化时"把已折叠的发送区缩到 0"的动画器
-        self._tx_shrink = None
+        # 展开接收区之前，发送卡的真实高度（退出时原样还原）
+        self._pre_send_height = 0
+        # 接收区转场：**一条时间线**驱动所有几何（见 _rx_transition）。
+        #   self._rx_t     当前进度（0=普通态，1=最大化态），连续、可打断；
+        #   self._rx_target 目标进度（1 展开 / 0 收起）；
+        #   self._rx_full   普通态满量程（展开时现测、收起时复用）；
+        #   self._rx_*      发送区高、功能列宽、开关尺寸等派生量。
+        self._rx_tween: Tween | None = None
+        self._rx_t = 0.0
+        self._rx_target = 0.0
+        self._rx_full: dict = {}
+        self._rx_total = 900
+        self._rx_tx_normal = 0
+        self._rx_rail_normal = 48
+        self._rx_rail_expanded = 48
+        self._rx_row_w = 40
+        self._rx_row_h = 30
+        self._rx_hidden: set = set()
+        self._rx_switch_active = False
+        # 开关飞走期间占住它在配置卡里的那一格（见 _rx_place_home_gap）：
+        # 有它，卡内版式整段零位移；没它，开关进出会让下面控件整体上下窜 41px。
+        self._rx_home_gap: QWidget | None = None
+        # 开关那两格的**静止态**矩形（见 _rx_remember_home_slot / _rx_place_switch）。
+        # home：普通态卡片里那一格（x/宽冻结）；rail：收起方向起点那一格。
+        self._rx_home_slot: QRect | None = None
+        self._rx_switch_rail: QRect | None = None
+        # 展开方向的 rail 落点：最大化态实测值，落定时刷新（见 _rx_finish_expanded）。
+        # ⛔ 不要复用 _rx_switch_rail —— 那个是"本次转场的冻结值"，_rx_finish_normal
+        #    会把它清掉（见该函数末尾），而跨转场要保持的是最大化态那份。
+        self._rx_rail_rect_expanded: QRect | None = None
+        # 转场里每帧要**批量开关**的布局清单（见 _rx_collect_layouts / _rx_layouts_enabled）
+        self._rx_layouts: list[QLayout] = []
         self._split_tween: Tween | None = None
         self._split_from: list[int] = []
         self._split_to: list[int] = []
@@ -443,6 +583,11 @@ class MainWindow(QMainWindow):
         # 历史回放模式：为真时接收区显示的是本地留存数据，实时帧不写进画面
         # （但照常进 rx_history 与计数）。见 _open_history / _exit_replay。
         self._replay_active = False
+        # 提示条高度补间的句柄（见 _replay_bar_anim）：None = 当前没有在跑。
+        # 中途反向点击要"从当前高度折返"，所以必须留着上一段好打断。
+        self._replay_tween: Tween | None = None
+        # 接收区文字交叉淡入的补间句柄（见 _cross_fade_rx）
+        self._rx_shot_tween: Tween | None = None
         # 退出窗口全屏时要还原的普通几何。⚠️ 不能在全屏状态下调 saveGeometry
         # （那存下来的是满屏矩形）—— 普通态时由 moveEvent/resizeEvent 持续记忆
         self._normal_geometry: QRect | None = None
@@ -748,7 +893,31 @@ class MainWindow(QMainWindow):
 
         self._config_card = self._new_card("串口配置")
         self._config_card.setFixedWidth(310)
-        self._config_card.body.addLayout(self._build_config_panel(), 1)
+        # 「定宽容器 + 卡片裁切」—— 卡内表单在转场里**一帧都不重排**。
+        #
+        # 原先直接把表单布局交给 card.body（addLayout）：卡一窄，QVBoxLayout 就按
+        # 当前可用宽度**重新排版** —— setFixedWidth(64) 的标签被压、可编辑下拉框
+        # 缩到 minimumWidth(140) 以下开始横向滚动，宽度过某个临界值时又"啪"地弹回
+        # 最终版式。用户第三次反馈原话："过程中字体不要有干涉"。
+        #
+        # 现在表单住进一个**宽度写死**的容器：卡比容器窄时是**纯裁切**（Qt 天然
+        # 把子控件裁在父控件矩形内），容器里的控件几何恒定 → 没有重排、没有挤压、
+        # 没有"到某个宽度突然弹一下"。
+        # 附带收益：``_open_row_home``（= 表单的 col 布局）几何也钉死了，开关
+        # "回家"的落点不再随卡片宽度**每帧漂移**（原来落点一路变，尾巴上看得见
+        # 开关被往回拽一下）。
+        # ⚠️ 宽度 = 卡片宽 − 左右内边距（Card 的 SHADOW_PAD + CARD_PAD 各一份），
+        #    和原先 addLayout 时子布局拿到的宽度**一像素不差**；只在构造时算一次，
+        #    此后永不改变。
+        self._config_content = QWidget()
+        self._config_content.setFixedWidth(
+            310 - 2 * (SHADOW_PAD + CARD_PAD))
+        panel = self._build_config_panel()
+        self._config_content.setLayout(panel)
+        # ⚠️ setLayout 会把布局内边距改成样式默认值（本机 9px，白撑 18px）。原来的
+        #    嵌套子布局内边距是 0，这里必须跟着归零，否则内容整体缩进 9px。
+        panel.setContentsMargins(0, 0, 0, 0)
+        self._config_card.body.addWidget(self._config_content, 1)
         body.addWidget(self._config_card)
 
         inner.addLayout(body, 1)
@@ -1111,9 +1280,13 @@ class MainWindow(QMainWindow):
         # 「打开历史数据」（用户 2026-10-13 点名）：在软件内打开本地留存的
         # 接收数据，格式/风格/功能与实时接收一致。放在参数栏最下面 —— 它读的
         # 正是上面"保留行数"落在本地的那份备份，挨着最顺。
+        # ⚠️ 它是**开关**（回放态下再点 = 返回实时），文案随状态在「打开历史数据」
+        #    /「关闭历史数据」之间切（见 _refresh_replay_ui）。两个文案都是 6 个字，
+        #    切换时按钮宽度不变，布局不会抖。
         self.btn_open_history = InkButton("打开历史数据", variant="ghost")
         self.btn_open_history.setToolTip(
-            "在接收区打开本地留存的接收数据（格式与实时一致，可搜索 / 定位异常 / 复制）")
+            "在接收区打开本地留存的接收数据；回放中再点一次返回实时"
+            "（格式与实时一致，可搜索 / 定位异常 / 复制）")
         self.btn_open_history.clicked.connect(self._open_history)
         hist_row = QHBoxLayout()
         hist_row.setSpacing(10)
@@ -1154,13 +1327,25 @@ class MainWindow(QMainWindow):
         # 包一层容器：接收区全屏时要把这排工具栏**整体**藏掉（用户点名）。
         # ⚠️ setLayout 会把布局内边距设成样式默认值（本机 9px，白撑 18px），
         # 必须紧跟一句归零；竖直方向锁死，别让分割条把它拉高。
+        #
+        # 这排工具栏的收展**并入 _rx_transition 的统一时间线**（不再单独建 Reveal）：
+        # 多股补间并行、各停各的正是"最大化时工具栏啪一下没了 / 结尾跳一下"的根因。
+        #
+        # 「定高内容 + 行裁切」，和配置卡同一个套路：行高被压缩时若让 QHBoxLayout
+        # 自己重排，里面的开关/下拉框会被**竖直居中** —— 高度一小它们就整体上下
+        # 滑动（逐帧实测相对行顶漂 25px，看着就是"图标滑位、文字被切一半"）。
+        # 内容钉成自己的自然高度、贴着行的上沿，行高度再小也只是把下沿裁掉。
         self._rx_opts_row = QWidget()
-        # 接收区上方那条工具栏的收展动画器：**这里就建好**。懒创建的话首次
-        # 使用时 _t 还是 0（以为是收起态），第一次折叠会退化成空补间 ——
-        # 上一版就是这么把自测搞得不稳的（失败项每轮漂移）。
-        self._rx_opts_reveal = Reveal(self._rx_opts_row, 220, parent=self)
-        self._rx_opts_row.setLayout(opts)
+        self._opts_content = QWidget()
+        self._opts_content.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                         QSizePolicy.Policy.Fixed)
+        self._opts_content.setLayout(opts)
         opts.setContentsMargins(0, 0, 0, 0)
+        opts_row_lay = QVBoxLayout(self._rx_opts_row)
+        opts_row_lay.setContentsMargins(0, 0, 0, 0)
+        opts_row_lay.setSpacing(0)
+        # AlignTop：只做竖直对齐，不给它拉伸 —— 高度富余时也保持自然高度贴顶。
+        opts_row_lay.addWidget(self._opts_content, 0, Qt.AlignmentFlag.AlignTop)
         self._rx_opts_row.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         left.addWidget(self._rx_opts_row)
 
@@ -1188,14 +1373,28 @@ class MainWindow(QMainWindow):
         # 时间戳和每个采样点的"序号"染蓝（见 ui_highlight）。纯装饰层：
         # 文档里的文字一个字符都没改，保存/搜索/复制走的仍是纯文本。
         self._rx_highlighter = RxHighlighter(self.txt_rx.document())
+        # 回放 ←→ 实时切换时那张"旧内容"淡出层（见 _RxShot / _cross_fade_rx）。
+        # 挂 viewport 才能盖住正文；常隐藏，只在切换的那 160ms 里出现。
+        self._rx_shot = _RxShot(self.txt_rx.viewport())
         # 历史回放提示条（回放时才显示，见 _refresh_replay_ui）
         self._replay_bar = self._build_replay_bar()
+        # 初始是"收起"态：高度钉 0 + 隐藏，布局从一开始就把它当不存在。
+        # 后面所有显隐都走 _replay_bar_anim（0 ⇄ sizeHint 高度，可打断）。
+        self._replay_bar.setMinimumHeight(0)
+        self._replay_bar.setMaximumHeight(0)
         self._replay_bar.hide()
         left.addWidget(self._replay_bar)
         self._search_bar = self._build_search_bar()
         # 展开/收起走连续过渡（高度 + 不透明度，120fps）。直接 show/hide 是一帧
         # 跳变，日志框会被猛地顶下去，在高刷屏上很扎眼。
-        self._search_reveal = Reveal(self._search_bar, 200, parent=self)
+        # ⚠️ 曲线用 ``EASE``、时长 220ms，和 ``_replay_bar_anim`` 对齐：这条动画
+        #    动的也是**版式占位**（会把日志框顶走），项目定论是这类动画用 EASE
+        #    而不是 ``in_out_*``（逐帧对照表见 ``ui_anim.EASE`` 上方注释）——
+        #    ``in_out_quint`` 前 72ms 全在 3px 以内（用户报"前 80ms 纹丝不动"），
+        #    中段单步 8~9px 又是一跳；换成 EASE 后 13 个台阶、单步 ≤8px、首个
+        #    ≥2px 在 24ms，全程每一帧都看得见在走。
+        self._search_reveal = Reveal(self._search_bar, 220, curve=EASE,
+                                     parent=self)
         self._search_bar.hide()
         left.addWidget(self._search_bar)
         left.addWidget(self.txt_rx, 1)
@@ -1784,6 +1983,9 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         self._remember_normal_geometry()
+        # 窗口尺寸变过之后，最大化态 rail 落点的缓存就过期了 —— 清掉，下次展开
+        # 落定时重新量（缓存未命中时退化成就地现算，不会更差）。
+        self._rx_rail_rect_expanded = None
         super().resizeEvent(event)
 
     def changeEvent(self, event) -> None:
@@ -1988,6 +2190,11 @@ class MainWindow(QMainWindow):
         进入、Esc 退出），这里只切换卡片显隐，几何一个字节都不动。
         """
         self._expanded = True
+        # ⛔ 先把在途的转场补间**冻结**在当前进度：下面 showFullScreen + 等窗口落地
+        #    会阻塞（最多 160ms），不冻结的话反向点击时旧补间会在这段时间里继续跑
+        #    —— 就是用户说的"先跑完再反向"。_rx_transition 会从冻结值起跑。
+        if self._rx_tween is not None and self._rx_tween.running:
+            self._rx_tween.stop()
         # ⚠️ 动画期间**推迟着色 + 合并日志追加**（见 RxHighlighter.defer 与
         #    _set_rx_coalesce）：250 行/秒下这两项会和这次大布局 + 大面积重绘抢帧
         #    （QA 实测展开时 P50 掉到 42fps、>20ms 帧 42 个）。
@@ -2011,14 +2218,15 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
         self._enforce_native_fullscreen()
+        # ⛔ 动画必须在**窗口尺寸已经落地**之后才起跑，否则中途会整屏跳一次
+        #    （见 _settle_window_state 的实测数据）。
+        self._settle_window_state(True)
         # 功能键列改成"贴着数据卡片"（不再整列垂直居中）—— 见 _set_rail_compact
         self._set_rail_compact(True)
         # 全屏时接收区上方的工具栏（显示时间戳/HEX/编码那排）整个藏掉，
         # 搜索条若开着也收起 —— 全屏就是纯看数据。
-        # ⚠️ 用 Reveal **收掉**而不是直接 hide()：那排一瞬间消失，接收卡当场
-        #    往上窜一截（逐帧采样实测单帧位移 57px —— 就是用户说的"跳一下"）。
-        #    收起与展开走同一个 Reveal，和卡片让位同一拍、同一条曲线。
-        self._rx_opts_reveal.to(False)
+        # ⚠️ 这排的收展由 _rx_transition 统一驱动（和卡片让位同一条时间线），
+        #    不再单独起一条 Reveal —— 多股补间各停各的 = 速度折点 = "跳一下"。
         # 用户 22:29 明确：**不要改最大化后的主题颜色**。日志底色保持不变，
         # 只保留下面这几件真正必要的（卡片让位、发送区压零、开关搬家）。
         if self._search_bar.isVisible():
@@ -2030,13 +2238,18 @@ class MainWindow(QMainWindow):
                                                self._tx_card) if not w.isVisible()]
         # ⚠️ 记住发送区"展开前是不是折叠的"：开局默认就是折叠（定制项）。
         self._pre_send_collapsed = self._tx_collapsed
+        # 连同**真实高度**一起记：用户可能手工拖过分割器，收起时要原样还回去
+        # （只按 TX_COLLAPSED_H / tx_min_height 推是猜的，测试里量到对不上）。
+        self._pre_send_height = max(1, self._tx_card.height())
         # ⚠️ 动画**与窗口几何同步起跑**（不再"等几何落地再起"）。
         #    曾经为了躲开那帧整窗重绘，先轮询等全屏几何落地（最多 ~96ms）再起动画
         #    —— 那段等待里画面是"窗口已经全屏、卡片却还没动"的空档，用户看到的
         #    正是"接收区消失了一段时间" + "先跳一下再动"。
         #    现在 showFullScreen 与卡片让位同一拍开始，整段是一次连续的运动，
         #    接收区全程在屏上（逐帧采样验证见 devtools/_probe_fps.py）。
-        self._start_expand_anim()
+        # 所有几何（brand/config/opts/分割器/功能列/开关）由**一条时间线**驱动，
+        # 每帧一次布局 —— 见 _rx_transition。
+        self._rx_transition(True)
         self.btn_expand.set_glyph(GLYPH_RESTORE)
         self.btn_expand.setToolTip("退出全屏（Esc）")
 
@@ -2045,39 +2258,582 @@ class MainWindow(QMainWindow):
     #    冻结换不来帧率（实测 P95 130~243fps、>20ms 帧为 0），却会让"接收区信息
     #    消失一段时间"—— 谁想再加这条优化，先看 2026-10-17 的帧率数据。
 
-    def _start_expand_anim(self) -> None:
-        """展开的**动画部分**（与窗口几何同步起跑，见 _expand_receive 的说明）。"""
-        # 串口开关要搬进接收区的功能键列（全屏下它必须还能点）。⚠️ reparent
-        # 是**瞬时的**，和一堆动画放一起就是"开关从配置区跳到右侧"的跳变 ——
-        # 所以等这轮动画跑完再搬，搬完再淡入。
-        QTimer.singleShot(240, self._move_open_row_to_rx)
-        # 三块**同时**朝各自最近的窗口边收（用户点名要的逻辑）：
-        #   品牌页头 → 向上收；串口配置 → **向右**收（横向）；发送区 → 向下收。
-        # 三个方向一起退场，接收区卡片同时向四周铺满 —— 看着像"界面展开给人看"，
-        # 而不是"一块块消失"。
-        self._block_reveal(self.brand_header).to(False)
-        self._block_reveal(self._config_card, horizontal=True).to(False)
-        # 发送区在**分割器**里，不能走 Reveal（夹 maximumHeight 会和分割器的
-        # 尺寸分配互相打架 → 用户说的"很奇怪"）。它的让位交给分割器动画，
-        # 和用户手动收起发送区是同一套机制，观感一致。
-        if self._pre_send_collapsed:
-            # **已经是折叠的**：让它在这一步里同步缩到最小（和串口配置卡同一套
-            # Reveal、同样 220ms），而不是"先收一下、过 300ms 再突然消失"。
-            # ⚠️ 顺序很重要，否则会看到"鼓一下再缩"的跳变（实测 54→68→13→0）：
-            #   ① 先用 maximumHeight 把当前高度钉住
-            #   ② 再放开 minimumHeight（布局会把 maximum 夹到 minimum，不放开不动）
-            #   ③ 满量程取**当前 54px**，不要用 sizeHint（那是展开态尺寸，会顶大）
-            #   ④ 最后才起动画
-            self._tx_card.setMaximumHeight(TX_COLLAPSED_H)
-            self._tx_card.setMinimumHeight(0)
-            if self._tx_shrink is None:
-                self._tx_shrink = Reveal(self._tx_card, 220, parent=self)
-            self._tx_shrink.mark_expanded(TX_COLLAPSED_H)
-            self._tx_shrink.to(False)
+    def _settle_window_state(self, fullscreen: bool, timeout_ms: int = 160) -> None:
+        """把**挂起的**窗口状态变更压到动画起跑之前落地。
+
+        ⛔ ``showFullScreen()`` / ``showNormal()`` 是异步的：调用后窗口尺寸要过
+        一会儿才真正变。动画先起跑、窗口后落地的话，落地那一帧整个布局会跳一次
+        —— 逐帧实测 rx_card 单帧 +207px、txt_rx +223px（"最大化/退出时抽搐一下"）。
+        这里只等"客户区尺寸到位"，最多 160ms；窗口本来就是目标状态时立刻返回
+        （用户平时的路径 —— 开机即全屏 —— 等待为 0）。
+        """
+        app = QApplication.instance()
+        if app is None:
+            return
+        if fullscreen:
+            want = self.screen().geometry().size() if self.screen() else None
         else:
-            # 展开态：分割器一路压到 0，由 _on_split_anim 在 1/8 处当场隐藏 ——
-            # 不再"收到 54、再等 300ms 突然消失"（那就是用户看到的跳变）。
-            self._maximize_shrink_send()
+            want = self._pre_expand_geometry.size() if self._pre_expand_geometry else None
+        deadline = time.perf_counter() + timeout_ms / 1000.0
+        while time.perf_counter() < deadline:
+            got = self.size()
+            if want is None:
+                # 没有明确目标尺寸：以"状态真的切过去了"为准
+                if self.isFullScreen() == fullscreen:
+                    break
+            elif got == want:
+                break
+            app.processEvents()
+            time.sleep(0.004)
+        app.processEvents()
+
+    # ---------------------------------------------------------- 接收区转场（统一时间线）
+    #
+    # 2026-10-18 用户第三次反馈"仍跳变"，要求**根因修复**。上一版这里同时跑
+    # 四~五条补间（brand/config/opts 三块 Reveal、发送区分割器、开关飞行），
+    # 各有各的时长/曲线/起跑时刻：速度在合成处相加、短的那条先停 → 折点；
+    # 各自 _on_finished 又落在不同帧 → 收尾一连串小跳（逐帧实测单帧 60~110px）。
+    #
+    # 现在只有一条 Tween(260, STANDARD)：_on_rx_transition(t) 里一次性把所有
+    # 几何算出来并应用（每帧只触发一次布局），收尾也只有一个 _on_rx_done。
+    # t 连续 → 中途再次点击从当前 t 反向（Tween.start(self._rx_t, target)），
+    # 不跳回起点、也不跑完再反向。展开/退出用同一条公式（t 反向即镜像曲线）。
+    _RX_TRANSITION_MS = 260
+
+    # 配置卡"提前到位"的进度占比：q（普通态进度 0→1）走到 0.85 时卡片已是满宽。
+    #
+    # ⚠️ 这个数按**时间**标定过，不是拍的：基准曲线 STANDARD 前段极快 ——
+    #    它的 q 到 0.45 只花了 **18% 的时间**（≈48ms）。照字面用 0.45 当阈值，
+    #    310px 的卡会在 48ms、也就是三四帧里长完：逐帧峰值 **10.5px/ms**
+    #    （≈168px/帧），比现在还像"跳"。0.85 的结果（同一套数值微分算出）：
+    #      · 卡片在 t≈47%（≈124ms）长到满宽 → 后一半时间它**停住**等开关回来；
+    #      · 峰值 5.56px/ms（原线性 4.72，只 +18%）；
+    #      · max/中位 反而从 6.87 降到 2.48 —— 同样 310px 摊在更少的帧里，
+    #        中位速度被抬高，尖峰不再孤立。
+    #    既满足"提前预留开关位"，又不制造新的尖峰。
+    _RX_CARD_AHEAD = 0.85
+
+    def _rx_transition(self, to_expanded: bool) -> None:
+        """接收区最大化 / 退出：**一条时间线**驱动全部几何（见上方说明）。"""
+        target = 1.0 if to_expanded else 0.0
+        self._expanded = to_expanded
+        if to_expanded and self._rx_t <= 0.01:
+            # 只在与普通态交界处现测一次满量程；打断途中沿用旧值，不重测
+            self._rx_capture_full()
+        elif not to_expanded and not self._rx_full:
+            self._rx_capture_fallback()
+        self._rx_prepare(to_expanded)
+        self._rx_target = target
+        if self._rx_tween is None:
+            # ⚠️ min_interval_ms=16：接收区最大化每帧都要重排三张大卡 + 磨砂重绘，
+            #    单帧能到 13~22ms，扛不住 165Hz 的 6ms 节拍。不节流的话计时器会在
+            #    一次重绘卡顿后**连发两拍**（实测两次 tick 只隔 1.7~3.5ms），把攒下
+            #    的进度一口气推完 —— 逐帧看就是一帧滑出去 60~86px 的"跳"，且高分
+            #    辨率屏上这种连发更多、尾巴更长（时长 60Hz 275ms vs 165Hz 320ms）。
+            #    限到 ≈60fps 稳定节拍后：进度仍按 perf_counter 算（时长不变、终点帧
+            #    不吞），但不再有"追赶式连发"，每帧位移摊在真实 dt 上 → 速度连续。
+            #    这是 Tween 专门为"每帧改布局的重动画"留的档，不是调阈值糊。
+            self._rx_tween = Tween(self._RX_TRANSITION_MS, STANDARD,
+                                   self._on_rx_transition, self._on_rx_done,
+                                   parent=self, min_interval_ms=16)
+        self._rx_tween.start(self._rx_t, target)
+
+    def _rx_card_slot_w(self) -> int:
+        """开关"占位"需要的卡片宽度：左右内边距 + 开关本身宽。
+
+        卡片窄于这个值时，正在飞行的开关就会比卡还宽、戳到卡外面去。
+        """
+        return 2 * (SHADOW_PAD + CARD_PAD) + max(1, self._rx_row_w)
+
+    def _rx_card_width(self, q: float) -> int:
+        """配置卡这一帧该有多宽（0=收起，满宽=普通态满宽）。
+
+        「先让位 / 再归位 / 最后收尾」：卡片用自己**前约 47% 的时间**长到满宽，
+        之后停住等开关飞回来落位 —— 这就是用户要的"提前预留好串口开关的位置"，
+        也是"动画讲求逻辑性"：卡片先把位置腾好，开关再回到位。
+        展开方向同一条公式（q 反向递减）→ 卡片先撤走，开关随后飞出去，严格镜像。
+
+        宽度是 q 的**单调不减**函数（``min`` / ``max`` 组合），所以不会回抽、
+        不会"长到 90% 又缩回去再长"。
+        """
+        full = max(1, int(self._rx_full.get("config_w", 310)))
+        ratio = min(1.0, max(0.0, q) / self._RX_CARD_AHEAD)
+        cw = int(round(full * ratio))
+        # 硬保底：开关还在飞的**后半程**（q ≥ 0.5，它已经在卡片这一侧了）时，
+        # 卡片不得窄于"一个开关位"，免得出现开关比卡还宽、戳出卡外的帧。
+        # 正常几何下这条不生效（q ≥ 0.5 时按上面的比值卡片早已满宽），留着是防
+        # 字体/DPI 把开关撑宽之后，这条不变量被悄悄破坏。
+        if self._rx_switch_active and q >= 0.5:
+            cw = max(cw, self._rx_card_slot_w())
+        return cw
+
+    def _rx_capture_full(self) -> None:
+        """在**普通态**下量出各块的满量程（展开时现测，收起时复用）。"""
+        self._rx_full = {
+            "brand_h": max(1, self.brand_header.height()),
+            "config_w": max(1, self._config_card.width()),
+            "opts_h": max(1, self._rx_opts_row.height()),
+            "rail_w": max(1, self._rx_rail.width()),
+        }
+        # 工具栏内容钉成**普通态的自然高度**：不钉的话行高被压缩时它的布局会跟着
+        # 重排（逐帧实测行高 0→34 的过程里，里面的开关相对行顶漂了 29px —— 看着
+        # 就是图标在滑）。钉住之后行再矮也只是把内容下沿裁掉。
+        self._opts_content.setFixedHeight(self._rx_full["opts_h"])
+        if self._pre_send_collapsed:
+            self._rx_tx_normal = TX_COLLAPSED_H
+        else:
+            self._rx_tx_normal = max(TX_COLLAPSED_H,
+                                     int(self._pre_send_height or self._tx_min_height))
+        self._rx_rail_normal = self._rx_full["rail_w"]
+        row = self._open_row
+        self._rx_row_w = max(1, row.sizeHint().width())
+        self._rx_row_h = max(1, row.sizeHint().height())
+        lay = self._rx_rail.layout()
+        m = lay.contentsMargins() if lay is not None else None
+        pad = (m.left() + m.right()) if m is not None else 0
+        self._rx_rail_expanded = max(self._rx_rail_normal, self._rx_row_w + pad)
+        self._rx_hidden = {w for w in (self.brand_header, self._config_card,
+                                       self._tx_card) if w in self._pre_hidden_blocks}
+
+    def _rx_capture_fallback(self) -> None:
+        """没有展开前记录（如开机即最大化）时的兜底满量程。"""
+        self._rx_full = {
+            "brand_h": max(1, self.brand_header.sizeHint().height()),
+            "config_w": max(1, self._config_card.width()) or 310,
+            "opts_h": max(1, self._rx_opts_row.sizeHint().height()),
+            "rail_w": max(1, self._rx_rail_normal),
+        }
+        # 同上：内容高度钉死（这条路径没在普通态量过，用 sizeHint 兜底）
+        self._opts_content.setFixedHeight(self._rx_full["opts_h"])
+        self._rx_tx_normal = (TX_COLLAPSED_H if self._pre_send_collapsed
+                              else max(TX_COLLAPSED_H, self._tx_min_height))
+        self._rx_row_w = max(1, self._open_row.sizeHint().width())
+        self._rx_row_h = max(1, self._open_row.sizeHint().height())
+        self._rx_rail_expanded = max(self._rx_rail_normal, self._rx_rail.width())
+
+    def _rx_prepare(self, to_expanded: bool) -> None:
+        """转场起跑前的准备：掐掉手动分割器补间、接管开关、钉住发送卡策略。
+
+        ⚠️ 必须对**中途反向**安全：不去重置"已在该值上"的东西（否则反向那一下
+        会跳）。分割器尺寸、发送卡上限都由 _on_rx_transition 每帧按 t 现算。
+        """
+        if self._split_tween is not None and self._split_tween.running:
+            self._split_tween.stop()
+        self._rx_total = sum(self._splitter.sizes()) or 900
+        self._set_tx_vpolicy(QSizePolicy.Policy.Ignored)
+        self._tx_card.setMinimumHeight(0)
+        if self._tx_card.isHidden() and not to_expanded:
+            # 从最大化态收起：发送卡藏着 → 先钉 0 上限再 show（否则布局当场
+            # 抢走 64px，动画没有起点），之后由每帧抬上限把它喂大。
+            self._tx_card.setMaximumHeight(0)
+            self._rx_card_show_tx()
+        else:
+            self._tx_card.setMaximumHeight(max(0, self._tx_card.height()))
+        # ⚠️ 顺序要紧：先在**还看得见、还没被钉宽**的这一刻把"卡片那一格"记下来
+        #    （收起方向此刻卡是藏着的，量不到，只能用上次静止态记下的值）。
+        already_flying = (self._rx_switch_active
+                          and self._open_row.parentWidget() is self)
+        self._rx_remember_home_slot(to_expanded)
+        # 功能列那一格的"冻结值"：
+        #   收起方向：此刻还是最大化版式，直接量（和原来一样准）。
+        #   展开方向：此刻是普通版式，最大化那一格还不存在 → 用上次落定时缓存的
+        #   值；没有缓存（首次展开 / 冷启动即最大化）才回退逐帧现算。
+        # ⚠️ 展开方向为什么不能逐帧现算：rail 每帧被 setFixedWidth 改列宽，它的
+        #    x 跟着漂（起手那一瞬窄列甚至落在开关家格左边）→ 开关追着一个正在
+        #    移动的落点飞，头部先被拽回去 14~17px 再折返（用户报的"回抽"，
+        #    量化见 devtools/_probe_rx_switch_retract.py 的阳性对照）。
+        if not already_flying:
+            self._rx_switch_rail = (self._rx_rail_rect() if not to_expanded
+                                    else self._rx_rail_rect_expanded)
+        self._rx_detach_switch()
+        # 配置卡宽度：**两个方向都先钉住**（原来只在展开方向钉）。
+        # 开关离开卡片的那一瞬间卡的 sizeHint 就变小了，布局会当场按内容换一次
+        # 宽度；收起方向也一样 —— 卡刚从隐藏态长回来时，布局先按内容算一次的宽度
+        # 和随后时间线给的宽度不是一个值，那就是"起手抖一下"。
+        # 钉成当前真实宽之后，宽度**只由时间线**逐帧决定，起手/落定都不跳。
+        self._rx_collect_layouts()      # 本段每帧批量开关的那份布局清单（见该函数）
+        self._config_card.setMinimumWidth(0)
+        self._config_card.setFixedWidth(max(1, self._config_card.width()))
+        # 起手这一帧就先把布局落地：上面「摘开关 + 插占位」改的是卡内的 col 布局，
+        # 不落地的话第一帧画出来是"少一格"的中间态（逐帧实测标签差 29px，
+        # 要等下一帧才补齐 —— 用户看到的就是卡内文字闪一下）。
+        self._rx_apply_layout_now()
+
+    def _rx_card_show_tx(self) -> None:
+        """显示发送卡（内容按需），供收起路径把 pane 从 0 喂起来。"""
+        if self._tx_content.isHidden():
+            self._tx_content.show()
+        self._tx_card.show()
+
+    def _rx_remember_home_slot(self, to_expanded: bool) -> None:
+        """记下"开关在普通态那一格"的矩形（只在**普通态、开关还在位**时记）。
+
+        为什么要有它：卡片在动画里是**右对齐长宽**的，`home.x` = 卡左沿 + 内边距，
+        于是它的 x 会跟着卡片宽度一路漂 —— 逐帧实测收起段从 1607 漂到 1302
+        （305px）。开关如果追着这个漂移的落点飞，路径上就会先往右窜一下再往回
+        走（用户说的"没预留位置、被往回拽"）。所以 x/宽用这份**静止态**记下的
+        值，y 仍逐帧现算（纵向是整页布局在变，那是真实世界在动，该跟着走）。
+        """
+        if not to_expanded:
+            return                       # 收起方向此刻卡是藏着的，量不到，沿用旧值
+        row = self._open_row
+        if row.parentWidget() is self:   # 正飞着（中途反向）：不是静止态
+            return
+        self._rx_home_slot = QRect(row.mapTo(self, QPoint(0, 0)), row.size())
+
+    def _rx_home_target(self) -> QRect:
+        """开关在卡片里那一格的**落点**（x/宽冻结、y 现算，见上）。"""
+        live = self._rx_home_rect()
+        slot = self._rx_home_slot
+        if slot is None:                 # 冷启动即最大化：没有静止态记录，退化为现算
+            return live
+        return QRect(slot.x(), live.y(), max(1, slot.width()), self._rx_row_h)
+
+    def _rx_detach_switch(self) -> None:
+        """把串口开关从布局里摘出来挂到窗口上（飞行由每条帧摆位）。
+
+        中途反向时它已经在窗口上飞着，直接复用即可（_rx_switch_active）。
+
+        ⭐ 摘走的同时在**原位补一个同尺寸占位**：这一格就是用户说的
+        "提前预留好串口开关的位置" ——
+          · 不给占位：开关一离开 col 布局，下面所有控件立刻整体上移 41px，
+            落定时开关插回去又整体下移 41px（逐帧实测：``串口选择`` 标签相对
+            卡片的位置变了 41px）。用户眼里就是"文字突然窜一下 / 字体在打架"。
+          · 给了占位：整段动画里这一格始终在，卡片里的版式一帧都不变；开关
+            飞回来的落点就是这一格，落定换回真控件时零位移。
+        """
+        if self._rx_switch_active and self._open_row.parentWidget() is self:
+            return
+        row = self._open_row
+        rail_lay = self._rx_rail.layout()
+        in_rail = rail_lay is not None and rail_lay.indexOf(row) >= 0
+        if row.parentWidget() is self:
+            start = QRect(row.geometry())
+        else:
+            start = QRect(row.mapTo(self, QPoint(0, 0)), row.size())
+        start.setHeight(max(1, start.height()))
+        if in_rail and rail_lay is not None:
+            rail_lay.removeWidget(row)
+        elif self._open_row_home.indexOf(row) >= 0:
+            self._open_row_home.removeWidget(row)
+        self._rx_place_home_gap()
+        row.setParent(self)
+        row.setGeometry(start)
+        row.show()
+        row.raise_()
+        self._rx_switch_active = True
+
+    def _rx_place_home_gap(self) -> None:
+        """在开关的原始格位放一个**同尺寸占位**（原因见 _rx_detach_switch）。
+
+        高度取 ``_rx_row_h``（= 开关行的自然高度，转场开始时现测）；每次转场都
+        重新对齐一次，主题/DPI 变了也不会停在旧高度上。
+        """
+        height = max(1, self._rx_row_h)
+        gap = self._rx_home_gap
+        if gap is None:
+            gap = QWidget()
+            gap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self._rx_home_gap = gap
+            # ⚠️ 顺序：**先定高 → 再进布局 → 最后 show()**。新建 QWidget 的
+            #    sizeHint 无效（进布局那一瞬高度算 0），而插入/show 都可能**同步**
+            #    触发一次布局 —— 顺序一颠倒就会留下一帧"占位 0 高"的中间态
+            #    （逐帧实测卡内标签先少 29px、下一帧再补回来，看着就是闪一下）。
+            gap.setFixedHeight(height)
+            self._open_row_home.insertWidget(0, gap)
+            # ⚠️ 必须 show()：**隐藏的控件会被布局直接忽略**，占位等于没放
+            #    （首轮实测：少了这一句，第一次展开时卡内版式整体上移 41px）。
+            gap.show()
+        else:
+            gap.setFixedHeight(height)
+
+    def _rx_clear_home_gap(self) -> None:
+        """收掉占位（真开关要插回同一格之前必须清掉，否则会占两格）。"""
+        gap = self._rx_home_gap
+        if gap is None:
+            return
+        self._open_row_home.removeWidget(gap)
+        gap.setParent(None)
+        gap.deleteLater()
+        self._rx_home_gap = None
+
+    def _on_rx_transition(self, t: float) -> None:
+        """每一帧：按进度 t 一次性算出并应用**全部**几何（0=普通, 1=最大化）。"""
+        self._rx_t = t
+        p = t
+        q = 1.0 - p
+        # ⛔ **这一帧的布局只许落地一次**。
+        #    实测：光靠"先设好所有 fixed*、最后 activate 一次"是不够的 —— 每个
+        #    setFixedHeight/setFixedWidth/show/hide 都会让某层布局**当场**重排一次，
+        #    于是同一帧里 rx_card / txt_rx / opts 各自落地两三遍，彼此间隔 1.6~4.3ms。
+        #    第二次（也是最正确的一次）永远来自末尾的 _rx_apply_layout_now，前面
+        #    那些都是拿"半更新的输入"算出来的中间态 —— 165Hz 逐帧取样就会量到
+        #    "100px / 6.1ms"（理论峰值 4.91 的 3.4 倍）。
+        #    解法是 Qt 自己的批处理开关：把这段用到的布局全部 setEnabled(False)，
+        #    期间所有 LayoutRequest 都不响应；收尾 setEnabled(True) + 一次
+        #    _rx_apply_layout_now，整帧只有一次落地。
+        self._rx_layouts_enabled(False)
+        try:
+            # brand 页头（竖向收放）
+            if self.brand_header not in self._rx_hidden:
+                bh = int(round(self._rx_full["brand_h"] * q))
+                if bh <= 3:
+                    self.brand_header.hide()
+                else:
+                    self.brand_header.setFixedHeight(bh)
+                    self.brand_header.show()
+            # config 配置卡（横向收放）。宽度走 _rx_card_width：**提前到位**
+            # （展开方向先撤走、收起方向先让位），后半程停住等开关飞回来。
+            # 卡内是定宽容器，卡窄时只是裁切，表单不重排（见 _build_ui）。
+            if self._config_card not in self._rx_hidden:
+                cw = self._rx_card_width(q)
+                if cw <= 3:
+                    self._config_card.hide()
+                else:
+                    self._config_card.setFixedWidth(cw)
+                    self._config_card.show()
+            # opts 工具栏（竖向收放）。收起方向：一开始就 show（0 高、逐帧长回来，
+            # isVisible 立即为真 —— 和旧行为一致）；展开方向：收到 ≤3px 才 hide。
+            # 暂停中收起保持藏（沿用旧的守卫）。
+            collapsing = self._rx_target < 0.5
+            oh = int(round(self._rx_full["opts_h"] * q))
+            if self._paused and collapsing:
+                self._rx_opts_row.hide()
+            elif collapsing:
+                self._rx_opts_row.setFixedHeight(max(0, oh))
+                self._rx_opts_row.show()
+            elif oh <= 3:
+                self._rx_opts_row.hide()
+            else:
+                self._rx_opts_row.setFixedHeight(oh)
+                self._rx_opts_row.show()
+            # 功能列宽度：普通宽 → 最大化宽（容下开关）
+            # ⚠️ 必须在 setSizes **之前**设：``setFixedWidth`` 只把 LayoutRequest 排进
+            #    队列，setSizes 却是**同步**重排 —— 反过来的话分割器先按旧列宽摆一遍，
+            #    _rx_apply_layout_now 再按新列宽摆第二遍，同一帧落地两次。
+            rail_w = int(round(self._rx_rail_normal
+                               + (self._rx_rail_expanded - self._rx_rail_normal) * p))
+            self._rx_rail.setFixedWidth(max(1, rail_w))
+            # 分割器：发送 pane = 普通高 × (1-p)，接收区吃掉其余。
+            # ⚠️ 真正把尺寸交给分割器要放到**这一帧的最后**（见收尾那段）：
+            #    QSplitter 对子控件的尺寸约束变化会**当场**重排（它自己有子控件事件
+            #    过滤器，绕过 QLayout 的 enable 开关），放在中间就会先生成一个
+            #    "宽度还是旧的、高度已经新了"的中间态，随后宽度落地再排第二次。
+            tx = max(0, min(self._rx_tx_normal,
+                            int(round(self._rx_tx_normal * q))))
+            rx = max(160, self._rx_total - tx)
+            # ⛔ **不再调 setSizes**：``QSplitter.setSizes`` 是**同步**重排，但排的是
+            #    "分割器**当前**矩形里的两个子控件"—— 而分割器自己的 y/高 要等外层
+            #    布局跑完才更新（上面 brand 这一帧刚变高）。于是同一帧里必然落地两次：
+            #    先按旧外框摆一遍，外层布局跑完再摆第二遍。逐帧实测两次相隔 0.7~2.2ms，
+            #    第二次位移最大 108px（配置卡 y 56→104、高 894→846），在 165Hz 逐帧
+            #    取样里就是"100px / 6.1ms"的跳变。
+            #    改成**把上下限钉死**：tx 卡同时钉 min/max，分割器在任何一次布局里都
+            #    只能给它这个高度 —— 于是整帧只剩**一次**落地（下面那次 apply）。
+            if self._tx_card in self._rx_hidden:
+                pass
+            elif tx <= 3:
+                self._tx_card.hide()
+            else:
+                self._tx_card.show()
+            # 收尾，顺序不能换：
+            #   ① 放开布局、当场落地一次 —— 宽度（配置卡/功能列）在这一步生效；
+            #   ② 再把这一帧的发送区高度交给分割器 —— 这是**最后一笔**几何修改，
+            #      之后不再有任何布局动作，所以整帧只有一次"最终落地"。
+            self._rx_layouts_enabled(True)
+            self._rx_apply_layout_now()
+            # ⚠️ 发送卡的**高度上限必须跟着 tx 同帧抬**：分割器给了 pane 多少高，
+            #    卡就得能长到多少。缺这一句的话，`_rx_prepare` 钉的 maxHeight=0 会
+            #    一直钉到落定 —— 整个退出过程 pane 是空的（底部一条 168px / 折叠态
+            #    54px 的空带），落定那一帧 `setMaximumHeight(max(current, target_h))`
+            #    才一次性放开，发送卡整块 pop 进来、接收区同时缩一截（用户报的
+            #    "取消最大化还有跳变"）。逐帧实测：补之前 tx.h 是 `0 0 0 … 0 168`
+            #    （有效步 1、单步 +168px = 100% 行程）；补之后是逐帧单调的坡。
+            # ⚠️ 位置：**紧挨 setSizes 之前**，不能挪到 `_rx_apply_layout_now()` 之前。
+            #    `_tx_card` 是分割器的**直接子控件**（:888 addWidget），而 QSplitter
+            #    靠自己的子控件事件过滤器监听尺寸约束变化、会**当场**重排（绕过
+            #    QLayout 的 enable 开关，见本函数里给功能列设宽度那段注释）——
+            #    放到前面只会多一次"旧尺寸 + 新上限"的中间重排。
+            self._tx_card.setMaximumHeight(max(0, tx))
+            self._splitter.setSizes([rx, tx])
+            # 串口开关位置：rail(1) ↔ home(0)
+            self._rx_place_switch(p)
+        except RuntimeError:                     # 窗口收尾，控件已析构
+            if self._rx_tween is not None:
+                self._rx_tween.stop()
+        finally:
+            self._rx_layouts_enabled(True)       # 出错也要放开，别让界面永久冻死
+
+    def _rx_layouts_enabled(self, enabled: bool) -> None:
+        """整段转场用的布局**批处理开关**（幂等）。
+
+        ``QLayout.setEnabled(False)`` 期间该布局不响应任何 LayoutRequest —— 这正是
+        我们要的"这一帧先别排，等我把输入改完"。逐帧实测：不批处理时一帧里
+        rx_card 会被排 2~3 遍（间隔 1.6~4.3ms），其中只有最后一遍用的是正确输入，
+        前面那些"半成品"在 165Hz 上就是肉眼级的抽动。
+        """
+        if not self._rx_layouts:
+            self._rx_collect_layouts()
+        for lay in self._rx_layouts:
+            try:
+                lay.setEnabled(enabled)
+            except RuntimeError:
+                pass
+
+    def _rx_collect_layouts(self) -> None:
+        """把转场会碰到的**所有**嵌套布局收集起来（每帧 invalidate 用）。
+
+        ⚠️ 只 invalidate 最外层那几层是不够的：``QLayout.invalidate()`` 只清自己那份
+        缓存，**不会**递归到子布局。而 ``setSizes`` 判定上下限时问的是子控件的
+        ``minimumSizeHint()`` → 子布局里那份**没被清掉**的旧缓存 → 分割器仍按上一帧
+        的上下限分配一趟，``_rx_apply_layout_now`` 再按新的分配一趟，同一帧落地两次
+        （实测间隔 1.5~2.2ms、第二次最大位移 93px）。
+        每帧现算 ``findChildren`` 太贵，所以在 ``_rx_prepare`` 里收一次、整段复用。
+        """
+        roots = (self._rx_card, self._tx_card, self._splitter, self.centralWidget())
+        found: list[QLayout] = []
+        for root in roots:
+            if root is None:
+                continue
+            own = root.layout()
+            if own is not None and own not in found:
+                found.append(own)
+            for lay in root.findChildren(QLayout):
+                if lay not in found:
+                    found.append(lay)
+        self._rx_layouts = found
+
+    def _rx_apply_layout_now(self) -> None:
+        """把这一帧设下的所有 ``fixed*`` / ``setSizes`` **当场**落成布局。
+
+        ⚠️ 只调 ``centralWidget().layout().activate()`` **不够**：那一层布局认为
+        自己是"已激活"的，直接早退，卡片的位置要等下一次事件循环才更新 —— 逐帧
+        实测卡片左沿比宽度慢整整一帧（宽度已经 79px 时左沿还停在上帧 1581 的
+        位置，于是卡片从窗口右边缘"戳"出去 79px 被裁掉，看上去像卡片在抖）。
+        这里从卡片自己开始**逐级** invalidate + activate 一直到中央控件：每层都
+        真的重排一次，几何与 t 严格同帧。
+        """
+
+        node = self._config_card.parentWidget()
+        while node is not None:
+            lay = node.layout()
+            if lay is not None:
+                lay.invalidate()
+                lay.activate()
+            if node is self.centralWidget():
+                break
+            node = node.parentWidget()
+
+    def _rx_place_switch(self, p: float) -> None:
+        """把开关摆到 p 对应的位置（p=1 在功能列那侧，p=0 落在卡片那一格）。
+
+        ⚠️ 两端都尽量用**固定目标**：起点/落点逐帧现算的话，开关会去追一个正在
+        移动的点 —— 落点跟着卡片长宽漂（305px）、起点跟着功能列宽度飘，人眼看
+        就是"飞到一半被拽一下"。冻结的端点见 `_rx_remember_home_slot` 与
+        `_rx_prepare`（功能列那一格只在收起方向冻结）。
+        """
+        row = self._open_row
+        if row.parentWidget() is not self:
+            return
+        home = self._rx_home_target()
+        rail = self._rx_switch_rail if self._rx_switch_rail is not None \
+            else self._rx_rail_rect()
+        x = int(round(home.x() + (rail.x() - home.x()) * p))
+        y = int(round(home.y() + (rail.y() - home.y()) * p))
+        w = int(round(home.width() + (rail.width() - home.width()) * p))
+        row.setGeometry(x, y, max(1, w), self._rx_row_h)
+
+    def _rx_home_rect(self) -> QRect:
+        home = self._open_row_home
+        host = home.parentWidget()
+        box = home.geometry()
+        origin = host.mapTo(self, QPoint(0, 0)) if host is not None else QPoint(0, 0)
+        return QRect(origin.x() + box.x(), origin.y() + box.y(),
+                     max(1, box.width()), self._rx_row_h)
+
+    def _rx_rail_rect(self) -> QRect:
+        rail = self._rx_rail
+        lay = rail.layout()
+        m = lay.contentsMargins() if lay is not None else None
+        pos = rail.mapTo(self, QPoint(0, 0))
+        left = m.left() if m is not None else 0
+        top = m.top() if m is not None else 0
+        return QRect(pos.x() + left, pos.y() + top, self._rx_row_w, self._rx_row_h)
+
+    def _on_rx_done(self) -> None:
+        try:
+            if self._rx_target >= 0.5:
+                self._rx_finish_expanded()
+            else:
+                self._rx_finish_normal()
+        except RuntimeError:
+            pass
+
+    def _rx_finish_expanded(self) -> None:
+        """落定到最大化态：藏掉让位的块、发送区钉 0、开关塞进功能列顶。"""
+        self._rx_t = 1.0
+        self._expanded = True
+        for w in (self.brand_header, self._config_card):
+            if w not in self._rx_hidden:
+                w.hide()
+        self._rx_opts_row.hide()
+        self._set_tx_vpolicy(QSizePolicy.Policy.Preferred)
+        self._tx_card.setMinimumHeight(0)
+        self._tx_card.setMaximumHeight(0)
+        if self._tx_card not in self._rx_hidden:
+            self._tx_card.hide()
+        self._splitter.setSizes([max(160, self._rx_total), 0])
+        rail_lay = self._rx_rail.layout()
+        if rail_lay is not None:
+            self._rx_rail.setMinimumWidth(0)
+            self._rx_rail.setMaximumWidth(WIDGETSIZE_MAX)
+            rail_lay.insertWidget(0, self._open_row)
+            self._open_row.show()
+        # 此刻是真正的最大化版式、尺寸已还原、开关也已插进功能列顶 —— 量一次
+        # rail 落点缓存下来，供**下一次展开**用（展开方向 prepare 时还在普通
+        # 版式，量不到最大化那一格，只能借用上次落定时实测的值）。
+        self._rx_apply_layout_now()
+        self._rx_rail_rect_expanded = self._rx_rail_rect()
+        self._rx_switch_active = False
+
+    def _rx_finish_normal(self) -> None:
+        """落定到普通态：三块还原、发送区按记录还原、开关回配置卡。"""
+        self._rx_t = 0.0
+        self._expanded = False
+        if self.brand_header not in self._rx_hidden:
+            self.brand_header.setMinimumHeight(0)
+            self.brand_header.setMaximumHeight(WIDGETSIZE_MAX)
+            self.brand_header.show()
+        if self._config_card not in self._rx_hidden:
+            self._config_card.setMinimumWidth(0)
+            self._config_card.setMaximumWidth(WIDGETSIZE_MAX)
+            # ⚠️ 落定这一帧的宽度**必须正好等于**时间线最后一帧算出的那个值，
+            #    否则收尾会跳一下（最容易漏的一处）。q=1 时 _rx_card_width 返回
+            #    的正是满宽（min(1, 1/0.85)=1），所以这里用**同一个函数**取值，
+            #    而不是另写一个常量。逐帧探针会核对：最后一帧宽 == 落定后宽。
+            self._config_card.setFixedWidth(self._rx_card_width(1.0))
+            self._config_card.show()
+        self._rx_opts_row.setMinimumHeight(0)
+        self._rx_opts_row.setMaximumHeight(WIDGETSIZE_MAX)
+        if not self._paused:
+            self._rx_opts_row.show()
+        target_h = self._rx_tx_normal
+        content = not self._pre_send_collapsed
+        if self._tx_card not in self._rx_hidden:
+            self._finish_reveal_send(target_h, content)
+        self._splitter.setSizes([max(160, self._rx_total - target_h), target_h])
+        # 先把"预留的那一格"撤掉，再把真开关插回同一格：两件都发生在**同一帧**，
+        # 且占位与真控件同高 → 卡内版式零位移（见 _rx_place_home_gap）。
+        self._rx_clear_home_gap()
+        self._open_row_home.insertWidget(0, self._open_row)
+        self._open_row.show()
+        # 落定后重记一次"那一格"（窗口尺寸/DPI 变过之后仍然准）
+        self._rx_apply_layout_now()
+        self._rx_remember_home_slot(True)
+        self._rx_switch_rail = None
+        self._rx_rail.setMinimumWidth(0)
+        self._rx_rail.setMaximumWidth(WIDGETSIZE_MAX)
+        self._rx_switch_active = False
 
     def _set_rail_compact(self, compact: bool) -> None:
         """功能键列的尺寸策略：两种状态**完全一样**（2026-10-17 起）。
@@ -2106,67 +2862,49 @@ class MainWindow(QMainWindow):
         self._rx_rail.setSizePolicy(policy)
         self._rx_rail.updateGeometry()
 
+    def _restore_window_state(self) -> None:
+        """退出展开时把窗口状态还原到"点全屏按钮之前"，并**等它落地**。"""
+        if self._pre_expand_fullscreen:
+            self.showFullScreen()
+            self.raise_()
+            self.activateWindow()
+            self._enforce_native_fullscreen()
+            self._settle_window_state(True)
+            return
+        # 回到普通窗口 —— "想要全屏"跟着降下来，别让延迟核对又把它拽回去
+        self._want_fullscreen = False
+        self._expect_normal = True
+        self.showNormal()
+        if self._pre_expand_geometry is not None:
+            self.setGeometry(self._pre_expand_geometry)
+        self._settle_window_state(False)
+        self._expect_normal = False
+        self._set_corner_preference(int(self.winId()), round_=True)
+        if self._pre_expand_geometry is not None:
+            # ⚠️ 这一刻配置卡还在做"从右长回来"的动画，布局的最小宽度偏高，
+            #    窗口会被**夹到比目标更宽**（实测 839 被顶成 1134）。动画跑完
+            #    再重申一次几何，保证和展开前完全一致。
+            QTimer.singleShot(320, self._reassert_pre_expand_geometry)
+
     def _collapse_receive(self) -> None:
         """退出接收区展开：卡片们回来，窗口保持在全屏（软件是全屏应用）。"""
         self._expanded = False
+        # ⛔ 冻结在途转场补间（原因同 _expand_receive）：下面 _restore_window_state
+        #    会阻塞等窗口落地，不冻结的话展开会先跑完再反向。_rx_transition 从冻结值起跑。
+        if self._rx_tween is not None and self._rx_tween.running:
+            self._rx_tween.stop()
         self._rx_highlighter.defer(420)   # 同上：退场动画期间也合并高亮重刷
         self._set_rx_coalesce(RX_COALESCE_MS)
         QTimer.singleShot(300, self._end_rx_coalesce)
         self._set_rail_compact(False)   # 功能列还原成整列居中（见 _set_rail_compact）
         self.btn_expand.set_glyph(GLYPH_EXPAND)
         self.btn_expand.setToolTip("接收区全屏显示（Esc 退出）")
-        # 反向：开关也**错峰**搬回家 —— 立刻搬的话它会瞬间从右侧列跳回左边，
-        # 而配置卡那一刻还是收着的、位置对不上（用户："退出最大化时有跳变"）。
-        # ⚠️ 240ms 是"卡片已经长回来"的判据：各块 Reveal 是 220ms，180ms 那会儿
-        #    配置卡还在半路上，开关搬过去就会落在错误位置（又一处跳变）——
-        #    所以这里必须 > Reveal 时长，与展开侧的 240ms 对称。
-        # 反向：开关 240ms 后搬回配置卡原位（见 _move_open_row_home）——
-        # 那一刻配置卡已长回，开关不会落在错误位置（避免退出最大化时的跳变）。
-        QTimer.singleShot(240, self._move_open_row_home)
-        # 反向：三块**同时**从各自的方向长回来（页头自上、配置自右、发送自下），
-        # 和展开严格镜像。
-        hidden = self._pre_hidden_blocks
-        if self.brand_header not in hidden:
-            self._block_reveal(self.brand_header).to(True)
-        if self._config_card not in hidden:
-            self._block_reveal(self._config_card, horizontal=True).to(True)
-        self._tx_card.show()
-        if self._tx_shrink is not None and not self._pre_send_collapsed:
-            # 展开态：从 0 长回原高度（同一套 Reveal，和展开时严格镜像）
-            self._tx_card.setMinimumHeight(0)
-            self._tx_card.setMaximumHeight(WIDGETSIZE_MAX)
-            self._tx_shrink.to(True)
-        elif self._pre_send_collapsed:
-            # 本来就是折叠的：从 0 长回标题栏那条
-            if self._tx_shrink is not None:
-                self._tx_shrink.to(True)
-            self._tx_card.setMinimumHeight(TX_COLLAPSED_H)
-        else:
-            self._set_send_collapsed(False)
-        # （日志底色不再随最大化变化，见展开侧的说明）
-        if not self._paused:                # 暂停中工具栏是故意藏的，别替它掀开
-            self._rx_opts_reveal.to(True)    # 跟着动画长回来，别瞬间弹出来
-        # 完整还原到点全屏按钮之前：之前是窗口全屏 → 重申全屏（无条件，
-        # 见 _expand_receive 的说明）；之前是普通窗口 → showNormal + 还原
-        # 记下的几何，不能把窗口留在全屏
-        if self._pre_expand_fullscreen:
-            self.showFullScreen()
-            self.raise_()
-            self.activateWindow()
-            self._enforce_native_fullscreen()
-        else:
-            # 回到普通窗口 —— "想要全屏"跟着降下来，别让延迟核对又把它拽回去
-            self._want_fullscreen = False
-            self._expect_normal = True
-            self.showNormal()
-            if self._pre_expand_geometry is not None:
-                self.setGeometry(self._pre_expand_geometry)
-                # ⚠️ 这一刻配置卡还在做"从右长回来"的动画，布局的最小宽度偏高，
-                #    窗口会被**夹到比目标更宽**（实测 839 被顶成 1134）。动画跑完
-                #    再重申一次几何，保证和展开前完全一致。
-                QTimer.singleShot(320, self._reassert_pre_expand_geometry)
-            self._expect_normal = False
-            self._set_corner_preference(int(self.winId()), round_=True)
+        # ⛔ 窗口状态**先落地、再起动画**：原先这步排在函数末尾，动画跑到 80ms
+        #    时窗口才变，整屏当场跳 12px（逐帧探针抓到过）。见 _restore_window_state。
+        self._restore_window_state()
+        # 所有几何（brand/config/opts/分割器/功能列/开关）由**一条时间线**反向驱动
+        # （和展开严格镜像），见 _rx_transition。
+        self._rx_transition(False)
 
     # ------------------------------------------------------------ 发送区最小化
 
@@ -2192,59 +2930,8 @@ class MainWindow(QMainWindow):
 
 
 
-
-    def _move_open_row_home(self) -> None:
-        """收起动画跑完后，把串口开关搬回配置卡原位（见 _collapse_receive）。"""
-        if self._expanded:
-            return                          # 又展开了，别搬
-        rail_layout = self._rx_rail.layout()
-        if rail_layout is not None and rail_layout.indexOf(self._open_row) >= 0:
-            rail_layout.removeWidget(self._open_row)   # 列宽跟着缩回图标宽
-        self._open_row_home.insertWidget(0, self._open_row)
-        self._open_row.show()
-
-    def _move_open_row_to_rx(self) -> None:
-        """展开动画跑完后，把串口开关放进右侧功能列的**列顶**。
-
-        用户口径（2026-10-17）：开关在**右上角**（时钟下面），图标列贴列的左边
-        （左边距不变、离卡片右缘变远），日志数据栏在整列的**左侧**。
-        开关进列顶占一格，列宽自动撑到开关宽度 —— 图标位置由 AlignLeft 钉在
-        列的左边（见 _build_receive_area），不受列宽变化影响。
-        """
-        if not self._expanded:
-            return                          # 这一轮已经被收起了，别搬
-        rail_layout = self._rx_rail.layout()
-        if rail_layout is None:
-            return
-        if rail_layout.indexOf(self._open_row) < 0:
-            rail_layout.insertWidget(0, self._open_row)
-        self._open_row.show()
-
-    def _maximize_shrink_send(self, duration: int = 220) -> None:
-        """接收区最大化：把发送区**平滑压到消失**（折叠态/展开态分开处理）。
-
-        节奏与串口配置卡一致：220ms、缩到 1/8 就隐藏 —— 两者同一时刻消失。
-        ⚠️ 展开态不要用 Reveal 夹卡片高度：分割器 pane 的尺寸由分割器分配，
-        夹 maximumHeight 会互相打架，观感就是"鼓一下再缩"的跳变（实测踩过）。
-        """
-        # 折叠态和展开态**走同一条 Reveal**，只有满量程不同：
-        #   折叠态 = 54px 标题栏；展开态 = 当前高度。
-        # ⚠️ 顺序不能换，否则会看到"鼓一下再缩"的跳变：
-        #   ① 先 setMaximumHeight 把当前高度钉住（防布局回弹）
-        #   ② 再 setMinimumHeight(0) 放开最小（布局会把 maximum 夹到 minimum）
-        #   ③ 满量程取**当前高度**，不用 sizeHint（那是展开态尺寸，会顶大）
-        #   ④ 最后才起动画
-        full = TX_COLLAPSED_H if self._pre_send_collapsed else self._tx_card.height()
-        if full <= 0:
-            return
-        self._tx_card.setMaximumHeight(full)
-        self._tx_card.setMinimumHeight(0)
-        if self._tx_shrink is None:
-            self._tx_shrink = Reveal(self._tx_card, duration, parent=self)
-        self._tx_shrink.mark_expanded(full)
-        self._tx_shrink.to(False)
-
-    def _animate_splitter(self, target: list[int], duration: int = 240, on_done=None) -> None:
+    def _animate_splitter(self, target: list[int], duration: int = 240, on_done=None,
+                          start: list[int] | None = None) -> None:
         """把分割器尺寸**逐帧**推到目标（发送区收展、接收区最大化都用它）。
 
         直接 ``setSizes`` 是一帧跳变；这里插值成一段连续动画。
@@ -2252,13 +2939,23 @@ class MainWindow(QMainWindow):
         分割器的尺寸分配**互相打架**：一边按动画压高度、另一边按比例重分配，
         观感就是"很奇怪"（用户点名的"发送区展开时接收区最大化动画很奇怪"）。
         """
-        start = self._splitter.sizes()
-        if len(start) != len(target) or start == target:
+        # ⛔ 起点默认取分割器的 sizes()，但它**不等于卡片的真实高度**：卡片被
+        #    setMaximumHeight 钉住时（折叠态 54），分割器仍然报展开尺寸 168。
+        #    调用方知道真实高度就把 start 传进来，否则"展开"会因为
+        #    start == target 直接跳到终态（实测单帧 54→168，一点动画都没有）。
+        begin = list(start) if start is not None else self._splitter.sizes()
+        if len(begin) != len(target):
             self._splitter.setSizes(target)
             if on_done:
                 on_done()
             return
-        self._split_from = list(start)
+        self._split_from = list(begin)
+        if begin == list(target):
+            # 真的没有位移：直接落终态（也要给 on_done 一次，钉高度靠它）
+            self._splitter.setSizes(target)
+            if on_done:
+                on_done()
+            return
         self._split_to = list(target)
         # ⛔ Tween 只建一次、反复复用，on_finished **不能**在构造时钉死 —— 否则
         #   第一段动画的回调（开局折叠那次：钉回 54）会跟着这个 Tween 过一辈子，
@@ -2285,9 +2982,11 @@ class MainWindow(QMainWindow):
             # （停在半高再突然 hide 就是用户看到的跳变）。
             # ⚠️ 必须按**实际尺寸**判，不能按 t：第一帧 t=0 就 ≤0.125，那时隐藏会让
             #    分割器当场把它的空间收走 —— 观感就是"嗖一下没了"的跳变（实测踩过）。
+            # 同 Reveal 的阈值：1/8 太早（54px 时是 6px、168px 时是 21px），
+            # 收到 3px 以内再藏，收尾那一帧就只剩几像素的位移。
             if (self._expanded and len(sizes) > 1 and self._split_to[1] == 0
                     and self._split_from[1] > 0
-                    and sizes[1] <= max(1, self._split_from[1] // 8)):
+                    and sizes[1] <= 3):
                 self._tx_card.setVisible(False)
         except RuntimeError:            # 窗口收尾时分割器可能已析构
             if self._split_tween is not None:
@@ -2308,33 +3007,55 @@ class MainWindow(QMainWindow):
             if remember:
                 self._tx_saved_sizes = self._splitter.sizes()
             self._tx_collapsed = True
-            self._tx_content.hide()
             self.btn_minimize.set_glyph(GLYPH_EXPAND_CHEVRON)
             self.btn_minimize.setToolTip("展开发送区")
-            self._tx_card.setMinimumHeight(0)   # 放开下限，交给分割器平滑驱动
-            # 不在这里即刻夹死 54px：先放开上/下限，让分割器逐帧把卡片压到 54；
-            # 动画结束（on_done）再钉回 54 —— 否则 setMaximumHeight(54) 会当场把
-            # 卡片弹回 54，分割器动画形同虚设（用户看到的"收起跳一下"根因）。
-            self._tx_card.setMaximumHeight(WIDGETSIZE_MAX)
-            total = sum(self._splitter.sizes()) or 900
+            # ⛔ 顺序是量出来的（2026-10-17 逐帧）：**先钉住当前高度，再放开下限**。
+            #    反过来写（min=0 再 max=WIDGETSIZE_MAX）的话，放开的那一瞬布局会按
+            #    sizeHint 把卡片顶回展开态 —— 实测单帧 70→168px 的跳变，然后才被
+            #    分割器动画压回去（用户看到的"收起点一下"）。
+            current = max(TX_COLLAPSED_H, self._tx_card.height())
+            self._tx_card.setMaximumHeight(current)
+            self._tx_card.setMinimumHeight(0)
+            # ⛔ 光放开 min/max 还不够：卡片里还有内容，它的 minimumSizeHint 会
+            #    经 qSmartMinSize 变成分割器的下限 —— 动画压到 168 就压不动了，
+            #    最后 on_done 一钉才"啪"地跳成 54。动画期间把竖直策略设成
+            #    Ignored（布局不再看它的 sizeHint/最小值），收完再还原。
+            self._set_tx_vpolicy(QSizePolicy.Policy.Ignored)
+            sizes = self._splitter.sizes()
+            total = sum(sizes) or 900
+            begin = ([max(160, total - current), current]
+                     if len(sizes) == 2 else None)
             self._animate_splitter([max(160, total - TX_COLLAPSED_H), TX_COLLAPSED_H],
                                    duration=TX_ANIM_MS,
-                                   on_done=lambda: (self._tx_card.setMinimumHeight(TX_COLLAPSED_H),
-                                                    self._tx_card.setMaximumHeight(TX_COLLAPSED_H)))
+                                   on_done=self._finish_send_collapsed,
+                                   start=begin)
             # 收起后"展开发送区"那颗键必须**始终可见可点**（用户点名）—— 卡片收
             # 到只剩标题栏，那颗键就在标题行上，这里显式钉一次，任何一条路径把
             # 它藏过都能自动恢复。
             self.btn_minimize.setVisible(True)
         else:
             self._tx_collapsed = False
-            self._tx_content.show()
             self.btn_minimize.set_glyph(GLYPH_COLLAPSE)
             self.btn_minimize.setToolTip("最小化发送区")
-            self._tx_card.setMaximumHeight(WIDGETSIZE_MAX)
+            target = self._tx_saved_sizes or self._tx_expanded_sizes()
+            # 上限钉在**目标高度**（不是当前 54）：既让分割器能长上去，又不放开到
+            # sizeHint —— 放开就是"先弹到展开尺寸再缩回来"的那一跳。
+            current = self._tx_card.height()
+            target_h = target[-1] if target else current
+            self._tx_card.setMaximumHeight(max(current, target_h))
             self._tx_card.setMinimumHeight(0)  # 放开下限，动画结束再钉回
-            self._animate_splitter(self._tx_saved_sizes or self._tx_expanded_sizes(),
-                                   duration=TX_ANIM_MS,
-                                   on_done=lambda: self._tx_card.setMinimumHeight(self._tx_min_height))
+            # 同收起：内容一显示出来，卡片的 minimumSizeHint 就把分割器顶到展开
+            # 高度，动画根本没法从 54 起步（实测 cardH 一直是 168）—— 动画期间
+            # 同样把竖直策略设成 Ignored，收尾还原。
+            self._set_tx_vpolicy(QSizePolicy.Policy.Ignored)
+            self._tx_content.show()
+            sizes = self._splitter.sizes()
+            total = sum(sizes) or 900
+            begin = ([max(160, total - current), current]
+                     if len(sizes) == 2 else None)
+            self._animate_splitter(target, duration=TX_ANIM_MS,
+                                   on_done=self._finish_send_expanded,
+                                   start=begin)
             self.btn_minimize.setVisible(True)
         # 折叠/展开改变接收区视口高度 —— 布局的几何重排是**异步**激活的，
         # 不在这里强制落地的话，紧跟着的暂停定位（_snap_to_round_start）拿到
@@ -2343,37 +3064,66 @@ class MainWindow(QMainWindow):
         if self.centralWidget() is not None and self.centralWidget().layout():
             self.centralWidget().layout().activate()
 
-    def _block_reveal(self, widget, horizontal: bool = False) -> Reveal:
-        """取（或建）某个块的展开/收起动画器。
+    def _finish_reveal_send(self, target_h: int, content: bool) -> None:
+        """退出最大化时把发送卡从 0 长回来的收尾：钉回上下限、还原策略。"""
+        # 兜底：万一这条路上有别的分支把卡片藏过（自测里偶发过一次），
+        # 收尾必须把它**拉回可见**并把分割器尺寸补齐，状态不能留在半路。
+        if self._tx_card.isHidden():
+            self._tx_card.show()
+            sizes = self._splitter.sizes()
+            total = sum(sizes) or 900
+            self._splitter.setSizes([max(160, total - target_h), target_h])
+        self._set_tx_vpolicy(QSizePolicy.Policy.Preferred)
+        if content:
+            self._tx_card.setMinimumHeight(self._tx_min_height)
+            self._tx_card.setMaximumHeight(WIDGETSIZE_MAX)
+        else:
+            self._tx_card.setMinimumHeight(TX_COLLAPSED_H)
+            self._tx_card.setMaximumHeight(TX_COLLAPSED_H)
+            self._tx_content.hide()
+        self._repin_rx_bottom()
 
-        用 ``Reveal`` 而不是直接 show/hide：它把高度从 0 连续长到自然高度
-        （反过来压到 0 再隐藏），整段 125Hz、两头慢的曲线 —— 接收区最大化
-        时那三块"依次让位"，接收区随之连续长高，不是"啪一下全没了"。
+    def _set_tx_vpolicy(self, policy) -> None:
+        """临时改发送卡的竖直尺寸策略（动画期间用 Ignored 让分割器能压下去）。"""
+        sp = self._tx_card.sizePolicy()
+        if sp.verticalPolicy() == policy:
+            return
+        sp.setVerticalPolicy(policy)
+        self._tx_card.setSizePolicy(sp)
+        self._tx_card.updateGeometry()
+
+    def _repin_rx_bottom(self) -> None:
+        """视口高度变化落定后重新压到底（追底的一次性动作会被后续高度变化作废）。
+
+        追底 = 把滚动条设到 maximum；如果**之后**视口又变了（发送区收/展的动画
+        落定），maximum 跟着变，视图就停在半路 —— 实测最新 4 行被挤出可视区
+        （自测「收包合并与暂停继续」就挂在这）。暂停中/搜索定位中不动，免得
+        把用户自己滚到的地方拽走。
         """
-        key = (widget, horizontal)
-        reveal = self._block_reveals.get(key)
-        if reveal is None:
-            # 帧率保持 125Hz（用户明确要求"至少 120"）：不降帧。
-            # ⚠️ 曾经想用"动画期间跳过磨砂颗粒重绘"来省每帧开销，但那样表面纹理
-            #    会在动画中途消失又回来 —— 本身就是一次看得见的跳变（用户连续三
-            #    轮反馈"还是有跳变"）。2026-10-16 的返工结论是**宁可每帧多花点功夫，
-            #    也要纹理连续**（见 ui_surface._paint_frosted），别再改回去。
-            if horizontal:
-                # 横向折叠要"贴着右侧退场"：布局默认把控件钉在左边，直接收宽度
-                # 会变成"从右往左被抹掉"（方向正好反）。⚠️ 只在这里设**一次**、
-                # 之后不再动：在 to()/_on_finished 里反复设/清会和布局打架，
-                # 实测把配置卡顶在半宽不消失、还挂掉两条自测（2026-10-16 踩过）。
-                holder = widget.parentWidget()
-                lay = holder.layout() if holder is not None else None
-                if lay is not None:
-                    lay.setAlignment(widget, Qt.AlignmentFlag.AlignRight
-                                     | Qt.AlignmentFlag.AlignVCenter)
-            reveal = Reveal(widget, 220, parent=self, horizontal=horizontal)
-            if widget.isVisible():
-                reveal.mark_expanded()      # 控件本来就是展开的，先对齐状态
-            self._block_reveals[key] = reveal
-        return reveal
+        if self._paused or self._search_pinned:
+            return
+        bar = self.txt_rx.verticalScrollBar()
+        if bar.value() < bar.maximum():
+            bar.setValue(bar.maximum())
 
+    def _finish_send_collapsed(self) -> None:
+        """收起动画落定：钉成标题栏高度，**这时**才隐藏卡片内容。
+
+        ⛔ 内容不能在动画开始时 hide：卡片那一刻还是满高的，文字整块消失 =
+        一次"内容突然没了"的跳变。留着它，让高度动画把内容一路裁下去，
+        落到 54px 再藏 —— 全程是"被卡片收走"，不是一个消失的瞬间。
+        """
+        self._set_tx_vpolicy(QSizePolicy.Policy.Preferred)
+        self._tx_card.setMinimumHeight(TX_COLLAPSED_H)
+        self._tx_card.setMaximumHeight(TX_COLLAPSED_H)
+        self._tx_content.hide()
+
+    def _finish_send_expanded(self) -> None:
+        """展开动画落定：策略/上下限都还原，之后高度归分割器与用户拖拽。"""
+        self._set_tx_vpolicy(QSizePolicy.Policy.Preferred)
+        self._tx_card.setMinimumHeight(self._tx_min_height)
+        self._tx_card.setMaximumHeight(WIDGETSIZE_MAX)
+        self._repin_rx_bottom()
     def _play_intro(self) -> None:
         # 小米那套入场是短促的淡入，不做位移也不做扫光
         fade_in(self.brand_header, delay_ms=0, duration_ms=220)
@@ -2942,6 +3692,13 @@ class MainWindow(QMainWindow):
             display = f"{head}\n{text}"
         else:
             display = text
+        # ⛔ 历史接收数据在**收到数据这一刻**就记，不等"显示"。
+        #    以前 feed 挂在 _flush_rx_display 上：暂停期间数据只进 _paused_frames
+        #    不喂历史，用户"看了半天数据，历史文件却一直停在暂停那一刻"
+        #    （2026-10-18 用户点名："每次读取到串口数据就要更新"）。
+        #    合并期（动画期间 60ms 批）同理：数据到了就该进历史。
+        import rx_history
+        rx_history.feed(display)
         if self._paused:
             # 暂停 = **冻结显示**：新数据连同到达时刻的时间戳一起进后台队列，
             # 画面一个像素都不动 —— 这就是"停留在当前数据页面"的严格实现。
@@ -2952,9 +3709,7 @@ class MainWindow(QMainWindow):
         # 历史回放中：实时数据照常记进本地留存（不丢），但不写进这块正在
         # 展示历史数据的只读画面 —— 否则用户翻看的内容会被新帧冲走。
         if self._replay_active:
-            import rx_history
-            rx_history.feed(display)
-            return
+            return                      # 历史已在上游记过（见上），别重复写
         self._append_display(text, display)
 
     def _append_display(self, text: str, display: str) -> None:
@@ -2978,10 +3733,8 @@ class MainWindow(QMainWindow):
     def _flush_rx_display(self, text: str, display: str) -> None:
         """真正往接收区写一帧（合并期由 ``_flush_rx_coalesced`` 批量调它）。"""
         self.txt_rx.appendPlainText(display)
-        # 历史接收数据：display 里已含时间戳行，直接整帧喂给历史模块
-        # （纯内存入队，落盘由 1s 定时器批量做 —— 见 rx_history.feed）。
-        import rx_history
-        rx_history.feed(display)
+        # 历史已在 _emit_block 入口记过（暂停/回放期间也记），这里不再喂 ——
+        # 再喂一次会把每一帧写两遍。
         # appendPlainText 只在"视图本来就在底部"时才跟着走。暂停过又恢复时
         # 视图停在半路，新数据会静静地堆在下面看不见 —— 所以显式滚到底。
         # 搜索钉住时例外：用户正盯着某条命中看，不能把视图拽走。
@@ -3015,9 +3768,6 @@ class MainWindow(QMainWindow):
         self._rx_coalesce_timer.stop()
         if not buffered:
             return
-        import rx_history
-        for _text, display in buffered:
-            rx_history.feed(display)
         self.txt_rx.appendPlainText("\n".join(display for _text, display in buffered))
         if not self._search_pinned:
             self._follow_rx_bottom()
@@ -3073,6 +3823,10 @@ class MainWindow(QMainWindow):
         if not self._search_pinned:
             bar = self.txt_rx.verticalScrollBar()
             bar.setValue(bar.maximum())
+            # ⚠️ 追底之后再补一次（340ms > 发送区收展的 300ms 动画）：恢复时如果
+            #    同时还在长回发送区，视口会在**这之后**变矮，maximum 变大，刚才
+            #    那一下就被作废了 —— 实测最新 4 行被挤出可视区（151/155）。
+            QTimer.singleShot(340, self._repin_rx_bottom)
 
     def _stamp(self) -> str:
         # 精确到秒就够 —— 数据本身的间隔远大于 1ms，毫秒那三位只是噪音。
@@ -3421,7 +4175,11 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------- 历史数据回放
 
     def _open_history(self) -> None:
-        """在软件内打开本地留存的接收数据（用户 2026-10-13 点名）。
+        """「打开 / 关闭历史数据」—— 这颗键是**开关**，不是单向入口。
+
+        用户点名两次（先"要能打开本地留存数据"，再"再点一次就该关掉"）：所以
+        回放态下再点它 = 返回实时，不是再灌一遍同一个文件。文案随状态变（见
+        ``_refresh_replay_ui``），否则用户看不到这一下会"关掉"。
 
         格式、风格、功能与实时接收**完全一致** —— 不复刻一套渲染，而是把文件
         内容灌进同一个接收区、同一套着色器/排版管线，所以时间戳紫、序号蓝、
@@ -3429,6 +4187,9 @@ class MainWindow(QMainWindow):
         回放期间实时数据不覆盖画面（串口若开着，帧照样进历史文件，只是不往
         这块只读画面里写）——顶部给一条返回实时的提示条。
         """
+        if self._replay_active:
+            self._exit_replay()
+            return
         import rx_history
         rows = rx_history.all_lines()
         if not rows:
@@ -3439,7 +4200,23 @@ class MainWindow(QMainWindow):
                     "点右上角返回实时）", 5000)
 
     def _enter_replay(self, rows) -> None:
-        """把给定行灌进接收区并进入回放模式。"""
+        """把给定行灌进接收区并进入回放模式。
+
+        三步的顺序都是刻意排的：
+          1. 先抓"当前画面"并**立刻铺上去**（见 ``_show_rx_shot``）——
+             必须在改文本**之前**，否则后面那次同步重绘会把新内容直接亮出来，
+             交叉淡入就没了；
+          2. ``clear() + setPlainText()`` 换内容，然后 ``viewport().repaint()``
+             把"塞进几千行之后的第一帧重排 + 高亮 + 绘制"**当场付掉**；
+          3. 最后才起两条动画（提示条高度补间、快照淡出）。
+
+        ⚠️ 第 2 步那个 ``repaint()`` 不是多余的：实测把它去掉的话，那一帧的重绘
+        会落在补间**起跑之后**，把计时器堵住 100ms 以上 —— 220ms 的坡被吃掉头
+        三分之一，条从 0 直接跳到 43px（QA 实测"只有 3 个高度变化帧"就是这么来
+        的）。在快照盖住的情况下先画，用户看到的仍然是旧画面。
+        """
+        shot = self._grab_rx_shot()
+        self._show_rx_shot(shot)
         self.txt_rx.clear()
         self._reset_matches()
         self._clear_alert_highlight()
@@ -3452,25 +4229,248 @@ class MainWindow(QMainWindow):
         text = "\n".join(rows)
         self.txt_rx.setPlainText(text)
         self.txt_rx.moveCursor(QTextCursor.MoveOperation.Start)
+        self._settle_rx_layout()
         self._replay_active = True
         self._refresh_replay_ui()
+        self._fade_rx_shot()
 
     def _exit_replay(self) -> None:
         """返回实时：清掉回放画面，回到"等待实时数据"的姿态。"""
+        shot = self._grab_rx_shot()
+        self._show_rx_shot(shot)
         self._replay_active = False
         self._refresh_replay_ui()
         self._clear_receive()
+        self._settle_rx_layout()
+        self._fade_rx_shot()
+
+    def _settle_rx_layout(self) -> None:
+        """把接收区的"第一帧大重排"当场画掉（同步，不等事件循环）。
+
+        回放的几千行刚塞进 ``QPlainTextEdit`` 时，文档重排 + 高亮 + 整块绘制要
+        几十到上百毫秒，而且**发生在下一次绘制时**。让它落在动画起跑之前，
+        动画才不会被堵成两三个台阶。
+        """
+        try:
+            self.txt_rx.viewport().repaint()
+        except RuntimeError:                # 窗口已析构（退出流程里会走到）
+            pass
 
     def _refresh_replay_ui(self) -> None:
-        """回放模式下：显示返回实时的提示条，接收区改成回忆态提示。"""
+        """回放模式下：显示返回实时的提示条、按钮文案改成"关闭"、换占位提示。
+
+        提示条的显隐**不直接 show/hide**，走 ``_replay_bar_anim`` 的高度补间：
+        一帧里凭空多出 50px 会把下面的日志框猛地顶下去。
+        """
         if self._replay_active:
-            self._replay_bar.show()
+            self.btn_open_history.setText("关闭历史数据")
+            self._replay_bar_anim(True)
             self.txt_rx.setPlaceholderText("正在查看本地留存数据（点右上角返回实时）")
         else:
-            self._replay_bar.hide()
+            self.btn_open_history.setText("打开历史数据")
+            self._replay_bar_anim(False)
             # 与 __init__ 一致：**不设**占位提示（Qt 只按"正文色×≈0.5"画它，
             # 永远比别处暗一半；详见 __init__ 里那段说明）。
             self.txt_rx.setPlaceholderText("")
+
+    def _replay_bar_height(self) -> int:
+        """提示条展开后的高度（≈50）—— 按布局的 sizeHint 现算，别写死。
+
+        ⚠️ 用 ``layout().sizeHint()`` 而不是 ``widget.sizeHint()``：条的高度在
+        动画期间被 ``setMaximumHeight`` 钉着，控件级的 sizeHint 会被那些约束
+        夹住；布局的 sizeHint 只跟内容（内边距 + 按钮高）有关，是稳的。
+        """
+        bar = self._replay_bar
+        layout = bar.layout()
+        hint = layout.sizeHint().height() if layout is not None else bar.sizeHint().height()
+        return max(1, int(hint) if hint > 0 else 50)
+
+    def _replay_bar_anim(self, expand: bool) -> None:
+        """提示条高度补间：0 ⇄ ``_replay_bar_height()``，220ms ``EASE``。
+
+        为什么补间：一帧里凭空多出 50px，日志框会被猛地顶下去 —— 高刷屏上非常
+        扎眼（搜索条就是同一个理由用的 Reveal）。
+
+        ⚠️ 曲线用 ``ui_anim.EASE``（``cubic-bezier(0.25, 0.1, 0.25, 1)``，即 CSS
+        的 ``ease``），**不是** ``STANDARD``／``in_out_cubic``／``in_out_quint``。
+        这条动画动的是**版式占位**（50px 高度），不是透明度/缩放，验收口径是
+        "每一帧都看得出来在走"。同一套补间引擎（120Hz 节拍、``min_interval_ms=16``、
+        ``max(1, round(v))`` 量化地板）下逐帧高度实测/推演：
+          · ``STANDARD`` = ``bezier(0.2, 0, 0, 1)``：1,10,23,31,36,40,... —— 第一帧
+            就 1→10px，像"被甩进来"，后段又几乎不动（12 个值但前 40ms 走完 62%）；
+          · ``in_out_quint``：1,3,8,19,34,44,48,49,50 —— 前 72ms 全在 3px 以内，
+            然后 60ms 里窜到 44px，更难看；
+          · ``in_out_cubic``：1,3,7,13,21,31,39,44,47,49,50 —— 比 quint 好，但前
+            56ms 只到 3px；165Hz 屏上这就是"顿一下再开始"（用户原话）；
+          · ``EASE``：1,5,13,21,28,34,39,42,45,47,48,49,50 —— **13 个台阶、单步
+            ≤8px、首个 ≥2px 在 24ms、末变仍在 200ms**（220ms ± 一帧内跑满）。
+        注意 ``t=0`` 那一帧高度就是 1px（``max(1, round(0.0))`` 的地板），所以
+        "首帧有没有变化"按 1px 算是 0ms、按 ≥2px 算是 24ms。
+
+        ⛔ 不要在调用处写 ``bezier(...)``：曲线是**调参单点**，住在 ``ui_anim.EASE``。
+
+        **可打断**：起点取条的**当前真实高度**，中途反向点击就是平滑折返，
+        不会先跳回 0 再重新长。
+
+        **为什么要节流到 60fps**（``min_interval_ms=16``）：这条动画每帧都要
+        把日志区高度改一次，而日志区重绘一次实测 7~14ms（2x DPR、3000 行文本
+        整块重画，见 devtools 里那组基准）。125Hz 的共享计时器每 6ms 就送一个
+        新值，布局根本跟不上 —— 一帧里连推 3 次高度，最终只渲染最后一次，
+        条就变成几个大台阶。锁到 16ms 之后每送一次就渲染一次。
+
+        收尾还原 min/max（见 ``_replay_bar_settle``）：动画期间高度由 max 独占，
+        钉死了不还回去，以后换字号/换主题条就再也长不高了。
+        """
+        bar = self._replay_bar
+        full = float(self._replay_bar_height())
+        target = full if expand else 0.0
+        # 藏着的时候真实高度是"上一次的残留"，一律当 0 看
+        start = 0.0 if bar.isHidden() else float(bar.height())
+        if self._replay_tween is not None:
+            self._replay_tween.stop()
+            # 每段补间都是新对象（起点不同），旧的不回收就会一直挂在 self 下
+            self._replay_tween.deleteLater()
+            self._replay_tween = None
+        if abs(start - target) < 0.5:
+            self._replay_bar_settle(expand)
+            return
+        if expand:
+            bar.show()
+        # 补间期间 min 一律放开、只由 max 说话（见 _replay_bar_step 的说明）
+        bar.setMinimumHeight(0)
+        bar.setMaximumHeight(max(1, round(full)))
+        tween = Tween(_REPLAY_BAR_MS, EASE,
+                      self._replay_bar_step if expand else self._replay_bar_step_down,
+                      lambda: self._replay_bar_settle(expand),
+                      parent=self, min_interval_ms=_REPLAY_BAR_MIN_MS)
+        self._replay_tween = tween
+        tween.start(start, target, _REPLAY_BAR_MS)
+
+    def _replay_bar_step(self, value: float) -> None:
+        """补间的一帧：**只改 maximumHeight**，把高度压到当前值。
+
+        为什么不同时改 minimumHeight（那样才是"钉死高度"）：
+          · 实测只改 max、min 恒 0 时单帧成本 **6.5ms**，两个都改是 **13~14ms**
+            —— 一帧 220ms 的动画只剩 15 个台阶，还不如不补间；
+          · 效果完全一样：条的 sizeHint 是 50、max 压到 h，布局给的就是 h。
+        数据见 ``devtools`` 里那组 `setFixedHeight(h)+processEvents` 基准。
+
+        ⚠️ ``max`` 不许写 0：``_refresh_replay_ui`` 之后马上断
+        ``maximumHeight() > 0`` 会假挂（补间 ``start()`` 会立刻送一次起点值）。
+        收起方向那根 1px 亮线由 ``_replay_bar_step_down`` 提前 hide 掉。
+        """
+        self._replay_bar.setMaximumHeight(max(1, round(value)))
+
+    def _replay_bar_step_down(self, value: float) -> None:
+        """收起方向的一帧：落到 ≤2px 就直接藏起来。
+
+        1px 高的自绘圆角（``ReplayBar.paintEvent`` 按 ``min(RADIUS, h/2)`` 取半径）
+        整条横向都是描边，会在收尾挂一根亮线；2px 高时肉眼已经看不出来，从这里
+        hide 不产生任何可见跳变（补间照旧跑完，收尾还会再 hide 一次）。
+        """
+        self._replay_bar_step(value)
+        if round(value) <= 2:
+            self._replay_bar.hide()
+
+    def _replay_bar_settle(self, expand: bool) -> None:
+        """补间收尾：展开 → 还原 min/max（回到按 sizeHint 自适应）；收起 → 归零并 hide。"""
+        tween = self._replay_tween
+        self._replay_tween = None
+        if tween is not None:
+            tween.deleteLater()      # 这一段已经跑完，别一直挂在 self 底下
+        bar = self._replay_bar
+        if expand:
+            bar.setMinimumHeight(0)
+            bar.setMaximumHeight(_WIDGET_MAX)
+            bar.show()
+            return
+        bar.setMinimumHeight(0)
+        bar.setMaximumHeight(0)
+        bar.hide()
+
+    def _grab_rx_shot(self) -> QPixmap | None:
+        """抓接收区**当前画面**（viewport）—— 交叉淡入的底图。
+
+        抓不到（窗口没建/尺寸为 0/已被析构）就返回 None，调用方直接跳过淡入
+        —— 宁可硬切，也不能因为抓图失败把文字切换本身搞坏。
+        """
+        try:
+            viewport = self.txt_rx.viewport()
+        except RuntimeError:                    # 窗口已析构（退出流程里会走到）
+            return None
+        if viewport is None or viewport.width() <= 0 or viewport.height() <= 0:
+            return None
+        try:
+            shot = viewport.grab()
+        except RuntimeError:
+            return None
+        if shot.isNull():
+            return None
+        # 抓回来的是物理像素，标好比例，贴图时才不会被 Qt 按 1x 缩放一次
+        shot.setDevicePixelRatio(viewport.devicePixelRatioF())
+        return shot
+
+    def _show_rx_shot(self, shot: QPixmap | None) -> None:
+        """把旧画面**铺上去并停在完全不透明**，等 ``_fade_rx_shot`` 淡出。
+
+        分成"铺"和"淡"两步是因为中间要夹一次同步重绘（见 ``_settle_rx_layout``）：
+        换内容的瞬间就必须有东西盖着，否则那次重绘会把新内容直接亮出来。
+
+        打断规则：上一段还没跑完就从**它当前的 alpha** 接着走（不重置回 1），
+        否则连点两下会看到旧画面"闪回去"再淡一次。
+        """
+        layer = self._rx_shot
+        if self._rx_shot_tween is not None:
+            self._rx_shot_tween.stop()
+            self._rx_shot_tween.deleteLater()
+            self._rx_shot_tween = None
+        if shot is None:
+            layer.hide()
+            layer.set_shot(None)
+            layer.set_alpha(1.0)
+            return
+        # ⚠️ 用 isHidden() 而不是 isVisible()：窗口本身没显示时（自测就是）
+        #    isVisible() 恒为 False，那样每次都会当成"没有正在跑的淡出"、从 1.0
+        #    重新开始 —— 连点两下就会看到旧画面闪回去。isHidden() 才是"这一层
+        #    是否被要求显示"。
+        layer.set_shot(shot)
+        layer.set_alpha(layer.alpha() if not layer.isHidden() else 1.0)
+        layer.sync_geometry()
+        layer.show()
+        layer.raise_()
+
+    def _fade_rx_shot(self) -> None:
+        """旧画面 160ms 淡出（从它**当前**的 alpha 起跑，可打断）。
+
+        新内容已经在底下了、一开始就是完全不透明的，所以这里只做"旧内容淡出"
+        —— 视觉上是一次交叉淡入，没有中间的空帧。
+        """
+        layer = self._rx_shot
+        if layer.isHidden() or layer.get_shot() is None:
+            return
+        start = layer.alpha()
+        if start <= 0.001:
+            self._finish_rx_xfade()
+            return
+        tween = Tween(_RX_XFADE_MS, STANDARD, self._rx_xfade_step,
+                      self._finish_rx_xfade, parent=self)
+        self._rx_shot_tween = tween
+        tween.start(start, 0.0, _RX_XFADE_MS)
+
+    def _rx_xfade_step(self, value: float) -> None:
+        """交叉淡入的一帧：几何跟着 viewport（滚动条可能刚显隐），再推透明度。"""
+        self._rx_shot.sync_geometry()
+        self._rx_shot.set_alpha(value)
+
+    def _finish_rx_xfade(self) -> None:
+        """淡完收尾：撤图、藏层、alpha 复位（下一段从全不透明重新开始）。"""
+        tween = self._rx_shot_tween
+        self._rx_shot_tween = None
+        if tween is not None:
+            tween.deleteLater()
+        self._rx_shot.hide()
+        self._rx_shot.set_shot(None)
+        self._rx_shot.set_alpha(1.0)
 
     def _on_replay_close(self) -> None:
         self._exit_replay()
@@ -3630,8 +4630,10 @@ class MainWindow(QMainWindow):
         previous_material = material()
         previous_hidden = set(self._hidden_buttons)
         previous_font = customization.display_value("rx_font_size")
+        # 帧率也要记：取消时得还回去（它是**立即生效**的，不还就"点取消也变了"）
+        previous_fps = ui_anim.frame_hz()
         self._settings_previous = (previous_glass, previous_material,
-                                   previous_hidden, previous_font)
+                                   previous_hidden, previous_font, previous_fps)
         dialog = SettingsDialog(self._theme_mode, previous_glass,
                                 BUTTON_SPECS, sorted(self._hidden_buttons),
                                 on_glass=self._apply_glass,
@@ -3639,6 +4641,9 @@ class MainWindow(QMainWindow):
                                 on_custom=self._preview_custom, parent=self)
         # ⚠️ 必须**非模态**：模态会自己起一个局部事件循环，把补间挡在外面。
         dialog.setModal(False)
+        # 记下**静止态**的最小尺寸（A3）：``_animate_settings_geometry`` 会把它
+        # 放开成 (0, 0)，落定时这里整份还回去（不只是宽度，见 __init__ 里的说明）。
+        self._settings_min_size = dialog.minimumSize()
         self._settings_dialog = dialog
         dialog.accepted.connect(self._on_settings_accepted)
         dialog.rejected.connect(self._on_settings_rejected)
@@ -3664,6 +4669,12 @@ class MainWindow(QMainWindow):
         self._settings_geom_from = self._settings_button_rect()
         self._settings_geom_to = QRect(target)
         self._settings_geom_opening = True
+        # 确保快照以**全不透明、非分层**状态开始：入场是「硬切」，落定那拍
+        # 真面板以不透明上屏、快照同拍撤走，动画期间没有任何亚满 alpha 操作，
+        # 所以这道窗口始终是普通非分层窗口（见 _SettingsShot 的 exstyle 说明），
+        # 不会触发「非分层↔分层」的 DWM 合成切换 —— 那次切换正是当初
+        # 「打开时最后一帧闪」的根因（现由硬切 + 不带 layered 一起根除）。
+        self._settings_shot.set_alpha(1.0)
         self._show_settings_shot(self._grab_settings_frame())
         dialog.hide()
         self._animate_settings_geometry(self._settings_geom_from,
@@ -3689,13 +4700,22 @@ class MainWindow(QMainWindow):
             time.sleep(0.004)
 
     def _settings_button_rect(self) -> QRect:
-        """设置按钮在**主窗口**里的矩形 —— 面板从这里长出来，也收回这里。
+        """设置按钮的矩形 —— 面板从这里长出来，也收回这里。
 
-        返回主窗口坐标（不是屏幕坐标）：``_SettingsShot`` 是主窗口的 child，
-        它的 geometry 用的是父控件坐标，两边必须同一套坐标系，否则收尾互换
-        会错位一整个窗口位置。
+        ⚠️ 返回的是**屏幕坐标**（``mapToGlobal``），不是主窗口坐标。
+
+        为什么非得是屏幕坐标：``_SettingsShot`` 构造时被设成
+        ``Qt.WindowType.ToolTip``（要无边框、不抢焦点），它就**变成了顶层窗口**
+        —— 不再是主窗口的 child widget 意义上的绘制层，``setGeometry`` 收的是
+        **屏幕坐标**。而动画终点 ``_settings_geom_to`` 取的是
+        ``dialog.frameGeometry()``，那本来就是屏幕坐标。起点用主窗口坐标、
+        终点用屏幕坐标 = 两套坐标系混着插值，主窗口只要不在屏幕左上角
+        (0, 0)，面板就会"斜着滑一段再稳住"，收场则缩到离按钮很远的地方。
+
+        早先这里写的是 ``mapTo(self, QPoint(0, 0))``（返主窗口坐标），是因为
+        那时误以为快照是主窗口的子控件 —— 它其实是顶层窗口，所以必须换过来。
         """
-        return QRect(self.btn_settings.mapTo(self, QPoint(0, 0)),
+        return QRect(self.btn_settings.mapToGlobal(QPoint(0, 0)),
                      self.btn_settings.size())
 
     def _animate_settings_geometry(self, start: QRect, end: QRect,
@@ -3769,9 +4789,17 @@ class MainWindow(QMainWindow):
         #    那样会多裁掉一个标题栏（实测位图矮了 16px）。
         window_rect = _window_rect_physical(int(dialog.winId()))
         if window_rect is not None:
-            left = window_rect[0] - int(round(frame.x() * dpr))
-            top = window_rect[1] - int(round(frame.y() * dpr))
-            crop_x, crop_y = max(0, left), max(0, top)
+            # ⚠️ GetWindowRect（物理）**包住** frameGeometry：DWM 那圈不可见缩放
+            #    边框长在 frame 的**外侧**（实测 dpr=2 时：左/右/下各 13 物理px，
+            #    上边 0 —— 顶部是标题栏，阴影不往上长）。所以要裁掉的是
+            #    **frame 物理左 − WindowRect 左**（正数 13）。
+            # ⛔ 千万别写成 `window_rect[0] - frame`（反了）：那得 −13，被
+            #    max(0, ·) 夹成 0 = **根本没裁** —— 快照内容整体右偏一个边框宽
+            #    （dpr=2 → 约 7 逻辑px），撤快照那一下真面板相对快照**向左跳 7px**。
+            #    这正是用户报的「打开设置最后一帧整体往左闪一下」（2026-10-18
+            #    用 `devtools/_probe_settings_swaplr.py` 前后帧对比实测 dx=−7 定位）。
+            crop_x = max(0, int(round(frame.x() * dpr)) - window_rect[0])
+            crop_y = max(0, int(round(frame.y() * dpr)) - window_rect[1])
             crop_w = min(want_w, pixmap.width() - crop_x)
             crop_h = min(want_h, pixmap.height() - crop_y)
             if crop_w > 8 and crop_h > 8 and (crop_x or crop_y
@@ -3820,18 +4848,34 @@ class MainWindow(QMainWindow):
 
         左上角对齐的插值看着是"滑过去"；改成"尺寸按 t 插值 + 中心按 t 插值"
         之后，面板是从设置按钮那个点**鼓大**并漂到居中的。
+
+        ⚠️ 中心一律用**浮点**算（``x + width / 2.0``），⛔ 不要读
+        ``QRect.center()``：它是 ``left + (width - 1) // 2``，宽高为**奇数**时
+        比几何中心少 0.5px。起点是按钮（宽 30）、终点是面板（宽 500），两者的
+        奇偶不同，于是"中心"这条曲线在 t=1 那端差半个像素 —— 落地前的最后
+        一帧快照比真面板偏 1px，换帧时就是一条横线在抖。探针
+        ``_probe_settings_residual.py`` 量到过这一条：客户区 y≈660 那一带
+        2269 个点全变（占该带 90%），正是面板的底边线。
+
+        ⚠️ ``t >= 1.0`` 直接**精确落位**成 ``_settings_geom_to``：兜住上面那个
+        取整残差，保证换帧那一刻快照与真面板是**同一个矩形**（逐像素可比）。
         """
         holder = self._settings_shot
         if not holder.isVisible():
             return
         a, b = self._settings_geom_from, self._settings_geom_to
-        width = int(round(a.width() + (b.width() - a.width()) * t))
-        height = int(round(a.height() + (b.height() - a.height()) * t))
-        center_x = a.center().x() + (b.center().x() - a.center().x()) * t
-        center_y = a.center().y() + (b.center().y() - a.center().y()) * t
-        holder.setGeometry(QRect(int(round(center_x - width / 2.0)),
-                                 int(round(center_y - height / 2.0)),
-                                 width, height))
+        if t >= 1.0:
+            holder.setGeometry(b)
+            return
+        width = a.width() + (b.width() - a.width()) * t
+        height = a.height() + (b.height() - a.height()) * t
+        ax, ay = a.x() + a.width() / 2.0, a.y() + a.height() / 2.0
+        bx, by = b.x() + b.width() / 2.0, b.y() + b.height() / 2.0
+        center_x = ax + (bx - ax) * t
+        center_y = ay + (by - ay) * t
+        holder.setGeometry(QRect(round(center_x - width / 2.0),
+                                 round(center_y - height / 2.0),
+                                 max(1, round(width)), max(1, round(height))))
 
     def _on_settings_geometry_done(self) -> None:
         """入场跑完 → 换回真面板；收场跑完 → 落地结果并关闭。
@@ -3840,28 +4884,48 @@ class MainWindow(QMainWindow):
         内容，用户看不出"闪了一下"。探针 ``_probe_settings_anim.py`` 会抓两张
         图逐点比对中心与四角。
         """
-        dialog = self._settings_dialog
+        try:
+            dialog = self._settings_dialog
+        except RuntimeError:       # 窗口先被析构（退出时补间才回调），直接收手
+            return
         if dialog is None:
             return
         if self._settings_geom_opening:
-            # ⚠️ 先恢复 500 最小宽**再**落位：反过来会先按 0 宽定位、show 后又触发
+            # ⚠️ 先恢复最小尺寸**再**落位：反过来会先按 0 宽定位、show 后又触发
             #    一次重排，首帧尺寸会跳一下（用户说的"闪"的另一处来源）。
-            dialog.setMinimumWidth(500)
+            # ⚠️ 必须**整份**还原（A3）：早先只写 setMinimumWidth(500)，面板内容
+            #    撑出来的**最小高**一直停在动画期间的 0 —— 之后任何一次重排
+            #    （改字号、切主题）都会按"能缩到很矮"重新算，面板高度会抖一下。
+            self._restore_settings_min_size(dialog)
             # ⚠️ 落位用"边框矩形"换算：动画全程（含标题栏）的坐标是整窗矩形，
             #    而 setGeometry 收客户区 —— 不换算窗口会整体偏一个标题栏的高度
             #    （实测 29px），落地那一下内容会往上跳一截。
             self._place_dialog_frame(dialog, self._settings_geom_to)
-            # 换帧 = **透明渐入**（80ms）：快照垫底、真面板从 opacity 0 渐到 1，
-            # 渐完才撤快照。为什么必须渐：快照与真面板的内容虽已逐像素一致，但
-            # DWM 阴影、圆角抗锯齿、激活态标题栏颜色这些**抓不进位图**的东西会在
-            # show() 那一瞬凭空出现 —— 内容再一致也压不住（用户："最后一帧有抽搐"）。
-            # setWindowOpacity 是 DWM 合成属性，不是被禁的 QGraphicsOpacityEffect
-            # （那条铁律禁的是控件级离屏合成），渐入把所有残差变成 80ms 的平滑坡。
+            # 以**不透明**上屏：setWindowOpacity(1.0) 是 DWM 合成属性（不是被禁的
+            # QGraphicsOpacityEffect），窗口从第一帧就是非分层、系统阴影同一拍到位，
+            # 不会「先没阴影→啪一下出现」。快照先 raise_ 垫在最顶，真面板 show
+            # 之后同拍用硬切换掉它（见下方「为什么是硬切」），全程只有一份面板像素。
             self._settings_shot.raise_()
-            dialog.setWindowOpacity(0.0)
+            dialog.setWindowOpacity(1.0)
             dialog.show()
             dialog.raise_()
-            self._start_settings_swap_fade(dialog)
+            # ⚠️ show() 只是"请求映射"，真正的首帧要等这一拍的事件循环。
+            #    所以先**同步**把首帧画出来（repaint 不等事件循环），再让 DWM
+            #    立刻合成一遍。
+            dialog.repaint()
+            self._dwm_flush()
+            # 快照抬到最顶，盖住 dialog：dialog 首帧 DWM 会先呈白底（见下）。
+            self._settings_shot.raise_()
+            # 换帧 = **硬切**，但快照延迟一拍撤：dialog 渲染本身正确
+            # （dialog.grab() 均值≈34，深色），白底是 DWM 首帧合成时序竞态——
+            # show() 把窗口映射、repaint()+dwm_flush() 把深色背板刷好，但 DWM
+            # 把「白底默认帧」呈现给屏幕往往比深色背板快一拍（纯合成时序，非渲染）。
+            # 同拍撤快照→那一白帧漏出来（devtools/_frames_open_sync/f007_settled.png
+            # 整片白、均值 209）。故把**不透明、与真面板逐像素一致**的快照多留约
+            # 2 帧盖住它，等 dialog 合成出深色再硬切——既无白闪，也无旧版 96ms
+            # 半透明叠加鬼影（快照全程 alpha=1.0，不碰分层/亚满透明度）。
+            self._settings_swap_target = dialog
+            QTimer.singleShot(50, lambda: self._finish_settings_swap(dialog))
             return
         accepted = bool(self._settings_result)
         self._settings_dialog = None
@@ -3872,52 +4936,67 @@ class MainWindow(QMainWindow):
             dialog.deleteLater()
         except RuntimeError:
             pass
-        self._apply_settings_result(accepted)
+        # ⚠️ 退出时窗口可能**先被析构**，几何补间才回调到这里（Qt 拆窗口时会把
+        #    还在跑的补间 stop(finished=True) 一次）—— 那时 self 已经是"内部
+        #    C++ 对象已删除"的空壳，_apply_settings_result 里任何 self.xxx() 都会
+        #    抛 RuntimeError。除了 traceback 什么都不会坏，所以只吞这一种。
+        try:
+            self._apply_settings_result(accepted)
+        except RuntimeError:
+            pass
 
-    def _start_settings_swap_fade(self, dialog) -> None:
-        """落地换帧的渐入：真面板 opacity 0→1（6 步 × 16ms ≈ 96ms），完了撤快照。
+    def _restore_settings_min_size(self, dialog) -> None:
+        """把面板的最小尺寸还原成**静止态**那一份（A3）。
 
-        期间快照一直垫在下面（与本面板逐像素一致），所以渐入本身不可见；可见的
-        只有阴影/圆角这些残差的平滑出现。用户在渐入期间点关闭也没事 —— 各定时器
-        都有 ``_settings_swap_target`` 守卫，收场路径会自己接管快照。
+        ⚠️ 只还宽度不够：``ui_settings`` 给面板钉了 ``setMinimumWidth(500)``，但
+        内容布局还会撑出一个最小高 —— 动画期间两者都被放开成 0，落定只还宽度
+        的话，高度那一半会永远停在"能缩到很矮"的状态，之后任何一次重排（切主题、
+        改字号）都会让面板高度抖一下。
+
+        ``_settings_min_size`` 拿不到（极端时序 / 面板已析构）时退回原来那条
+        ``setMinimumWidth(500)``，行为不比改动前差。
         """
-        self._settings_swap_target = dialog
-        dialog.installEventFilter(self)     # 收场取消链路仍要摘这个过滤器
-        steps = 6
-        for i in range(1, steps + 1):
-            QTimer.singleShot(16 * i,
-                              lambda v=i / steps, d=dialog:
-                              self._fade_settings_step(d, v))
-        QTimer.singleShot(16 * steps + 16,
-                          lambda: self._finish_settings_swap(dialog))
+        size = self._settings_min_size
+        try:
+            if size is not None and size.isValid():
+                dialog.setMinimumSize(size)
+            else:
+                dialog.setMinimumWidth(500)
+        except RuntimeError:                    # 面板已经被析构掉了
+            pass
 
-    def _fade_settings_step(self, dialog, value: float) -> None:
-        """渐入的一步（窗口被关掉/换目标时静默跳过）。"""
-        if self._settings_swap_target is not dialog:
+    @staticmethod
+    def _dwm_flush() -> None:
+        """把 DWM 待合成的队列**当场刷出去**（仅 Windows，失败静默）。
+
+        Qt 的 ``show()`` / ``repaint()`` 只保证"像素进了窗口表面"，真正上屏还要
+        等 DWM 合成。不等它就直接起渐隐坡，坡的第一帧会跑在**上一帧**的内容上。
+        ``DwmFlush()`` 是同步的（阻塞到合成完成），代价约一两毫秒，只在换帧这
+        一次调用，不进任何动画循环。
+
+        非 Windows、或 dwmapi 里没有这个符号（很老的系统 / 某些远程桌面会话）
+        就跳过 —— 这一步只负责"首帧早点上屏"，缺了不影响正确性。
+        """
+        if sys.platform != "win32":
             return
         try:
-            dialog.setWindowOpacity(value)
-        except RuntimeError:
+            import ctypes
+            ctypes.windll.dwmapi.DwmFlush()
+        except Exception:               # noqa: BLE001, S110  ← 拿不到 dwmapi 就算了
             pass
 
     def _finish_settings_swap(self, dialog) -> None:
-        """撤快照收尾（渐入跑完或 100ms 级兜底触发）。"""
+        """撤快照收尾（入场落定硬切时触发）。
+
+        硬切是同步的：调用方在落定那一拍里先 ``show()`` + ``repaint()`` +
+        ``_dwm_flush()`` 把真面板推上屏，再调这里把垫着的快照撤掉 —— 全程
+        屏幕上只有一份面板像素，没有「半透明快照叠真面板」的 1 帧双击曝光鬼影。
+        """
         if self._settings_swap_target is not dialog:
             return
         try:
-            dialog.removeEventFilter(self)
             if dialog.windowOpacity() < 1.0:
-                dialog.setWindowOpacity(1.0)    # 兜底：无论如何最终必须全不透明
-        except RuntimeError:
-            pass
-        self._settings_swap_target = None
-
-    def _finish_settings_swap(self, dialog) -> None:
-        """撤快照收尾（被 eventFilter 的首帧 Paint 或 100ms 兜底触发）。"""
-        if self._settings_swap_target is not dialog:
-            return
-        try:
-            dialog.removeEventFilter(self)
+                dialog.setWindowOpacity(1.0)    # 兜底：落定必须全不透明
         except RuntimeError:
             pass
         self._settings_swap_target = None
@@ -3927,6 +5006,7 @@ class MainWindow(QMainWindow):
         if self._settings_geom_opening and self._settings_shot is not None:
             self._settings_shot.hide()
             self._settings_shot.set_shot(None)
+            self._settings_shot.set_alpha(1.0)
 
     def _on_settings_accepted(self) -> None:
         self._close_settings_dialog(accepted=True)
@@ -3939,15 +5019,13 @@ class MainWindow(QMainWindow):
         dialog = self._settings_dialog
         if dialog is None:
             return
-        # 取消可能还挂着的"入场快照交换"（100ms 兜底 / eventFilter 的首帧 Paint）。
-        # 不取消的话，那个定时器/事件稍后触发会把**正在缩回的**快照 blanks 掉，
-        # 关闭动画就缺了底图、闪一下。
+        # 防御性收尾：入场换帧现在是**硬切**（落定那拍同步 show+repaint+
+        # _dwm_flush+撤快照，没有挂着的渐隐补间），正常情况下用户能点关闭时
+        # ``_settings_swap_target`` 早已被清。这里只兜底清状态，并确保快照是
+        # 全不透明的——收场动画拿它当底图缩回按钮，半透明会整段漏底（"淡着消失"）。
         if self._settings_swap_target is dialog:
-            try:
-                dialog.removeEventFilter(self)
-            except RuntimeError:
-                pass
             self._settings_swap_target = None
+        self._settings_shot.set_alpha(1.0)
         self._settings_result = bool(accepted)
         # ⚠️ 面板会在关闭动画结束时析构，结果必须**现在**抓下来（含"定制功能"
         # 里被改过的项），否则应用阶段会踩到已删除的控件。
@@ -3971,13 +5049,14 @@ class MainWindow(QMainWindow):
         if not accepted:
             # 取消：把实时预览（强度、材质、按钮显隐、字号）一并还原 ——
             # 少还原一样，界面就会停在预览状态里。
-            previous_glass, previous_material, previous_hidden, previous_font \
-                = self._settings_previous
+            (previous_glass, previous_material, previous_hidden, previous_font,
+             previous_fps) = self._settings_previous
             self._apply_glass(previous_glass)
             self._apply_material(previous_material)
             self._hidden_buttons = previous_hidden
             self._apply_button_visibility()
             self._apply_rx_font_size(previous_font)
+            ui_anim.set_frame_hz(previous_fps)
             return
         theme_mode, glass = self._settings_values
         # 「定制功能」由注册表统一管理：面板按 specs() 生成控件，这里统一落盘。
@@ -4054,6 +5133,10 @@ class MainWindow(QMainWindow):
         """
         if key == "rx_font_size":
             self._apply_rx_font_size(value)
+        elif key == "anim_fps":
+            # 帧率**实时生效**：拖滑杆当场就能感觉到顺滑度变化（用户点名要
+            # "无级调节"）。⛔ 只改每帧间隔，动画时长不变（见 ui_anim.set_frame_hz）。
+            ui_anim.set_frame_hz(int(value))
         elif key == "material":
             # 换材质**当场**生效（用户点名"实时生效、不用重启"）
             self._apply_material(str(value))

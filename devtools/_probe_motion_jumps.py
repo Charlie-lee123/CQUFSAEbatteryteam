@@ -27,6 +27,10 @@ apply_startup_state()（默认"启动时最大化"= 整窗全屏，和真实启�
 ⚠️ 不许与其它探针并行跑（QSettings 竞态）。收尾会还原 QSettings 快照、
 删掉探针新建的键，并把窗口几何设成 (0,0,1134,820) 再关。
 
+⚠️ 2026-10-17 修：①~④ 的遍历原先写成 `for key in TRACK`（TRACK 是
+(短名, 属性名) 元组），`_series` 拿到元组当键 → 永远是空 → 四条判据
+全部静默输出"（无）"。本探针在那之前**没有真正生效过**，别信旧结论。
+
 用法：python devtools/_probe_motion_jumps.py
 """
 import os
@@ -252,7 +256,7 @@ def report(name, rows):
     # ① 帧间阶跃
     lines.append("-- ① 帧间阶跃（>2px；★ = 前后帧都基本不动的孤立跳变）--")
     any_jump = False
-    for key in TRACK:
+    for key, _attr in TRACK:
         for e in find_jumps(rows, key):
             any_jump = True
             star = "★" if e["isolated"] else " "
@@ -267,7 +271,7 @@ def report(name, rows):
     # ② 非单调
     lines.append("-- ② 非单调（方向翻转 >2px）--")
     any_nm = False
-    for key in TRACK:
+    for key, _attr in TRACK:
         for e in find_nonmonotonic(rows, key):
             any_nm = True
             lines.append(f"   t={e['t']:.0f}ms  {key}.{NAME[e['field']]} "
@@ -278,7 +282,7 @@ def report(name, rows):
     # ③ 显隐翻转
     lines.append("-- ③ isVisible 翻转 --")
     any_flip = False
-    for key in TRACK:
+    for key, _attr in TRACK:
         for e in find_flips(rows, key):
             any_flip = True
             lines.append(f"   t={e['t']:.0f}ms  {key} → "
@@ -289,7 +293,7 @@ def report(name, rows):
     # ④ 同步（有位移的元素的到达时间两两比对）
     lines.append(f"-- ④ 到达时间差（> {SYNC_MS:.0f}ms 报警；到达 = 落到终值±2px）--")
     moved = {}
-    for key in TRACK:
+    for key, _attr in TRACK:
         series = _series(rows, key)
         if len(series) < 2:
             continue
@@ -298,22 +302,24 @@ def report(name, rows):
                 a = arrival(rows, key, field)
                 if a is not None:
                     moved[(key, field)] = a
-    keys = sorted(moved, key=lambda k: moved[k])
+    # ⚠️ 这里原先是 `for k, v in keys` —— keys 的元素是 (控件, 字段) 二元组，
+    #    解包出来的 v 其实是字段名（字符串），拿去 `:.0f` 必崩。改成遍历 items。
+    keys = sorted(moved.items(), key=lambda kv: kv[1])
     reported = False
     for i in range(len(keys)):
         for j in range(i + 1, len(keys)):
-            diff = moved[keys[j]] - moved[keys[i]]
+            diff = keys[j][1] - keys[i][1]
             if diff > SYNC_MS:
                 reported = True
-                lines.append(f"   {keys[i][0]}.{NAME[keys[i][1]]} "
-                             f"{moved[keys[i]]:.0f}ms  vs  "
-                             f"{keys[j][0]}.{NAME[keys[j][1]]} "
-                             f"{moved[keys[j]]:.0f}ms   差 {diff:.0f}ms")
+                (ka, fa), ta = keys[i]
+                (kb, fb), tb = keys[j]
+                lines.append(f"   {ka}.{NAME[fa]} {ta:.0f}ms  vs  "
+                             f"{kb}.{NAME[fb]} {tb:.0f}ms   差 {diff:.0f}ms")
     if not reported:
         lines.append(" （没有超过阈值的组合）")
     if keys:
         lines.append("   全部到达时间：" + "  ".join(
-            f"{k[0]}.{NAME[k[1]]}={v:.0f}ms" for k, v in keys))
+            f"{k[0]}.{NAME[k[1]]}={t:.0f}ms" for k, t in keys))
 
     # ⑤ reparent
     lines.append("-- ⑤ 串口开关 reparent --")

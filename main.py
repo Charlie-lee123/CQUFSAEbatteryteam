@@ -170,6 +170,10 @@ def main() -> int:
     # 先定主题再建窗口，窗口构造时拿到的就是正确配色，不会闪一下再换
     apply_scheme(detect_system_scheme())
     app.setFont(ui_font(12.5))
+    # 动画帧率（设置里可无级调，上限跟显示器刷新率走）：必须在建窗口**之前**生效，
+    # 否则首屏入场动画会先按默认 120fps 跑一段再切过去。
+    import ui_anim
+    ui_anim.set_frame_hz(customization.get("anim_fps"))
 
     window = MainWindow()
     window.show()

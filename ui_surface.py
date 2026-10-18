@@ -237,28 +237,76 @@ def _paint_glass_border(painter: QPainter, path: QPainterPath, name: str,
     painter.strokePath(path, pen)
 
 
+# 阴影尺寸的量化步长。⛔ 缓存键必须量化：动画期间卡片**每帧尺寸都不同**，
+# 按精确尺寸做键 = 每帧都 miss = 每帧重算一次高斯模糊。实测单次 22ms（1500x900
+# 的卡片），两三张卡同时在动就是 40~60ms/帧 —— 这就是"动画一卡一卡、末尾追平"
+# 的真正来源（逐帧日志表现为"全部控件同一时刻停滞 15~20ms"）。
+# 量化到 32px 后，一次 200px 的动画只重建 6 次阴影，其余全部命中缓存。
+_SHADOW_STEP = 48
+# 阴影构建的降采样倍数（见 card_shadow）：2 = 半分辨率，成本约 1/4。
+_SHADOW_SUPERSAMPLE = 2
+
+
+def _quantize_shadow(size: int) -> int:
+    """向上取整到 _SHADOW_STEP 的倍数（宁可大一点：阴影大一圈看不出来，小一圈会缺角）。"""
+    return max(_SHADOW_STEP, int((size + _SHADOW_STEP - 1) // _SHADOW_STEP) * _SHADOW_STEP)
+
+
+def _anim_running() -> bool:
+    """当前是否有补间在跑（有的话阴影允许"拉伸凑合"，见 card_shadow）。"""
+    try:
+        from ui_anim import ticker_active
+        return ticker_active()
+    except Exception:                  # noqa: BLE001 - 取不到就按"没在动"
+        return False
+
+
 def card_shadow(width: int, height: int, radius: int, alpha: int) -> QPixmap:
-    """卡片阴影：圆角剪影模糊一次后缓存。按 (宽, 高, 圆角, 透明度) 取。"""
+    """卡片阴影：圆角剪影模糊一次后缓存。**尺寸量化**后取（见 _SHADOW_STEP）。
+
+    返回的位图尺寸可能比请求的大（最多 32px）—— 调用方按目标矩形**缩放**贴，
+    避免动画期间每帧重建模糊。
+    """
+    width, height = _quantize_shadow(width), _quantize_shadow(height)
     key = (width, height, radius, alpha)
     cached = _shadows.get(key)
     if cached is not None:
         return cached
+    # ⛔ 动画期间**直接复用已有阴影**（任意尺寸，调用方会缩放到精确大小）：
+    #    尺寸每帧都在变，再量化也还是要每跨一档重建一次（单次 ~12ms，一次
+    #    200ms 动画要撞 5 次 = 5 次可感知的顿）。卡片在动的时候没人看得出一
+    #    张模糊阴影被拉伸了几十像素；动画一停，下一帧就会按正确尺寸重建。
+    if _anim_running():
+        for (rw, rh, rr, ra), pix in _shadows.items():
+            if rr == radius and ra == alpha:
+                return pix
     if len(_shadows) >= _SHADOW_CACHE_LIMIT:
         _shadows.clear()
 
+    # ⛔ **半分辨率构造**：阴影是一条低频模糊渐变，用一半分辨率画剪影、
+    #    按一半的半径模糊、再放大回来，肉眼看不出差别，成本却只有 1/4。
+    #    实测 1500x900 的卡片：全分辨率 22ms → 半分辨率约 5ms（动画期间
+    #    每跨一个量化档才重建一次，摊到每帧基本不可见）。
+    s = _SHADOW_SUPERSAMPLE
     spread = SHADOW_BLUR
-    image = QImage(width + spread * 2, height + spread * 2,
+    half_w, half_h = max(1, width // s), max(1, height // s)
+    pad = max(2, spread // s)
+    image = QImage(half_w + pad * 2, half_h + pad * 2,
                    QImage.Format.Format_ARGB32_Premultiplied)
     image.fill(Qt.GlobalColor.transparent)
     painter = QPainter(image)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     silhouette = QPainterPath()
-    silhouette.addRoundedRect(QRectF(spread, spread, width, height), radius, radius)
+    silhouette.addRoundedRect(QRectF(pad, pad, half_w, half_h),
+                              max(1.0, radius / s), max(1.0, radius / s))
     painter.fillPath(silhouette, QColor(0, 0, 0, alpha))
     painter.end()
 
-    blurred = gaussian_blur(image, SHADOW_BLUR // 2)
-    shadow = QPixmap.fromImage(blurred)
+    blurred = gaussian_blur(image, max(1, (SHADOW_BLUR // 2) // s))
+    full = blurred.scaled(width + spread * 2, height + spread * 2,
+                          Qt.AspectRatioMode.IgnoreAspectRatio,
+                          Qt.TransformationMode.SmoothTransformation)
+    shadow = QPixmap.fromImage(full)
     _shadows[key] = shadow
     return shadow
 
@@ -430,9 +478,13 @@ class Card(QFrame):
         alpha = shadow_alpha()
         if alpha > 0:
             shadow = card_shadow(int(box.width()), int(box.height()), radius, alpha)
+            # ⚠️ 目标矩形按**请求尺寸**算、位图按它的实际尺寸缩放贴：阴影位图
+            #    现在可能比卡片大最多 32px（量化缓存），直接按位图尺寸贴会让
+            #    剪影整体偏移、右下角多出一圈。
             painter.drawPixmap(
                 QRectF(box.left() - SHADOW_BLUR, box.top() - SHADOW_BLUR,
-                       shadow.width(), shadow.height()),
+                       box.width() + SHADOW_BLUR * 2,
+                       box.height() + SHADOW_BLUR * 2),
                 shadow, QRectF(shadow.rect()))
 
         # 2) 材质面：按当前材质（毛玻璃 / 液态玻璃）画主体、颗粒 / 镜面高光、描边。

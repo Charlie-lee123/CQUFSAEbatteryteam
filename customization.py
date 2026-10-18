@@ -19,29 +19,42 @@ from PySide6.QtCore import QSettings
 
 _ORG, _APP = "MimoWorks", "SerialAssistant"
 _SPECS: list[dict] = []
+# key → spec 的**索引**：get/set/display_value 每次都要按 key 找 spec，
+# 线性扫 _SPECS 是 O(n)。用一张表建索引后是 O(1)（接收路径每个时间戳都要
+# 取 3 个开关，省下来的是每秒几十次的无谓扫描）。
+_BY_KEY: dict[str, dict] = {}
 
 # 改过默认值的配置：{key: 旧默认值}。迁移时只动"没被用户选过、且还停在旧默认值"
 # 的那些（见 migrate_defaults）；新默认值直接取注册表里那一条。
 _LEGACY_DEFAULTS: dict[str, object] = {}
 
 
+def _add(spec: dict) -> None:
+    """登记一条配置，同时建 key 索引（保持注册顺序，供面板生成）。"""
+    _SPECS.append(spec)
+    # setdefault：与旧实现 ``next(s for s in _SPECS if ...)`` 的"取第一条"语义
+    # 完全一致 —— 万一哪天重复注册同一个 key，也不会偷偷切到后一条。
+    _BY_KEY.setdefault(spec["key"], spec)
+
+
 def register_bool(key: str, label: str, default: bool = False, tip: str = "") -> None:
     """注册一个布尔型定制配置（设置面板里是一枚拨动开关）。"""
-    _SPECS.append({"key": key, "kind": "bool", "label": label,
-                   "default": default, "tip": tip})
+    _add({"key": key, "kind": "bool", "label": label,
+          "default": default, "tip": tip})
 
 
 def register_int(key: str, label: str, default: int, minimum: int, maximum: int,
                  tip: str = "", suffix: str = "") -> None:
     """注册一个整数型定制配置（设置面板里是一个数字框）。"""
-    _SPECS.append({"key": key, "kind": "int", "label": label, "default": default,
-                   "minimum": minimum, "maximum": maximum, "tip": tip,
-                   "suffix": suffix})
+    _add({"key": key, "kind": "int", "label": label, "default": default,
+          "minimum": minimum, "maximum": maximum, "tip": tip,
+          "suffix": suffix})
 
 
 def register_slider(key: str, label: str, default: int, minimum: int,
                     maximum: int, tip: str = "", suffix: str = "",
-                    scale: float = 1.0, preview: str = "") -> None:
+                    scale: float = 1.0, preview: str = "",
+                    maximum_fn=None) -> None:
     """注册一个**滑动无级调节**的整数配置（设置面板里是一根滑杆）。
 
     取值类型与 ``register_int`` 完全一样（``kind`` 仍是 ``"int"``），只是面板
@@ -55,10 +68,12 @@ def register_slider(key: str, label: str, default: int, minimum: int,
     ``preview``：非空时在这一行**下方**再挂一行等宽字的预览（用当前字号渲染、
     用接收区正文的颜色），拖滑块当场能看到字号变化。
     """
-    _SPECS.append({"key": key, "kind": "int", "widget": "slider", "label": label,
-                   "default": default, "minimum": minimum, "maximum": maximum,
-                   "tip": tip, "suffix": suffix, "scale": scale,
-                   "preview": preview})
+    # ``maximum_fn``：右端要按**运行环境**现算时用（比如"动画帧率"的上限是
+    # 当前显示器的刷新率）。面板每次打开都会重新调它，换显示器不用重启。
+    _add({"key": key, "kind": "int", "widget": "slider", "label": label,
+          "default": default, "minimum": minimum, "maximum": maximum,
+          "tip": tip, "suffix": suffix, "scale": scale,
+          "preview": preview, "maximum_fn": maximum_fn})
 
 
 def register_choice(key: str, label: str, default: str, options, tip: str = "") -> None:
@@ -68,8 +83,8 @@ def register_choice(key: str, label: str, default: str, options, tip: str = "") 
     之后要能原样读回来（见 ``get`` 的归一：不在 options 里的值一律退回默认）。
     取值类型与其它类型一样走 ``get``/``set``，所以面板/主窗口都无需为它分情况。
     """
-    _SPECS.append({"key": key, "kind": "choice", "label": label,
-                   "default": default, "options": tuple(options), "tip": tip})
+    _add({"key": key, "kind": "choice", "label": label,
+          "default": default, "options": tuple(options), "tip": tip})
 
 
 def specs() -> tuple[dict, ...]:
@@ -79,7 +94,7 @@ def specs() -> tuple[dict, ...]:
 
 def get(key: str):
     """取一个定制配置的当前值。未注册的 key 直接抛 KeyError（写错了要炸出来）。"""
-    spec = next(s for s in _SPECS if s["key"] == key)
+    spec = _BY_KEY[key]
     value = QSettings(_ORG, _APP).value(f"custom/{key}", spec["default"])
     if value is None:
         # 键被显式写成过 null（快照恢复 setValue(key, None) 会这样写）——
@@ -107,7 +122,7 @@ def display_value(key: str) -> float:
     字号这类小数用整数存储（半磅：21 → 10.5pt），面板上的标签与预览、以及
     主窗口应用字号时都走这里，免得 scale 的知识散落在各处。
     """
-    spec = next(s for s in _SPECS if s["key"] == key)
+    spec = _BY_KEY[key]
     return get(key) * float(spec.get("scale", 1.0))
 
 
@@ -117,7 +132,7 @@ def set(key: str, value) -> None:
     写完立刻 ``sync()``：QSettings 的写入按实例缓冲，不同步的话紧接着
     另一个实例去读会拿到旧值（自测里 set(7) 后 snap 读到的还是 3，实测踩过）。
     """
-    next(s for s in _SPECS if s["key"] == key)      # 未注册的 key 照样炸出来
+    _BY_KEY[key]                                    # 未注册的 key 照样炸出来
     settings = QSettings(_ORG, _APP)
     settings.setValue(f"custom/{key}", value)
     settings.sync()
@@ -130,7 +145,7 @@ def mark_chosen(key: str) -> None:
     拨到旧默认值那一侧的选择会被当成"没动过"覆盖掉（毛玻璃强度那边踩过同一个
     坑，见 MEMORY.md 的 ``glass_chosen``）。
     """
-    next(s for s in _SPECS if s["key"] == key)      # 未注册的 key 照样炸出来
+    _BY_KEY[key]                                    # 未注册的 key 照样炸出来
     settings = QSettings(_ORG, _APP)
     settings.setValue(f"custom/{key}_chosen", True)
     settings.sync()
@@ -149,7 +164,7 @@ def migrate_defaults() -> None:
     for key, legacy in _LEGACY_DEFAULTS.items():
         if settings.value(f"custom/{key}_chosen", False, type=bool):
             continue                                # 用户明确选过
-        spec = next(s for s in _SPECS if s["key"] == key)
+        spec = _BY_KEY[key]
         raw = settings.value(f"custom/{key}", None)
         if raw is None or spec["default"] == legacy:
             continue                                # 没存过 / 默认值没变
@@ -234,6 +249,27 @@ register_bool("highlight_errors", "高亮异常数据", True,
 register_slider("rx_font_size", "接收区字体大小", 21, 16, 48, scale=0.5,
                 suffix=" pt", preview="CQUFSAE.2026",
                 tip="接收区数据显示的字号；拖动滑块即时预览，确定后生效")
+
+
+def _display_max_hz() -> int:
+    """显示器最高刷新率（延迟 import：customization 别把 ui_anim/QtWidgets 拉进来）。
+
+    每次面板打开都**先丢缓存再取** —— 换显示器/改刷新率之后滑杆右端要跟着变，
+    不能吃上一次的缓存值。
+    """
+    from ui_anim import display_max_hz, forget_screen_hz
+    forget_screen_hz()
+    return display_max_hz()
+
+
+# 动画帧率（用户 2026-10-17 点名）：无级调节，**上限 = 显示器最高刷新率**
+# （他那台笔记本是 165Hz，默认 120 是为了省电；调满更顺滑）。
+# ⛔ 改帧率**不改动画时长** —— 补间按真实时间算进度（见 ui_anim 的说明）。
+register_slider("anim_fps", "动画帧率", 120, 24, 240, suffix=" Hz",
+                maximum_fn=_display_max_hz,
+                tip="动画每秒推进多少次。右端自动取当前显示器的最高刷新率；"
+                    "调高更顺滑但更吃显卡，调低更省电 —— 动画的**时长不变**，"
+                    "只是每秒画的张数不同")
 
 # ---- 电池数据网格排版 ----
 # 三者都用来决定"采样点网格该排成什么样"（展示层，解析逻辑不动）：

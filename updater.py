@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import tempfile
+import time
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -34,12 +35,48 @@ from PySide6.QtWidgets import (
 
 from ui_controls import InkButton
 from ui_theme import GAP, ui_font
-SOURCE_TIMEOUT_MS = 8000         # 版本检测单源超时
+
+SOURCE_TIMEOUT_MS = 4000         # 版本检测**单源**超时（并行测速，不用等满）
 CHECK_PASSES = 2                 # 整条源链的重试轮数
-DOWNLOAD_PASSES = 2              # 下载源链的重试轮数
+DOWNLOAD_PASSES = 1              # 下载源链重试轮数（源多了，一轮足够）
+STALL_MS = 8000                  # 下载"多久没有任何新字节"就换源
+SLOW_BYTES_PER_S = 40_000        # 慢于这个速度且已下 >8s，也换源（镜像限速时用）
 
 
-# ------------------------------------------------------------------ 源定义
+
+# ------------------------------------------------------------------ 镜像表
+#
+# GitHub 的 release 资产在国内直连基本拉不动，实际都走"前缀式"加速镜像：
+#
+#     https://<镜像>/https://github.com/<owner>/<repo>/releases/download/...
+#
+# 这些镜像**都有随时挂掉/限速的可能**，所以这里不是"选一条最靠谱"，而是：
+#   ① 版本检测：**所有源并行发**，谁先回有效内容就用谁（顺手完成测速）；
+#   ② 下载：用刚才测出来的最快镜像起跑，**卡住 8 秒没新字节就换下一条**。
+# 多列几条的意义在于"总有一条活着"，而不是指望某一条永远在。
+MIRROR_PREFIXES = (
+    "https://ghfast.top/",
+    "https://gh-proxy.com/",
+    "https://ghproxy.net/",
+    "https://hub.gitmirror.com/",
+    "https://gitdl.cn/",
+)
+
+# 本次会话里测出来的最快镜像前缀（UpdateChecker 命中镜像源时更新）。
+# 下载从它起跑；没有就按 MIRROR_PREFIXES 的默认顺序。
+_BEST_PREFIX: str | None = None
+
+
+def best_prefix() -> str | None:
+    return _BEST_PREFIX
+
+
+def note_best_prefix(prefix: str | None) -> None:
+    """记下本次测速最快的镜像（供下载起跑用；空值忽略）。"""
+    global _BEST_PREFIX
+    if prefix:
+        _BEST_PREFIX = prefix
+
 
 def _OWNER_REPO() -> str:
     from version import OWNER_REPO
@@ -47,40 +84,44 @@ def _OWNER_REPO() -> str:
 
 
 def version_sources() -> tuple:
-    """版本检测源链（名字, url, 解析器）—— 依次尝试，失败回退。
+    """版本检测源（名字, url, 解析器, 镜像前缀）—— **并行**发，先回者胜。
 
-    ① jsDelivr CDN（国内可直连，仓库根目录的 version.py）
-    ②③ 镜像加速的 GitHub raw（两个常用镜像互为备份）
-    ④ GitHub raw 直连（开着代理的用户）
-    ⑤ GitHub API 标签列表（兜底；只有版本号、没有哈希）
+    ① jsDelivr 三个边缘节点（国内可直连，仓库根目录的 version.py）
+    ② 各镜像加速的 GitHub raw（前缀见 MIRROR_PREFIXES）
+    ③ GitHub raw 直连（开着代理的用户）
+    ④ GitHub API 标签列表（兜底；只有版本号、没有哈希）
     """
     repo = _OWNER_REPO()
     raw = f"https://raw.githubusercontent.com/{repo}/main/version.py"
-    return (
-        ("jsDelivr",
-         f"https://cdn.jsdelivr.net/gh/{repo}@main/version.py",
-         parse_version_file),
-        ("ghfast",
-         f"https://ghfast.top/{raw}", parse_version_file),
-        ("gh-proxy",
-         f"https://gh-proxy.com/{raw}", parse_version_file),
-        ("GitHub raw", raw, parse_version_file),
-        ("GitHub API",
-         f"https://api.github.com/repos/{repo}/tags", parse_tags_json),
-    )
+    out = [
+        ("jsDelivr", f"https://cdn.jsdelivr.net/gh/{repo}@main/version.py",
+         parse_version_file, None),
+        ("jsDelivr-fastly", f"https://fastly.jsdelivr.net/gh/{repo}@main/version.py",
+         parse_version_file, None),
+        ("jsDelivr-gcore", f"https://gcore.jsdelivr.net/gh/{repo}@main/version.py",
+         parse_version_file, None),
+    ]
+    for prefix in MIRROR_PREFIXES:
+        host = prefix.rstrip("/").split("//", 1)[-1]
+        out.append((host, f"{prefix}{raw}", parse_version_file, prefix))
+    out.append(("GitHub raw", raw, parse_version_file, None))
+    out.append(("GitHub API", f"https://api.github.com/repos/{repo}/tags",
+                parse_tags_json, None))
+    return tuple(out)
 
 
 def release_download_urls(tag: str, asset: str | None = None) -> tuple:
-    """某版本的 exe 下载源链（镜像加速在前，GitHub 直连兜底）。"""
+    """某版本资产的下载源链：**测速最快的镜像在前**，其余镜像随后，直连兜底。"""
     from version import ASSET_NAME
     asset = asset or ASSET_NAME
     repo = _OWNER_REPO()
     direct = f"https://github.com/{repo}/releases/download/{tag}/{asset}"
-    return (
-        f"https://ghfast.top/{direct}",
-        f"https://gh-proxy.com/{direct}",
-        direct,
-    )
+    prefixes = list(MIRROR_PREFIXES)
+    best = best_prefix()
+    if best in prefixes:
+        prefixes.remove(best)
+        prefixes.insert(0, best)
+    return tuple([f"{p}{direct}" for p in prefixes] + [direct])
 
 
 def setup_asset_name(version: str) -> str:
@@ -231,10 +272,17 @@ def spawn_apply_update(new_exe: str, target_exe: str) -> None:
 # ------------------------------------------------------------------ 检测器
 
 class UpdateChecker(QObject):
-    """多源版本检测：逐源请求（每源独立超时），失败自动回退，链完再重试。
+    """多源版本检测：**所有源并行发**，第一条回有效内容的胜出。
 
-    结果信号 ``checked(info)``：info 为归一化字典
-    ``{"version": "1.6", "sha256": "..."/None, "tag": "v1.6"/None}``；
+    为什么改成并行（2026-10-17，用户："自动更新太慢了"）：原来是"逐源串行 +
+    每源 8 秒超时"，国内常见的坏情况是**某条镜像连得上但极慢**——用户要干等
+    8 秒才轮到下一条，运气差时 20 秒才拿到版本号。并行之后：
+      · 总耗时 ≈ **最快那条源**的耗时（通常 0.3~1.5s），慢的那几条不影响结果；
+      · 顺手完成了"测速"——赢的那条就是当前网络下最快的镜像，
+        ``note_best_prefix()`` 记下来，下载直接从它起跑；
+      · 首轮全挂才会进第二轮（CHECK_PASSES），不会再出现"卡在一条源上"。
+
+    结果信号 ``checked(info)``：info 含 ``version`` / ``sha256`` / ``source``；
     全部失败发 ``failed(reason)``。
     """
 
@@ -244,73 +292,94 @@ class UpdateChecker(QObject):
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._nam = QNetworkAccessManager(self)
-        self._reply = None
+        self._replies: list = []
         self._pass = 0
-        self._idx = 0
+        self._done = False
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._on_timeout)
+        # 胜出后给镜像留的"报到窗口"（见 _on_one）：整体冠军可能来自 jsDelivr
+        # 或直连，这时候还不知道哪条镜像最快 —— 但下载恰恰要用镜像。
+        self._grace = QTimer(self)
+        self._grace.setSingleShot(True)
+        self._grace.timeout.connect(self._abort_all)
 
     def start(self) -> None:
         self._pass = 0
-        self._idx = 0
-        self._try_next()
+        self._launch_pass()
 
-    def _try_next(self) -> None:
-        sources = version_sources()
-        if self._idx >= len(sources):
-            self._pass += 1
-            self._idx = 0
-            if self._pass >= CHECK_PASSES:
-                self.failed.emit("所有版本源都不可达")
+    # -- 内部 ------------------------------------------------------------
+
+    def _launch_pass(self) -> None:
+        self._done = False
+        self._abort_all()
+        for name, url, parser, prefix in version_sources():
+            request = QNetworkRequest(QUrl(url))
+            request.setTransferTimeout(SOURCE_TIMEOUT_MS)
+            request.setAttribute(
+                QNetworkRequest.RedirectPolicyAttribute,
+                QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy)
+            reply = self._nam.get(request)
+            reply.finished.connect(
+                lambda r=reply, n=name, p=parser, pre=prefix:
+                self._on_one(r, n, p, pre))
+            self._replies.append(reply)
+        # 整轮兜底：并行也要防止"全部挂起不回调"
+        self._timer.start(SOURCE_TIMEOUT_MS + 800)
+
+    def _abort_all(self) -> None:
+        self._grace.stop()
+        for reply in self._replies:
+            try:
+                reply.finished.disconnect()
+                reply.abort()
+                reply.deleteLater()
+            except (RuntimeError, TypeError):
+                pass
+        self._replies = []
+
+    def _on_one(self, reply, name: str, parser, prefix: str | None) -> None:
+        if self._done:
+            # 已经有源赢了：剩下的回应只用来"认一下最快的镜像"，不参与结果
+            if prefix and reply.error() == QNetworkReply.NetworkError.NoError:
+                note_best_prefix(prefix)
+            return
+        data = bytes(reply.readAll())
+        error = reply.error()
+        if error == QNetworkReply.NetworkError.NoError and data:
+            try:
+                info = parser(data.decode("utf-8", errors="replace"))
+            except Exception:
+                info = None
+            if info and info.get("version"):
+                self._done = True
+                self._timer.stop()
+                info.setdefault("sha256", None)
+                info["source"] = name
+                note_best_prefix(prefix)
+                self.checked.emit(info)
+                # 先发结果（用户不必等），镜像再留 400ms 的报到窗口：
+                # 第一条回来的镜像就是下载该用的那条（见 note_best_prefix）。
+                if prefix is None:
+                    self._grace.start(400)
+                else:
+                    self._abort_all()
                 return
-        name, url, parser = sources[self._idx]
-        self._parser = parser
-        self._source_name = name
-        request = QNetworkRequest(QUrl(url))
-        request.setTransferTimeout(SOURCE_TIMEOUT_MS)
-        request.setAttribute(QNetworkRequest.RedirectPolicyAttribute,
-                             QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy)
-        self._reply = self._nam.get(request)
-        self._reply.finished.connect(self._on_finished)
-        self._timer.start(SOURCE_TIMEOUT_MS)
-
-    def _advance(self) -> None:
-        """回退到下一源；链尾则进入下一轮。"""
-        self._idx += 1
-        self._try_next()
+            if prefix:
+                note_best_prefix(prefix)     # 镜像活着就算数（即使还没解析出结果）
+                return
+        # 这条不行（超时/空/解析失败）：等别的源；全部失败由 _on_timeout 收尾
 
     def _on_timeout(self) -> None:
-        if self._reply is None:
+        if self._done:
             return
-        self._reply.disconnect(self)
-        self._reply.abort()
-        self._reply.deleteLater()
-        self._reply = None
-        self._advance()
-
-    def _on_finished(self) -> None:
-        reply = self.sender()
-        if reply is not getattr(self, "_reply", None):
-            return                      # 迟到的回应，忽略
-        self._timer.stop()
-        error = reply.error()
-        data = bytes(reply.readAll())
-        reply.deleteLater()
-        self._reply = None
-        if error != QNetworkReply.NetworkError.NoError:
-            self._advance()
+        self._pass += 1
+        self._abort_all()
+        if self._pass >= CHECK_PASSES:
+            self._done = True
+            self.failed.emit("所有版本源都不可达（已并行尝试全部镜像与直连）")
             return
-        try:
-            info = self._parser(data.decode("utf-8", errors="replace"))
-        except Exception:
-            info = None
-        if not info or not info.get("version"):
-            self._advance()             # 解析不出也当源失败，回退下一源
-            return
-        info.setdefault("sha256", None)
-        info["source"] = self._source_name
-        self.checked.emit(info)
+        self._launch_pass()
 
 
 # ------------------------------------------------------------------ 弹窗
@@ -351,6 +420,12 @@ class UpdateDialog(QDialog):
         self._download_pass = 0
         self._url_idx = 0
         self._data = bytearray()
+        # 卡源看门狗：镜像"连上了但不给数据"是最常见的坑（TCP 通、字节不来），
+        # 没有它的话下载会一直挂在那条源上，用户只能看着进度条不动。
+        self._stall = QTimer(self)
+        self._stall.setSingleShot(True)
+        self._stall.timeout.connect(self._on_stall)
+        self._dl_started = 0.0
 
         root = QVBoxLayout(self)
         root.setContentsMargins(GAP + 6, GAP + 6, GAP + 6, GAP + 6)
@@ -435,19 +510,26 @@ class UpdateDialog(QDialog):
             self._download_pass += 1
             self._url_idx = 0
             if self._download_pass >= DOWNLOAD_PASSES:
-                self._download_failed("所有下载源都失败了")
+                self._download_failed("所有下载源都失败了（镜像与直连都试过）")
                 return
             self._status.setText("下载失败，正在自动重试…")
         self._url = urls[self._url_idx]
+        host = self._url.split("/")[2]
         request = QNetworkRequest(QUrl(self._url))
-        request.setTransferTimeout(0)            # 大文件不设整体超时，靠失败回退
+        request.setTransferTimeout(0)            # 大文件不设整体超时，靠看门狗换源
         request.setAttribute(QNetworkRequest.RedirectPolicyAttribute,
                              QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy)
         self._reply = self._nam.get(request)
         self._reply.downloadProgress.connect(self._on_progress)
         self._reply.finished.connect(self._on_download_finished)
+        self._data.clear()                       # ⛔ 换源必须清空：否则上一源的半截
+        #    字节会和这一源的拼在一起，哈希永远对不上（旧版就是这么"所有源都失败"的）
+        self._dl_started = time.perf_counter()
+        self._stall.start(STALL_MS)
+        self._status.setText(f"正在下载更新（{host}）…")
 
     def _on_progress(self, received: int, total: int) -> None:
+        self._stall.start(STALL_MS)              # 有字节进来 = 这条源还活着
         if total > 0:
             self._progress.setValue(int(received * 100 / total))
             self._status.setText(f"正在下载更新… {received / 1e6:.1f} / "
@@ -455,18 +537,50 @@ class UpdateDialog(QDialog):
         else:
             self._progress.setRange(0, 0)
             self._status.setText(f"正在下载更新… {received / 1e6:.1f} MB")
+        # 限速型镜像：连得上、也在动，但慢得离谱 —— 与其让用户等两分钟，
+        # 不如换下一条（剩下的源里大概率有快的）。
+        elapsed = time.perf_counter() - self._dl_started
+        if elapsed > 8.0 and received > 0 and received / elapsed < SLOW_BYTES_PER_S:
+            self._switch_source(f"当前镜像太慢（{received / elapsed / 1024:.0f} KB/s）")
+
+    def _on_stall(self) -> None:
+        """看门狗：连续 STALL_MS 没有新字节 → 判这条源卡死，换下一条。"""
+        if self._reply is None:
+            return
+        self._switch_source("下载停滞")
+
+    def _switch_source(self, reason: str) -> None:
+        """放弃当前源，换下一条镜像（清掉半截数据，进度归零重来）。"""
+        self._stall.stop()
+        reply, self._reply = self._reply, None
+        if reply is not None:
+            try:
+                reply.downloadProgress.disconnect()
+                reply.finished.disconnect()
+                reply.abort()
+                reply.deleteLater()
+            except (RuntimeError, TypeError):
+                pass
+        self._data.clear()
+        self._progress.setValue(0)
+        self._progress.setRange(0, 100)
+        self._status.setText(f"{reason}，正在换源重试…")
+        self._url_idx += 1
+        self._try_download()
 
     def _on_download_finished(self) -> None:
         reply = self.sender()
         if reply is not getattr(self, "_reply", None):
             return
+        self._stall.stop()
         error = reply.error()
         self._data += bytes(reply.readAll())
         reply.deleteLater()
         self._reply = None
         if error != QNetworkReply.NetworkError.NoError:
-            # 该源失败：回退下一源 / 下一轮重试
+            # 该源失败：换下一条（_switch_source 会清数据，别在这儿再 +=）
             self._url_idx += 1
+            self._data.clear()
             self._try_download()
             return
         ok, why = verify_integrity(bytes(self._data), self._sha256, self._size)

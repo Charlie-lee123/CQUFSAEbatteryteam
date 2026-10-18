@@ -275,6 +275,18 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
     ⚠️ 数字本身一个都不动：只在前导位置补数字 0（用户："在前方补零"）、重排
     空白 —— 自测用"摘掉前导 0、压平空白后逐字等于原文"兜底。
     """
+    # ⛔ 序号补位宽度 = 这一帧里**最大序号的位数**（下限 INDEX_PAD_WIDTH）。
+    #    固定 2 位的话，序号上到 100 以上就多占一格：实测一帧 1..120，小数点
+    #    间距是 11,11,11,12,11 —— "100." 那格凸出去，用户的"个位数字上下对齐"
+    #    就破了。按帧内最宽序号补位后，整帧 '.' 落在同一条竖线上。
+    max_index = 0
+    for _m in SAMPLE_RE.finditer(text):
+        try:
+            max_index = max(max_index, int(_m.group(1)))
+        except (TypeError, ValueError):
+            continue
+    index_width = max(int(index_width), len(str(max_index)))
+
     lines = text.split("\n")
 
     # 逐行推进段状态，同时标记"电压/温度段的纯数据行"（整行都是采样点）。

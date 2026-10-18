@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -27,20 +28,60 @@ _FILE: RotatingFileHandler | None = None
 _PATH: Path | None = None
 
 
-def _pick_dir() -> Path | None:
-    """选日志目录：程序旁边优先（跟着软件走，好找），失败退回用户主目录。"""
-    if getattr(sys, "frozen", False):
-        candidates = [Path(sys.executable).resolve().parent]
-    else:
-        candidates = [Path(__file__).resolve().parent]
-    candidates.append(Path.home() / ".serialassistant")
-    for base in candidates:
+# 用户数据（日志 + 接收历史）放在**用户目录**，不跟安装目录走。
+# ⛔ 为什么不能放程序旁边：升级时安装器可能先 DelTree 旧目录（换目录安装），
+#    卸载器也会删 {app}\logs —— 用户的接收历史会跟着没了（2026-10-18 用户点名：
+#    "每次更新的时候用户数据要保留，包括历史读取数据"）。
+APP_DIR_NAME = "CQUFSAE-SerialAssistant"
+# 旧版本放在程序目录里的文件：首次运行时搬到新位置（不覆盖已有数据）
+_LEGACY_FILES = ("serialassistant.log", "serialassistant.log.1",
+                 "serialassistant.log.2", "serialassistant.log.3",
+                 "接收历史.log")
+
+
+def _data_root() -> Path:
+    """用户数据根目录：Windows 用 %LOCALAPPDATA%，其它系统 ~/.serialassistant。"""
+    local = os.environ.get("LOCALAPPDATA")
+    if os.name == "nt" and local:
+        return Path(local) / APP_DIR_NAME
+    return Path.home() / ".serialassistant"
+
+
+def _program_dir() -> Path:
+    base = (Path(sys.executable).resolve().parent
+            if getattr(sys, "frozen", False) else Path(__file__).resolve().parent)
+    return base
+
+
+def _migrate_legacy(target: Path) -> None:
+    """把旧版放在程序目录里的日志/接收历史搬过来（只搬一次，绝不覆盖新数据）。"""
+    import shutil
+    legacy = _program_dir() / "logs"
+    try:
+        if not legacy.is_dir() or legacy.resolve() == target.resolve():
+            return
+    except OSError:
+        return
+    for name in _LEGACY_FILES:
+        source, dest = legacy / name, target / name
+        if not source.exists() or dest.exists():
+            continue
         try:
-            directory = base / "logs"
+            shutil.copy2(source, dest)
+        except OSError:
+            pass                      # 搬不动就留着旧文件，不影响使用
+
+
+def _pick_dir() -> Path | None:
+    """选日志目录：**用户目录优先**（升级/换目录安装都不会丢），失败再退回。"""
+    candidates = [_data_root() / "logs", Path.home() / ".serialassistant" / "logs"]
+    for directory in candidates:
+        try:
             directory.mkdir(parents=True, exist_ok=True)
-            return directory
         except OSError:
             continue                  # 只读盘符等：换下一个候选
+        _migrate_legacy(directory)
+        return directory
     return None
 
 
