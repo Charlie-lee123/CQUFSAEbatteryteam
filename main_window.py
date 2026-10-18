@@ -3253,6 +3253,13 @@ class MainWindow(QMainWindow):
             self.cmb_port.setCurrentIndex(index)
         else:
             self.cmb_port.setEditText(device)
+        # ⛔ 可编辑下拉在 setCurrentIndex/setEditText 之后会把光标放到**末尾**，
+        #    条目文字比框宽时（蓝牙设备那一长串"MAC — 名字 — 信号 — 负载"）
+        #    框里显示的就是**尾巴**（"…46dBm（有广播负载）"），设备名整个看不见。
+        #    把光标拨回开头，用户看到的是 MAC 和设备名。
+        line = self.cmb_port.lineEdit()
+        if line is not None:
+            line.setCursorPosition(0)
 
     def _fill_port_combo(self, ports: list[tuple[str, str]], keep_device: str = "") -> None:
         """把扫描到的端口填进下拉框。``device`` 进 userData，描述只作显示。"""
