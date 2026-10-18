@@ -139,7 +139,7 @@ macOS / Linux：
   要"发一条等回包"用 send_and_wait（给 expect_regex 更稳）；初始化寄存器用 send_repl。
 · 收数据缓冲默认留最近 5000 行，长时间跑不会吃内存。
 
-来源：{REPO_URL}（v{VERSION}，设置面板 →「AI 接入」可再次复制本段）
+来源：{REPO_URL}（v{VERSION}，设置面板 →「MCP Service」可再次复制本段）
 """
 
 

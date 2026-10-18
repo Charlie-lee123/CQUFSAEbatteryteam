@@ -213,16 +213,16 @@ begin
   // ⛔ 先把旧目录里的 logs 搬到临时位置再 DelTree：里面是用户的**接收历史**
   //    （2026-10-18 用户点名"更新时用户数据要保留"）。装完由 CurStepChanged
   //    搬回 {app}\logs，新版首次启动会再把它迁到 %LOCALAPPDATA%。
-  // ⚠️ Pascal Script 里没有 CopyFiles（那是预处理宏）—— 用 FileCopy 逐个搬，
+  // ⚠️ Pascal Script 里没有 CopyFiles（那是预处理宏）—— 用 CopyFile 逐个搬，
   //    只搬真正有用的两份：日志与接收历史。
   KeepDir := ExpandConstant('{tmp}\CQUFSAE_keep');
   if DirExists(Dir + '\logs') then
   begin
     ForceDirectories(KeepDir);
-    if FileCopy(Dir + '\logs\serialassistant.log',
+    if CopyFile(Dir + '\logs\serialassistant.log',
                 KeepDir + '\serialassistant.log', False) then
       Log('  已备份旧日志');
-    if FileCopy(Dir + '\logs\接收历史.log',
+    if CopyFile(Dir + '\logs\接收历史.log',
                 KeepDir + '\接收历史.log', False) then
       Log('  已备份旧接收历史');
   end;
@@ -349,9 +349,9 @@ begin
     if DirExists(KeepDir) then
     begin
       ForceDirectories(ExpandConstant('{app}\logs'));
-      FileCopy(KeepDir + '\serialassistant.log',
+      CopyFile(KeepDir + '\serialassistant.log',
                ExpandConstant('{app}\logs\serialassistant.log'), False);
-      FileCopy(KeepDir + '\接收历史.log',
+      CopyFile(KeepDir + '\接收历史.log',
                ExpandConstant('{app}\logs\接收历史.log'), False);
       Log('已把旧日志/接收历史搬回安装目录（新版启动后会迁到用户目录）');
     end;

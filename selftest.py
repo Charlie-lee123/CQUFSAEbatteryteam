@@ -595,6 +595,11 @@ def check_ui_roundtrip(app: QApplication) -> None:
         window.btn_pause.click()
         assert window._scroll_frozen(), "点击暂停键后没有进入暂停态"
         assert "继续滚动" in window.btn_pause.toolTip(), window.btn_pause.toolTip()
+        # 暂停定位现在是 200ms 的滚动补间（见 _snap_to_round_start）——
+        # 先让它跑完再钉位置，否则下面"位置被钉住"会被还在跑的补间带着走。
+        assert wait_for(app, lambda: not (window._rx_scroll_tween
+                                          and window._rx_scroll_tween.running),
+                        timeout=1.0), "暂停定位的滚动补间一直没停下"
         bar = window.txt_rx.verticalScrollBar()
         bar.setValue(bar.maximum())          # 先滚到底，稍后验证位置被钉住
         pinned = bar.value()
@@ -790,6 +795,8 @@ def check_light_pure_white(app: QApplication) -> None:
 
     from PySide6.QtGui import QColor
     from PySide6.QtWidgets import QWidget
+    from ui_theme import MATERIAL_FROSTED, material as current_material
+    from ui_theme import set_material as apply_material
 
     def edge_gain(rim_alpha: int) -> tuple[float, float]:
         ui_surface.RIM_ALPHA = rim_alpha
@@ -813,16 +820,26 @@ def check_light_pure_white(app: QApplication) -> None:
         return band(5, 10), band(189, 194)          # 顶边 5 行（含峰值行）/底边 5 行
 
     set_scheme("light")
-    top_off, bottom_off = edge_gain(0)
-    top_on, bottom_on = edge_gain(84)
-    # 实测基准：峰值行 +4.0/+4.8 灰阶，5 行均摊 ~1.4 —— 阈值按实测校准
-    # （rim 是 1px 渐变描边，均摊到 5 行就是这个量级；阈值定 1.5 是拿
-    # 颗粒噪声凑出来的假余量，必挂）
-    assert top_on - top_off > 1.0, \
-        f"磨砂开着时上缘没兜到光: {top_off:.2f} -> {top_on:.2f}"
-    assert abs(bottom_on - bottom_off) < 0.5, \
-        f"光边漏到下缘了，那叫描白边不叫玻璃: {bottom_off:.2f} -> {bottom_on:.2f}"
-    ui_surface.RIM_ALPHA = 84
+    # ⛔ 必须**自己钉住材质**：全局材质是"最后一个建过的窗口"按用户配置设的
+    #    （main_window `_apply_material` ← custom/material）。用户把材质切成
+    #    液态玻璃之后，毛玻璃那条 rim 根本不画，这里量到的就是 183.38 → 183.38
+    #    （2026-10-18 实测恒挂，与本轮动画改动无关）。用完还原，别把别人的状态
+    #    改了。
+    prev_material = current_material()
+    apply_material(MATERIAL_FROSTED)
+    try:
+        top_off, bottom_off = edge_gain(0)
+        top_on, bottom_on = edge_gain(84)
+        # 实测基准：峰值行 +4.0/+4.8 灰阶，5 行均摊 ~1.4 —— 阈值按实测校准
+        # （rim 是 1px 渐变描边，均摊到 5 行就是这个量级；阈值定 1.5 是拿
+        # 颗粒噪声凑出来的假余量，必挂）
+        assert top_on - top_off > 1.0, \
+            f"磨砂开着时上缘没兜到光: {top_off:.2f} -> {top_on:.2f}"
+        assert abs(bottom_on - bottom_off) < 0.5, \
+            f"光边漏到下缘了，那叫描白边不叫玻璃: {bottom_off:.2f} -> {bottom_on:.2f}"
+    finally:
+        ui_surface.RIM_ALPHA = 84
+        apply_material(prev_material)
     set_glass_strength(68)
 
     set_scheme("dark")
@@ -2706,7 +2723,10 @@ def check_customization(app: QApplication) -> None:
             bar.setValue(bar.maximum() // 2)
             app.processEvents()
             window._toggle_pause()
-            app.processEvents()
+            # 暂停定位走 200ms 滚动补间（_snap_to_round_start），等它落定再量
+            assert wait_for(app, lambda: not (window._rx_scroll_tween
+                                              and window._rx_scroll_tween.running),
+                            timeout=1.0), "暂停定位的滚动补间一直没停下"
             stamps = [b for b in range(doc.blockCount())
                       if doc.findBlockByNumber(b).text().startswith("[")]
             assert stamps, "数据里没有时间戳行"
@@ -3549,9 +3569,16 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
         window._toggle_pause()
         # 暂停时发送区自动折叠（接收区多吃一截高度），且**先折叠后定位**
         assert window._tx_collapsed, "暂停时发送区没有折叠"
-        # 显示时间戳/HEX/编码那排工具栏也一并折叠（用户点名）
-        assert window._rx_opts_row.isHidden(), \
-            "暂停时工具栏（显示时间戳那排）没有折叠"
+        # 显示时间戳/HEX/编码那排工具栏也一并折叠（用户点名）。折叠与定位现在
+        # 都是补间（工具栏 240ms 收高、定位 200ms 滚动，见 _animate_opts_row /
+        # _snap_to_round_start），量之前先等它们落定。
+        # ⚠️ 收起后行高归零但**不 hide**：hide 会把布局间距（10px）一起收走，
+        #    落定那一帧接收区视口又要跳 10px（44px 硬跳改动画后只剩这条尾巴）。
+        assert wait_for(app, lambda: window._rx_opts_row.height() <= 1, timeout=1.0), \
+            f"暂停时工具栏（显示时间戳那排）没有收起来：高 {window._rx_opts_row.height()}"
+        assert wait_for(app, lambda: not (window._rx_scroll_tween
+                                          and window._rx_scroll_tween.running),
+                        timeout=1.0), "暂停定位的滚动补间一直没停下"
         doc = window.txt_rx.document()
         from PySide6.QtGui import QTextCursor
         # 定位后**应有某个时间戳行**落在视口顶下方 7 个视觉行处（第 8 行 =
@@ -3632,7 +3659,9 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
         app.processEvents()
         shown = window.txt_rx.toPlainText()
         assert "drift 039" in shown, "恢复后最后一批数据没刷进来"
-        assert bar.value() >= bar.maximum() - 1, "恢复后没有追底"
+        # 追底是补间（180ms）+ 340ms 后再补一次，等它落到最新底部
+        assert wait_for(app, lambda: bar.value() >= bar.maximum() - 1, timeout=2.0), \
+            f"恢复后没有追底：{bar.value()} / {bar.maximum()}"
         window._on_rx_lines_changed(window._rx_blocks)   # 还原保留行数
         window._clear_receive()
 

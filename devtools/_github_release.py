@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -25,7 +26,31 @@ import urllib.request
 OWNER_REPO = "Charlie-lee123/CQUFSAEbatteryteam"
 API = f"https://api.github.com/repos/{OWNER_REPO}"
 UPLOAD = f"https://uploads.github.com/repos/{OWNER_REPO}/releases"
-PROXIES = {"http": "http://127.0.0.1:7897", "https": "http://127.0.0.1:7897"}
+
+# 代理候选：环境变量给的（WorkBuddy 内部代理 / 系统代理）→ 本机 Clash → 直连。
+# ⛔ 以前这里把 127.0.0.1:7897 写死，Clash 没开时 urllib 直接 ConnectionRefused，
+#    报错完全看不出是代理的问题（2026-10-18 发 2.2 时踩到）。现在逐个探活，
+#    全不通就用空 ProxyHandler 直连。
+_PROXY_CANDIDATES = (
+    os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "",
+    "http://127.0.0.1:7897",
+    "http://127.0.0.1:60199",
+)
+_PROXY_CHOSEN: list[str] = []
+
+
+def _proxy_url() -> str:
+    """探活挑一个能连上的代理；都连不上返回空串（= 直连）。"""
+    for url in _PROXY_CANDIDATES:
+        if not url:
+            continue
+        try:
+            host, port = url.split("//", 1)[-1].rstrip("/").split(":")
+            with socket.create_connection((host, int(port)), timeout=1.5):
+                return url
+        except (OSError, ValueError):
+            continue
+    return ""
 
 
 def sha256_of(path: str) -> str:
@@ -91,7 +116,12 @@ def get_token() -> str:
 
 
 def opener():
-    return urllib.request.build_opener(urllib.request.ProxyHandler(PROXIES))
+    if not _PROXY_CHOSEN:
+        _PROXY_CHOSEN.append(_proxy_url())
+        print(f"  · 网络出口：{_PROXY_CHOSEN[0] or '直连'}")
+    url = _PROXY_CHOSEN[0]
+    mapping = {"http": url, "https": url} if url else {}
+    return urllib.request.build_opener(urllib.request.ProxyHandler(mapping))
 
 
 def api(op, token, url, method="GET", data=None, headers=None, timeout=120):

@@ -489,6 +489,10 @@ class MainWindow(QMainWindow):
         self._theme_to = ""
         # 接收区"跟随到底"的平滑滚动补间（见 _follow_rx_bottom）
         self._rx_scroll_tween: Tween | None = None
+        # 暂停时「时间戳/HEX/编码」工具栏的收展补间（见 _animate_opts_row）
+        self._opts_tween: Tween | None = None
+        self._opts_from = 0.0
+        self._opts_to = 0.0
         # 设置面板的"从哪里来往哪里去"动画状态（见 _open_settings / 苹果 §7）
         self._settings_dialog = None
         self._settings_geom_tween: Tween | None = None
@@ -1615,7 +1619,7 @@ class MainWindow(QMainWindow):
                 self._toggle_send_area()
             # 显示时间戳/HEX/编码那排工具栏一并折叠（用户点名）
             self._opts_visible_on_resume = self._rx_opts_row.isVisible()
-            self._rx_opts_row.hide()
+            self._animate_opts_row(False)
             self._snap_to_round_start()
             self._toast("滚动已暂停，数据仍在后台接收", 3000)
         else:
@@ -1627,7 +1631,7 @@ class MainWindow(QMainWindow):
                 self._toggle_send_area()
             self._tx_expand_on_resume = False
             if self._opts_visible_on_resume:
-                self._rx_opts_row.show()
+                self._animate_opts_row(True)
             self._opts_visible_on_resume = False
             # 恢复 = 把暂停期间攒下的帧一次性刷进来再追底 —— 视图直接落在
             # 最新读取的数据上（少这一步，新数据全堆在看不见的队列里）。
@@ -1638,6 +1642,86 @@ class MainWindow(QMainWindow):
         self.btn_pause.set_active(self._paused)
         self.btn_pause.setToolTip("继续滚动（空格）" if self._paused
                                   else "暂停滚动（空格）")
+
+    # ---- 暂停时工具栏的收展（走补间，不再一步 hide） ----
+
+    def _opts_row_natural_height(self) -> int:
+        """工具栏的自然行高。
+
+        行被压扁/隐藏时 ``height()`` 是旧值或 0，所以取内容控件的 sizeHint；
+        都拿不到（还没上过屏）就退回实测行高 34。
+        """
+        for probe in (self._opts_content, self._rx_opts_row):
+            try:
+                hint = probe.sizeHint().height()
+            except RuntimeError:
+                hint = 0
+            if hint > 4:
+                return hint
+        return 34
+
+    def _animate_opts_row(self, show: bool, duration: int = 240) -> None:
+        """把「显示时间戳 / HEX / 编码」这排工具栏**动画**收起来或展开。
+
+        以前是 ``hide()`` / ``show()`` 一步到位：接收区视口当场多出（或少掉）
+        44px（34 行高 + 10 布局间距），紧挨着 240ms 的发送区补间就是"啪"一下
+        的硬跳 —— 用户说的"暂停的动画不够顺滑"，一半来自这一下。现在按行高
+        插值、和发送区同一条时间线（240ms / in_out_quint），落定再把 min/max
+        交还布局（与 ``_rx_finish_normal`` 同一个收尾口径）。
+        """
+        row = self._rx_opts_row
+        target = self._opts_row_natural_height() if show else 0
+        if show:
+            # ⛔ 先压到 0 再 show：否则 show 的瞬间行就顶到满高，等于没动画
+            row.setFixedHeight(0)
+            row.show()
+            begin = 0
+        else:
+            begin = row.height() if row.isVisible() else 0
+            if begin <= 0:
+                return
+            row.setFixedHeight(begin)
+        self._opts_from = float(begin)
+        self._opts_to = float(target)
+        if self._opts_tween is None:
+            self._opts_tween = Tween(duration, in_out_quint, self._on_opts_anim,
+                                     self._finish_opts_anim, parent=self)
+        self._opts_tween.start(0.0, 1.0, duration)
+
+    def _on_opts_anim(self, t: float) -> None:
+        height = int(round(self._opts_from + (self._opts_to - self._opts_from) * t))
+        try:
+            self._rx_opts_row.setFixedHeight(max(0, height))
+        except RuntimeError:
+            pass
+
+    def _finish_opts_anim(self) -> None:
+        """落定：收起方向停在 0 高，展开方向把 min/max 还给布局。
+
+        ⛔ 收起方向**不要 hide()**：hide 会把布局间距（10px）一起收走，落定那
+        一帧接收区视口又要跳 10px（44px 的硬跳改动画后只剩这条尾巴）。留一个
+        0 高的**可见**行，间距原地不动，开合两头都连续。
+        """
+        row = self._rx_opts_row
+        try:
+            if self._opts_to <= 0:
+                row.setFixedHeight(0)
+            else:
+                row.setMinimumHeight(0)
+                row.setMaximumHeight(WIDGETSIZE_MAX)
+        except RuntimeError:
+            pass
+
+    def _cancel_opts_anim(self) -> None:
+        """打断工具栏补间并把尺寸约束还给布局（接收区全屏过渡要重算行高）。"""
+        tween = self._opts_tween
+        if tween is not None:
+            tween.stop()
+        try:
+            self._rx_opts_row.setMinimumHeight(0)
+            self._rx_opts_row.setMaximumHeight(WIDGETSIZE_MAX)
+        except RuntimeError:
+            pass
 
     def _scroll_frozen(self) -> bool:
         """视图要不要"钉住"。暂停键是一类，搜索挑中某条之后是另一类。"""
@@ -2419,6 +2503,9 @@ class MainWindow(QMainWindow):
         """
         if self._split_tween is not None and self._split_tween.running:
             self._split_tween.stop()
+        # 暂停时工具栏可能正在收/展（见 _animate_opts_row）：先把行高还给布局，
+        # 下面 _rx_full["opts_h"] 才是真值（否则会把半路的 0~34 记成"自然高度"）。
+        self._cancel_opts_anim()
         self._rx_total = sum(self._splitter.sizes()) or 900
         self._set_tx_vpolicy(QSizePolicy.Policy.Ignored)
         self._tx_card.setMinimumHeight(0)
@@ -3095,16 +3182,17 @@ class MainWindow(QMainWindow):
     def _repin_rx_bottom(self) -> None:
         """视口高度变化落定后重新压到底（追底的一次性动作会被后续高度变化作废）。
 
-        追底 = 把滚动条设到 maximum；如果**之后**视口又变了（发送区收/展的动画
+        追底 = 把滚动条推到 maximum；如果**之后**视口又变了（发送区收/展的动画
         落定），maximum 跟着变，视图就停在半路 —— 实测最新 4 行被挤出可视区
         （自测「收包合并与暂停继续」就挂在这）。暂停中/搜索定位中不动，免得
         把用户自己滚到的地方拽走。
+
+        推的时候走 ``_follow_rx_bottom``（180ms 补间）：这里是"收尾补一下"，
+        一步 setValue 就是最后一帧的硬跳（恢复暂停时实测差 8 行 ≈150px）。
         """
         if self._paused or self._search_pinned:
             return
-        bar = self.txt_rx.verticalScrollBar()
-        if bar.value() < bar.maximum():
-            bar.setValue(bar.maximum())
+        self._follow_rx_bottom()
 
     def _finish_send_collapsed(self) -> None:
         """收起动画落定：钉成标题栏高度，**这时**才隐藏卡片内容。
@@ -3821,8 +3909,10 @@ class MainWindow(QMainWindow):
         if self._rx_scroll_tween is not None:
             self._rx_scroll_tween.stop()
         if not self._search_pinned:
-            bar = self.txt_rx.verticalScrollBar()
-            bar.setValue(bar.maximum())
+            # 追底走**平滑补间**（180ms，见 _follow_rx_bottom）：暂停恢复时视口还在
+            # 变长（发送区展开 + 工具栏长回来），一步 setValue 只会落在"旧底部"，
+            # 等布局落地后再"啪"地补一下 —— 那一下正是恢复动画的最后一跳。
+            self._follow_rx_bottom()
             # ⚠️ 追底之后再补一次（340ms > 发送区收展的 300ms 动画）：恢复时如果
             #    同时还在长回发送区，视口会在**这之后**变矮，maximum 变大，刚才
             #    那一下就被作废了 —— 实测最新 4 行被挤出可视区（151/155）。
@@ -3931,12 +4021,42 @@ class MainWindow(QMainWindow):
         row_height = self.txt_rx.blockBoundingGeometry(
             document.findBlockByNumber(stamp_start)).height()
         bar = self.txt_rx.verticalScrollBar()
-        bar.setValue(max(0, self._visual_line_index(stamp_start, row_height) - keep))
-        # 光标放回本轮时间戳行（焦点/选区别留在半路），顺带兜底保证可见
+        target = max(0, self._visual_line_index(stamp_start, row_height) - keep)
+        # 暂停定位这一下以前是 ``setValue`` **硬跳**：实测整跳 10 行（≈190px），
+        # 又紧挨着 240ms 的发送区折叠补间，观感就是"平滑收着突然窜一下" ——
+        # 用户说的"暂停的动画不够顺滑"另一半就在这儿。改成和"跟随到底"同一条
+        # 补间（200ms / out_cubic，可随时打断）：起点是当前值，落点精确到 target。
+        # ⚠️ 目标只由**行号**决定、与视口高度无关，所以折叠过程中视口在长也不
+        #    影响落点（视口变高只会让 maximum 变小，target 在它下面，不会被夹）。
+        smooth = animations_enabled() and abs(bar.value() - target) >= 3
+        if smooth:
+            if self._rx_scroll_tween is None:
+                self._rx_scroll_tween = Tween(180, out_cubic, self._on_rx_scroll,
+                                              parent=self)
+            self._rx_scroll_tween.start(bar.value(), target, 200)
+        else:
+            if self._rx_scroll_tween is not None:
+                self._rx_scroll_tween.stop()
+            bar.setValue(target)
+        # 光标放回本轮时间戳行（焦点/选区别留在半路）。
         cursor = QTextCursor(document)
         cursor.setPosition(document.findBlockByNumber(stamp_start).position())
         self.txt_rx.setTextCursor(cursor)
-        self.txt_rx.ensureCursorVisible()
+        if smooth:
+            # ⛔ 动画途中**不能** ensureCursorVisible：它会把滚动条当场拽到光标
+            #    那里，补间就白跑了。等落点到位再兜一次（此时通常已是空操作）。
+            QTimer.singleShot(220, self._ensure_pause_cursor_visible)
+        else:
+            self.txt_rx.ensureCursorVisible()
+
+    def _ensure_pause_cursor_visible(self) -> None:
+        """暂停定位落点之后兜一次光标可见（已恢复滚动就不管了）。"""
+        if not self._paused:
+            return
+        try:
+            self.txt_rx.ensureCursorVisible()
+        except RuntimeError:
+            pass
 
     def _visual_line_index(self, block_number: int, row_height: float) -> int:
         """块首在文档里的**视觉行号**（折行按多行计）。

@@ -149,7 +149,7 @@ class SettingsDialog(QDialog):
         # 日志一节放在**界面按钮的下方**（用户点名），整段一起随面板滚动
         self._build_log_section(form)
 
-        # 「AI 接入」：把 MCP 服务交给 Agent 的入口（2.1 新增）
+        # 「MCP Service」：把 MCP 服务交给 Agent 的入口（2.1 新增，2.2 起这么叫）
         self._build_mcp_section(form)
 
         body_layout.addStretch(1)
@@ -541,17 +541,17 @@ class SettingsDialog(QDialog):
             hrow.addStretch(1)         # 同上：按钮紧挨文字，空白推到行尾
             form.addRow(self._row(hrow))
 
-    # ------------------------------------------------------------ AI 接入（MCP）
+    # -------------------------------------------------------- MCP Service
 
     def _build_mcp_section(self, form: QFormLayout) -> None:
-        """「AI 接入」一行：一键复制自包含的 MCP 部署包。
+        """「MCP Service」一行：一键复制自包含的 MCP 部署包。
 
         为什么是"复制一段话"而不是"帮我装好"：装 MCP 要在**用户自己的**机器上
         建 venv、写文件、改客户端的 mcp.json —— 这些都是 Agent 擅长且被沙箱授权的
         事，软件自己去改别人的配置文件反而是越界。所以这里只负责把**完整上下文**
         （依赖、源码、注册片段、自检三条）一次性交出去，复制 → 粘给 Agent 即可。
         """
-        form.addRow(self._caption("AI 接入"))
+        form.addRow(self._caption("MCP Service"))
         row = QHBoxLayout()
         row.setSpacing(10)
         # ⚠️ 提示文字必须短：这行给按钮留位之后，剩余宽度有限，长文案会被
