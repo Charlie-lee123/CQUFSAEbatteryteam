@@ -3684,18 +3684,55 @@ class MainWindow(QMainWindow):
         return max(0, int(usable / advance))
 
     def _rx_grid_hints(self) -> dict:
-        """数据网格的排版参数（设置 → 模组个数 / 每模组电芯数 / 每模组温度采集数）。
+        """数据网格的排版参数（设置 → 车辆 / 模组个数 / 每模组电芯数 / 温度采集数）。
 
-        三个值**默认都是 0**：那时"每排个数"跟随设备发来的每行点数，但
-        "末排多一、其余各排一致"的分配规则**始终生效**（见 customization 与
-        ui_highlight.grid_row_sizes）。每次排版都现取，所以改完设置**下一帧就按
-        新布局排**。
+        **两套参数，车辆优先**（2026-10-22 "车辆管理 + 逐模组配置"）：
+
+        - 选了车（``customization.active_profile()`` 不是 None）→ 用车辆档案里的
+          **逐模组尺寸**（``volt_row_sizes`` / ``temp_row_sizes``）：一排 = 一个
+          模组，各模组长短不必一致（用户原话："把每个模组个数和每个模组温度采集
+          个数改成一个一个模组自行设置"）。此时旧的三个 hint 不传 —— 同一时刻只
+          该有一套参数说话，两套一起给会互相打架（见 ui_highlight.grid_row_sizes）。
+        - 没选车 → 完全维持老行为：三个值**默认都是 0**，那时"每排个数"跟随设备
+          发来的每行点数，但"末排多一、其余各排一致"的分配规则**始终生效**。
+
+        每次排版都现取，所以改完设置**下一帧就按新布局排**。读取只碰一次
+        QSettings（``active_profile`` 内部合并读），这条路径每帧都会走。
         """
+        profile = customization.active_profile()
+        if profile is not None:
+            cells, temps = profile
+            return {"volt_row_sizes": cells, "temp_row_sizes": temps}
         return {
             "rows_hint": int(customization.get("module_count")),
             "volt_cols_hint": int(customization.get("cells_per_module")),
             "temp_cols_hint": int(customization.get("temps_per_module")),
         }
+
+    def _schedule_vehicle_relayout(self, delay_ms: int = 200) -> None:
+        """车辆结构改了一格 → **合并**一段时间再重排整篇接收区。
+
+        为什么要合并、且要延迟：设置面板里「模组个数」和每个模组的两个数字框
+        都是**改一下立刻落盘**的（车辆档案不像别的定制项那样等按确定），而重排
+        一次整篇文档（几千行要重新补零+折行）是毫秒级、还会搬滚动条 —— 连点
+        数字框的上下箭头时每一下都同步重排，手感就是"卡"。200ms 合并窗口内的
+        连续改动只排一次（用户看到的是松手后才变）。
+
+        计时器挂在主窗口而不是面板上：面板可能先被关掉（关掉动画期间还在路上
+        的那次重排不能丢），主窗口活得比它久。
+        """
+        timer = getattr(self, "_vehicle_relayout_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._relayout_vehicle_grid)
+            self._vehicle_relayout_timer = timer
+        timer.start(max(0, int(delay_ms)))
+
+    def _relayout_vehicle_grid(self) -> None:
+        """计时器到点：按**当前**车辆结构重排已显示的接收文本（幂等，没变就不动）。"""
+        if self._relayout_rx_document():
+            app_log.info("接收区已按当前车辆的模组结构重排")
 
     def _relayout_rx_document(self) -> bool:
         """把**已显示**的接收文本按当前排版配置重排（改完设置立刻看到效果）。
@@ -5253,10 +5290,15 @@ class MainWindow(QMainWindow):
         self.txt_rx.setFont(mono_font(float(point_size)))
 
     def _preview_custom(self, key: str, value) -> None:
-        """设置面板里拖**滑杆**时的实时预览（不落盘）。
+        """设置面板里拖**滑杆** / 改车辆时的实时预览（不落盘）。
 
         面板只把 ``key`` 与显示值丢过来 —— "要不要实时生效、怎么生效"由这里
         决定，面板自己不认识任何具体配置项（它只按 customization 注册表生成控件）。
+
+        ⚠️ ``vehicle`` 是个**例外**：车辆档案（选车 / 模组个数 / 逐模组数字）
+        在面板里是**改一格就落盘**的（见 ui_settings._build_vehicle_section），
+        所以这里不复述"落盘"那一步，只负责把已显示的接收区按新结构重排 ——
+        合并 200ms，避免连点数字框时每一下都重排整篇（见 _schedule_vehicle_relayout）。
         """
         if key == "rx_font_size":
             self._apply_rx_font_size(value)
@@ -5267,6 +5309,8 @@ class MainWindow(QMainWindow):
         elif key == "material":
             # 换材质**当场**生效（用户点名"实时生效、不用重启"）
             self._apply_material(str(value))
+        elif key == "vehicle":
+            self._schedule_vehicle_relayout()
 
     def _preview_buttons(self, hidden: list[str]) -> None:
         """设置面板拖动开关时的实时预览（不落盘）。"""

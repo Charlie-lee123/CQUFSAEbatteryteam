@@ -15,7 +15,8 @@ r"""重新生成 README 配图（docs/images/*.png）。
     docs/images/main-light.png      主界面（浅色）
     docs/images/data-coloring.png   接收区着色（裁切）
     docs/images/ble-mode.png        蓝牙广播模式
-    docs/images/settings.png        设置面板
+    docs/images/settings.png        设置面板（顶部）
+    docs/images/vehicle-settings.png 设置面板「车辆（电池箱）」一节
 """
 from __future__ import annotations
 
@@ -29,7 +30,7 @@ if _ROOT not in sys.path:
 os.environ.setdefault("QT_QPA_PLATFORM", "windows")
 
 from PySide6.QtCore import QPoint, QRect, QSettings                # noqa: E402
-from PySide6.QtWidgets import QApplication                        # noqa: E402
+from PySide6.QtWidgets import QApplication, QScrollArea            # noqa: E402
 
 OUT = os.path.join(_ROOT, "docs", "images")
 WIN_W, WIN_H = 1180, 940
@@ -182,11 +183,23 @@ def main() -> int:
         # ---- 设置面板 ----
         window.cmb_link.setCurrentText("串口")
         pump(app, 0.2)
+        # 车辆一节要看到「模组 1/2/3」的逐模组行，先造一台示例车并选中
+        # （脚本收尾会按 snapshot 整体还原，不会留在用户配置里）
+        import customization
+        customization.save_vehicle("赛季主包", [25, 24, 25], [8, 5, 6])
+        customization.select_vehicle("赛季主包")
         dialog = SettingsDialog(theme_mode="dark")
         try:
             dialog.show()
-            pump(app, 0.5)
+            pump(app, 0.6)
             dialog.grab().save(os.path.join(OUT, "settings.png"))
+            # 再滚到「车辆（电池箱）」那一节拍一张：README 讲多车型时用它
+            scroll = dialog.findChild(QScrollArea)
+            combo = getattr(dialog, "cmb_vehicle", None)
+            if scroll is not None and combo is not None:
+                scroll.ensureWidgetVisible(combo, 0, 40)
+                pump(app, 0.4)
+                dialog.grab().save(os.path.join(OUT, "vehicle-settings.png"))
         finally:
             dialog.close()
         pump(app, 0.2)
@@ -197,7 +210,7 @@ def main() -> int:
         restore_settings(settings, snapshot)
 
     for name in ("main-window.png", "main-light.png", "data-coloring.png",
-                 "ble-mode.png", "settings.png"):
+                 "ble-mode.png", "settings.png", "vehicle-settings.png"):
         path = os.path.join(OUT, name)
         print(f"  {name:22s} {os.path.getsize(path) // 1024} KB")
     print(f"→ {OUT}")

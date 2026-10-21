@@ -897,10 +897,20 @@ class _PopupItemDelegate(QStyledItemDelegate):
         painter.setPen(qcolor("ink"))
         painter.setFont(option.font)
         text_rect = option.rect.adjusted(self.PAD_X, 0, -self.PAD_X, 0)
+        # 超长条目（蓝牙设备那串 "MAC — 名字 — 信号 — 负载"）在屏幕宽度封顶后
+        # 必须省略，否则文字会被视口硬裁成半个字。
+        text = option.fontMetrics.elidedText(str(index.data() or ""),
+                                             Qt.TextElideMode.ElideRight,
+                                             max(0, text_rect.width()))
         painter.drawText(text_rect,
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                         str(index.data() or ""))
+                         text)
         painter.restore()
+
+
+# 弹层离屏幕边缘至少留这么多（逻辑像素）：弹层是独立顶层窗口，贴在窗口右侧的
+# 下拉（蓝牙设备那一栏）按最宽条目算出来的宽度会顶出屏幕右缘。
+_POPUP_SCREEN_MARGIN = 12
 
 
 class ChevronComboBox(QComboBox):
@@ -1085,6 +1095,18 @@ class ChevronComboBox(QComboBox):
         self._popup_target = target
         self._popup_below = below
         container.setGeometry(target)
+        # ⛔ 立刻进入"待展开"状态：先缩到起始高度、透明度归零，**再**返回事件循环。
+        #    以前这两步在 _start_popup_anim（延后一拍）里做，于是从 showPopup 返回到
+        #    那一拍之间，弹层是**满高且不透明**的 —— 用户看到"先整块闪一下、再缩回去
+        #    重新长出来"（逐帧实测：19ms 时 h=150/opacity=1.00，30ms 才变成 h=14/0.28）。
+        #    延后一拍仍然必须保留（要等 Qt 定完位），但"别让人看见"这一步不能等。
+        start_h = max(14, int(target.height() * 0.25))
+        if below:
+            container.setGeometry(target.x(), target.y(), target.width(), start_h)
+        else:
+            container.setGeometry(target.x(), target.y() + target.height() - start_h,
+                                  target.width(), start_h)
+        container.setWindowOpacity(0.0)
         self._animate_popup_open()
 
     def _ensure_popup_delegate(self) -> None:
@@ -1111,6 +1133,12 @@ class ChevronComboBox(QComboBox):
         # —— 编码框只有 92 宽，弹层却撑到 121（用户点名"这里宽了"）。
         # 视口两侧内缩 + 竖直滚动条 + 边框的余量按 28 给，实测够用。
         need = widest + _PopupItemDelegate.PAD_X * 2 + 28
+        # ⛔ 还要受**屏幕宽度**约束：蓝牙设备条目是"MАC — 名字 — 信号 — 负载"
+        #    一长串，按最宽项算出来能到 570px，控件又贴在窗口右侧 —— 弹层右半边
+        #    直接跑到屏幕外（用户点名"部分显示到屏幕外"）。这里先按屏幕封顶，
+        #    超长条目由委托**省略号截断**（见 _PopupItemDelegate.paint）。
+        screen_area = self.screen().availableGeometry()
+        need = min(need, max(160, screen_area.width() - _POPUP_SCREEN_MARGIN * 2))
         view.setMinimumWidth(max(self.width(), need))
 
     def _animate_popup_open(self) -> None:
@@ -1138,16 +1166,29 @@ class ChevronComboBox(QComboBox):
         gap = 4
         below_top = self.mapToGlobal(QPoint(0, self.height())).y() + gap
         screen_area = self.screen().availableGeometry()
+        # ⛔ 弹层是**独立顶层窗口**，Qt 只管把它摆到控件旁边，从不检查屏幕边界。
+        #    蓝牙设备那种长条目会把弹层撑到 570px，控件又贴着窗口右缘 —— 右半边
+        #    直接出屏（用户点名"部分显示到屏幕外"）。这里统一夹进屏幕可用区。
+        width = min(geo.width(),
+                    max(160, screen_area.width() - _POPUP_SCREEN_MARGIN * 2))
+        x = min(anchor.x(), screen_area.right() + 1 - width - _POPUP_SCREEN_MARGIN)
+        x = max(x, screen_area.left() + _POPUP_SCREEN_MARGIN)
         # 一律贴控件下方展开。下方空间不够时**压矮弹层**（列表自己滚），
         # 而不是翻到控件上方 —— 翻上去动画方向就反了，跟别的下拉不一致
         # （用户点名"保留行数那里打开方向有点问题"就是这个）。只有连两三行
         # 都放不下（底栏最下面那几个），才真的翻到上方。
         room = screen_area.bottom() - gap - below_top
         if room >= min(geo.height(), 120):
-            return (QRect(anchor.x(), below_top, geo.width(),
+            return (QRect(x, below_top, width,
                           min(geo.height(), room)), True)
-        return QRect(anchor.x(), anchor.y() - gap - geo.height(),
-                     geo.width(), geo.height()), False            # 翻到上方
+        above_room = anchor.y() - gap - screen_area.top() - _POPUP_SCREEN_MARGIN
+        above_h = max(64, min(geo.height(), above_room))
+        # ⚠️ 上边界也夹一次：只有"窗口自己顶部在屏外"时才用得上（正常走不到），
+        #    但既然下面是 max(64, …)，不夹就可能把弹层顶出屏幕。
+        above_y = max(screen_area.top() + _POPUP_SCREEN_MARGIN,
+                      anchor.y() - gap - above_h)
+        return QRect(x, above_y, width, above_h), False
+                     # 翻到上方
 
     def _start_popup_anim(self) -> None:
         """弹层展开动画：从锚点一侧"展开"到完整高度，同时淡入。
@@ -1160,6 +1201,11 @@ class ChevronComboBox(QComboBox):
         #    拿 isVisible() 当开关会把动画整个跳过（实测：七个下拉全都一帧到位）。
         #    弹层真被关了的话，往隐藏窗口推几何也无害，收尾统一交给 hidePopup。
         container = self.view().window()
+        # ⛔ showPopup 返回前已经把容器缩到起始高度了（为了不闪），这里**不能**
+        #    直接拿容器当前几何去量目标 —— 那量到的是"起始高度"，弹层会越开越矮
+        #    （实测 150 → 37）。先把目标矩形还回去，再按最新尺寸/位置重算一次。
+        if self._popup_target is not None:
+            container.setGeometry(self._popup_target)
         # 位置再算一遍：延后这一拍里 Qt 可能又调过尺寸（比如按屏幕高度收了），
         # 用最新尺寸重算，顺便把位置再按一次（showPopup 里已摆过一次）。
         target, below = self._popup_place()
@@ -1186,13 +1232,17 @@ class ChevronComboBox(QComboBox):
             return
         container = self.view().window()
         geo = self._popup_target
-        h = max(14, int(round(geo.height() * t)))
+        # 高度从**起始比例**长到满高（起始 25% 与 showPopup 里摆的那一帧对齐）：
+        # 以前按 h*global_t 算，t=0 那一帧会把 37px 直接缩到 14px —— 透明中看
+        # 不出来，但逐帧采样里就是一次"先缩一下再长"的反向位移。
+        k = 0.25 + 0.75 * t
+        h = max(14, int(round(geo.height() * k)))
         if self._popup_below:
             container.setGeometry(geo.x(), geo.y(), geo.width(), h)
         else:
             container.setGeometry(geo.x(), geo.y() + geo.height() - h,
                                   geo.width(), h)
-        container.setWindowOpacity(min(1.0, 0.25 + 0.75 * t))
+        container.setWindowOpacity(min(1.0, 0.35 + 0.65 * t))
 
     def hidePopup(self) -> None:
         if self._popup_tween is not None and self._popup_tween.running:

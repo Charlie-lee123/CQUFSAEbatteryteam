@@ -25,7 +25,7 @@ from PySide6.QtNetwork import (
 )
 from PySide6.QtWidgets import (
     QDialog, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QMessageBox, QScrollArea, QVBoxLayout, QWidget,
+    QLineEdit, QMessageBox, QScrollArea, QVBoxLayout, QWidget,
 )
 
 import app_log
@@ -49,6 +49,61 @@ SPIN_COLUMN_W = 158
 # 按钮开关排几列。三列是为了"一屏放完"：
 # 两列时最后一行会被滚动区截掉半颗开关，看着像画坏了。
 BUTTON_COLUMNS = 3
+# 「模组 i」一行里那两个数字框的宽度。**比 SPIN_COLUMN_W 窄**：一行要塞两个
+# （电芯 + 温度），按 158 摆两个会把整行顶出面板、右边的框被裁掉；"25 电芯"
+# 这种内容配 104 刚好（后缀 3 个汉字 + 两位数字 + chevron）。
+MODULE_SPIN_W = 104
+
+
+class _NameDialog(QDialog):
+    """单行文本输入的小模态框（新建车辆 / 改名用）。
+
+    为什么自己搭一个而不是 ``QInputDialog``：QInputDialog 在 Fusion 下出来是
+    系统样式的白框，和这套黑白灰 + 自绘标题栏的面板放一起像另一个程序。这里
+    沿用同一套积木（``InkButton`` 的 primary/ghost 两档、``GAP`` 边距、标题栏
+    主题走 ``apply_titlebar_theme``），尺寸也与设置面板同源。
+    """
+
+    def __init__(self, title: str, value: str, scheme: str = "dark",
+                 parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumWidth(380)
+        self._scheme = scheme
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(GAP + 6, GAP + 6, GAP + 6, GAP + 6)
+        root.setSpacing(GAP)
+
+        self.edit = QLineEdit(value)
+        self.edit.setFont(ui_font(12.5))
+        self.edit.selectAll()               # 预填名整段选中：直接打字就是替换
+        self.edit.returnPressed.connect(self.accept)
+        root.addWidget(self.edit)
+
+        row = QHBoxLayout()
+        row.setSpacing(GAP)
+        row.addStretch(1)
+        cancel = InkButton("取消", variant="ghost")
+        cancel.clicked.connect(self.reject)
+        confirm = InkButton("确定", variant="primary")
+        confirm.clicked.connect(self.accept)
+        confirm.setDefault(True)
+        row.addWidget(cancel)
+        row.addWidget(confirm)
+        root.addLayout(row)
+
+    def value(self) -> str:
+        """去掉首尾空白后的输入（面板只认这个名字，空串由调用方忽略）。"""
+        return self.edit.text().strip()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # 与设置面板同一套 DWM 深色标题栏 / 圆角（否则深色面板配白标题栏撞色）
+        apply_titlebar_theme(self, self._scheme)
+        self.edit.setFocus()
+
 
 
 class SettingsDialog(QDialog):
@@ -67,7 +122,12 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setModal(True)
-        self.setMinimumWidth(500)
+        # 最小宽度 500 → 524（2026-10-22）：新增的「车辆」一节里最宽的一行是
+        # 「下拉 + 新建 + 删除」，加上「定制功能」那两个最长的标签（每模组电芯数 /
+        # 每模组温度采集数）后，表单最小宽度 470 出头 —— 500 宽时滚动区视口只有
+        # 442，body 被撑到 456 会**横向溢出**（内容右侧被裁、且能偷偷横向滚，实测
+        # 截图上左侧标签被削掉半个字）。不动那两处既有标签，把面板放宽最稳。
+        self.setMinimumWidth(524)
         self._on_glass = on_glass
         self._on_buttons = on_buttons
         self._on_custom = on_custom
@@ -139,9 +199,21 @@ class SettingsDialog(QDialog):
         glass_row.addWidget(self.lbl_glass)
         form.addRow(self._label("材质强度"), self._row(glass_row))
 
+        # 「车辆」：一套电池箱结构 = 一台车（模组个数 + 每个模组的电芯/温度采集数）。
+        # 放在「定制功能」**之前**：选车是"我用的是哪台电池箱"这个前提，下面那些
+        # 定制项是它的细节；而且选车一换，定制项里那三个旧的全局网格参数就整体
+        # 隐藏（见 _sync_vehicle_rows）——
+        #  ⚠️ 与 customize 的说明一致：车辆档案**不走 register_* 注册表**（它不是
+        #     标量），所以这一节是手写的，其余定制项仍按 specs() 自动生成。
+        self._build_vehicle_section(form)
+
         # 「定制功能」：BMS 专用配置的统一管理入口。控件**按注册表动态生成**
         # （customization.specs()），以后加定制配置这里一行都不用改。
         self._build_custom_section(form)
+        # 车辆一节的**首次同步**必须等「定制功能」建完：选车后要隐藏旧的三件套
+        # （module_count / cells_per_module / temps_per_module），那三颗控件是
+        # 上面按注册表生成的（见 _build_custom_section 里的 _custom_rows）。
+        self._sync_vehicle_rows()
 
         if button_specs:
             self._build_button_section(form, button_specs, set(hidden_buttons))
@@ -229,6 +301,348 @@ class SettingsDialog(QDialog):
             return
         super().done(result)
 
+    # ------------------------------------------------------------ 车辆
+
+    # 旧的全局网格三件套：选车后整行隐藏（一套参数说话，见 _sync_vehicle_rows）。
+    # 名字与 customization 里那三条 register_int 一一对应。
+    _LEGACY_GRID_KEYS = ("module_count", "cells_per_module", "temps_per_module")
+
+    def _build_vehicle_section(self, form: QFormLayout) -> None:
+        """「车辆」一节：选车 / 新建 / 删除 / 改名 + 逐模组的电芯与温度采集数。
+
+        数据全在 ``customization`` 的两个键里（vehicles JSON + vehicle 当前名），
+        面板只是它的编辑器。三条设计取舍：
+
+        - **车辆档案是"改一下立刻落盘"的**，不像别的定制项那样攒到按确定：
+          它同时驱动接收区重排（改一格就该看到效果），而"确定"是可取消的 ——
+          让重排效果与磁盘状态在一个可取消的事务里，用户永远说不清自己看到的是
+          哪一版。代价是取消面板也回不去（文档在 customization / 本节说明）。
+        - **模组个数=0 或没选车时，逐模组行整段不生成**，退回「定制功能」里那三个
+          全局参数；选车后那三行**整行隐藏**，避免两套参数同时存在互相打架。
+        - 每一行都是"左侧行标签 + 右侧控件"，与上面几节共用同一张表单，左边缘
+          因此严格对齐（QFormLayout 的标签列宽按全表最宽算）。
+        """
+        form.addRow(self._caption("车辆（电池箱）"))
+
+        # ---- 选车行：下拉 + 新建 + 删除 ----
+        self.cmb_vehicle = ChevronComboBox()
+        # ⚠️ 最小宽度只给 110：这一行是「下拉 + 新建 + 删除」，下拉按 190 兜底会把
+        #    整行撑到 370，body 就比滚动区视口宽 30 多 px —— 面板右侧被裁掉一条、
+        #    横向还能偷偷滚（实测 body 532 / 视口 498）。下拉本来就有 stretch=1，
+        #    宽度会吃掉整行的剩余空间，兜底给小一点反而不会顶破面板。
+        self.cmb_vehicle.setMinimumWidth(110)
+        self.cmb_vehicle.setToolTip(
+            "一台车 = 一套电池箱结构（模组个数与每个模组的电芯/温度采集数）。"
+            "选「（未选择）」则退回「定制功能」里的三个全局参数")
+        self.cmb_vehicle.currentIndexChanged.connect(self._on_vehicle_picked)
+
+        self.btn_vehicle_new = InkButton("新建", variant="ghost")
+        self.btn_vehicle_new.setToolTip(
+            "新建一台车：默认名「新车 N」，结构按当前配置预填"
+            "（旧模组个数 >0 就用它，否则 3 模组 × 25 电芯 × 8 温度）")
+        self.btn_vehicle_new.clicked.connect(self._on_vehicle_new)
+
+        self.btn_vehicle_delete = InkButton("删除", variant="ghost")
+        self.btn_vehicle_delete.setToolTip("删除当前这台车（只删结构，已接收的数据不受影响）")
+        self.btn_vehicle_delete.clicked.connect(self._on_vehicle_delete)
+
+        pick_row = QHBoxLayout()
+        pick_row.setSpacing(10)
+        pick_row.addWidget(self.cmb_vehicle, 1)
+        pick_row.addWidget(self.btn_vehicle_new)
+        pick_row.addWidget(self.btn_vehicle_delete)
+
+        # ---- 改名行：QLineEdit（editingFinished 落盘）+ 一行短提示 ----
+        self.edit_vehicle_name = QLineEdit()
+        self.edit_vehicle_name.setFont(ui_font(12.5))
+        self.edit_vehicle_name.setMinimumWidth(150)      # 同上下拉：别把面板顶宽
+        self.edit_vehicle_name.setToolTip("改名后立刻生效；与已有车辆重名会被拒绝")
+        self.edit_vehicle_name.editingFinished.connect(self._on_vehicle_renamed)
+        # ⚠️ 提示文字必须**短**：这行右侧宽度有限，长文案会被裁掉（同 MCP 那行）
+        self.lbl_vehicle_hint = QLabel("")
+        self.lbl_vehicle_hint.setFont(ui_font(10.5))
+        self.lbl_vehicle_hint.setObjectName("groupCaption")
+        self.lbl_vehicle_hint.setMinimumWidth(1)      # 不能是 0（同日志行，见上）
+        name_row = QHBoxLayout()
+        name_row.setSpacing(10)
+        name_row.addWidget(self.edit_vehicle_name, 1)
+        name_row.addWidget(self.lbl_vehicle_hint)
+
+        # ---- 模组个数行：0 = 不配（退回旧的三个全局参数） ----
+        self.spin_vehicle_modules = ChevronSpinBox()
+        self.spin_vehicle_modules.setRange(0, 64)
+        self.spin_vehicle_modules.setFixedWidth(SPIN_COLUMN_W)
+        self.spin_vehicle_modules.setToolTip(
+            "模组个数 = 下面「模组 i」的行数；新增的模组沿用最后一个模组的配置，"
+            "缩短则从末尾截断")
+        self.spin_vehicle_modules.valueChanged.connect(self._on_vehicle_modules_changed)
+
+        self._vehicle_rows: dict[str, tuple[QLabel, QWidget]] = {
+            "pick": (self._label("车辆"), self._row(pick_row)),
+            "name": (self._label("车辆名称"), self._row(name_row)),
+            "modules": (self._label("模组个数"), self.spin_vehicle_modules),
+        }
+        form.addRow(*self._vehicle_rows["pick"])
+        form.addRow(*self._vehicle_rows["name"])
+        form.addRow(*self._vehicle_rows["modules"])
+
+        # 逐模组行插在这个位置（= 本节之后、「定制功能」之前）。
+        # ⚠️ 用 insertRow/removeRow 按**行号**增删，不用容器套布局：套一层容器的话
+        #    里面的标签会落到字段列那一列上，跟本节其它行标签错开一大截。
+        self._module_row_base = form.rowCount()
+        self._module_rows: list[tuple[QLabel, QWidget]] = []
+
+    def _refresh_vehicle_combo(self) -> None:
+        """按磁盘上的车辆列表重建下拉（当前项跟随 customization.current_vehicle）。"""
+        names = customization.vehicle_names()
+        current = customization.current_vehicle()
+        combo = self.cmb_vehicle
+        combo.blockSignals(True)          # 重建期间别触发 currentIndexChanged
+        combo.clear()
+        if not names or not current:
+            # 没有车辆、或"有车但一台都没选"（刚删掉当前车）时给一个明确的空项 ——
+            # 少了它，下拉会自己停在第一台车上，用户会以为已经选上了
+            combo.addItem("（未选择）", "")
+        for name in names:
+            combo.addItem(name, name)
+        index = combo.findData(current)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _sync_vehicle_rows(self) -> None:
+        """按"当前有没有选车"整体摆一次：整行显隐 + 填值 + 重建逐模组行。
+
+        这是本节**唯一**的刷新入口（选车 / 新建 / 删除 / 改名 / 改模组个数之后
+        都调它）：分散着各改一半，最容易出现"下拉是新名字、数字框还是旧结构"。
+        """
+        current = customization.current_vehicle()
+        profile = customization.active_profile()
+        has_vehicle = bool(current)
+        cells, temps = profile if profile else ([], [])
+
+        self._refresh_vehicle_combo()
+
+        # 选车行永远在；改名 / 模组个数两行只在选了车时才有意义。
+        self._vehicle_rows["pick"][0].setVisible(True)
+        self._vehicle_rows["pick"][1].setVisible(True)
+        for key in ("name", "modules"):
+            label, field = self._vehicle_rows[key]
+            label.setVisible(has_vehicle)
+            field.setVisible(has_vehicle)
+        self._sync_grid_params_visibility()
+
+        self.btn_vehicle_delete.setEnabled(has_vehicle)
+        self.edit_vehicle_name.setText(current if has_vehicle else "")
+        spin = self.spin_vehicle_modules
+        spin.blockSignals(True)
+        # 没选车时这颗框**绑旧的 module_count**（老用户在同一位置看到同一个数，
+        # 不会出现"设置里有两个模组个数、数值还不一样"）
+        spin.setValue(len(cells) if has_vehicle
+                      else int(customization.get("module_count")))
+        spin.blockSignals(False)
+        self._rebuild_module_rows(cells, temps)
+
+    def _sync_grid_params_visibility(self) -> None:
+        """网格参数二选一的**唯一判据**：接收区此刻真正吃哪一套，就只显示哪一套。
+
+        判据直接取 ``customization.active_profile() is None`` —— 与主窗口
+        ``_rx_grid_hints`` 完全同一条（不是"选没选车"）：选了车但模组个数还是 0
+        时，主窗口走的就是旧的三件套，那面板也得把旧的三件套露出来，否则用户
+        面对一个"选了车、却没有任何参数能调"的面板。
+        ⚠️ 显隐要**连着行标签一起**设：只藏字段会在表单里留一个孤零零的文字。
+        """
+        legacy_on = customization.active_profile() is None
+        for key in self._LEGACY_GRID_KEYS:
+            pair = self._custom_rows.get(key)
+            if pair is not None:
+                for widget in pair:
+                    widget.setVisible(legacy_on)
+
+    def _rebuild_module_rows(self, cells: list[int], temps: list[int]) -> None:
+        """重建「模组 1..N」逐行控件（每行两个数字框：电芯 / 温度采集数）。"""
+        while self._module_rows:
+            self._module_rows.pop()
+            # 先 pop 再按"剩下的行数"算最后一行的行号：删一行后后面的行号整体上移
+            self.form.removeRow(self._module_row_base + len(self._module_rows))
+        for index in range(min(len(cells), len(temps))):
+            spin_cells = ChevronSpinBox()
+            spin_cells.setRange(0, 32)
+            spin_cells.setValue(int(cells[index]))
+            spin_cells.setSuffix(" 电芯")
+            spin_cells.setFixedWidth(MODULE_SPIN_W)
+            spin_cells.setToolTip(
+                f"第 {index + 1} 个模组的电芯数 → 电压段这一排放几个点（0 = 这排不排）")
+            spin_cells.valueChanged.connect(
+                lambda value, i=index: self._on_module_value(i, False, value))
+
+            spin_temps = ChevronSpinBox()
+            spin_temps.setRange(0, 64)
+            spin_temps.setValue(int(temps[index]))
+            spin_temps.setSuffix(" 温度")
+            spin_temps.setFixedWidth(MODULE_SPIN_W)
+            spin_temps.setToolTip(
+                f"第 {index + 1} 个模组的温度采集数 → 温度段这一排放几个点（0 = 这排不排）")
+            spin_temps.valueChanged.connect(
+                lambda value, i=index: self._on_module_value(i, True, value))
+
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            row.addWidget(spin_cells)
+            row.addWidget(spin_temps)
+            row.addStretch(1)
+            label = self._label(f"模组 {index + 1}")
+            field = self._row(row)
+            self.form.insertRow(self._module_row_base + index, label, field)
+            self._module_rows.append((label, field))
+
+    def _on_module_value(self, index: int, is_temp: bool, value: int) -> None:
+        """某个模组的电芯/温度数改了：**立刻写回这台车**，并请主窗口重排。"""
+        name = customization.current_vehicle()
+        profile = customization.active_profile()
+        if not name or profile is None:
+            return
+        cells, temps = list(profile[0]), list(profile[1])
+        if not (0 <= index < len(cells) and index < len(temps)):
+            return
+        if is_temp:
+            temps[index] = int(value)
+        else:
+            cells[index] = int(value)
+        customization.save_vehicle(name, cells, temps)
+        self._notify_vehicle_changed()
+
+    def _on_vehicle_modules_changed(self, value: int) -> None:
+        """模组个数改了：改**当前车辆的结构长度**（没选车时绑旧的 module_count）。
+
+        增删规则（用户按了才看得见，所以要有确定的语义）：新增的模组沿用**最后
+        一个模组**的配置（没有就默认 25 电芯 / 8 温度）；缩短从末尾截断 —— 与
+        "一排 = 一个模组"的下标语义一致，改第 1 个模组不会因为改了总数而错位。
+        """
+        count = max(0, min(64, int(value)))
+        name = customization.current_vehicle()
+        if not name:
+            legacy = self._custom_widgets.get("module_count")
+            if legacy is not None:
+                legacy.setValue(count)
+            return
+        profile = customization.active_profile()
+        cells, temps = (list(profile[0]), list(profile[1])) if profile else ([], [])
+        last_cell = cells[-1] if cells else customization.DEFAULT_CELLS
+        last_temp = temps[-1] if temps else customization.DEFAULT_TEMPS
+        cells = cells[:count] + [last_cell] * max(0, count - len(cells))
+        temps = temps[:count] + [last_temp] * max(0, count - len(temps))
+        customization.save_vehicle(name, cells, temps)
+        # ⚠️ 这里不能用 _sync_vehicle_rows：那会把下拉框重建一遍，正在编辑的
+        #    数字框会丢焦点（用户连点箭头就被打断）。只重建逐模组行 + 重摆
+        #    "网格参数显隐"（模组个数从 0 变 1 或反过来时，旧三件套要跟着让位/露面）。
+        self._rebuild_module_rows(cells, temps)
+        self._sync_grid_params_visibility()
+        self._notify_vehicle_changed()
+
+    def _on_vehicle_picked(self, index: int) -> None:
+        """下拉换了一台车（或换回「（未选择）」）。"""
+        name = str(self.cmb_vehicle.itemData(index) or "")
+        if name == customization.current_vehicle():
+            return
+        customization.select_vehicle(name)
+        self._sync_vehicle_rows()
+        self._notify_vehicle_changed()
+
+    def _on_vehicle_new(self) -> None:
+        """新建车辆：弹一个同风格的单行输入框，确认后建好并自动选中。"""
+        default = self._next_new_vehicle_name(customization.vehicle_names())
+        dialog = _NameDialog("新建车辆", default, self._scheme, self)
+        try:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            name = dialog.value()
+        finally:
+            dialog.deleteLater()
+        if not accepted or not name:
+            return
+        self._create_vehicle(name)
+
+    def _create_vehicle(self, name: str) -> None:
+        """按当前配置预填一台新车并选中它（``_on_vehicle_new`` 的实际动作）。"""
+        name = str(name or "").strip()
+        if not name:
+            return
+        if name in customization.vehicle_names():
+            self._flash_vehicle_hint("已存在同名车辆")
+            return
+        # 预填口径（用户点名）：旧 module_count > 0 就用它，否则默认 3 × 25 × 8。
+        # 选车之后那三个旧键就不再参与排版了，但"接着上次的模组个数建新车"是
+        # 顺手的事 —— 用户刚在这台车/旧配置上填过的数不该白填。
+        count = int(customization.get("module_count"))
+        total = count if count > 0 else customization.DEFAULT_MODULES
+        total = max(1, min(64, total))
+        cells = [customization.DEFAULT_CELLS] * total
+        temps = [customization.DEFAULT_TEMPS] * total
+        customization.save_vehicle(name, cells, temps)
+        customization.select_vehicle(name)
+        self._sync_vehicle_rows()
+        self._notify_vehicle_changed()
+
+    def _on_vehicle_delete(self) -> None:
+        """删除当前车：先确认（删的是整套结构，误点一次就得重填）。"""
+        name = customization.current_vehicle()
+        if not name:
+            return
+        answer = QMessageBox.question(
+            self, "删除车辆",
+            f"确定删除「{name}」吗？\n\n只删这台车的模组结构，已接收的数据不受影响。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        customization.delete_vehicle(name)
+        self._sync_vehicle_rows()
+        self._notify_vehicle_changed()
+
+    def _on_vehicle_renamed(self) -> None:
+        """改名落盘：重名 / 空名一律**拒绝并把输入框回滚**（不留一个假的成功态）。"""
+        old = customization.current_vehicle()
+        if not old:
+            return
+        new = self.edit_vehicle_name.text().strip()
+        if new == old:
+            return
+        if not customization.rename_vehicle(old, new):
+            self.edit_vehicle_name.setText(old)
+            self._flash_vehicle_hint("名称已存在" if new else "名称不能为空")
+            return
+        self._sync_vehicle_rows()
+        self._notify_vehicle_changed()
+
+    @staticmethod
+    def _next_new_vehicle_name(names: list[str]) -> str:
+        """下一个可用的默认名：新车 1、新车 2……（永远不撞已有名字）。"""
+        used = set(names)
+        index = 1
+        while f"新车 {index}" in used:
+            index += 1
+        return f"新车 {index}"
+
+    def _flash_vehicle_hint(self, text: str, ms: int = 2500) -> None:
+        """在「车辆名称」右侧原位显示一句短提示，几秒后自己消失。"""
+        self.lbl_vehicle_hint.setText(text)
+
+        def _clear() -> None:
+            try:
+                self.lbl_vehicle_hint.setText("")
+            except RuntimeError:          # 面板已析构，别再碰 C++ 对象
+                pass
+
+        QTimer.singleShot(ms, _clear)
+
+    def _notify_vehicle_changed(self) -> None:
+        """告诉主窗口"车辆结构变了"（它负责合并 200ms 后重排接收区）。
+
+        复用既有的 ``on_custom`` 回调通道（不新造信号/事件总线）：面板认识的
+        永远是"一个 key 一个值"，怎么生效由主窗口决定（见 _preview_custom）。
+        """
+        if self._on_custom is not None:
+            self._on_custom("vehicle", customization.current_vehicle())
+
     # ------------------------------------------------------------ 定制功能
 
     def _build_custom_section(self, form: QFormLayout) -> None:
@@ -246,6 +660,10 @@ class SettingsDialog(QDialog):
         form.addRow(self._caption("定制功能"))
 
         self._custom_widgets: dict[str, QWidget] = {}
+        # 每一行的（左侧行标签, 字段控件）。选车后要整行隐藏旧的三件套网格参数
+        # （module_count / cells_per_module / temps_per_module）—— 只藏字段不藏
+        # 标签会在表单里留一个孤立文字，看着像坏了。
+        self._custom_rows: dict[str, tuple[QLabel, QWidget]] = {}
         # 滑杆型配置的预览标签（"拖动即时看效果"的那种），key -> QLabel
         self._custom_previews: dict[str, QLabel] = {}
         for spec in specs:
@@ -355,6 +773,7 @@ class SettingsDialog(QDialog):
             # 记**输入控件本身**（不是包装容器）：custom_values() 要在它身上取值
             self._custom_widgets[spec["key"]] = widget
             form.addRow(row_label, field)
+            self._custom_rows[spec["key"]] = (row_label, field)
             if preview is not None:
                 # 预览行整行跨两列，紧贴在它那根滑杆下面
                 form.addRow(preview)

@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import json
+
 from PySide6.QtCore import QSettings
 
 _ORG, _APP = "MimoWorks", "SerialAssistant"
@@ -291,3 +293,268 @@ register_int("cells_per_module", "每模组电芯数", 0, 0, 32,
 register_int("temps_per_module", "每模组温度采集数", 0, 0, 64,
              tip="每个模组的温度采集点数 → 温度段每排放几个点；"
                  "0 = 跟随设备发来的每行点数")
+
+
+# ---------------------------------------------------------------- 车辆（车型）管理
+# 为什么要"车辆"这一层（用户 2026-10-22 原话："我需要一个功能能够自行适配更多
+# 车型的电池箱……这个车辆选择要和模组个数绑定"）：
+# 上面那三个 register_int 是**全机唯一**的一套数字 —— 换一台车（模组个数、每个
+# 模组的电芯/温度采集数都不一样）就得手改三遍、还会改错。把"一套电池箱结构"
+# 整个存成一条**车辆档案**，选车就换结构，才是这件事该有的形状。
+#
+# ⚠️ 为什么不给 vehicles 走 register_* 注册表：注册表的取值类型只有
+# bool / int / choice 三种标量，而这里是一条**结构体列表**。硬塞进去要么把它
+# 压成字符串再让设置面板去解析（面板不该认识业务结构），要么给注册表加第五种
+# 类型（面板得写一套它专属的生成代码）。两者都比"本模块内自己读写两个键"更绕
+# —— 所以这两个键**不进 specs()**：它们不参与"确定时统一落盘"那套流程（改一行
+# 模组数字就该立刻看到接收区重排，等按确定太迟钝，见 ui_settings 的说明）。
+#
+# 存储形状（两个键，`custom/` 前缀与其它定制配置一致）：
+#   custom/vehicles = 一段 JSON：{"current": "<当前车辆名>",
+#                                "items": [{"name": …, "cells": [...], "temps": [...]}]}
+#   custom/vehicle  = 当前车辆名（纯字符串镜像）
+# 为什么还要一个单独的 vehicle 键：JSON 是给"人改注册表/排查"看的整体，而
+# "当前选了哪台车"是个**标量状态**，单独一个键改起来最不容易写坏整体结构；
+# 两者由本模块唯一的写入口 ``_save_store`` 一起写，永远不会各说各话。
+#
+# 铁律（与旧三件套的兼容）：**没有选车 / 车辆没有模组结构时，本模块一个字都
+# 不多说** —— ``active_profile()`` 返回 None，主窗口照旧读 module_count /
+# cells_per_module / temps_per_module（0 = 自动）。所以这套新东西对老用户是
+# 完全惰性的，selftest 全程把三个旧键钉成 0 也不会因为"存在一台车"而变行为。
+_VEHICLES_KEY = "vehicles"
+_VEHICLE_KEY = "vehicle"
+
+# 新车辆的预填值（用户点名："否则默认 3 模组 × 25 电芯 × 8 温度"）
+DEFAULT_MODULES = 3
+DEFAULT_CELLS = 25
+DEFAULT_TEMPS = 8
+# 单模组取值范围：与 register_int 里那两个上限一致（超过设备协议就不合理）
+_CELL_RANGE = (0, 32)
+_TEMP_RANGE = (0, 64)
+_MAX_MODULES = 64
+
+
+def _read_custom(key: str) -> str:
+    """读一个 `custom/` 下的字符串配置（没存过 / 存过 null → 空串）。"""
+    value = QSettings(_ORG, _APP).value(f"custom/{key}", "")
+    if value is None:
+        return ""                    # 显式写成 null（快照恢复会这样）→ 当没存过
+    return str(value)
+
+
+def _clamp_list(raw, limits: tuple[int, int]) -> list[int] | None:
+    """把 JSON 里的一段数字列表归一成 int 列表；结构不对返回 None。
+
+    单个值坏掉（"abc"、null）不当整条档案废掉 —— 归到下限（0 = 该排不参与
+    分组），因为一台车丢几个模组数字，比整台车从列表里消失好排查得多。
+    """
+    if not isinstance(raw, (list, tuple)):
+        return None
+    low, high = limits
+    out: list[int] = []
+    for value in raw:
+        try:
+            out.append(max(low, min(high, int(value))))
+        except (TypeError, ValueError):
+            out.append(low)
+    return out
+
+
+def _equalize(cells: list[int], temps: list[int]) -> tuple[list[int], list[int]]:
+    """让 cells / temps 长度相等（不变式：两者长度都等于模组个数）。
+
+    短的一边用**自己最后一个值**补齐（新增模组沿用上一个模组的配置 —— 与设置
+    面板"改模组个数时新增模组沿用最后一个模组的值"完全同一口径）；整边为空就
+    用默认的 25 / 8。为什么不直接截断成 min：截断会**静默丢模组**，而这台车的
+    模组个数是用户明确配过的，宁可补也不要少。
+    """
+    length = max(len(cells), len(temps))
+    if length == 0:
+        return [], []
+    if len(cells) < length:
+        cells = cells + [cells[-1] if cells else DEFAULT_CELLS] * (length - len(cells))
+    if len(temps) < length:
+        temps = temps + [temps[-1] if temps else DEFAULT_TEMPS] * (length - len(temps))
+    return cells, temps
+
+
+def _normalize_items(raw) -> list[dict]:
+    """把 JSON 里的 items 归一成 ``[{"name", "cells", "temps"}, ...]``（只读，不改磁盘）。
+
+    丢弃的只有"彻底没法用"的条目：不是字典、名字为空、名字重复（同名就认第一条
+    —— 后面那条没有身份，留着会让"选中哪一台"变得不可预测）。
+    """
+    items: list[dict] = []
+    # ⚠️ 本模块里 ``set`` 是被 register_int/set 那个**写配置函数**占用的名字，
+    #    这里不能用内建 ``set()``（会 TypeError），用 list 判重就够（车辆数很少）。
+    seen: list[str] = []
+    for entry in raw if isinstance(raw, (list, tuple)) else ():
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        cells = _clamp_list(entry.get("cells"), _CELL_RANGE) or []
+        temps = _clamp_list(entry.get("temps"), _TEMP_RANGE) or []
+        cells, temps = _equalize(cells[: _MAX_MODULES], temps[: _MAX_MODULES])
+        seen.append(name)
+        items.append({"name": name, "cells": cells, "temps": temps})
+    return items
+
+
+def _load_store() -> dict:
+    """读出 ``{"current": str, "items": [...]}``（**唯一读入口**）。
+
+    只读一次 QSettings：主窗口每帧排版都会问一遍 ``active_profile()``，把
+    "取 JSON + 取当前名"合并成一次读，热路径上少一次注册表往返。
+    JSON 坏了（手改注册表、旧版本残留）就当成"没有车辆档案"——**不抛异常**：
+    接收区排版不该因为一条坏配置就整段停摆。
+    """
+    data = None
+    raw = _read_custom(_VEHICLES_KEY)
+    if raw:
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            data = None
+    if not isinstance(data, dict):
+        data = {}
+    items = _normalize_items(data.get("items"))
+    current = str(data.get("current") or "").strip()
+    if current not in {item["name"] for item in items}:
+        # JSON 里的 current 与 items 对不上（手改过）→ 退回单独的 vehicle 键
+        current = _read_custom(_VEHICLE_KEY).strip()
+    if current not in {item["name"] for item in items}:
+        current = ""
+    return {"current": current, "items": items}
+
+
+def _save_store(items: list[dict], current: str) -> None:
+    """**唯一写入口**：JSON 与 vehicle 镜像一起写、一起 sync（不会各说各话）。"""
+    payload = json.dumps({"current": current, "items": items}, ensure_ascii=False)
+    settings = QSettings(_ORG, _APP)
+    settings.setValue(f"custom/{_VEHICLES_KEY}", payload)
+    settings.setValue(f"custom/{_VEHICLE_KEY}", current)
+    settings.sync()
+
+
+def vehicles() -> list[dict]:
+    """全部车辆档案（每条都带 name / cells / temps，结构已归一）。
+
+    返回的是**副本**：调用方改了也不会悄悄改到磁盘上的档案（只在
+    ``save_vehicle`` 里才落盘）。坏了的数据在这里就被丢掉了，上层不用再做防御。
+    """
+    return [{"name": item["name"],
+             "cells": list(item["cells"]),
+             "temps": list(item["temps"])}
+            for item in _load_store()["items"]]
+
+
+def vehicle_names() -> list[str]:
+    """车辆名列表（下拉框按它生成，顺序 = 档案顺序 = 创建顺序）。"""
+    return [item["name"] for item in _load_store()["items"]]
+
+
+def current_vehicle() -> str:
+    """当前车辆名；没选车（或名已不存在）返回空串。
+
+    ⚠️ 空串是**正常状态**，不是错误：那时整套旧的三件套参数继续生效，行为与
+    加这个功能之前一字不差（见本段开头的铁律）。
+    """
+    return _load_store()["current"]
+
+
+def select_vehicle(name: str) -> None:
+    """选中一台车。传空串 = 取消选择；传不存在的名字 = 不动（回调里少一层判断）。"""
+    store = _load_store()
+    target = str(name or "").strip()
+    if target and target not in {item["name"] for item in store["items"]}:
+        return
+    _save_store(store["items"], target)
+
+
+def save_vehicle(name: str, cells, temps) -> None:
+    """存一台车的模组结构（**同名覆盖**，否则追加到末尾）。
+
+    ``cells[i]`` / ``temps[i]`` 是第 i 个模组的电芯数 / 温度采集数，两者长度都
+    等于模组个数（不等的话按 ``_equalize`` 补齐）。名字为空直接忽略 —— 没有名字
+    的档案没法被选中，存了也只是条垃圾。同一条档案的**位置不变**（覆盖而不是
+    删了再追加）：下拉框的排列顺序是用户认位置的一部分，改名/改结构不该让它跳。
+    """
+    target = str(name or "").strip()
+    if not target:
+        return
+    cells_list = _clamp_list(list(cells or []), _CELL_RANGE) or []
+    temps_list = _clamp_list(list(temps or []), _TEMP_RANGE) or []
+    cells_list, temps_list = _equalize(cells_list[: _MAX_MODULES],
+                                       temps_list[: _MAX_MODULES])
+    store = _load_store()
+    items = store["items"]
+    for item in items:
+        if item["name"] == target:
+            item["cells"], item["temps"] = cells_list, temps_list
+            break
+    else:
+        items.append({"name": target, "cells": cells_list, "temps": temps_list})
+    _save_store(items, store["current"])
+
+
+def delete_vehicle(name: str) -> None:
+    """删掉一台车；删的正好是当前选中的那台 → 顺便把选择清空。
+
+    为什么删当前车要清空而不是"自动选下一台"：选谁开哪台车的电池箱是用户的
+    判断，替用户挑一台等于把数据按错误的模组结构排版（这是会看错电池的）。
+    """
+    target = str(name or "").strip()
+    store = _load_store()
+    items = [item for item in store["items"] if item["name"] != target]
+    if len(items) == len(store["items"]):
+        return                                  # 没有这台车，别白写一次注册表
+    current = "" if store["current"] == target else store["current"]
+    _save_store(items, current)
+
+
+def rename_vehicle(old: str, new: str) -> bool:
+    """改名：成功 True；**重名 / 老名字不存在 / 新名字为空 → False**（一个字不改）。
+
+    重名必须拒绝而不是覆盖：两台同名车在下拉框里长得一样，"我改的是哪台"就
+    永远说不清了（覆盖还会顺手毁掉另一台车的结构）。
+    """
+    source = str(old or "").strip()
+    target = str(new or "").strip()
+    if not target:
+        return False
+    store = _load_store()
+    names = [item["name"] for item in store["items"]]
+    if source not in names:
+        return False
+    if target != source and target in names:
+        return False
+    if target == source:
+        return True                             # 没改，也算成功（别回滚输入框）
+    for item in store["items"]:
+        if item["name"] == source:
+            item["name"] = target
+            break
+    current = target if store["current"] == source else store["current"]
+    _save_store(store["items"], current)
+    return True
+
+
+def active_profile() -> tuple[list[int], list[int]] | None:
+    """当前车辆的逐模组结构 ``(cells, temps)``；**没选车 / 结构为空 → None**。
+
+    这个 None 就是兼容开关：主窗口拿到 None 就走旧的三件套（0 = 自动），
+    拿到列表就按列表逐排排（一排 = 一个模组，见 ui_highlight 的
+    ``volt_row_sizes`` / ``temp_row_sizes``）。返回副本，调用方随便改。
+    """
+    store = _load_store()
+    current = store["current"]
+    if not current:
+        return None
+    for item in store["items"]:
+        if item["name"] == current:
+            if not item["cells"]:
+                return None                     # 选了车但还没配模组 → 等同没选
+            return list(item["cells"]), list(item["temps"])
+    return None

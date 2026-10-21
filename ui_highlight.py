@@ -164,29 +164,68 @@ def _pad_line(line: str, section: str, widths: dict[str, int],
     return SAMPLE_RE.sub(pad, line)
 
 
-def grid_row_sizes(count: int, rows_hint: int = 0, cols_hint: int = 0) -> list[int]:
+def grid_row_sizes(count: int, rows_hint: int = 0, cols_hint: int = 0,
+                   row_sizes: list[int] | None = None) -> list[int]:
     """把 ``count`` 个采样点分成若干排，**每排该放几个**。
 
     用户点名的规则（原话）："若为奇数个数据，那么就让最后一排数据比前一排数据
     多一个，别的排数据个数保持一致且对齐。"
 
-    算法：
-      1) 先定行数 ``rows``：给了 ``rows_hint``（模组个数）就用它；否则按
-         ``cols_hint``（每排目标个数）推算 ceil(count / cols_hint)；
-      2) 再定列数 ``cols``：给了 ``cols_hint`` 就用它，否则 ceil(count / rows)。
-         ⚠️ **两者都给了但 rows×cols 装不下 count 时，以 count 为准按 cols 重算
-         行数** —— 宁可多排一行，也绝不丢掉任何一个采样点；
-      3) 均分：``base, rem = divmod(count, rows)``，前 ``rows - rem`` 排各 base 个，
-         最后 ``rem`` 排各 base+1 个。
-         · 各排相差 ≤ 1（base 或 base+1）；
-         · 最后一排**只多不少**（rem ≥ 1 时它就是 base+1 —— 正是"末排多一"）；
-         · rem == 1 时（奇数个的典型情况）除末排外**全部一致**，即用户要的效果。
-         · 对齐不由本函数保证：调用方把每个单元格 ``ljust`` 到同一宽度、
-           用同一个 CELL_GAP 拼接，列起点自然齐（见 _grid_rows）。
+    **两条优先级**（给了 ``row_sizes`` 就先走它，一条都不走均分那套）：
+
+    ① ``row_sizes`` 是**逐排显式尺寸**（车辆档案里"第 i 个模组的电芯/温度数"）：
+       第 i 排就放 ``row_sizes[i]`` 个点 —— 一排 = 一个模组，模组长短不一时各排
+       自然不一样（这正是"逐模组自行设置"的用途）。三条兜底：
+       · 数据点比列表**多** → 多出来的仍按**最后一排的尺寸**继续往下排
+         （绝不丢点；新增的模组沿用最后一个模组的配置，与设置面板同一口径）；
+       · 数据点比列表**少** → 按实际点数截断，**不补假数据**（最后那排短一截）；
+       · 列表里 ≤0 的项直接跳过（某个模组没接电芯 = 这一排不占行）。
+       ⚠️ 这里只负责"按模组切"；**视口装不下时在模组内部再拆**是 ``_cap_rows``
+       的事（由 ``_grid_rows`` 在拿到行尺寸之后做）—— 两件事分开，本函数保持
+       纯逻辑、不受控件宽度影响（自测才好钉）。
+
+    ② 没给 ``row_sizes``（None / 空列表，= 没选车）→ 完全走原来的均分算法，
+       一个字节都不变（老行为）：
+       1) 先定行数 ``rows``：给了 ``rows_hint``（模组个数）就用它；否则按
+          ``cols_hint``（每排目标个数）推算 ceil(count / cols_hint)；
+       2) 再定列数 ``cols``：给了 ``cols_hint`` 就用它，否则 ceil(count / rows)。
+          ⚠️ **两者都给了但 rows×cols 装不下 count 时，以 count 为准按 cols 重算
+          行数** —— 宁可多排一行，也绝不丢掉任何一个采样点；
+       3) 均分：``base, rem = divmod(count, rows)``，前 ``rows - rem`` 排各 base 个，
+          最后 ``rem`` 排各 base+1 个。
+          · 各排相差 ≤ 1（base 或 base+1）；
+          · 最后一排**只多不少**（rem ≥ 1 时它就是 base+1 —— 正是"末排多一"）；
+          · rem == 1 时（奇数个的典型情况）除末排外**全部一致**，即用户要的效果。
+          · 对齐不由本函数保证：调用方把每个单元格 ``ljust`` 到同一宽度、
+            用同一个 CELL_GAP 拼接，列起点自然齐（见 _grid_rows）。
     """
     count = max(0, int(count))
     if count == 0:
         return []
+    if row_sizes:
+        sizes: list[int] = []
+        used = 0
+        last = 0
+        for raw in row_sizes:
+            try:
+                size = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if size <= 0:
+                continue                        # 这个模组没接采样点：不占排
+            take = min(size, count - used)
+            sizes.append(take)
+            used += take
+            last = size
+            if used >= count:
+                break
+        if sizes:
+            while used < count:                 # 数据多出来 → 按最后一排继续
+                take = min(last, count - used)
+                sizes.append(take)
+                used += take
+            return sizes
+        # 一路全是 0 / 坏值：退回均分算法，别把数据排成空
     rows = int(rows_hint) if rows_hint and rows_hint > 0 else 0
     cols = int(cols_hint) if cols_hint and cols_hint > 0 else 0
     if rows <= 0:
@@ -200,10 +239,43 @@ def grid_row_sizes(count: int, rows_hint: int = 0, cols_hint: int = 0) -> list[i
     return [base] * (rows - rem) + [base + 1] * rem
 
 
+def _cap_rows(sizes: list[int], fit: int) -> list[int]:
+    """把"一排 = 一个模组"的尺寸按视口容量**在模组内部**均衡拆行。
+
+    单个模组装得下（``n <= fit``）就原样保留；装不下就拆成 ``ceil(n/fit)`` 个子排，
+    子排之间相差 ≤1。拆出来的子排**连续**，所以模组的先后顺序不变、点数一个不丢，
+    只是模组边界在视觉上被视口切开。
+
+    ⚠️ 多出来的那一个放在**后面**（25 / fit=23 → 12+13）：整篇均分那条路的规则
+    是用户 2026-10-11 点名的"最后一排比前一排多一个"，模组内部的子排沿用**同一条**
+    口径 —— 同一个界面里出现两种"多出来的那行在前还是在后"的规则，用户只会觉得
+    排布随机。代价是模组被折成两行时"第一行短、第二行长"，视觉上像一段末行被
+    拉长的文字，但这与整篇的观感是一致的，不打架。
+
+    为什么必须拆（而不是让 QPlainTextEdit 自己软换行）：25 电芯一排是
+    25×7 + 24×3 = 247 个字符，1180 宽的视口只放得下 120 来个 —— 软换行会把第 25
+    个点甩到下一行，变成"行尾孤零零一个单元格"，正是用户 2026-10-11 截图点名的
+    那个毛病。封顶后每条视觉行都贴着视口容量、断点由我们自己定。
+    """
+    fit = max(1, int(fit))
+    out: list[int] = []
+    for size in sizes:
+        size = int(size)
+        if size <= 0:
+            continue
+        if size <= fit:
+            out.append(size)
+            continue
+        chunks = -(-size // fit)                 # ceil(size / fit)
+        base, rem = divmod(size, chunks)
+        out.extend([base] * (chunks - rem) + [base + 1] * rem)
+    return out
+
+
 def _grid_rows(tokens: list[tuple[str, str]], section: str,
                widths: dict[str, int], index_width: int, cols: int,
                max_row_chars: int = 0, rows_hint: int = 0,
-               cols_hint: int = 0) -> list[str]:
+               cols_hint: int = 0, row_sizes: list[int] | None = None) -> list[str]:
     """把一组采样点排成等宽网格：值补零到段内最宽；电压段序号补零到
     index_width（0 号点、温度段都不补）；单元格补空格到等宽后以 CELL_GAP 拼接。
 
@@ -213,10 +285,18 @@ def _grid_rows(tokens: list[tuple[str, str]], section: str,
     ``cols``：设备自己发来的每行点数（这组里最宽一行的列数 —— 设备的排版意图）。
     ``rows_hint`` / ``cols_hint``：设置里的「模组个数」「每模组电芯数/温度采集数」
     （0 = 自动，跟随设备）。短行（分包劈出来的孤行）被并回网格，不单独占一行。
+    ``row_sizes``：车辆档案的逐模组尺寸（一排 = 一个模组）。
 
     ``max_row_chars``：视口一行能放下的字符数（主窗口量出来传入）。行宽超过
     视口的话软换行会在行尾甩出一个孤零零的单元格（用户截图里"13.6553"单独
-    占一行），所以列数取 min(目标列数, 视口装得下的列数)。0 = 不设上限。
+    占一行），所以每条视觉行都要封顶在这个容量内。0 = 不设上限。
+
+    **两条路都封顶，但封法不同**：
+    - 没有 ``row_sizes``（没选车）→ 先按视口把"每排目标个数"压到 fit，再交给
+      ``grid_row_sizes`` 均分（老行为）；
+    - 给了 ``row_sizes``（选了车）→ **先按模组切**（``grid_row_sizes`` 的显式尺寸
+      分支），**再按视口在模组内部均衡拆**（``_cap_rows``）：模组还是那个模组，
+      只是它长到装不下一行时，由我们决定断在第几个电芯，而不是让控件软换行。
     """
     cells: list[str] = []
     for index, value in tokens:
@@ -225,14 +305,23 @@ def _grid_rows(tokens: list[tuple[str, str]], section: str,
             index = "0" * max(0, index_width - len(index)) + index
         cells.append(index + "." + value)
     cell_w = max(len(cell) for cell in cells)
+    # 一行 n 个单元格只有 n-1 个间隔 → 精确上界是 (max_row_chars + len(CELL_GAP))
+    # // (cell_w + len(CELL_GAP))（不是 +2：那会平白少放一格）。
+    fit = 0
     if max_row_chars > 0:
-        pitch = cell_w + len(CELL_GAP)
-        fit = max(1, (max_row_chars + len(CELL_GAP)) // pitch)
-        cols = min(cols, fit)
-        if cols_hint > 0:
-            cols_hint = min(cols_hint, fit)
+        fit = max(1, (max_row_chars + len(CELL_GAP)) // (cell_w + len(CELL_GAP)))
     # 没给"模组网格"就用设备自己的列数当目标列数（rows_hint=0 → 行数由列数推）
-    sizes = grid_row_sizes(len(cells), rows_hint, cols_hint if cols_hint > 0 else cols)
+    if row_sizes:
+        sizes = grid_row_sizes(len(cells), row_sizes=row_sizes)
+        if fit:
+            sizes = _cap_rows(sizes, fit)
+    else:
+        if fit:
+            cols = min(cols, fit)
+            if cols_hint > 0:
+                cols_hint = min(cols_hint, fit)
+        sizes = grid_row_sizes(len(cells), rows_hint,
+                               cols_hint if cols_hint > 0 else cols)
     rows: list[str] = []
     start = 0
     for size in sizes:
@@ -245,7 +334,9 @@ def _grid_rows(tokens: list[tuple[str, str]], section: str,
 def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
                   section: str = SECTION_OTHER,
                   max_row_chars: int = 0, rows_hint: int = 0,
-                  volt_cols_hint: int = 0, temp_cols_hint: int = 0) -> str:
+                  volt_cols_hint: int = 0, temp_cols_hint: int = 0,
+                  volt_row_sizes: list[int] | None = None,
+                  temp_row_sizes: list[int] | None = None) -> str:
     """采样点排版对齐：电压/温度段的连续数据行按**等宽网格**重排。
 
     - 序号：**只有电压段**补 —— `"1.3820"` -> `"01.3820"`（0 号点除外）；
@@ -271,6 +362,12 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
     ``rows_hint`` / ``volt_cols_hint`` / ``temp_cols_hint``：设置里的「模组个数」
     与「每模组电芯数 / 每模组温度采集数」（见 customization）。**0 = 自动**，
     完全沿用设备发来的每行点数（这也是默认值，保证老行为不变）。
+
+    ``volt_row_sizes`` / ``temp_row_sizes``：**选车之后的逐模组尺寸**（第 i 个
+    模组的电芯数 / 温度采集数，见 customization.active_profile）。给了列表就
+    按"一排 = 一个模组"排 —— 优先级**高于**上面三个 hint（同一时刻只该有一套
+    参数说话；车辆档案是用户明确选中的那套，旧的全局三件套在选车后就该让位）。
+    列表为 None → 与加这个参数之前一字不差。
 
     ⚠️ 数字本身一个都不动：只在前导位置补数字 0（用户："在前方补零"）、重排
     空白 —— 自测用"摘掉前导 0、压平空白后逐字等于原文"兜底。
@@ -332,8 +429,9 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
             tokens.extend(found)
             j += 1
         hint = volt_cols_hint if sec == SECTION_VOLT else temp_cols_hint
+        sizes = volt_row_sizes if sec == SECTION_VOLT else temp_row_sizes
         out.extend(_grid_rows(tokens, sec, widths, index_width, cols,
-                              max_row_chars, rows_hint, hint))
+                              max_row_chars, rows_hint, hint, sizes))
         i = j
     return "\n".join(out)
 

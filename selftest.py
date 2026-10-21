@@ -99,6 +99,14 @@ def pin_rx_grid_defaults(settings) -> None:
     """
     for key in ("module_count", "cells_per_module", "temps_per_module"):
         settings.setValue(f"custom/{key}", 0)
+    # ⛔ 光把那三个键写成 0 **不够**：只要有一台车被选中，``active_profile()`` 就会
+    #    压过它们（车辆档案的优先级高于旧三件套）。而"取消选车"也不能只写
+    #    ``custom/vehicle=""`` —— ``customization._load_store`` 先看 ``custom/vehicles``
+    #    JSON 里的 ``current``，镜像键只是兜底（2026-10-22 QA 实测：只清镜像键时
+    #    三模组各 1 电芯的车仍生效，「收包合并与暂停继续」等三条用例假挂）。
+    #    走 ``select_vehicle("")`` 才会把 JSON 与镜像键一起改掉。
+    import customization
+    customization.select_vehicle("")
     settings.sync()
 
 
@@ -4738,6 +4746,192 @@ def check_alert_locate(app: QApplication) -> None:
         settings.sync()
 
 
+def check_vehicle_profiles(app: QApplication) -> None:
+    """车辆（车型）管理与逐模组配置：档案读写、改名/重名、删当前车、逐排排版。
+
+    为什么单开一条（2026-10-22 用户点名"一个功能能够自行适配更多车型的电池箱"）：
+    这件事在**两处**同时落地 —— 数据模型（customization 的车辆档案）与排版
+    （ui_highlight 的显式行尺寸），任何一边回退都不会报错，只会静默变成"所有车
+    都按同一套参数排版/改了不生效"（看起来只是行宽不对）。所以这里既验 API 语义，
+    也验"一排 = 一个模组"的**实际点数**。
+
+    覆盖（含反例）：
+      · 新建两车 → 列表长度 / 当前选择 / active_profile；
+      · 改名成功、**重名被拒**；
+      · 删当前车 → current 清空且 active_profile 变 None（不能偷偷按旧参数排）；
+      · 25/24/25 三个模组喂 90 个点 → 三排正好 25/24/25；
+      · 数据比尺寸合计多（100 点 / 合计 74）→ **一个点都不丢**；
+      · 数据比尺寸少 → 按实际截断，**不补假数据**；
+      · 没选车 + 旧三件套全 0 → 与改动前一字不差（均分算法原样）；
+      · 设置面板接线上：选车后旧的三个全局参数整行隐藏、逐模组行数跟随。
+
+    ⛔ 只碰数据模型与纯函数（不建主窗口，快）：接收区的重排链路由
+    「收包合并与暂停继续」覆盖。QSettings 一律走 restore_settings 还原 ——
+    用户真实的车辆档案（可能有）在这条跑完后原样还在。
+    """
+    import customization
+    from ui_highlight import (
+        SAMPLE_RE, _cap_rows, align_indexes, grid_row_sizes,
+    )
+
+    def _row_point_counts(text: str) -> list[int]:
+        """每排（每行）有几个采样点 —— 只看有数据的行。"""
+        return [len(SAMPLE_RE.findall(line)) for line in text.split("\n")
+                if SAMPLE_RE.search(line)]
+
+    settings = QSettings("MimoWorks", "SerialAssistant")
+    snapshot = {key: settings.value(key) for key in settings.allKeys()}
+    try:
+        # 旧三件套钉成 0=自动：下面"没选车时与改动前一致"才有确定的前提
+        pin_rx_grid_defaults(settings)
+        # 车辆档案清空（用户真实的车辆由 snapshot 在 finally 里原样还回去）
+        for name in customization.vehicle_names():
+            customization.delete_vehicle(name)
+        assert customization.vehicles() == [], "清空后不该还剩车辆档案"
+        assert customization.current_vehicle() == ""
+        assert customization.active_profile() is None, \
+            "没选车时 active_profile 必须是 None（否则旧三件套被顶掉）"
+
+        # ---- 1) 新建两台车 → 列表 / 当前选择 / 结构 ----
+        customization.save_vehicle("测试车A", [25, 24, 25], [8, 8, 6])
+        customization.save_vehicle("测试车B", [10, 10], [4, 4])
+        assert len(customization.vehicles()) == 2, customization.vehicles()
+        customization.select_vehicle("测试车A")
+        assert customization.current_vehicle() == "测试车A"
+        assert customization.active_profile() == ([25, 24, 25], [8, 8, 6]), \
+            f"逐模组结构读回来不对：{customization.active_profile()}"
+        # 同名保存 = **覆盖**（不是又加一台）；位置也不该跳（下拉按位置认车）
+        customization.save_vehicle("测试车A", [25, 24, 25], [8, 8, 6])
+        assert len(customization.vehicles()) == 2
+        assert [v["name"] for v in customization.vehicles()] == ["测试车A", "测试车B"]
+        # 档案是副本：调用方改返回值不该改到磁盘
+        _copy = customization.active_profile()
+        _copy[0][0] = 999
+        assert customization.active_profile()[0][0] == 25, "active_profile 必须返回副本"
+        # 两边长度不等时补成等长（不变式：长度 == 模组个数），沿用最后一个值
+        customization.save_vehicle("不等长", [7, 9], [3])
+        _odd = next(v for v in customization.vehicles() if v["name"] == "不等长")
+        assert _odd["cells"] == [7, 9] and _odd["temps"] == [3, 3], \
+            f"cells/temps 长度不相等时应当补成等长：{_odd}"
+        customization.delete_vehicle("不等长")
+        assert len(customization.vehicles()) == 2
+
+        # ---- 2) 改名：成功 / **重名被拒** ----
+        assert customization.rename_vehicle("测试车B", "测试车C") is True
+        _names = [v["name"] for v in customization.vehicles()]
+        assert _names == ["测试车A", "测试车C"], f"改名后顺序/名字不对：{_names}"
+        assert customization.rename_vehicle("测试车C", "测试车A") is False, \
+            "重名必须拒绝（否则两台同名车永远说不清改的是哪台）"
+        assert customization.rename_vehicle("测试车C", "  ") is False, "空名必须拒绝"
+        assert [v["name"] for v in customization.vehicles()] == ["测试车A", "测试车C"]
+        # 改名带上当前选择：改的正好是当前车时 current 跟着走
+        assert customization.rename_vehicle("测试车A", "测试车A2") is True
+        assert customization.current_vehicle() == "测试车A2", \
+            "改名后当前车辆名没跟上"
+        assert customization.rename_vehicle("测试车A2", "测试车A") is True
+
+        # ---- 3) 删当前车 → 选择清空、active_profile 回到 None ----
+        customization.delete_vehicle("测试车A")
+        assert customization.current_vehicle() == "", "删掉当前车后必须清空选择"
+        assert customization.active_profile() is None, \
+            "选择清空后必须回到 None（不能拿旧参数继续排）"
+        assert [v["name"] for v in customization.vehicles()] == ["测试车C"]
+
+        # ---- 4) 逐排排版：一排 = 一个模组（25 / 24 / 25）----
+        _text = "Voltage1:\n" + " ".join(f"{i}.3700" for i in range(1, 91))
+        _rows = _row_point_counts(align_indexes(_text, volt_row_sizes=[25, 24, 25]))
+        assert _rows[:3] == [25, 24, 25], f"三排点数应当正好 25/24/25：{_rows}"
+        assert sum(_rows) == 90, f"90 个点必须一个不丢：{_rows}"
+        # 数据比"逐模组尺寸"多：多出来的按**最后一排尺寸**继续排（绝不丢点）
+        assert sum(grid_row_sizes(100, row_sizes=[25, 24, 25])) == 100, \
+            grid_row_sizes(100, row_sizes=[25, 24, 25])
+        _text100 = "Voltage1:\n" + " ".join(f"{i}.3700" for i in range(1, 101))
+        _rows100 = _row_point_counts(align_indexes(_text100, volt_row_sizes=[25, 24, 25]))
+        assert sum(_rows100) == 100, f"100 个点喂 74 的尺寸后丢点了：{_rows100}"
+        assert _rows100[:3] == [25, 24, 25], f"前三排应当仍是整模组：{_rows100}"
+        # 数据比尺寸合计少：按实际截断，不补假数据
+        assert grid_row_sizes(40, row_sizes=[25, 24, 25]) == [25, 15]
+        assert grid_row_sizes(40, row_sizes=[0, 0, 0]) == [40], \
+            "逐模组尺寸全是 0 时要退回均分算法，不能排成空"
+        # 温度段同一套规则（8 / 5 / 6）
+        _temp = "Temperature1:\n" + " ".join(f"{i}.25" for i in range(1, 20))
+        assert _row_point_counts(align_indexes(_temp, temp_row_sizes=[8, 5, 6])) \
+            == [8, 5, 6], "温度段的逐模组尺寸没生效"
+
+        # ---- 4b) 视口封顶：先按模组切，再在模组内部**均衡拆** ----
+        # 25 电芯一排是 247 字符，1180 宽的视口只放得下 120 来个 —— 不拆就会被
+        # 软换行甩出"行尾孤零零一个单元格"（用户点名的毛病）。拆分口径：子排
+        # 相差 ≤1，多出来的那一个放**后面**（12+13）—— 与整篇均分的"末排多一"
+        # 同一条口径（用户 2026-10-11 点名的规则），一个界面里不许有两种规则。
+        assert _cap_rows([25, 24, 25], 23) == [12, 13, 12, 12, 12, 13], \
+            f"单模组 25 按 23 拆应当是 12+13：{_cap_rows([25, 24, 25], 23)}"
+        assert _cap_rows([25, 24, 25], 20) == [12, 13, 12, 12, 12, 13], \
+            f"按 20 拆同样是 12+13 / 12+12 / 12+13：{_cap_rows([25, 24, 25], 20)}"
+        assert _cap_rows([10], 23) == [10], "单个模组装得下就不许拆"
+        assert sum(_cap_rows([25, 24, 25], 23)) == 74, "拆完不能丢点"
+        # 端到端：cell_w=7（"01.3700"）、pitch=10 → max_row_chars=230 时 fit=23
+        _capped = _row_point_counts(align_indexes(
+            "Voltage1:\n" + " ".join(f"{i}.3700" for i in range(1, 91)),
+            max_row_chars=230, volt_row_sizes=[25, 24, 25]))
+        assert _capped == [12, 13, 12, 12, 12, 13, 16], \
+            f"视口封顶没接进排版链（应当 6+1 排、合计 90）：{_capped}"
+
+        # ---- 5) 没选车 + 旧三件套全 0 → 与改动前一字不差 ----
+        _legacy = align_indexes(_text)
+        assert align_indexes(_text, volt_row_sizes=None, temp_row_sizes=None) == _legacy
+        assert _row_point_counts(_legacy) == [90], \
+            f"没选车时应当完全沿用设备/旧规则（一整个数据组不拆排）：{_row_point_counts(_legacy)}"
+        # 旧两参数均分语义原样（3 排 × 25 装不下 90 → 以数据量为准扩成 4 排）
+        assert grid_row_sizes(90, 3, 25) == [22, 22, 23, 23], \
+            f"旧的「模组个数 × 每模组电芯数」均分语义被改了：{grid_row_sizes(90, 3, 25)}"
+
+        # ---- 6) 设置面板接线：旧的三个全局参数在选车后整行隐藏 ----
+        from ui_settings import SettingsDialog
+        _dlg = SettingsDialog("dark", 55)
+        try:
+            customization.select_vehicle("")
+            _dlg._sync_vehicle_rows()
+            assert not _dlg._module_rows, "没选车时不该有逐模组行"
+            assert all(_dlg._custom_rows[key][0].isVisibleTo(_dlg)
+                       for key in _dlg._LEGACY_GRID_KEYS), \
+                "没选车时旧的三个全局参数必须可见"
+            # 新建：默认名「新车 1」+ 预填 3 模组 × 25 电芯 × 8 温度
+            # （module_count 已被钉成 0，所以走默认档）
+            assert _dlg._next_new_vehicle_name(customization.vehicle_names()) == "新车 1"
+            _dlg._create_vehicle("面板车")
+            assert customization.current_vehicle() == "面板车", "新建后应当自动选中"
+            assert customization.active_profile() == ([25, 25, 25], [8, 8, 8]), \
+                f"新车的预填结构不对：{customization.active_profile()}"
+            assert len(_dlg._module_rows) == 3, "逐模组行数没有跟随模组个数"
+            assert not any(_dlg._custom_rows[key][0].isVisibleTo(_dlg)
+                           for key in _dlg._LEGACY_GRID_KEYS), \
+                "选车后旧的三个全局参数必须整行隐藏（两套参数不能同时露面）"
+            assert _dlg.spin_vehicle_modules.value() == 3
+            # 改模组个数 = 改结构长度（新增的模组沿用最后一个模组的配置）
+            _dlg.spin_vehicle_modules.setValue(5)
+            assert len(_dlg._module_rows) == 5, "模组个数变了，逐模组行没跟上"
+            assert customization.active_profile() == ([25] * 5, [8] * 5), \
+                f"扩到 5 个模组时应当沿用 25/8：{customization.active_profile()}"
+            _dlg.spin_vehicle_modules.setValue(2)
+            assert customization.active_profile() == ([25, 25], [8, 8]), \
+                f"缩到 2 个模组时应当从末尾截断：{customization.active_profile()}"
+            # 模组个数 = 0：逐模组行清空，旧的三件套**重新露面** —— 判据与主窗口
+            # 同一条（active_profile() 是 None 就吃旧参数），否则用户会面对一个
+            # "选了车却没有任何参数可调"的面板
+            _dlg.spin_vehicle_modules.setValue(0)
+            assert not _dlg._module_rows, "模组个数 0 时不该还有逐模组行"
+            assert customization.active_profile() is None, \
+                "模组个数 0 时 active_profile 必须是 None"
+            assert all(_dlg._custom_rows[key][1].isVisibleTo(_dlg)
+                       for key in _dlg._LEGACY_GRID_KEYS), \
+                "选了车但模组个数为 0 时，旧的三个全局参数必须重新露面"
+        finally:
+            _dlg.close()
+    finally:
+        restore_settings(settings, snapshot)
+        settings.sync()
+
+
 CHECKS = [
     ("HEX 编解码", check_hex_codec),
     ("增量文本解码", check_stream_decoder),
@@ -4766,6 +4960,7 @@ CHECKS = [
     ("启动时最大化开关", check_startup_state),
     ("默认折叠发送区开关", check_send_collapsed_startup),
     ("定位最近异常按钮", check_alert_locate),
+    ("车辆与逐模组配置", check_vehicle_profiles),
 ]
 
 
@@ -4834,8 +5029,18 @@ def main() -> int:
     # "最近一次异常"定位到不含 1.3700 的那行）。
     # ⚠️ 必须在 global_snapshot **之后**清零：收尾那段无条件还原会把用户真实值
     #    写回，绝不污染用户配置。
+    # ⛔ 键名必须带 ``custom/`` 前缀（2026-10-22 修）：这里以前写的是裸键名，
+    #    结果 0 被写进顶层无用键、**用户真实的 module_count=5 一直生效** ——
+    #    注释声称的"自测全程钉成 0"其实从没生效过，上面那三条敏感用例只是碰巧
+    #    没被踩到（各 check 自己会调 pin_rx_grid_defaults 兜着）。
+    #    顺带：选了车的机器（custom/vehicle 非空）也不该影响自测，所以这里连
+    #    当前车辆一起清空 —— 否则 active_profile() 会压过这三个 0。
     for _grid_key in ("module_count", "cells_per_module", "temps_per_module"):
-        global_settings.setValue(_grid_key, 0)
+        global_settings.setValue(f"custom/{_grid_key}", 0)
+    # ⛔ 取消选车必须走 select_vehicle("")：只写 custom/vehicle 镜像键没用
+    #    （_load_store 优先认 vehicles JSON 里的 current，见 pin_rx_grid_defaults 的说明）。
+    import customization as _cu_main
+    _cu_main.select_vehicle("")
     global_settings.sync()
     failed = 0
     for name, func in CHECKS:
