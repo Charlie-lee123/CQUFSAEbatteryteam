@@ -599,6 +599,30 @@ QLineEdit#searchEdit:focus {
     border: 1px solid @line_strong@;
 }
 
+/* ---- 设置面板「模组 i」的数量输入框（电芯数量：〔N〕个）----
+   与 searchEdit 同一套族谱：surface_2 底 + line 描边 + CONTROL_RADIUS 圆角，
+   hover/focus 也一致。高度对齐 QComboBox（min/max 20 + 上下 padding 6 + 边框 2
+   = 34，见下面 QComboBox 那条的换算），同一行里两种控件才不会一高一矮。 */
+QLineEdit#countEdit {
+    background: @surface_2@;
+    border: 1px solid @line@;
+    border-radius: @CONTROL_RADIUS@px;
+    padding: 6px 8px;
+    min-height: 20px;
+    max-height: 20px;
+    color: @ink@;
+    selection-background-color: rgba(@sel_rgb@,0.18);
+    selection-color: @ink@;
+}
+
+QLineEdit#countEdit:hover {
+    background: @surface_hover@;
+}
+
+QLineEdit#countEdit:focus {
+    border: 1px solid @line_strong@;
+}
+
 QLabel#searchCount {
     color: @ink_2@;
 }

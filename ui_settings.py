@@ -499,6 +499,10 @@ class SettingsDialog(QDialog):
         数字就是框里那个自定义值（不再把数量塞进短单位文字里）。
         """
         box = QLineEdit()
+        # 挂 objectName 走 ui_theme 里的 QSS（QLineEdit#countEdit）：和下拉框/
+        # 数字框同族外观（surface_2 底 + line 描边 + CONTROL_RADIUS 圆角）。
+        # ⛔ 不能用裸 QLineEdit 规则——可编辑下拉框内部也藏着 QLineEdit。
+        box.setObjectName("countEdit")
         box.setValidator(QIntValidator(0, 999, box))
         box.setText(str(int(value)))
         box.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)

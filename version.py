@@ -30,9 +30,9 @@ SETUP_ASSET_SUFFIX = ".exe"
 # 空串 = 该版本发布时尚未记录（自动更新会退回大小/跳过校验）。
 # ⚠️ 升版本时必须先清空成空串：留着**上一版**的哈希会让"拉到的版本文件没解析出
 #    哈希"时的兜底校验拿旧哈希去比新包，直接把更新卡死。发布完由脚本写回。
-LATEST_EXE_SHA256 = "d7ed1cbd40fc84e7dea6a634afd42d6b5b84077d727f4995b359a7361e3b551c"
+LATEST_EXE_SHA256 = "03dd0974266b8c217e4b41a86336a1cac0a9407519c538363ca850c784821ad3"
 
 # 当前 Release 里**安装包**的 SHA256（同上，由发布脚本写回）。
 # 空串 = 尚未记录，走大小/跳过校验。
-LATEST_SETUP_SHA256 = "846b524730c0001e749d518f32f8af0f1b672d5afdceda8eac75b672ad5842c5"
+LATEST_SETUP_SHA256 = "73a36b1eefcb475088313e60d8f169f10a490116f2dd13cc2dae3bf413f866bc"
 
