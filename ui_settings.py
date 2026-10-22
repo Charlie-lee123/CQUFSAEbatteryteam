@@ -24,8 +24,9 @@ from PySide6.QtNetwork import (
     QNetworkAccessManager, QNetworkReply, QNetworkRequest,
 )
 from PySide6.QtWidgets import (
-    QDialog, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QScrollArea, QVBoxLayout, QWidget,
+    QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QGridLayout,
+    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QScrollArea, QVBoxLayout,
+    QWidget,
 )
 
 import app_log
@@ -53,6 +54,9 @@ BUTTON_COLUMNS = 3
 # （电芯 + 温度），按 158 摆两个会把整行顶出面板、右边的框被裁掉；"25 电芯"
 # 这种内容配 104 刚好（后缀 3 个汉字 + 两位数字 + chevron）。
 MODULE_SPIN_W = 104
+# 「模组 i」里两个数量框的预置值：常用配置一点即用，想填别的直接输入（0~999）。
+MODULE_CELL_PRESETS = (0, 8, 10, 12, 16, 20, 24, 25, 32)
+MODULE_TEMP_PRESETS = (0, 2, 4, 6, 8, 10, 12, 16)
 
 
 class _NameDialog(QDialog):
@@ -324,17 +328,26 @@ class SettingsDialog(QDialog):
         """
         form.addRow(self._caption("车辆（电池箱）"))
 
-        # ---- 选车行：下拉 + 新建 + 删除 ----
+        # ---- 选车行：**可编辑**下拉（就地改名）+ 新建 + 删除 ----
         self.cmb_vehicle = ChevronComboBox()
+        # 用户 2026-10-22："有了车辆选项就不需要车辆名称了，选择的时候就需要可以
+        # 编辑车辆名称" —— 选车与改名是同一件事的两半，合成一行：直接在框里改写
+        # 就是给当前车辆改名（回车/失焦生效，重名或空名回滚）。
+        self.cmb_vehicle.setEditable(True)
+        self.cmb_vehicle.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         # ⚠️ 最小宽度只给 110：这一行是「下拉 + 新建 + 删除」，下拉按 190 兜底会把
         #    整行撑到 370，body 就比滚动区视口宽 30 多 px —— 面板右侧被裁掉一条、
         #    横向还能偷偷滚（实测 body 532 / 视口 498）。下拉本来就有 stretch=1，
         #    宽度会吃掉整行的剩余空间，兜底给小一点反而不会顶破面板。
         self.cmb_vehicle.setMinimumWidth(110)
         self.cmb_vehicle.setToolTip(
-            "一台车 = 一套电池箱结构（模组个数与每个模组的电芯/温度采集数）。"
+            "一台车 = 一套电池箱结构（模组个数与每个模组的电芯/温度采集数）。\n"
+            "直接改写框里的名字 = 给当前车辆改名（回车或点别处生效）；\n"
             "选「（未选择）」则退回「定制功能」里的三个全局参数")
         self.cmb_vehicle.currentIndexChanged.connect(self._on_vehicle_picked)
+        _vehicle_line = self.cmb_vehicle.lineEdit()
+        if _vehicle_line is not None:
+            _vehicle_line.editingFinished.connect(self._on_vehicle_rename_typed)
 
         self.btn_vehicle_new = InkButton("新建", variant="ghost")
         self.btn_vehicle_new.setToolTip(
@@ -346,27 +359,20 @@ class SettingsDialog(QDialog):
         self.btn_vehicle_delete.setToolTip("删除当前这台车（只删结构，已接收的数据不受影响）")
         self.btn_vehicle_delete.clicked.connect(self._on_vehicle_delete)
 
+        # 改名失败时的短提示：平时藏起来（不占宽度），出错那两秒才出现
+        # ⚠️ 提示文字必须**短**（同 MCP 那行），长文案会被裁掉
+        self.lbl_vehicle_hint = QLabel("")
+        self.lbl_vehicle_hint.setFont(ui_font(10.5))
+        self.lbl_vehicle_hint.setObjectName("groupCaption")
+        self.lbl_vehicle_hint.setMinimumWidth(1)      # 不能是 0（同日志行，见上）
+        self.lbl_vehicle_hint.setVisible(False)
+
         pick_row = QHBoxLayout()
         pick_row.setSpacing(10)
         pick_row.addWidget(self.cmb_vehicle, 1)
         pick_row.addWidget(self.btn_vehicle_new)
         pick_row.addWidget(self.btn_vehicle_delete)
-
-        # ---- 改名行：QLineEdit（editingFinished 落盘）+ 一行短提示 ----
-        self.edit_vehicle_name = QLineEdit()
-        self.edit_vehicle_name.setFont(ui_font(12.5))
-        self.edit_vehicle_name.setMinimumWidth(150)      # 同上下拉：别把面板顶宽
-        self.edit_vehicle_name.setToolTip("改名后立刻生效；与已有车辆重名会被拒绝")
-        self.edit_vehicle_name.editingFinished.connect(self._on_vehicle_renamed)
-        # ⚠️ 提示文字必须**短**：这行右侧宽度有限，长文案会被裁掉（同 MCP 那行）
-        self.lbl_vehicle_hint = QLabel("")
-        self.lbl_vehicle_hint.setFont(ui_font(10.5))
-        self.lbl_vehicle_hint.setObjectName("groupCaption")
-        self.lbl_vehicle_hint.setMinimumWidth(1)      # 不能是 0（同日志行，见上）
-        name_row = QHBoxLayout()
-        name_row.setSpacing(10)
-        name_row.addWidget(self.edit_vehicle_name, 1)
-        name_row.addWidget(self.lbl_vehicle_hint)
+        pick_row.addWidget(self.lbl_vehicle_hint)
 
         # ---- 模组个数行：0 = 不配（退回旧的三个全局参数） ----
         self.spin_vehicle_modules = ChevronSpinBox()
@@ -379,11 +385,9 @@ class SettingsDialog(QDialog):
 
         self._vehicle_rows: dict[str, tuple[QLabel, QWidget]] = {
             "pick": (self._label("车辆"), self._row(pick_row)),
-            "name": (self._label("车辆名称"), self._row(name_row)),
             "modules": (self._label("模组个数"), self.spin_vehicle_modules),
         }
         form.addRow(*self._vehicle_rows["pick"])
-        form.addRow(*self._vehicle_rows["name"])
         form.addRow(*self._vehicle_rows["modules"])
 
         # 逐模组行插在这个位置（= 本节之后、「定制功能」之前）。
@@ -425,14 +429,13 @@ class SettingsDialog(QDialog):
         # 选车行永远在；改名 / 模组个数两行只在选了车时才有意义。
         self._vehicle_rows["pick"][0].setVisible(True)
         self._vehicle_rows["pick"][1].setVisible(True)
-        for key in ("name", "modules"):
+        for key in ("modules",):
             label, field = self._vehicle_rows[key]
             label.setVisible(has_vehicle)
             field.setVisible(has_vehicle)
         self._sync_grid_params_visibility()
 
         self.btn_vehicle_delete.setEnabled(has_vehicle)
-        self.edit_vehicle_name.setText(current if has_vehicle else "")
         spin = self.spin_vehicle_modules
         spin.blockSignals(True)
         # 没选车时这颗框**绑旧的 module_count**（老用户在同一位置看到同一个数，
@@ -458,37 +461,72 @@ class SettingsDialog(QDialog):
                 for widget in pair:
                     widget.setVisible(legacy_on)
 
+    def _make_count_field(self, value: int, presets: tuple[int, ...], unit: str,
+                          tip: str, on_apply) -> QWidget:
+        """一个"数量"输入：**可编辑下拉**（点预置值 + 直接输入任意数量）。
+
+        用户 2026-10-22："改成电芯个数后面可以自定义数量，还有温度采集数量也同理"
+        —— 原来的 QSpinBox 只能按箭头步进，还被卡在 0~32 的上限里。这里换成和
+        「保留行数」同一套可编辑下拉：常用值一点即用，想填多少直接敲（0~999），
+        非法输入回滚到原值。
+        """
+        combo = ChevronComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        combo.addItems([str(int(preset)) for preset in presets])
+        combo.setCurrentText(str(int(value)))
+        combo.setFixedWidth(MODULE_SPIN_W)
+        combo.setToolTip(tip)
+        unit_label = QLabel(unit)
+        unit_label.setFont(ui_font(10.5))
+        unit_label.setObjectName("groupCaption")
+        unit_label.setMinimumWidth(1)
+
+        def apply(text: str, box: ChevronComboBox = combo) -> None:
+            raw = str(text).strip()
+            try:
+                number = int(raw)
+            except ValueError:
+                box.setCurrentText(str(int(value)))      # 非法输入回滚
+                return
+            on_apply(max(0, min(999, number)))
+
+        combo.activated.connect(lambda _i, box=combo: apply(box.currentText()))
+        line = combo.lineEdit()
+        if line is not None:
+            line.editingFinished.connect(lambda box=combo: apply(box.currentText()))
+
+        holder = QWidget()
+        lay = QHBoxLayout(holder)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        lay.addWidget(combo)
+        lay.addWidget(unit_label)
+        lay.addStretch(1)
+        return holder
+
     def _rebuild_module_rows(self, cells: list[int], temps: list[int]) -> None:
-        """重建「模组 1..N」逐行控件（每行两个数字框：电芯 / 温度采集数）。"""
+        """重建「模组 1..N」逐行控件（每行：电芯数 + 温度采集数，都可自定义）。"""
         while self._module_rows:
             self._module_rows.pop()
             # 先 pop 再按"剩下的行数"算最后一行的行号：删一行后后面的行号整体上移
             self.form.removeRow(self._module_row_base + len(self._module_rows))
         for index in range(min(len(cells), len(temps))):
-            spin_cells = ChevronSpinBox()
-            spin_cells.setRange(0, 32)
-            spin_cells.setValue(int(cells[index]))
-            spin_cells.setSuffix(" 电芯")
-            spin_cells.setFixedWidth(MODULE_SPIN_W)
-            spin_cells.setToolTip(
-                f"第 {index + 1} 个模组的电芯数 → 电压段这一排放几个点（0 = 这排不排）")
-            spin_cells.valueChanged.connect(
-                lambda value, i=index: self._on_module_value(i, False, value))
-
-            spin_temps = ChevronSpinBox()
-            spin_temps.setRange(0, 64)
-            spin_temps.setValue(int(temps[index]))
-            spin_temps.setSuffix(" 温度")
-            spin_temps.setFixedWidth(MODULE_SPIN_W)
-            spin_temps.setToolTip(
-                f"第 {index + 1} 个模组的温度采集数 → 温度段这一排放几个点（0 = 这排不排）")
-            spin_temps.valueChanged.connect(
-                lambda value, i=index: self._on_module_value(i, True, value))
+            field_cells = self._make_count_field(
+                int(cells[index]), MODULE_CELL_PRESETS, "电芯",
+                f"第 {index + 1} 个模组的电芯数 → 电压段这一排放几个点"
+                "（0 = 这排不排）；可直接输入任意数量",
+                lambda number, i=index: self._on_module_value(i, False, number))
+            field_temps = self._make_count_field(
+                int(temps[index]), MODULE_TEMP_PRESETS, "温度",
+                f"第 {index + 1} 个模组的温度采集数 → 温度段这一排放几个点"
+                "（0 = 这排不排）；可直接输入任意数量",
+                lambda number, i=index: self._on_module_value(i, True, number))
 
             row = QHBoxLayout()
-            row.setSpacing(10)
-            row.addWidget(spin_cells)
-            row.addWidget(spin_temps)
+            row.setSpacing(14)
+            row.addWidget(field_cells)
+            row.addWidget(field_temps)
             row.addStretch(1)
             label = self._label(f"模组 {index + 1}")
             field = self._row(row)
@@ -540,7 +578,14 @@ class SettingsDialog(QDialog):
         self._notify_vehicle_changed()
 
     def _on_vehicle_picked(self, index: int) -> None:
-        """下拉换了一台车（或换回「（未选择）」）。"""
+        """下拉换了一台车（或换回「（未选择）」）。
+
+        ⚠️ ``index < 0`` = 用户正在框里**改写名字**（可编辑下拉把 currentIndex
+        打成 -1），那不是"换车"，改名交给 editingFinished 处理 —— 这里必须直接
+        返回，否则输到一半就被当成"取消选车"，下拉内容会被清回（未选择）。
+        """
+        if index < 0:
+            return
         name = str(self.cmb_vehicle.itemData(index) or "")
         if name == customization.current_vehicle():
             return
@@ -598,18 +643,28 @@ class SettingsDialog(QDialog):
         self._sync_vehicle_rows()
         self._notify_vehicle_changed()
 
-    def _on_vehicle_renamed(self) -> None:
-        """改名落盘：重名 / 空名一律**拒绝并把输入框回滚**（不留一个假的成功态）。"""
+    def _on_vehicle_rename_typed(self) -> None:
+        """在选车框里改写名字 = 给**当前车辆**改名（用户 2026-10-22 的口径）。
+
+        重名 / 空名一律**拒绝并回滚文本**（不留一个假的成功态）；没有选中车时
+        直接把文本还原成「（未选择）」，不凭空造一台车出来。
+        """
         old = customization.current_vehicle()
+        typed = self.cmb_vehicle.currentText().strip()
         if not old:
+            self._refresh_vehicle_combo()
             return
-        new = self.edit_vehicle_name.text().strip()
-        if new == old:
+        if not typed:
+            self.cmb_vehicle.setEditText(old)
+            self._flash_vehicle_hint("名称不能为空")
             return
-        if not customization.rename_vehicle(old, new):
-            self.edit_vehicle_name.setText(old)
-            self._flash_vehicle_hint("名称已存在" if new else "名称不能为空")
+        if typed == old:
             return
+        if not customization.rename_vehicle(old, typed):
+            self.cmb_vehicle.setEditText(old)
+            self._flash_vehicle_hint("名称已存在")
+            return
+        self._refresh_vehicle_combo()
         self._sync_vehicle_rows()
         self._notify_vehicle_changed()
 
@@ -623,12 +678,14 @@ class SettingsDialog(QDialog):
         return f"新车 {index}"
 
     def _flash_vehicle_hint(self, text: str, ms: int = 2500) -> None:
-        """在「车辆名称」右侧原位显示一句短提示，几秒后自己消失。"""
+        """在选车行右侧原位显示一句短提示，几秒后自己消失（平时不占宽度）。"""
         self.lbl_vehicle_hint.setText(text)
+        self.lbl_vehicle_hint.setVisible(bool(text))
 
         def _clear() -> None:
             try:
                 self.lbl_vehicle_hint.setText("")
+                self.lbl_vehicle_hint.setVisible(False)
             except RuntimeError:          # 面板已析构，别再碰 C++ 对象
                 pass
 

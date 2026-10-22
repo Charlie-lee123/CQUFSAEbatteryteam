@@ -80,8 +80,8 @@ def main() -> int:
         if len(dialog._module_rows) != 3:
             FAILS.append(f"3 模组车应当有 3 行逐模组控件，实际 {len(dialog._module_rows)}")
         xs = {label.text(): x_of(label, dialog) for label, _ in dialog._module_rows}
+        # 2026-10-22 起「车辆名称」并进了选车框（就地改名），这一节只剩两行
         ref = {"车辆": x_of(dialog._vehicle_rows["pick"][0], dialog),
-               "车辆名称": x_of(dialog._vehicle_rows["name"][0], dialog),
                "模组个数": x_of(dialog._vehicle_rows["modules"][0], dialog)}
         print("       标签左缘 x：", ref, xs)
         if len(set(xs.values())) != 1:
