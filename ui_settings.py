@@ -505,7 +505,9 @@ class SettingsDialog(QDialog):
         box.setObjectName("countEdit")
         box.setValidator(QIntValidator(0, 999, box))
         box.setText(str(int(value)))
-        box.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        # 数字**居中**（用户 2026-10-22："数据要居中啊"）：框很窄，右对齐的话
+        # 一位数的"8"会贴在右壁、左边空一大块，看着像没对齐。
+        box.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
         box.setFixedWidth(MODULE_INPUT_W)
         box.setToolTip(tip)
 
