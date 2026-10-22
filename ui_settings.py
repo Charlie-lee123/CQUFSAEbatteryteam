@@ -51,7 +51,7 @@ SPIN_COLUMN_W = 158
 # 两列时最后一行会被滚动区截掉半颗开关，看着像画坏了。
 BUTTON_COLUMNS = 3
 # 「模组 i」里两个"数量"输入框的宽度。**手动输入**（用户 2026-10-22 明确），
-# 所以只要装得下 3 位数 + 内边距；右边紧跟一句"电芯个数 / 温度采集个数"。
+# 所以只要装得下 3 位数 + 内边距；左边写"电芯数量："、右边跟一个"个"。
 MODULE_INPUT_W = 64
 
 
@@ -122,12 +122,12 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setModal(True)
-        # 最小宽度 500 → 524（2026-10-22）：新增的「车辆」一节里最宽的一行是
-        # 「下拉 + 新建 + 删除」，加上「定制功能」那两个最长的标签（每模组电芯数 /
-        # 每模组温度采集数）后，表单最小宽度 470 出头 —— 500 宽时滚动区视口只有
-        # 442，body 被撑到 456 会**横向溢出**（内容右侧被裁、且能偷偷横向滚，实测
-        # 截图上左侧标签被削掉半个字）。不动那两处既有标签，把面板放宽最稳。
-        self.setMinimumWidth(524)
+        # 最小宽度 524 → 580（2026-10-22 第四轮）：数量行改成「电芯数量：〔N〕个 /
+        # 温度采集数量：〔N〕个」之后，前缀"电芯数量：""温度采集数量："加上后缀"个"
+        # 一行要 370px，body 的 sizeHint 涨到 519。524 的面板视口只有 464 —— 右半截
+        # （温度的输入框 + "个"，以及「删除」按钮）一直被裁在滚动区外面（实测截图可见）。
+        # 580 时视口 520 ≥ 519，整行放得下。
+        self.setMinimumWidth(580)
         self._on_glass = on_glass
         self._on_buttons = on_buttons
         self._on_custom = on_custom
@@ -487,12 +487,16 @@ class SettingsDialog(QDialog):
                 for widget in pair:
                     widget.setVisible(legacy_on)
 
-    def _make_count_field(self, value: int, unit: str, tip: str, on_apply) -> QWidget:
+    def _make_count_field(self, value: int, prefix: str, tip: str, on_apply) -> QWidget:
         """一个"数量"输入框：**手动输入**（文本框 + 整数校验，回车/失焦生效）。
 
         用户 2026-10-22 两轮口径：先要"可以自定义数量"，再说"数量都需要手动输入"
         —— 所以不用下拉预置值、也不用只能按箭头的数字框，就是一个能直接敲的输入框
-        （0~999，非法输入回滚到原值）。框后面跟一句短单位（"电芯个数"…）。
+        （0~999，非法输入自动回滚）。
+
+        用户 2026-10-22 晚再定文案：一行读作「电芯数量：〔可填〕个」——
+        前缀（"电芯数量：" / "温度采集数量："）**在框左边**，量词"个"跟在框后，
+        数字就是框里那个自定义值（不再把数量塞进短单位文字里）。
         """
         box = QLineEdit()
         box.setValidator(QIntValidator(0, 999, box))
@@ -500,10 +504,21 @@ class SettingsDialog(QDialog):
         box.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         box.setFixedWidth(MODULE_INPUT_W)
         box.setToolTip(tip)
-        unit_label = QLabel(unit)
-        unit_label.setFont(ui_font(10.5))
-        unit_label.setObjectName("groupCaption")
-        unit_label.setMinimumWidth(1)
+
+        def caption(text: str) -> QLabel:
+            lab = QLabel(text)
+            lab.setFont(ui_font(10.5))
+            lab.setObjectName("groupCaption")
+            # ⛔ 最小宽度必须钉住**文字宽度**：字段区不够宽时 QLayout 会从
+            # min=1 的标签开始压，实测"个"被压到 2px（等于没画）、"："被挤没。
+            # 钉住之后压不下去，行会反过来要求面板加宽（见 _build_vehicle_section
+            # 里的面板最小宽），文字才完整。
+            lab.setMinimumWidth(
+                lab.fontMetrics().horizontalAdvance(text) + 2)
+            return lab
+
+        prefix_label = caption(prefix)
+        suffix_label = caption("个")
 
         # 回滚目标跟着"最近一次成功值"走：改了 24→30 之后又敲了非法内容，
         # 应当退回 30，而不是退回建行时的 24（否则用户会以为自己的修改丢了）。
@@ -528,26 +543,27 @@ class SettingsDialog(QDialog):
         lay = QHBoxLayout(holder)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
+        lay.addWidget(prefix_label)
         lay.addWidget(box)
-        lay.addWidget(unit_label)
+        lay.addWidget(suffix_label)
         lay.addStretch(1)
         return holder
 
     def _rebuild_module_rows(self, cells: list[int], temps: list[int]) -> None:
-        """重建「模组 1..N」逐行控件（每行：电芯个数 + 温度采集个数，都手动输入）。"""
+        """重建「模组 1..N」逐行控件（每行：电芯数量：N 个 + 温度采集数量：N 个）。"""
         while self._module_rows:
             self._module_rows.pop()
             # 先 pop 再按"剩下的行数"算最后一行的行号：删一行后后面的行号整体上移
             self.form.removeRow(self._module_row_base + len(self._module_rows))
         for index in range(min(len(cells), len(temps))):
             field_cells = self._make_count_field(
-                int(cells[index]), "电芯个数",
-                f"第 {index + 1} 个模组的电芯数 → 电压段这一排放几个点"
+                int(cells[index]), "电芯数量：",
+                f"第 {index + 1} 个模组的电芯数量 → 电压段这一排放几个点"
                 "（0 = 这排不排）；直接输入数字，回车或点别处生效",
                 lambda number, i=index: self._on_module_value(i, False, number))
             field_temps = self._make_count_field(
-                int(temps[index]), "温度采集个数",
-                f"第 {index + 1} 个模组的温度采集数 → 温度段这一排放几个点"
+                int(temps[index]), "温度采集数量：",
+                f"第 {index + 1} 个模组的温度采集数量 → 温度段这一排放几个点"
                 "（0 = 这排不排）；直接输入数字，回车或点别处生效",
                 lambda number, i=index: self._on_module_value(i, True, number))
 
