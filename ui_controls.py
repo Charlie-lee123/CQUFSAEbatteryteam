@@ -1313,46 +1313,38 @@ class ChevronSpinBox(QSpinBox):
         """
         event.ignore()
 
-    # 兜底用的字号线性近似（实测墨迹拿不到时才走，见 _place_edit）。
-    # 基准/增益是逐像素标定出来的，不是拍的（9pt 为 0 点、11.5pt ≈ +2px）。
-    VERT_PIVOT_PT = 9.0
-    VERT_GAIN = 0.8
-
-    def _text_top_compensation(self) -> int:
-        """行内编辑框往下推多少（**兜底**；正常路径是实测墨迹，见 _place_edit）。
-
-        只在编辑框抓不到渲染（无文字 / 聚焦 / 全选）时用作近似：字号越大，
-        行盒下方多出来的空白越多，按字号线性补一半。9pt ≈ 0、11.5pt ≈ +2。
-        """
-        pt = self.font().pointSizeF()
-        return max(0, int(round((pt - self.VERT_PIVOT_PT) * self.VERT_GAIN)))
-
     def _place_edit(self) -> None:
         """把行内编辑框摆到让**文字墨迹**在控件里竖直居中的位置。
 
-        主路径按实测墨迹（_edit_ink_offset）：把墨迹中心对准控件中心，
-        上下留白就相等 —— 不推算行盒、不猜字体回退，改了字号/字体也自动对。
-        实测不可用时退回"朴素居中 + 字号线性近似"。
+        ⛔ 这里**不用 grab 量墨迹**（早先的实现是抓图找墨迹中心）。抓图在真实
+        运行路径里会失准：设置面板是"位图放大 → 换真面板"上屏的，控件在某些
+        时刻 grab 到的不是最终状态，实测打包版里数字仍偏低 7px（用户两次反馈
+        "距离上下边框不一样"）。现在改成**纯字体度量**，不依赖任何截图：
 
-        resize / 编辑框移动时由事件过滤器自动调用；测试与探针也可以主动调一次，
-        保证量到的是**按当前逻辑算出来的**位置（位置只在 Move/Resize 时更新 ——
-        不主动推一下的话，改了逻辑也不会生效，反向验证就永远绿）。
+        - ``tightBoundingRect(text)`` 给出墨迹相对**基线**的上下界；
+        - 行盒里基线在 ``ascent`` 处，于是墨迹中心在行盒里的偏移是
+          ``ascent + (top+bottom)/2``；
+        - 要墨迹中心对齐控件中心，行盒顶就该在 ``h/2 - 该偏移``；
+        - 编辑框把行盒竖直居中，所以编辑框 y = 行盒顶 - (edit_h - line_h)/2。
 
-        ⚠️ 必须防重入：量墨迹要 grab()，而 grab() 会激活内部布局把编辑框挪一下，
-        那一挪又触发本函数（实测递归到 RecursionError）。守卫拦住嵌套调用。
+        改了字号/字体也自动对（全部从当前 fontMetrics 算）。
         """
         if self._edit is None or self._placing_edit \
                 or self.height() <= 0 or self._edit.height() <= 0:
             return
         self._placing_edit = True
         try:
-            offset = _edit_ink_offset(self._edit)
-            if offset is None:
-                want_y = ((self.height() - self._edit.height()) // 2
-                          + self._text_top_compensation())
+            fm = self._edit.fontMetrics()
+            text = self._edit.text()
+            tight = fm.tightBoundingRect(text) if text else None
+            if tight is not None and tight.height() > 0:
+                ink_center = fm.ascent() + (tight.top() + tight.bottom() + 1) / 2.0
+                line_h = fm.height()
+                want_y = round(self.height() / 2.0 - ink_center
+                               - (self._edit.height() - line_h) / 2.0)
             else:
-                want_y = round(self.height() / 2.0 - offset)
-                want_y = max(0, min(self.height() - self._edit.height(), want_y))
+                want_y = (self.height() - self._edit.height()) // 2
+            want_y = max(0, min(self.height() - self._edit.height(), want_y))
             if self._edit.y() != want_y:
                 self._edit.move(self._edit.x(), want_y)
         finally:
@@ -1362,6 +1354,19 @@ class ChevronSpinBox(QSpinBox):
         # 宿主先 resize，编辑框的坐标才是最终值 —— 这里再摆一次（缓存后很便宜）
         super().resizeEvent(event)
         self._place_edit()
+
+    def showEvent(self, event) -> None:
+        """显示后再补几拍纠正。
+
+        ⛔ 只在构造 / resize 时摆一次不够：真实路径里（设置面板是"位图放大 →
+        换真面板"上屏的）控件显示之后样式还会再摆一次编辑框，实测首帧 y=7、
+        正确值 6，打包版里偏差能到 5px 以上（用户两次反馈"距离上下边框不一样"）。
+        这里按 0/80/260/520ms 各纠正一次；位置收敛后都是空操作，开销可忽略。
+        """
+        super().showEvent(event)
+        self._place_edit()
+        for delay in (0, 80, 260, 520):
+            QTimer.singleShot(delay, self._place_edit)
 
     def eventFilter(self, obj, event) -> bool:
         if obj is self._edit and event.type() in (QEvent.Type.Move,

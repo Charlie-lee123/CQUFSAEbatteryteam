@@ -122,12 +122,11 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setModal(True)
-        # 最小宽度 524 → 580（2026-10-22 第四轮）：数量行改成「电芯数量：〔N〕个 /
-        # 温度采集数量：〔N〕个」之后，前缀"电芯数量：""温度采集数量："加上后缀"个"
-        # 一行要 370px，body 的 sizeHint 涨到 519。524 的面板视口只有 464 —— 右半截
-        # （温度的输入框 + "个"，以及「删除」按钮）一直被裁在滚动区外面（实测截图可见）。
-        # 580 时视口 520 ≥ 519，整行放得下。
-        self.setMinimumWidth(580)
+        # 最小宽度 580 → 540（2026-10-22 第五轮）：删掉数量框后面的量词"个"之后，
+        # 逐模组那一行窄了 32px，滚动区正文的 sizeHint 从 519 降到 475。
+        # 540 时视口 480 ≥ 475，整行仍放得下且不留大片空白。
+        # （历史：500 → 524 → 580 都是被"右侧内容被视口裁掉"逼上去的，别随手调小。）
+        self.setMinimumWidth(540)
         self._on_glass = on_glass
         self._on_buttons = on_buttons
         self._on_custom = on_custom
@@ -494,9 +493,9 @@ class SettingsDialog(QDialog):
         —— 所以不用下拉预置值、也不用只能按箭头的数字框，就是一个能直接敲的输入框
         （0~999，非法输入自动回滚）。
 
-        用户 2026-10-22 晚再定文案：一行读作「电芯数量：〔可填〕个」——
-        前缀（"电芯数量：" / "温度采集数量："）**在框左边**，量词"个"跟在框后，
-        数字就是框里那个自定义值（不再把数量塞进短单位文字里）。
+        用户 2026-10-22 晚定文案：一行读作「电芯数量：〔可填〕」——
+        前缀（"电芯数量：" / "温度采集数量："）**在框左边**，数字就是框里那个
+        自定义值。后来又说"全是个太难看了"，把框后面的量词"个"**删掉**了。
         """
         box = QLineEdit()
         # 挂 objectName 走 ui_theme 里的 QSS（QLineEdit#countEdit）：和下拉框/
@@ -524,7 +523,6 @@ class SettingsDialog(QDialog):
             return lab
 
         prefix_label = caption(prefix)
-        suffix_label = caption("个")
 
         # 回滚目标跟着"最近一次成功值"走：改了 24→30 之后又敲了非法内容，
         # 应当退回 30，而不是退回建行时的 24（否则用户会以为自己的修改丢了）。
@@ -551,7 +549,6 @@ class SettingsDialog(QDialog):
         lay.setSpacing(6)
         lay.addWidget(prefix_label)
         lay.addWidget(box)
-        lay.addWidget(suffix_label)
         lay.addStretch(1)
         return holder
 

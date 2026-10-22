@@ -15,10 +15,15 @@ os.chdir(ROOT)
 from PySide6.QtWidgets import QApplication, QLabel, QWidget  # noqa: E402
 
 import ui_settings  # noqa: E402
+import ui_theme  # noqa: E402
 
 OUT = os.path.join(ROOT, "_check", "count_labels.png")
 
 app = QApplication(sys.argv)
+# 主程序是 Fusion + 全站 QSS（main.py 里 app.setStyle("Fusion")）—— 探针要跟着，
+# 否则截出来的面板跟产品长得不一样。
+app.setStyle("Fusion")
+ui_theme.apply_scheme("dark")
 dialog = ui_settings.SettingsDialog("dark", 55)
 
 # 五个模组：25/24/25/24/25 电芯、8/5/6/5/8 温度（模拟用户截图里的那种配置）
@@ -40,7 +45,8 @@ for label, field in dialog._module_rows:
                 texts.append(item.text())
         if texts:
             print(f"  {label.text()}: {texts}")
-            if texts != ["电芯数量：", "个"] and texts != ["温度采集数量：", "个"]:
+            # 只有前缀（量词"个"已按用户要求删掉）
+            if texts not in (["电芯数量："], ["温度采集数量："]):
                 bad += 1
 print("文案不符的 holder 数:", bad)
 
