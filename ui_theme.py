@@ -348,6 +348,7 @@ GLYPH_CHEVRON_DOWN = GLYPH_COLLAPSE
 GLYPH_CHEVRON_UP = GLYPH_EXPAND_CHEVRON
 GLYPH_SEARCH = "\uE721"           # 放大镜
 GLYPH_CLOSE = "\uE711"            # 关闭（叉）
+GLYPH_ADD = "\uE710"              # 加号（新增）
 GLYPH_PAUSE = "\uE769"            # 暂停（两竖）
 GLYPH_PLAY = "\uE768"             # 播放（三角）
 GLYPH_COPY = "\uE8C8"             # 复制（两张纸）

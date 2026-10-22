@@ -830,6 +830,7 @@ class MainWindow(QMainWindow):
 
         self.brand_header = BrandHeader("串口调试助手")
         inner.addWidget(self.brand_header)
+        self._refresh_vehicle_badge()
 
         # 主体：左侧收发区 + 右侧串口配置栏（配置固定宽度，收发区吃掉剩余空间）
         body = QHBoxLayout()
@@ -3729,6 +3730,24 @@ class MainWindow(QMainWindow):
             self._vehicle_relayout_timer = timer
         timer.start(max(0, int(delay_ms)))
 
+    def _refresh_vehicle_badge(self) -> None:
+        """把当前赛季 + 车号画到页头「串口调试助手」下面（用户 2026-10-22 要求）。
+
+        没选车时副标题是空串（页头只显示产品名）。这里只读 customization，
+        改设置时由 ``_preview_custom`` 的 "vehicle" 分支顺带刷新。
+        """
+        season, number = customization.split_vehicle(
+            customization.current_vehicle())
+        if not number:
+            text = ""
+        elif season:
+            text = f"{season} 赛季 · {number}"
+        else:
+            text = number
+        header = getattr(self, "brand_header", None)
+        if header is not None:
+            header.set_vehicle(text)
+
     def _relayout_vehicle_grid(self) -> None:
         """计时器到点：按**当前**车辆结构重排已显示的接收文本（幂等，没变就不动）。"""
         if self._relayout_rx_document():
@@ -5310,6 +5329,7 @@ class MainWindow(QMainWindow):
             # 换材质**当场**生效（用户点名"实时生效、不用重启"）
             self._apply_material(str(value))
         elif key == "vehicle":
+            self._refresh_vehicle_badge()
             self._schedule_vehicle_relayout()
 
     def _preview_buttons(self, hidden: list[str]) -> None:

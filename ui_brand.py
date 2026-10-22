@@ -256,6 +256,10 @@ class BrandHeader(QWidget):
         super().__init__(parent)
         self._product = product
         self._product_face = ui_font(13.5)
+        # 当前赛季 + 车号（用户 2026-10-22：显示在「串口调试助手」下面）。
+        # 空串 = 没选车，不画第二行。
+        self._vehicle_text = ""
+        self._vehicle_face = ui_font(10.5)
         self._lockup: QPixmap | None = None
         self._dpr = 1.0
         self._load()
@@ -299,6 +303,18 @@ class BrandHeader(QWidget):
         self._load()
         self.update()
 
+    def set_vehicle(self, text: str) -> None:
+        """页头副标题：当前赛季 + 车号（空串 = 不显示）。
+
+        只 update() 不 updateGeometry()：标题块在页头里是**右对齐居中**的，
+        文字长短不改变页头高度，重绘一下就够。
+        """
+        value = str(text or "").strip()
+        if value == self._vehicle_text:
+            return
+        self._vehicle_text = value
+        self.update()
+
     def paintEvent(self, event) -> None:
         # 换显示器会换 DPI，这里顺手校一次；就是一次浮点比较，可以每帧做
         if self._screen_ratio() != self._dpr:
@@ -325,14 +341,32 @@ class BrandHeader(QWidget):
 
         # 产品名右对齐到最右端。窗口太窄时宁可不画，也不让它压到队标上 ——
         # 队标是品牌资产，任何情况下不能被盖住。
+        # 有当前车号时画成**两行**（产品名 + 赛季/车号），整体在页头里竖直居中。
         metrics = QFontMetricsF(self._product_face)
+        sub_metrics = QFontMetricsF(self._vehicle_face)
         text_w = metrics.horizontalAdvance(self._product)
+        if self._vehicle_text:
+            text_w = max(text_w, sub_metrics.horizontalAdvance(self._vehicle_text))
         if right - text_w > lockup_right + 24.0:
+            show_sub = bool(self._vehicle_text)
+            prod_h = metrics.height()
+            sub_h = sub_metrics.height()
+            gap = 2.0
+            block_h = prod_h + (sub_h + gap if show_sub else 0.0)
+            top = max(0.0, (height - block_h) / 2.0)
             painter.setFont(self._product_face)
             painter.setPen(qcolor("ink"))
-            painter.drawText(QRectF(right - text_w, 0.0, text_w, height),
+            painter.drawText(QRectF(right - text_w, top, text_w, prod_h),
                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                              self._product)
+            if show_sub:
+                painter.setFont(self._vehicle_face)
+                painter.setPen(qcolor("ink_3"))
+                painter.drawText(QRectF(right - text_w, top + prod_h + gap,
+                                        text_w, sub_h),
+                                 Qt.AlignmentFlag.AlignRight
+                                 | Qt.AlignmentFlag.AlignVCenter,
+                                 self._vehicle_text)
 
         # 页脚一条细线，把页头和内容分开 —— 不加框，只留线
         painter.setPen(QPen(qcolor("line"), 1.0))

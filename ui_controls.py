@@ -1394,6 +1394,19 @@ class ChevronSpinBox(QSpinBox):
         """
         event.ignore()
 
+    def minimumSizeHint(self) -> QSize:              # noqa: N802 (Qt 命名)
+        """显式设过最小宽度时，**以它为准**。
+
+        ⛔ 不覆写这条，布局不会理 ``setFixedWidth``：QAbstractSpinBox 的
+        minimumSizeHint 是按"最长数值 + 左右 padding + 箭头"算的（实测 78 宽的
+        赛季框报 111），于是同一排里的控件集体外溢 —— 2026-10-22 把
+        「赛季 / 车号 / 模组个数」并到一排时，加号直接被裁掉。
+        """
+        hint = super().minimumSizeHint()
+        if self.minimumWidth() > 0:
+            hint.setWidth(min(self.minimumWidth(), hint.width()))
+        return hint
+
     def _place_edit(self) -> None:
         """把行内编辑框摆到让**文字墨迹**在控件里竖直居中的位置。
 
