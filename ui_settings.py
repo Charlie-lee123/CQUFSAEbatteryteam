@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 import app_log
 import customization
 from ui_theme import apply_titlebar_theme
-from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication
+from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication, QIntValidator
 from PySide6.QtCore import QUrl
 from ui_controls import (
     ChevronComboBox, ChevronSpinBox, GlassSlider, IconButton, InkButton, Switch,
@@ -50,13 +50,9 @@ SPIN_COLUMN_W = 158
 # 按钮开关排几列。三列是为了"一屏放完"：
 # 两列时最后一行会被滚动区截掉半颗开关，看着像画坏了。
 BUTTON_COLUMNS = 3
-# 「模组 i」一行里那两个数字框的宽度。**比 SPIN_COLUMN_W 窄**：一行要塞两个
-# （电芯 + 温度），按 158 摆两个会把整行顶出面板、右边的框被裁掉；"25 电芯"
-# 这种内容配 104 刚好（后缀 3 个汉字 + 两位数字 + chevron）。
-MODULE_SPIN_W = 104
-# 「模组 i」里两个数量框的预置值：常用配置一点即用，想填别的直接输入（0~999）。
-MODULE_CELL_PRESETS = (0, 8, 10, 12, 16, 20, 24, 25, 32)
-MODULE_TEMP_PRESETS = (0, 2, 4, 6, 8, 10, 12, 16)
+# 「模组 i」里两个"数量"输入框的宽度。**手动输入**（用户 2026-10-22 明确），
+# 所以只要装得下 3 位数 + 内边距；右边紧跟一句"电芯个数 / 温度采集个数"。
+MODULE_INPUT_W = 64
 
 
 class _NameDialog(QDialog):
@@ -181,6 +177,12 @@ class SettingsDialog(QDialog):
         self.cmb_theme.setCurrentIndex(index if index >= 0 else 0)
         form.addRow(self._label("主题"), self.cmb_theme)
 
+        # 定制项的控件登记表要在**这一节之前**建好：「界面材质」虽然是
+        # customization 注册表里的枚举项，但它的行跟着「材质强度」一起摆在上面
+        # （见文件头说明），会先于 _build_custom_section 登记进这两张表。
+        self._custom_widgets: dict[str, QWidget] = {}
+        self._custom_rows: dict[str, tuple[QLabel, QWidget]] = {}
+
         # 材质强度：0~100 无级，**两种材质共用**这一根滑杆。
         # 0 = 清玻璃（几乎只剩一层很淡的底色），100 = 材质拉满（各自特征最明确）。
         # 毛玻璃动的是颗粒与透明度，液态玻璃动的是镜面高光 / 内发光 / 中心提亮。
@@ -202,6 +204,30 @@ class SettingsDialog(QDialog):
         glass_row.addWidget(self.slider_glass, 1)
         glass_row.addWidget(self.lbl_glass)
         form.addRow(self._label("材质强度"), self._row(glass_row))
+
+        # 「界面材质」：从「定制功能」里提到这里，紧跟在「材质强度」**下面**
+        # （用户 2026-10-22："把材质强度放到界面材质的上面"）。这两个是一对 ——
+        # 一个选材质、一个调它的强度，中间隔着一整节车辆档案就说不通了。
+        # 存储/默认值仍在 customization 的 register_choice("material")，
+        # 这里只是把它的那一行提前生成（_build_custom_section 会跳过它）。
+        material_spec = next((spec for spec in customization.specs()
+                              if spec["key"] == "material"), None)
+        if material_spec is not None:
+            self.cmb_material = ChevronComboBox()
+            for option_label, stored in material_spec["options"]:
+                self.cmb_material.addItem(option_label, stored)
+            material_index = self.cmb_material.findData(customization.get("material"))
+            self.cmb_material.setCurrentIndex(material_index if material_index >= 0 else 0)
+            if material_spec.get("tip"):
+                self.cmb_material.setToolTip(material_spec["tip"])
+            self.cmb_material.setMinimumWidth(190)
+            self.cmb_material.currentIndexChanged.connect(
+                lambda _idx, s=material_spec, c=self.cmb_material:
+                self._on_choice_changed(s, c))
+            material_label = self._label(material_spec["label"])
+            form.addRow(material_label, self.cmb_material)
+            self._custom_widgets["material"] = self.cmb_material
+            self._custom_rows["material"] = (material_label, self.cmb_material)
 
         # 「车辆」：一套电池箱结构 = 一台车（模组个数 + 每个模组的电芯/温度采集数）。
         # 放在「定制功能」**之前**：选车是"我用的是哪台电池箱"这个前提，下面那些
@@ -461,66 +487,68 @@ class SettingsDialog(QDialog):
                 for widget in pair:
                     widget.setVisible(legacy_on)
 
-    def _make_count_field(self, value: int, presets: tuple[int, ...], unit: str,
-                          tip: str, on_apply) -> QWidget:
-        """一个"数量"输入：**可编辑下拉**（点预置值 + 直接输入任意数量）。
+    def _make_count_field(self, value: int, unit: str, tip: str, on_apply) -> QWidget:
+        """一个"数量"输入框：**手动输入**（文本框 + 整数校验，回车/失焦生效）。
 
-        用户 2026-10-22："改成电芯个数后面可以自定义数量，还有温度采集数量也同理"
-        —— 原来的 QSpinBox 只能按箭头步进，还被卡在 0~32 的上限里。这里换成和
-        「保留行数」同一套可编辑下拉：常用值一点即用，想填多少直接敲（0~999），
-        非法输入回滚到原值。
+        用户 2026-10-22 两轮口径：先要"可以自定义数量"，再说"数量都需要手动输入"
+        —— 所以不用下拉预置值、也不用只能按箭头的数字框，就是一个能直接敲的输入框
+        （0~999，非法输入回滚到原值）。框后面跟一句短单位（"电芯个数"…）。
         """
-        combo = ChevronComboBox()
-        combo.setEditable(True)
-        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        combo.addItems([str(int(preset)) for preset in presets])
-        combo.setCurrentText(str(int(value)))
-        combo.setFixedWidth(MODULE_SPIN_W)
-        combo.setToolTip(tip)
+        box = QLineEdit()
+        box.setValidator(QIntValidator(0, 999, box))
+        box.setText(str(int(value)))
+        box.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        box.setFixedWidth(MODULE_INPUT_W)
+        box.setToolTip(tip)
         unit_label = QLabel(unit)
         unit_label.setFont(ui_font(10.5))
         unit_label.setObjectName("groupCaption")
         unit_label.setMinimumWidth(1)
 
-        def apply(text: str, box: ChevronComboBox = combo) -> None:
-            raw = str(text).strip()
+        # 回滚目标跟着"最近一次成功值"走：改了 24→30 之后又敲了非法内容，
+        # 应当退回 30，而不是退回建行时的 24（否则用户会以为自己的修改丢了）。
+        last_ok = [int(value)]
+
+        def apply(box_widget: QLineEdit = box) -> None:
+            raw = box_widget.text().strip()
             try:
                 number = int(raw)
             except ValueError:
-                box.setCurrentText(str(int(value)))      # 非法输入回滚
+                box_widget.setText(str(last_ok[0]))      # 空/非法 → 回滚
                 return
-            on_apply(max(0, min(999, number)))
+            number = max(0, min(999, number))
+            if raw != str(number):
+                box_widget.setText(str(number))          # "007" → "7"
+            last_ok[0] = number
+            on_apply(number)
 
-        combo.activated.connect(lambda _i, box=combo: apply(box.currentText()))
-        line = combo.lineEdit()
-        if line is not None:
-            line.editingFinished.connect(lambda box=combo: apply(box.currentText()))
+        box.editingFinished.connect(apply)
 
         holder = QWidget()
         lay = QHBoxLayout(holder)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
-        lay.addWidget(combo)
+        lay.addWidget(box)
         lay.addWidget(unit_label)
         lay.addStretch(1)
         return holder
 
     def _rebuild_module_rows(self, cells: list[int], temps: list[int]) -> None:
-        """重建「模组 1..N」逐行控件（每行：电芯数 + 温度采集数，都可自定义）。"""
+        """重建「模组 1..N」逐行控件（每行：电芯个数 + 温度采集个数，都手动输入）。"""
         while self._module_rows:
             self._module_rows.pop()
             # 先 pop 再按"剩下的行数"算最后一行的行号：删一行后后面的行号整体上移
             self.form.removeRow(self._module_row_base + len(self._module_rows))
         for index in range(min(len(cells), len(temps))):
             field_cells = self._make_count_field(
-                int(cells[index]), MODULE_CELL_PRESETS, "电芯",
+                int(cells[index]), "电芯个数",
                 f"第 {index + 1} 个模组的电芯数 → 电压段这一排放几个点"
-                "（0 = 这排不排）；可直接输入任意数量",
+                "（0 = 这排不排）；直接输入数字，回车或点别处生效",
                 lambda number, i=index: self._on_module_value(i, False, number))
             field_temps = self._make_count_field(
-                int(temps[index]), MODULE_TEMP_PRESETS, "温度",
+                int(temps[index]), "温度采集个数",
                 f"第 {index + 1} 个模组的温度采集数 → 温度段这一排放几个点"
-                "（0 = 这排不排）；可直接输入任意数量",
+                "（0 = 这排不排）；直接输入数字，回车或点别处生效",
                 lambda number, i=index: self._on_module_value(i, True, number))
 
             row = QHBoxLayout()
@@ -716,14 +744,17 @@ class SettingsDialog(QDialog):
             return
         form.addRow(self._caption("定制功能"))
 
-        self._custom_widgets: dict[str, QWidget] = {}
+        # ⚠️ 这两张表在「主题」一节之前就建好了（见 _build_theme_section 上方）：
+        #    「界面材质」会先登记进去，这里**不能重新赋值**，否则会被冲掉。
         # 每一行的（左侧行标签, 字段控件）。选车后要整行隐藏旧的三件套网格参数
         # （module_count / cells_per_module / temps_per_module）—— 只藏字段不藏
         # 标签会在表单里留一个孤立文字，看着像坏了。
-        self._custom_rows: dict[str, tuple[QLabel, QWidget]] = {}
         # 滑杆型配置的预览标签（"拖动即时看效果"的那种），key -> QLabel
         self._custom_previews: dict[str, QLabel] = {}
         for spec in specs:
+            if spec["key"] == "material":
+                # 已经在「主题 / 材质强度」那一对里生成（见 _build_theme_section）
+                continue
             preview = None
             if spec["kind"] == "bool":
                 # 开关**自己不带文字**：名字交给左侧的行标签。以前开关带文字、
