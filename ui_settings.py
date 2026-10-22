@@ -126,10 +126,9 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setModal(True)
-        # 最小宽度 540 → 580 → 630（2026-10-22）：车辆那一排现在是
-        # 「赛季 / 车号 / 模组个数 / ＋」四个控件并排，580 视口 522 放不下
-        # （实测正文最少要 567），630 视口 572 刚好，且不至于把面板撑得太宽。
-        self.setMinimumWidth(650)
+        # 最小宽度（2026-10-22）：车辆那一排「赛季 / 车号 / ＋ / 模组数」并排，
+        # 去掉左侧「车辆」行标签之后正文最少要 522，600 视口 542 留 20px 余量。
+        self.setMinimumWidth(600)
         self._on_glass = on_glass
         self._on_buttons = on_buttons
         self._on_custom = on_custom
@@ -418,18 +417,19 @@ class SettingsDialog(QDialog):
         self.lbl_vehicle_hint.setMinimumWidth(1)      # 不能是 0（同日志行，见上）
         self.lbl_vehicle_hint.setVisible(False)
 
-        # 模组个数（用户 2026-10-22 第三轮：赛季 / 车号 / 模组个数**并到一排**）
+        # 模组个数（用户 2026-10-22 第三轮：赛季 / 车号 / 模组个数**并到一排**；
+        # 第四轮：「模组数」移到**框外**当标签，加号紧跟车号）
         self.spin_vehicle_modules = ChevronSpinBox()
         self.spin_vehicle_modules.setRange(0, 64)
-        # ⛔ 不再给它单独一个「模组个数：」标签（那一栏要多 72px，整排就顶出面板）：
-        #    单位写进框里当**前缀**，和赛季/车号两个框并排时宽度才够。
-        self.spin_vehicle_modules.setPrefix("模组数 ")
         self.spin_vehicle_modules.setFixedWidth(MODULE_COUNT_W)
         self.spin_vehicle_modules.setToolTip(
             "模组个数 = 下面「模组 i」的行数；新增的模组沿用最后一个模组的配置，"
             "缩短则从末尾截断")
         self.spin_vehicle_modules.valueChanged.connect(self._on_vehicle_modules_changed)
 
+        # 行内顺序（用户 2026-10-22 第四轮）：赛季：[..]  车号：[..]  ＋  模组数：[..]
+        # 另外**去掉左侧的「车辆」行标签** —— 这一排自己已经说清是什么，多一个
+        # 行标签只会把整排往右推（它还占着表单的标签列宽）。
         pick_row = QHBoxLayout()
         pick_row.setSpacing(8)
         pick_row.addWidget(self._inline_caption("赛季："))
@@ -437,15 +437,15 @@ class SettingsDialog(QDialog):
         pick_row.addSpacing(2)
         pick_row.addWidget(self._inline_caption("车号："))
         pick_row.addWidget(self.cmb_vehicle_number, 1)
-        pick_row.addSpacing(2)
-        pick_row.addWidget(self.spin_vehicle_modules)
         pick_row.addWidget(self.btn_vehicle_new)
+        pick_row.addSpacing(6)
+        pick_row.addWidget(self._inline_caption("模组数："))
+        pick_row.addWidget(self.spin_vehicle_modules)
         pick_row.addWidget(self.lbl_vehicle_hint)
 
-        self._vehicle_rows: dict[str, tuple[QLabel, QWidget]] = {
-            "season": (self._label("车辆"), self._row(pick_row)),
-        }
-        form.addRow(*self._vehicle_rows["season"])
+        # 无行标签：单参 addRow 让它**横跨两列**，左边缘与其它行的标签列对齐
+        self._vehicle_field = self._row(pick_row)
+        form.addRow(self._vehicle_field)
 
         # 逐模组行插在这个位置（= 本节之后、「定制功能」之前）。
         # ⚠️ 用 insertRow/removeRow 按**行号**增删，不用容器套布局：套一层容器的话
@@ -501,9 +501,8 @@ class SettingsDialog(QDialog):
         season_spin.blockSignals(False)
         self._refresh_number_combo()
 
-        # 选车行永远在（赛季 / 车号 / 模组个数在同一排，见构造处的说明）。
-        self._vehicle_rows["season"][0].setVisible(True)
-        self._vehicle_rows["season"][1].setVisible(True)
+        # 这一排没有行标签，永远在；显隐只由 _sync_grid_params_visibility 管
+        self._vehicle_field.setVisible(True)
         self._sync_grid_params_visibility()
 
         spin = self.spin_vehicle_modules

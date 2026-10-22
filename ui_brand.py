@@ -360,11 +360,16 @@ class BrandHeader(QWidget):
                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                              self._product)
             if show_sub:
+                # 副标题**居中在标题的中轴线上**（用户 2026-10-22："中轴线和
+                # 串口调试助手中轴线对齐"）—— 不是各自右对齐：两行长短不同，
+                # 右对齐时副标题看着往右飘。
                 painter.setFont(self._vehicle_face)
                 painter.setPen(qcolor("ink_3"))
-                painter.drawText(QRectF(right - text_w, top + prod_h + gap,
-                                        text_w, sub_h),
-                                 Qt.AlignmentFlag.AlignRight
+                sub_w = sub_metrics.horizontalAdvance(self._vehicle_text)
+                center_x = right - metrics.horizontalAdvance(self._product) / 2.0
+                painter.drawText(QRectF(center_x - sub_w / 2.0,
+                                        top + prod_h + gap, sub_w, sub_h),
+                                 Qt.AlignmentFlag.AlignHCenter
                                  | Qt.AlignmentFlag.AlignVCenter,
                                  self._vehicle_text)
 
