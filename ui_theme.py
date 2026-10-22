@@ -708,6 +708,16 @@ QComboBox QLineEdit {
     border: none;
 }
 
+/* 数字框的内层编辑框**同样要去掉自带底**：QSpinBox 的 QSS padding 对行内编辑框
+   不生效（见 ChevronSpinBox 的注释），编辑框由样式直接摆 —— 它自带的那层不透明
+   底比 surface_2 深一档、高度又铺不满整框，框底会漏出一条浅带（用户 2026-10-22
+   报的"模组个数的数据距离上下边框距离不一样"，实测就是这条缝在视觉上把框"截短"了）。
+   透明之后外层统一上色，竖直居中仍由 _place_edit 按实测墨迹摆。 */
+QSpinBox QLineEdit {
+    background: transparent;
+    border: none;
+}
+
 QComboBox:focus, QSpinBox:focus {
     border: 1px solid @line_strong@;
 }
