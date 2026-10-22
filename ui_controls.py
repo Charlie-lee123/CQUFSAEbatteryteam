@@ -27,8 +27,8 @@ from PySide6.QtWidgets import (
 from ui_anim import (STANDARD, Tween, in_out_quint, linear, out_cubic, out_expo,
                      out_quint)
 from ui_theme import (
-    CAPTION_BTN_H, CAPTION_BTN_W, GLYPH_COLLAPSE, GLYPH_EXPAND_CHEVRON, SWITCH_KNOB, SWITCH_ON,
-    icon_font, mix, qcolor, switch_off_color, ui_font,
+    CAPTION_BTN_H, CAPTION_BTN_W, GLYPH_CLOSE, GLYPH_COLLAPSE, GLYPH_EXPAND_CHEVRON,
+    SWITCH_KNOB, SWITCH_ON, icon_font, mix, qcolor, switch_off_color, ui_font,
 )
 
 
@@ -875,6 +875,17 @@ class _PopupItemDelegate(QStyledItemDelegate):
     # 行高（逻辑像素）。比原先 QSS 撑出来的 30 略收一点，列表更紧凑。
     ROW_H = 28
 
+    # 条目右侧的删除叉（只在 ``set_item_delete_enabled(True)`` 的下拉上启用，
+    # 例如「车号」：用户 2026-10-22 要"车号展开后车号数字后面一个删除按钮(X)"）。
+    # 宽度要同时用于**绘制**和**命中判定**（见 ChevronComboBox.eventFilter），
+    # 两边必须用同一个常量，否则点得中看不见 / 看得见点不中。
+    DELETE_W = 30
+    DELETE_PX = 12
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.delete_enabled = False
+
     def sizeHint(self, option, index) -> QSize:      # noqa: N802 (Qt 命名)
         height = max(self.ROW_H, option.fontMetrics.height() + 12)
         return QSize(0, height)
@@ -896,7 +907,8 @@ class _PopupItemDelegate(QStyledItemDelegate):
         painter.save()
         painter.setPen(qcolor("ink"))
         painter.setFont(option.font)
-        text_rect = option.rect.adjusted(self.PAD_X, 0, -self.PAD_X, 0)
+        right_pad = self.PAD_X + (self.DELETE_W if self.delete_enabled else 0)
+        text_rect = option.rect.adjusted(self.PAD_X, 0, -right_pad, 0)
         # 超长条目（蓝牙设备那串 "MAC — 名字 — 信号 — 负载"）在屏幕宽度封顶后
         # 必须省略，否则文字会被视口硬裁成半个字。
         text = option.fontMetrics.elidedText(str(index.data() or ""),
@@ -905,6 +917,31 @@ class _PopupItemDelegate(QStyledItemDelegate):
         painter.drawText(text_rect,
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                          text)
+        painter.restore()
+
+        if self.delete_enabled and self._deletable(index):
+            self._paint_delete(painter, option)
+
+    @staticmethod
+    def _deletable(index) -> bool:
+        """这一条能不能删：条目 data 非空才算（「（未选择）」data 是空串）。
+
+        ⛔ 不能"开着 delete 就每条都画 ×"：占位行不是档案，点上去只会得到一个
+        什么都不做的确认框（第一版实测就是这样，看着像坏了）。
+        """
+        return bool(index.data(Qt.ItemDataRole.UserRole))
+
+    def _paint_delete(self, painter: QPainter, option) -> None:
+        """画条目右端的「×」：悬停条目上更亮一档，暗示"这里能点"。"""
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        rect = QRectF(option.rect.right() - self.DELETE_W + 4,
+                      option.rect.top(), self.DELETE_W - 8, option.rect.height())
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        painter.setPen(qcolor("ink_2" if hovered else "ink_3"))
+        painter.setFont(icon_font(self.DELETE_PX))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, GLYPH_CLOSE)
         painter.restore()
 
 
@@ -926,6 +963,8 @@ class ChevronComboBox(QComboBox):
 
     ARROW_W = 24
     GLYPH_PX = 11
+    # 条目右端的「×」被点击：(条目文字)。只在 set_item_delete_enabled(True) 时发。
+    delete_requested = Signal(str)
     # 可编辑时内部那层 QLineEdit 的目标 x。Qt 的 QSS 不支持负 margin，样式表
     # 挪不动它，只能像 ChevronSpinBox 那样在事件过滤器里摆。
     # 目标是让**墨迹左边缘**和不可编辑的下拉框（由 QSS padding-left(12px)+边框
@@ -944,6 +983,7 @@ class ChevronComboBox(QComboBox):
         # 一堆隐藏顶层窗口 —— 实测会改变窗口管理器对主窗口的行为（全屏往返后
         # 位置被夹到 (0,0)），所以第一次弹出时才装。
         self._item_delegate: _PopupItemDelegate | None = None
+        self._item_delete = False
         self._popup_target = None
         self._popup_below = True
         # 非编辑态的文字垂直自适应（见 _fit_text_vertical）：
@@ -1054,6 +1094,22 @@ class ChevronComboBox(QComboBox):
         if obj is self.lineEdit() and self.isEditable() \
                 and event.type() in (QEvent.Type.Move, QEvent.Type.Resize):
             self._place_edit()
+        # 弹层条目的「×」：按下就吞掉这次点击（不改选中、不留弹层），
+        # 交给调用方去弹二次确认。命中区域必须和委托绘制用同一个宽度。
+        if self._item_delete and event.type() == QEvent.Type.MouseButtonPress:
+            view = self.view()
+            if view is not None and obj is view.viewport():
+                pos = event.position().toPoint()
+                index = view.indexAt(pos)
+                if index.isValid() and _PopupItemDelegate._deletable(index):
+                    rect = view.visualRect(index)
+                    if pos.x() >= rect.right() - _PopupItemDelegate.DELETE_W + 1:
+                        # ⛔ 取 UserRole（= 档案名），不是显示文本：
+                        #    车号下拉显示的是"E74"，档案名是"E74-2026"。
+                        text = str(index.data(Qt.ItemDataRole.UserRole) or "")
+                        self.hidePopup()
+                        self.delete_requested.emit(text)
+                        return True
         return super().eventFilter(obj, event)
 
     def showPopup(self) -> None:
@@ -1114,7 +1170,28 @@ class ChevronComboBox(QComboBox):
         if self._item_delegate is None:
             view = self.view()
             self._item_delegate = _PopupItemDelegate(view)
+            self._item_delegate.delete_enabled = self._item_delete
             view.setItemDelegate(self._item_delegate)
+            # 「×」要能点中：弹层条目由委托画，命中判定得自己接鼠标。
+            # 过滤器挂在 viewport 上（条目区域就是它），并且开鼠标跟踪 ——
+            # 否则悬停时条目不会重绘，× 永远是暗的、看不出可点。
+            view.viewport().installEventFilter(self)
+            view.viewport().setMouseTracking(True)
+
+    def set_item_delete_enabled(self, enabled: bool) -> None:
+        """打开"每个条目右端有个 ×，点了删这一条"的模式（「车号」下拉用）。
+
+        用户 2026-10-22：车号展开后，数字后面要一个删除按钮（X），删除要二次确认。
+        二次确认由**调用方**在 ``delete_requested`` 里做（控件只管"点中了哪一条"）。
+        """
+        self._item_delete = bool(enabled)
+        if self._item_delegate is not None:
+            self._item_delegate.delete_enabled = bool(enabled)
+        if enabled:
+            view = self.view()
+            if view is not None:
+                view.viewport().installEventFilter(self)
+                view.viewport().setMouseTracking(True)
 
     def _fit_popup_width(self) -> None:
         """弹层宽度按**最宽的选项**自适应（下限是控件自身宽度）。
@@ -1133,6 +1210,10 @@ class ChevronComboBox(QComboBox):
         # —— 编码框只有 92 宽，弹层却撑到 121（用户点名"这里宽了"）。
         # 视口两侧内缩 + 竖直滚动条 + 边框的余量按 28 给，实测够用。
         need = widest + _PopupItemDelegate.PAD_X * 2 + 28
+        # 条目右端带 × 的下拉（车号）要多留一格，否则占位/短条目被 × 挤成省略号。
+        # ⚠️ 必须和委托绘制、命中判定用同一个常量，三处一起改。
+        if self._item_delete:
+            need += _PopupItemDelegate.DELETE_W
         # ⛔ 还要受**屏幕宽度**约束：蓝牙设备条目是"MАC — 名字 — 信号 — 负载"
         #    一长串，按最宽项算出来能到 570px，控件又贴在窗口右侧 —— 弹层右半边
         #    直接跑到屏幕外（用户点名"部分显示到屏幕外"）。这里先按屏幕封顶，

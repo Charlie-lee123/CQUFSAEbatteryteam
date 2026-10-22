@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from PySide6.QtCore import QSettings
 
@@ -453,6 +454,53 @@ def vehicles() -> list[dict]:
 def vehicle_names() -> list[str]:
     """车辆名列表（下拉框按它生成，顺序 = 档案顺序 = 创建顺序）。"""
     return [item["name"] for item in _load_store()["items"]]
+
+
+# ---- 赛季 / 车号：**不改数据格式**，从老名字里拆 -------------------------
+# 车名一直是「车号-赛季」（"E74-2026"），所以「联赛季 + 车号」只需要拆字符串，
+# 老档案（含用户手改过的）原样可用，不需要迁移、也不动磁盘上的键。
+
+_SEASON_RE = re.compile(r"^(?P<number>.+)-(?P<season>\d{4})$")
+
+
+def split_vehicle(name: str) -> tuple[str, str]:
+    """车名 → ``(赛季, 车号)``。
+
+    拆不出来（用户手改成了别的名字，如 "主包"）→ ``("", 原名)``：赛季留空、
+    车号显示原名，面板照样能改；用户一旦改了赛季/车号才按新格式落盘。
+    """
+    text = str(name or "").strip()
+    match = _SEASON_RE.match(text)
+    if match:
+        return match.group("season"), match.group("number").strip()
+    return "", text
+
+
+def vehicle_key(number: str, season: str) -> str:
+    """``(车号, 赛季)`` → 车名。赛季为空就只用车号（老档案的兼容形状）。"""
+    number = str(number or "").strip()
+    season = str(season or "").strip()
+    return f"{number}-{season}" if (number and season) else number
+
+
+def season_list() -> list[str]:
+    """档案里出现过的赛季（升序；没赛季的档案不计入）。"""
+    seasons = {split_vehicle(name)[0] for name in vehicle_names()}
+    seasons.discard("")
+    return sorted(seasons)
+
+
+def vehicle_names_in_season(season: str) -> list[str]:
+    """某个赛季下的车名（保持创建顺序，下拉框按它排）。
+
+    **没有赛季的老档案（名字里没有 ``-年份``）出现在每一份列表里**：它们本来
+    就不属于任何赛季，若只按赛季过滤就会"选不到"——那台车的结构还在磁盘上，
+    却在界面上消失了（设置面板里试过，等于静默丢数据）。用户改一次赛季/车号，
+    名字就会补成「车号-赛季」。
+    """
+    target = str(season or "").strip()
+    return [name for name in vehicle_names()
+            if split_vehicle(name)[0] in (target, "")]
 
 
 def current_vehicle() -> str:

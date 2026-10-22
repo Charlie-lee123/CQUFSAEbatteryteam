@@ -4770,6 +4770,7 @@ def check_vehicle_profiles(app: QApplication) -> None:
     用户真实的车辆档案（可能有）在这条跑完后原样还在。
     """
     import customization
+    import ui_settings
     from ui_highlight import (
         SAMPLE_RE, _cap_rows, align_indexes, grid_row_sizes,
     )
@@ -4791,6 +4792,14 @@ def check_vehicle_profiles(app: QApplication) -> None:
         assert customization.current_vehicle() == ""
         assert customization.active_profile() is None, \
             "没选车时 active_profile 必须是 None（否则旧三件套被顶掉）"
+
+        # ---- 0) 赛季 / 车号：从老名字里拆，**不改数据格式** ----
+        assert customization.split_vehicle("E74-2026") == ("2026", "E74"), \
+            f"拆车名不对：{customization.split_vehicle('E74-2026')}"
+        assert customization.vehicle_key("E74", "2026") == "E74-2026"
+        assert customization.split_vehicle("主包") == ("", "主包"), \
+            "没有赛季的老名字必须原样保留（不许被改写成带年份的）"
+        assert customization.vehicle_key("主包", "") == "主包"
 
         # ---- 1) 新建两台车 → 列表 / 当前选择 / 结构 ----
         customization.save_vehicle("测试车A", [25, 24, 25], [8, 8, 6])
@@ -4895,11 +4904,15 @@ def check_vehicle_profiles(app: QApplication) -> None:
             assert all(_dlg._custom_rows[key][0].isVisibleTo(_dlg)
                        for key in _dlg._LEGACY_GRID_KEYS), \
                 "没选车时旧的三个全局参数必须可见"
-            # 新建：默认名「新车 1」+ 预填 3 模组 × 25 电芯 × 8 温度
+            # 新建：默认车号「新车 1」+ 预填 3 模组 × 25 电芯 × 8 温度
             # （module_count 已被钉成 0，所以走默认档）
-            assert _dlg._next_new_vehicle_name(customization.vehicle_names()) == "新车 1"
-            _dlg._create_vehicle("面板车")
-            assert customization.current_vehicle() == "面板车", "新建后应当自动选中"
+            assert _dlg._next_new_number_name("2026") == "新车 1"
+            _dlg._create_vehicle(customization.vehicle_key("面板车", "2026"))
+            assert customization.current_vehicle() == "面板车-2026", \
+                f"新建后应当自动选中「车号-赛季」：{customization.current_vehicle()}"
+            assert _dlg.spin_vehicle_season.value() == 2026, "赛季框没有跟上当前车"
+            assert _dlg.cmb_vehicle_number.currentText() == "面板车", \
+                f"车号框没跟上当前车：{_dlg.cmb_vehicle_number.currentText()!r}"
             assert customization.active_profile() == ([25, 25, 25], [8, 8, 8]), \
                 f"新车的预填结构不对：{customization.active_profile()}"
             assert len(_dlg._module_rows) == 3, "逐模组行数没有跟随模组个数"
@@ -4925,6 +4938,39 @@ def check_vehicle_profiles(app: QApplication) -> None:
             assert all(_dlg._custom_rows[key][1].isVisibleTo(_dlg)
                        for key in _dlg._LEGACY_GRID_KEYS), \
                 "选了车但模组个数为 0 时，旧的三个全局参数必须重新露面"
+
+            # ---- 7) 车号右端的 × ：必须二次确认，确认后才删、并清空当前选择 ----
+            _dlg.spin_vehicle_season.setValue(2026)
+            _dlg.cmb_vehicle_number.setCurrentIndex(
+                _dlg.cmb_vehicle_number.findData("面板车-2026"))
+            _orig_box = ui_settings.QMessageBox.question
+            asked = []
+
+            def _yes(*_a, **_k):
+                asked.append(True)
+                return ui_settings.QMessageBox.StandardButton.Yes
+
+            ui_settings.QMessageBox.question = staticmethod(_yes)
+            try:
+                _dlg._on_vehicle_delete_requested("面板车-2026")
+            finally:
+                ui_settings.QMessageBox.question = _orig_box
+            assert asked, "点 × 必须走二次确认（不能直接删）"
+            assert "面板车-2026" not in customization.vehicle_names(), \
+                f"确认后没删掉：{customization.vehicle_names()}"
+            assert customization.current_vehicle() == "", \
+                "删掉当前车后选择要清空（不许替用户挑下一台）"
+            # 取消确认时不许动数据：再建一台、确认结果换成 No
+            _dlg._create_vehicle("保留车-2026")
+            _orig_no = ui_settings.QMessageBox.question
+            ui_settings.QMessageBox.question = staticmethod(
+                lambda *_a, **_k: ui_settings.QMessageBox.StandardButton.No)
+            try:
+                _dlg._on_vehicle_delete_requested("保留车-2026")
+            finally:
+                ui_settings.QMessageBox.question = _orig_no
+            assert "保留车-2026" in customization.vehicle_names(), \
+                "点了「取消」却把车删掉了"
         finally:
             _dlg.close()
     finally:

@@ -19,7 +19,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QDate, QTimer, Qt
 from PySide6.QtNetwork import (
     QNetworkAccessManager, QNetworkReply, QNetworkRequest,
 )
@@ -51,8 +51,10 @@ SPIN_COLUMN_W = 158
 # 两列时最后一行会被滚动区截掉半颗开关，看着像画坏了。
 BUTTON_COLUMNS = 3
 # 「模组 i」里两个"数量"输入框的宽度。**手动输入**（用户 2026-10-22 明确），
-# 所以只要装得下 3 位数 + 内边距；左边写"电芯数量："、右边跟一个"个"。
+# 所以只要装得下 3 位数 + 内边距；左边写"电芯数量："、右边再没有量词了。
 MODULE_INPUT_W = 64
+# 「赛季」年份框的宽度：4 位数 + 内边距 + 右侧 chevron
+SEASON_SPIN_W = 78
 
 
 class _NameDialog(QDialog):
@@ -122,11 +124,10 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setModal(True)
-        # 最小宽度 580 → 540（2026-10-22 第五轮）：删掉数量框后面的量词"个"之后，
-        # 逐模组那一行窄了 32px，滚动区正文的 sizeHint 从 519 降到 475。
-        # 540 时视口 480 ≥ 475，整行仍放得下且不留大片空白。
-        # （历史：500 → 524 → 580 都是被"右侧内容被视口裁掉"逼上去的，别随手调小。）
-        self.setMinimumWidth(540)
+        # 最小宽度 540 → 580（2026-10-22 第六轮）：车辆拆成「赛季 + 车号 + ＋」
+        # 之后这一行要 500 出头，540 时视口只有 482 —— 「＋」被裁掉半个
+        # （实测截图可见）。580 视口 522，整行放得下。
+        self.setMinimumWidth(580)
         self._on_glass = on_glass
         self._on_buttons = on_buttons
         self._on_custom = on_custom
@@ -353,36 +354,54 @@ class SettingsDialog(QDialog):
         """
         form.addRow(self._caption("车辆（电池箱）"))
 
-        # ---- 选车行：**可编辑**下拉（就地改名）+ 新建 + 删除 ----
-        self.cmb_vehicle = ChevronComboBox()
-        # 用户 2026-10-22："有了车辆选项就不需要车辆名称了，选择的时候就需要可以
-        # 编辑车辆名称" —— 选车与改名是同一件事的两半，合成一行：直接在框里改写
-        # 就是给当前车辆改名（回车/失焦生效，重名或空名回滚）。
-        self.cmb_vehicle.setEditable(True)
-        self.cmb_vehicle.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        # ⚠️ 最小宽度只给 110：这一行是「下拉 + 新建 + 删除」，下拉按 190 兜底会把
-        #    整行撑到 370，body 就比滚动区视口宽 30 多 px —— 面板右侧被裁掉一条、
-        #    横向还能偷偷滚（实测 body 532 / 视口 498）。下拉本来就有 stretch=1，
-        #    宽度会吃掉整行的剩余空间，兜底给小一点反而不会顶破面板。
-        self.cmb_vehicle.setMinimumWidth(110)
-        self.cmb_vehicle.setToolTip(
-            "一台车 = 一套电池箱结构（模组个数与每个模组的电芯/温度采集数）。\n"
-            "直接改写框里的名字 = 给当前车辆改名（回车或点别处生效）；\n"
-            "选「（未选择）」则退回「定制功能」里的三个全局参数")
-        self.cmb_vehicle.currentIndexChanged.connect(self._on_vehicle_picked)
-        _vehicle_line = self.cmb_vehicle.lineEdit()
-        if _vehicle_line is not None:
-            _vehicle_line.editingFinished.connect(self._on_vehicle_rename_typed)
+        # ---- 赛季 / 车号行（用户 2026-10-22 定案）----
+        # 原来是「车辆 [E74-2026 ▾] [新建] [删除]」。现在拆成
+        #     赛季：[2026]   车号：[E74 ▾]   [＋]
+        # 删除挪进「车号」的弹层：每条右端一个 ×，点了要二次确认（见
+        # ChevronComboBox.delete_requested / _PopupItemDelegate._paint_delete）。
+        # 主行只留"选"和"加"两个正面动作，删除这种破坏性操作不放在手边。
+        #
+        # ⚠️ **数据格式不变**：车名仍是「车号-赛季」（如 E74-2026），老档案原样
+        #    可用；赛季与车号只是从名字里拆出来分别编辑（customization.split_vehicle）。
+        self.spin_vehicle_season = ChevronSpinBox()
+        self.spin_vehicle_season.setRange(2000, 2100)
+        # 默认当年（不是量程下限）：没有赛季的老档案也得显示一个像样的年份，
+        # 否则一开面板就是 2000（看着像坏了）。
+        self.spin_vehicle_season.setValue(QDate.currentDate().year())
+        self.spin_vehicle_season.setFixedWidth(SEASON_SPIN_W)
+        self.spin_vehicle_season.setToolTip(
+            "赛季 = 车名的后半段年份（E74-2026 的 2026）。\n"
+            "改赛季只决定「车号」里列哪些车，不会自动改到别的车。")
+        self.spin_vehicle_season.valueChanged.connect(self._on_season_changed)
 
-        self.btn_vehicle_new = InkButton("新建", variant="ghost")
+        self.cmb_vehicle_number = ChevronComboBox()
+        # 就地改写车号 = 改名（沿用"选车与改名合一"的老口径，回车/失焦生效）
+        self.cmb_vehicle_number.setEditable(True)
+        self.cmb_vehicle_number.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        # ⚠️ 最小宽度给小：这一行有「赛季 + 车号 + ＋」，车号有 stretch=1 会吃掉
+        #    剩余宽度，兜底给小一点反而不会顶破滚动区视口（老坑，见 git 历史）。
+        self.cmb_vehicle_number.setMinimumWidth(84)
+        # ⛔ 不设这条，sizeHint 会按最宽条目（「（未选择）」）算，把整行顶宽、
+        #    右侧「＋」被裁。按"最短 4 个字"算，宽度由 stretch 吃剩余空间。
+        self.cmb_vehicle_number.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_vehicle_number.setMinimumContentsLength(4)
+        self.cmb_vehicle_number.set_item_delete_enabled(True)
+        self.cmb_vehicle_number.setToolTip(
+            "车号 = 车名的前半段（E74-2026 的 E74）。\n"
+            "直接改写框里的车号 = 改名（回车或点别处生效）；\n"
+            "展开后每条右端的 × 删除该车号（会二次确认）")
+        self.cmb_vehicle_number.currentIndexChanged.connect(self._on_vehicle_picked)
+        self.cmb_vehicle_number.delete_requested.connect(self._on_vehicle_delete_requested)
+        _number_line = self.cmb_vehicle_number.lineEdit()
+        if _number_line is not None:
+            _number_line.editingFinished.connect(self._on_vehicle_number_typed)
+
+        self.btn_vehicle_new = InkButton("+", variant="ghost")
         self.btn_vehicle_new.setToolTip(
-            "新建一台车：默认名「新车 N」，结构按当前配置预填"
+            "在当前赛季下新建车号：默认「新车 N」，结构按当前配置预填"
             "（旧模组个数 >0 就用它，否则 3 模组 × 25 电芯 × 8 温度）")
         self.btn_vehicle_new.clicked.connect(self._on_vehicle_new)
-
-        self.btn_vehicle_delete = InkButton("删除", variant="ghost")
-        self.btn_vehicle_delete.setToolTip("删除当前这台车（只删结构，已接收的数据不受影响）")
-        self.btn_vehicle_delete.clicked.connect(self._on_vehicle_delete)
 
         # 改名失败时的短提示：平时藏起来（不占宽度），出错那两秒才出现
         # ⚠️ 提示文字必须**短**（同 MCP 那行），长文案会被裁掉
@@ -393,10 +412,13 @@ class SettingsDialog(QDialog):
         self.lbl_vehicle_hint.setVisible(False)
 
         pick_row = QHBoxLayout()
-        pick_row.setSpacing(10)
-        pick_row.addWidget(self.cmb_vehicle, 1)
+        pick_row.setSpacing(8)
+        pick_row.addWidget(self._inline_caption("赛季："))
+        pick_row.addWidget(self.spin_vehicle_season)
+        pick_row.addSpacing(2)
+        pick_row.addWidget(self._inline_caption("车号："))
+        pick_row.addWidget(self.cmb_vehicle_number, 1)
         pick_row.addWidget(self.btn_vehicle_new)
-        pick_row.addWidget(self.btn_vehicle_delete)
         pick_row.addWidget(self.lbl_vehicle_hint)
 
         # ---- 模组个数行：0 = 不配（退回旧的三个全局参数） ----
@@ -409,10 +431,10 @@ class SettingsDialog(QDialog):
         self.spin_vehicle_modules.valueChanged.connect(self._on_vehicle_modules_changed)
 
         self._vehicle_rows: dict[str, tuple[QLabel, QWidget]] = {
-            "pick": (self._label("车辆"), self._row(pick_row)),
+            "season": (self._label("赛季 / 车号"), self._row(pick_row)),
             "modules": (self._label("模组个数"), self.spin_vehicle_modules),
         }
-        form.addRow(*self._vehicle_rows["pick"])
+        form.addRow(*self._vehicle_rows["season"])
         form.addRow(*self._vehicle_rows["modules"])
 
         # 逐模组行插在这个位置（= 本节之后、「定制功能」之前）。
@@ -421,46 +443,63 @@ class SettingsDialog(QDialog):
         self._module_row_base = form.rowCount()
         self._module_rows: list[tuple[QLabel, QWidget]] = []
 
-    def _refresh_vehicle_combo(self) -> None:
-        """按磁盘上的车辆列表重建下拉（当前项跟随 customization.current_vehicle）。"""
-        names = customization.vehicle_names()
+    def _current_season(self) -> str:
+        return str(self.spin_vehicle_season.value())
+
+    def _refresh_number_combo(self) -> None:
+        """按**当前赛季**重建车号下拉（当前项跟随 customization.current_vehicle）。
+
+        第一项永远是「（未选择）」：少了它，下拉会自己停在第一台车上，用户会
+        以为"已经选上了"，而实际排版用的是老的三件套参数（踩过）。
+        """
+        season = self._current_season()
+        names = customization.vehicle_names_in_season(season)
         current = customization.current_vehicle()
-        combo = self.cmb_vehicle
+        combo = self.cmb_vehicle_number
         combo.blockSignals(True)          # 重建期间别触发 currentIndexChanged
         combo.clear()
-        if not names or not current:
-            # 没有车辆、或"有车但一台都没选"（刚删掉当前车）时给一个明确的空项 ——
-            # 少了它，下拉会自己停在第一台车上，用户会以为已经选上了
-            combo.addItem("（未选择）", "")
+        combo.addItem("（未选择）", "")
         for name in names:
-            combo.addItem(name, name)
+            combo.addItem(customization.split_vehicle(name)[1], name)
         index = combo.findData(current)
         combo.setCurrentIndex(index if index >= 0 else 0)
         combo.blockSignals(False)
+        # ⛔ 可编辑下拉 setCurrentIndex/setEditText 之后光标停在**末尾**，条目比框宽
+        #    时显示的是尾巴（实测「（未选择）」只剩「择）」）—— 和老坑同一条。
+        line = combo.lineEdit()
+        if line is not None:
+            line.setCursorPosition(0)
 
     def _sync_vehicle_rows(self) -> None:
         """按"当前有没有选车"整体摆一次：整行显隐 + 填值 + 重建逐模组行。
 
-        这是本节**唯一**的刷新入口（选车 / 新建 / 删除 / 改名 / 改模组个数之后
-        都调它）：分散着各改一半，最容易出现"下拉是新名字、数字框还是旧结构"。
+        这是本节**唯一**的刷新入口（选赛季 / 选车号 / 新建 / 删除 / 改名 /
+        改模组个数之后都调它）：分散着各改一半，最容易出现"下拉是新名字、
+        数字框还是旧结构"。
         """
         current = customization.current_vehicle()
         profile = customization.active_profile()
         has_vehicle = bool(current)
         cells, temps = profile if profile else ([], [])
 
-        self._refresh_vehicle_combo()
+        # 赛季框跟着当前车走；没选车（或那台车没有赛季）就保持用户当前选的年份
+        season, _number = customization.split_vehicle(current)
+        season_spin = self.spin_vehicle_season
+        season_spin.blockSignals(True)
+        if season.isdigit():
+            season_spin.setValue(int(season))
+        season_spin.blockSignals(False)
+        self._refresh_number_combo()
 
-        # 选车行永远在；改名 / 模组个数两行只在选了车时才有意义。
-        self._vehicle_rows["pick"][0].setVisible(True)
-        self._vehicle_rows["pick"][1].setVisible(True)
+        # 选车行永远在；模组个数行只在选了车时才有意义。
+        self._vehicle_rows["season"][0].setVisible(True)
+        self._vehicle_rows["season"][1].setVisible(True)
         for key in ("modules",):
             label, field = self._vehicle_rows[key]
             label.setVisible(has_vehicle)
             field.setVisible(has_vehicle)
         self._sync_grid_params_visibility()
 
-        self.btn_vehicle_delete.setEnabled(has_vehicle)
         spin = self.spin_vehicle_modules
         spin.blockSignals(True)
         # 没选车时这颗框**绑旧的 module_count**（老用户在同一位置看到同一个数，
@@ -624,16 +663,32 @@ class SettingsDialog(QDialog):
         self._sync_grid_params_visibility()
         self._notify_vehicle_changed()
 
-    def _on_vehicle_picked(self, index: int) -> None:
-        """下拉换了一台车（或换回「（未选择）」）。
+    def _on_season_changed(self, value: int) -> None:
+        """换赛季：只重排「车号」列表，**不自动选车**。
 
-        ⚠️ ``index < 0`` = 用户正在框里**改写名字**（可编辑下拉把 currentIndex
+        为什么不自动选第一台：替用户挑一台 = 接着把模组结构按那台车改，
+        一不留神就改错了车（这会影响接收区怎么排电池数据）。所以当前车不属于
+        新赛季时就直接变成"未选车"，让用户自己点。
+        """
+        season = str(value)
+        name = customization.current_vehicle()
+        if name and customization.split_vehicle(name)[0] != season:
+            customization.select_vehicle("")
+            self._sync_vehicle_rows()
+            self._notify_vehicle_changed()
+            return
+        self._refresh_number_combo()
+
+    def _on_vehicle_picked(self, index: int) -> None:
+        """车号下拉换了一台车（或换回「（未选择）」）。
+
+        ⚠️ ``index < 0`` = 用户正在框里**改写车号**（可编辑下拉把 currentIndex
         打成 -1），那不是"换车"，改名交给 editingFinished 处理 —— 这里必须直接
         返回，否则输到一半就被当成"取消选车"，下拉内容会被清回（未选择）。
         """
         if index < 0:
             return
-        name = str(self.cmb_vehicle.itemData(index) or "")
+        name = str(self.cmb_vehicle_number.itemData(index) or "")
         if name == customization.current_vehicle():
             return
         customization.select_vehicle(name)
@@ -641,17 +696,18 @@ class SettingsDialog(QDialog):
         self._notify_vehicle_changed()
 
     def _on_vehicle_new(self) -> None:
-        """新建车辆：弹一个同风格的单行输入框，确认后建好并自动选中。"""
-        default = self._next_new_vehicle_name(customization.vehicle_names())
-        dialog = _NameDialog("新建车辆", default, self._scheme, self)
+        """在当前赛季下新建车号：同风格单行输入框，确认后建好并自动选中。"""
+        season = self._current_season()
+        default = self._next_new_number_name(season)
+        dialog = _NameDialog("新建车号", default, self._scheme, self)
         try:
             accepted = dialog.exec() == QDialog.DialogCode.Accepted
-            name = dialog.value()
+            number = dialog.value()
         finally:
             dialog.deleteLater()
-        if not accepted or not name:
+        if not accepted or not number:
             return
-        self._create_vehicle(name)
+        self._create_vehicle(customization.vehicle_key(number, season))
 
     def _create_vehicle(self, name: str) -> None:
         """按当前配置预填一台新车并选中它（``_on_vehicle_new`` 的实际动作）。"""
@@ -659,7 +715,7 @@ class SettingsDialog(QDialog):
         if not name:
             return
         if name in customization.vehicle_names():
-            self._flash_vehicle_hint("已存在同名车辆")
+            self._flash_vehicle_hint("已存在同车号")
             return
         # 预填口径（用户点名）：旧 module_count > 0 就用它，否则默认 3 × 25 × 8。
         # 选车之后那三个旧键就不再参与排版了，但"接着上次的模组个数建新车"是
@@ -674,51 +730,60 @@ class SettingsDialog(QDialog):
         self._sync_vehicle_rows()
         self._notify_vehicle_changed()
 
-    def _on_vehicle_delete(self) -> None:
-        """删除当前车：先确认（删的是整套结构，误点一次就得重填）。"""
-        name = customization.current_vehicle()
-        if not name:
+    def _on_vehicle_delete_requested(self, name: str) -> None:
+        """弹层条目右端的 × 被点了：**二次确认**后才真删。
+
+        用户 2026-10-22 明确要求"删除需要二次确认"—— 删除入口从主行挪进弹层，
+        鼠标划过列表时误点的概率变高了，确认这一步不能省。删的正好是当前车时，
+        选择会被清空（见 customization.delete_vehicle）。
+        """
+        target = str(name or "").strip()
+        if not target:
             return
+        season, number = customization.split_vehicle(target)
+        label = f"{number}（{season} 赛季）" if season else number
         answer = QMessageBox.question(
-            self, "删除车辆",
-            f"确定删除「{name}」吗？\n\n只删这台车的模组结构，已接收的数据不受影响。",
+            self, "删除车号",
+            f"确定删除「{label}」吗？\n\n只删这套模组结构，已接收的数据不受影响。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if answer != QMessageBox.StandardButton.Yes:
             return
-        customization.delete_vehicle(name)
+        customization.delete_vehicle(target)
         self._sync_vehicle_rows()
         self._notify_vehicle_changed()
 
-    def _on_vehicle_rename_typed(self) -> None:
-        """在选车框里改写名字 = 给**当前车辆**改名（用户 2026-10-22 的口径）。
+    def _on_vehicle_number_typed(self) -> None:
+        """在车号框里改写 = 给**当前车辆**改车号（赛季保持不动）。
 
-        重名 / 空名一律**拒绝并回滚文本**（不留一个假的成功态）；没有选中车时
+        重名 / 空车号一律**拒绝并回滚文本**（不留一个假的成功态）；没有选中车时
         直接把文本还原成「（未选择）」，不凭空造一台车出来。
         """
         old = customization.current_vehicle()
-        typed = self.cmb_vehicle.currentText().strip()
+        typed = self.cmb_vehicle_number.currentText().strip()
         if not old:
-            self._refresh_vehicle_combo()
+            self._refresh_number_combo()
             return
         if not typed:
-            self.cmb_vehicle.setEditText(old)
-            self._flash_vehicle_hint("名称不能为空")
+            self._refresh_number_combo()
+            self._flash_vehicle_hint("车号不能为空")
             return
-        if typed == old:
+        season = customization.split_vehicle(old)[0] or self._current_season()
+        new = customization.vehicle_key(typed, season)
+        if new == old:
             return
-        if not customization.rename_vehicle(old, typed):
-            self.cmb_vehicle.setEditText(old)
-            self._flash_vehicle_hint("名称已存在")
+        if not customization.rename_vehicle(old, new):
+            self._refresh_number_combo()
+            self._flash_vehicle_hint("车号已存在")
             return
-        self._refresh_vehicle_combo()
         self._sync_vehicle_rows()
         self._notify_vehicle_changed()
 
     @staticmethod
-    def _next_new_vehicle_name(names: list[str]) -> str:
-        """下一个可用的默认名：新车 1、新车 2……（永远不撞已有名字）。"""
-        used = set(names)
+    def _next_new_number_name(season: str) -> str:
+        """该赛季下一个可用的默认车号：新车 1、新车 2……（不撞同赛季已有车号）。"""
+        used = {customization.split_vehicle(name)[1]
+                for name in customization.vehicle_names_in_season(season)}
         index = 1
         while f"新车 {index}" in used:
             index += 1
@@ -1397,6 +1462,20 @@ class SettingsDialog(QDialog):
     def _label(self, text: str) -> QLabel:
         label = QLabel(text)
         label.setFont(ui_font(12.5))
+        return label
+
+    def _inline_caption(self, text: str) -> QLabel:
+        """行内小标签（"赛季：" / "车号："）。
+
+        字号与「模组 i」里那些"电芯数量："一致（10.5pt 的 groupCaption），
+        这样同一张面板里"字段名前缀"看着是同一种东西。⛔ 最小宽度必须钉住
+        文字宽度：字段区不够宽时 QLayout 会把这个 min 小的标签压扁（踩过，
+        "个"被压成 2px）。
+        """
+        label = QLabel(text)
+        label.setFont(ui_font(10.5))
+        label.setObjectName("groupCaption")
+        label.setMinimumWidth(label.fontMetrics().horizontalAdvance(text) + 2)
         return label
 
     def _refresh_glass_label(self, value: int) -> None:

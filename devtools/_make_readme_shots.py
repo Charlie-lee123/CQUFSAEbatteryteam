@@ -186,8 +186,8 @@ def main() -> int:
         # 车辆一节要看到「模组 1/2/3」的逐模组行，先造一台示例车并选中
         # （脚本收尾会按 snapshot 整体还原，不会留在用户配置里）
         import customization
-        customization.save_vehicle("赛季主包", [25, 24, 25], [8, 5, 6])
-        customization.select_vehicle("赛季主包")
+        customization.save_vehicle("主包-2026", [25, 24, 25], [8, 5, 6])
+        customization.select_vehicle("主包-2026")
         dialog = SettingsDialog(theme_mode="dark")
         try:
             dialog.show()
@@ -195,7 +195,7 @@ def main() -> int:
             dialog.grab().save(os.path.join(OUT, "settings.png"))
             # 再滚到「车辆（电池箱）」那一节拍一张：README 讲多车型时用它
             scroll = dialog.findChild(QScrollArea)
-            combo = getattr(dialog, "cmb_vehicle", None)
+            combo = getattr(dialog, "cmb_vehicle_number", None)
             if scroll is not None and combo is not None:
                 scroll.ensureWidgetVisible(combo, 0, 40)
                 pump(app, 0.4)
