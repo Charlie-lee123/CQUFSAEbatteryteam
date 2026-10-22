@@ -277,7 +277,7 @@ def card_shadow(width: int, height: int, radius: int, alpha: int) -> QPixmap:
     #    200ms 动画要撞 5 次 = 5 次可感知的顿）。卡片在动的时候没人看得出一
     #    张模糊阴影被拉伸了几十像素；动画一停，下一帧就会按正确尺寸重建。
     if _anim_running():
-        for (rw, rh, rr, ra), pix in _shadows.items():
+        for (_rw, _rh, rr, ra), pix in _shadows.items():
             if rr == radius and ra == alpha:
                 return pix
     if len(_shadows) >= _SHADOW_CACHE_LIMIT:

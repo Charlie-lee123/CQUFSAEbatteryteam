@@ -483,13 +483,6 @@ def vehicle_key(number: str, season: str) -> str:
     return f"{number}-{season}" if (number and season) else number
 
 
-def season_list() -> list[str]:
-    """档案里出现过的赛季（升序；没赛季的档案不计入）。"""
-    seasons = {split_vehicle(name)[0] for name in vehicle_names()}
-    seasons.discard("")
-    return sorted(seasons)
-
-
 def vehicle_names_in_season(season: str) -> list[str]:
     """某个赛季下的车名（保持创建顺序，下拉框按它排）。
 

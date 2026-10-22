@@ -53,10 +53,14 @@ BUTTON_COLUMNS = 3
 # 「模组 i」里两个"数量"输入框的宽度。**手动输入**（用户 2026-10-22 明确），
 # 所以只要装得下 3 位数 + 内边距；左边写"电芯数量："、右边再没有量词了。
 MODULE_INPUT_W = 64
+# 独立下拉框（主题 / 界面材质 / 编码…）的宽度：**按内容定宽**，不再拉满整列。
+# 这些框里的值都很短（"深色""毛玻璃""utf-8"），铺满整行只会让人觉得空。
+FIELD_W = 210
 # 「赛季」年份框的宽度：4 位数 + 内边距 + 右侧 chevron
 SEASON_SPIN_W = 78
-# 车辆那一排里的「模组个数」框宽：要装下前缀「模组 」+ 2 位数 + chevron
-MODULE_COUNT_W = 118
+# 车辆那一排里的「模组数」框宽：两位数字 + 内边距 + 右侧 chevron
+# （前缀「模组数 」已经移到框外当标签了，框里只有数字）
+MODULE_COUNT_W = 86
 
 
 class _NameDialog(QDialog):
@@ -126,9 +130,9 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setModal(True)
-        # 最小宽度（2026-10-22）：车辆那一排「赛季 / 车号 / ＋ / 模组数」并排，
-        # 去掉左侧「车辆」行标签之后正文最少要 522，600 视口 542 留 20px 余量。
-        self.setMinimumWidth(600)
+        # 最小宽度（2026-10-22 收尾）：下拉框改成按内容定宽（FIELD_W）之后，
+        # 正文最少只要 490；560 视口 502 留 12px 余量，面板比原来窄一截。
+        self.setMinimumWidth(560)
         self._on_glass = on_glass
         self._on_buttons = on_buttons
         self._on_custom = on_custom
@@ -172,6 +176,7 @@ class SettingsDialog(QDialog):
         body_layout.addLayout(form)
 
         self.cmb_theme = ChevronComboBox()
+        self.cmb_theme.setFixedWidth(FIELD_W)
         for label, value in THEME_MODES:
             self.cmb_theme.addItem(label, value)
         index = self.cmb_theme.findData(theme_mode)
@@ -221,7 +226,7 @@ class SettingsDialog(QDialog):
             self.cmb_material.setCurrentIndex(material_index if material_index >= 0 else 0)
             if material_spec.get("tip"):
                 self.cmb_material.setToolTip(material_spec["tip"])
-            self.cmb_material.setMinimumWidth(190)
+            self.cmb_material.setFixedWidth(FIELD_W)
             self.cmb_material.currentIndexChanged.connect(
                 lambda _idx, s=material_spec, c=self.cmb_material:
                 self._on_choice_changed(s, c))
@@ -382,6 +387,9 @@ class SettingsDialog(QDialog):
         # ⚠️ 最小宽度给小：这一行有「赛季 + 车号 + ＋」，车号有 stretch=1 会吃掉
         #    剩余宽度，兜底给小一点反而不会顶破滚动区视口（老坑，见 git 历史）。
         self.cmb_vehicle_number.setMinimumWidth(84)
+        # 上限让"赛季/车号/模组数"三个框看着是一套的：面板拉宽时余量留给右侧空白，
+        # 而不是把车号框拉成一条长条（用户 2026-10-22："优化一下这些框的大小"）。
+        self.cmb_vehicle_number.setMaximumWidth(240)
         # ⛔ 不设这条，sizeHint 会按最宽条目（「（未选择）」）算，把整行顶宽、
         #    右侧「＋」被裁。按"最短 4 个字"算，宽度由 stretch 吃剩余空间。
         self.cmb_vehicle_number.setSizeAdjustPolicy(
@@ -927,7 +935,7 @@ class SettingsDialog(QDialog):
                 combo.setCurrentIndex(index if index >= 0 else 0)
                 if spec.get("tip"):
                     combo.setToolTip(spec["tip"])
-                combo.setMinimumWidth(190)
+                combo.setFixedWidth(FIELD_W)
                 combo.currentIndexChanged.connect(
                     lambda _idx, s=spec, c=combo: self._on_choice_changed(s, c))
                 field = combo

@@ -27,6 +27,15 @@ _DROP_BINARIES = {
     'qt6qmlmeta.dll', 'qt6qmlworkerscript.dll', 'qt6virtualkeyboard.dll',
     'qt6pdf.dll', 'qt6opengl.dll',
     'qtiff.dll', 'qwebp.dll',
+    # ---- 2026-10-22（2.3 瘦身）----
+    # 平台插件只留 qwindows：direct2d 是**可选**平台（Qt 默认走 windows），
+    # minimal/offscreen 只有显式设置 QT_QPA_PLATFORM 才会用到，产品从不设。
+    'qdirect2d.dll', 'qminimal.dll', 'qoffscreen.dll',
+    # 图片格式只留 png（内置）/ ico / svg / jpeg：gif/icns/tga/wbmp/pdf 全没用过
+    'qgif.dll', 'qicns.dll', 'qtga.dll', 'qwbmp.dll', 'qpdf.dll',
+    # 输入法/触摸/原生样式：程序启动时 app.setStyle("Fusion")，这三类都不加载
+    'qtuiotouchplugin.dll', 'qtvirtualkeyboardplugin.dll',
+    'qmodernwindowsstyle.dll',
 }
 
 a = Analysis(
@@ -56,6 +65,7 @@ a = Analysis(
         'distutils', 'setuptools', 'pip',
     ],
     noarchive=False,
+    # 1 = 去掉 assert 与 __debug__ 分支（产品代码没有依赖 assert 的逻辑）
     optimize=0,
 )
 
