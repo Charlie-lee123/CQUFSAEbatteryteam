@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections import deque
 from pathlib import Path
 
@@ -76,13 +77,42 @@ def path() -> str | None:
     return str(_path) if _path else None
 
 
-def load() -> str | None:
-    """启动时调用：定位文件、把已有尾巴读回内存。返回文件路径（可能没建成）。"""
+def _safe_key(key: str | None) -> str:
+    """车辆名 → 文件名安全段（非法字符换成 _，限长 80）。"""
+    text = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", str(key or "").strip())
+    return text.strip(" .")[:80]
+
+
+def file_for(key: str | None) -> str:
+    """车辆名 → 历史文件名；key 为空 = 未选车，落到通用文件。"""
+    safe = _safe_key(key)
+    return f"接收历史-{safe}.log" if safe else FILE_NAME
+
+
+def switch_target(key: str | None) -> str | None:
+    """把历史记录**切到某台车**（key=None = 未选车，用通用文件）。
+
+    不同电池箱的历史数据**分开放**（用户 2026-10-23 要求）：每台车一个
+    「接收历史-<车名>.log」，切车前先把当前文件的尾巴落盘，内存里换上新
+    文件的最近 _max_lines 行。删车**不删文件** —— 已接收的数据不受影响。
+    """
+    flush()
+    return load(key)
+
+
+def load(key: str | None = None) -> str | None:
+    """启动/切车时调用：定位文件、把已有尾巴读回内存。返回路径（可能没建成）。
+
+    ``key`` = 当前车辆名（"E74-2026" 这种）或 None（未选车 → 通用文件）。
+    """
     global _path, _file_lines, _timer
+    _pending.clear()
+    _lines.clear()
+    _file_lines = 0
     directory = _resolve_dir()
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        _path = directory / FILE_NAME
+        _path = directory / file_for(key)
     except OSError:
         _path = None
         return None
@@ -106,14 +136,21 @@ def load() -> str | None:
 def feed(display_text: str) -> None:
     """把接收区实际显示的一帧（可多行）记进历史。
 
-    只做内存入队（deque 满了自动挤掉最老的），O(帧行数) 且无 IO ——
-    接收路径上开销可忽略。空行不记（显示里的轮间空行是排版用的）。
+    ⛔ **空行也要记**（2026-10-24 用户点名："怎么出现了该空行的地方没有空行…
+    历史数据格式得和接收时一模一样"）。接收区里轮与轮之间那一行空行是
+    ``_emit_block`` 用 ``f"\\n{stamp}"`` 造出来的**真实的一行**，以前这里
+    ``if ln.strip()`` 把它滤掉了 —— 于是历史里每轮的时间戳都紧贴着上一轮的
+    数据，回放出来跟实时看到的不是一个样子。
+
+    存的就是 ``display`` 这个字符串原样拆行：它已经过 ``_emit_block`` 的
+    align_indexes 排版、也已含时间戳行，观感与屏上一致。只做内存入队，
+    O(帧行数) 且无 IO。
     """
     if not display_text:
         return
-    got = [ln for ln in display_text.split("\n") if ln.strip()]
-    if not got:
-        return
+    got = display_text.split("\n")
+    if not any(line.strip() for line in got):
+        return                       # 整帧都是空行：不值得占位
     _lines.extend(got)
     _pending.extend(got)
 

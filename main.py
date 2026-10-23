@@ -10,6 +10,8 @@ import sys
 # 其它模块（如设置面板）要从 version.py 取，不能反向 import 这里。
 from version import VERSION as __version__
 
+from PySide6.QtCore import QTimer, QUrl
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWidgets import QApplication
 
 import customization
@@ -48,6 +50,58 @@ def _run_apply_update(target: str) -> int:
     subprocess.Popen([target], cwd=os.path.dirname(target) or ".",
                      close_fds=True)
     return 0
+
+
+def _run_check_net(argv: list[str]) -> int:
+    """`--check-net [url]`：不进界面，用**产品同一条网络栈**取一次 HTTPS。
+
+    为什么需要它：2.4 起打包去掉了 Qt 的 OpenSSL 后端（改用 Windows 自带的
+    Schannel），"更新检查还能不能连上"必须**在产物上**验，而不是在源码里想当然。
+    这里刻意用 ``QNetworkAccessManager``（updater / 设置面板用的就是它），
+    结果写进文件再退出 —— exe 是 console=False，控制台看不到输出。
+    """
+    import app_log
+
+    rest = [a for a in argv[1:] if not a.startswith("--")]
+    url = rest[0] if rest else (
+        "https://cdn.jsdelivr.net/gh/Charlie-lee123/CQUFSAEbatteryteam@main/version.py")
+    out = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "net_check.txt")
+
+    app = QApplication([])                     # QNetworkAccessManager 要 QCoreApplication
+    result: dict[str, object] = {}
+
+    def _done(reply) -> None:
+        result["status"] = reply.attribute(
+            QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        # ⚠️ PySide6 的 reply.error() 返回的是 NetworkError 枚举，**不能** int() 硬转
+        #    （实测 TypeError: int() argument must be ... not 'NetworkError'），
+        #    它自带 .value。取不到就退回字符串比较。
+        err = reply.error()
+        result["err"] = getattr(err, "value", err)
+        body = bytes(reply.readAll())
+        result["bytes"] = len(body)
+        result["head"] = body[:40].decode("utf-8", "replace").replace("\n", " ")
+        reply.deleteLater()
+        app.quit()
+
+    nam = QNetworkAccessManager()
+    request = QNetworkRequest(QUrl(url))
+    request.setTransferTimeout(15000)
+    nam.finished.connect(_done)
+    nam.get(request)
+    QTimer.singleShot(20000, app.quit)         # 兜底：不联网/被墙时别挂死
+    app.exec()
+
+    ok = result.get("err") == 0 and (result.get("status") or 0) == 200
+    text = (f"{'OK' if ok else 'FAIL'} url={url} "
+            f"status={result.get('status')} err={result.get('err')} "
+            f"bytes={result.get('bytes')} head={result.get('head')!r}\n")
+    try:
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except OSError as exc:
+        app_log.error(f"--check-net 写结果失败: {exc}")
+    return 0 if ok else 1
 
 
 def _run_ble_scan(argv: list[str]) -> int:
@@ -138,6 +192,11 @@ def main() -> int:
         app_log.init()
         app_log.info(f"自动更新：接管替换流程，目标 {target}")
         return _run_apply_update(target)
+
+    # 命令行探针：用产品同一条网络栈取一次 HTTPS（验证"去掉 Qt OpenSSL 后端
+    # 之后更新检查还能不能连"——这是 2.4 瘦身唯一有联网风险的改动）
+    if "--check-net" in sys.argv:
+        return _run_check_net(sys.argv)
 
     # 命令行探针：只扫 BLE 广播、不进界面（验证产物 / 查自己的设备）
     if "--ble-scan" in sys.argv:

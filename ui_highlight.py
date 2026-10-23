@@ -20,7 +20,7 @@ from __future__ import annotations
 import re
 
 from PySide6.QtCore import QTimer
-from PySide6.QtGui import QSyntaxHighlighter, QTextCharFormat
+from PySide6.QtGui import QFont, QSyntaxHighlighter, QTextCharFormat
 
 import customization
 from ui_theme import qcolor, rx_accent, stamp_accent
@@ -50,7 +50,12 @@ SECTION_VOLT = "voltage"
 SECTION_TEMP = "temperature"
 SECTION_OTHER = "other"
 
-BMS_ERROR_TEXT = "BMS ERROR"
+# ⛔ **必须忽略大小写**（2026-10-24 用户点名"出现 BMS Error 得标黄"）：真机发的是
+#    "BMS Error"（只有首字母大写），而这个常量原来写的是全大写 "BMS ERROR"，
+#    ``text.find()`` 区分大小写 → 一条都匹配不上，BMS 那行从来没被标过色。
+#    注意：只给这几个字上色，**不做**"错误明细整块标橙"（用户 2026-10-24 第二次
+#    点名"只标黄 BMS Error"）；BMS OK 不带 ERROR，自然一个字都不标。
+BMS_ERROR_RE = re.compile(r"BMS\s+ERROR", re.IGNORECASE)
 
 
 def section_of(text: str, current: str = SECTION_OTHER) -> str:
@@ -82,6 +87,19 @@ def section_of(text: str, current: str = SECTION_OTHER) -> str:
         return SECTION_VOLT
     if OTHER_HEADER_RE.match(text):
         return SECTION_OTHER
+    # ⛔ **纯电压格式数据行 = 电压段**（自愈，2026-10-23）：设备有的轮次**不发**
+    #    "Voltage1:" 标题，直接就是一整行 "01.3858 02.3859 …"。这种行接在
+    #    BMS 错误块后面时，段状态还停在 OTHER，于是
+    #      · 整行被当成 BMS 明细**铺成黄底**（用户报的"电压区域有一整排电压
+    #        数据标黄"）；
+    #      · 电压值也不按 mV 阈值判红绿、不参与网格重排。
+    #    数据实证（发布/logs/接收历史.log 4137 行）：BMS 明细永远是
+    #    "errorTime=0" / "5.8 Over Temp" / "CVMax=3866, Min=0" / "1111…" 这类
+    #    **不是纯采样行**的文本，所以"整行都是 4 位小数采样点"可以安全地当作
+    #    电压段的起点。判据用 _is_volt_line（4 位小数），温度行（2 位小数）
+    #    不会误触发。
+    if current in (SECTION_TEMP, SECTION_OTHER) and _is_volt_line(text):
+        return SECTION_VOLT
     return current
 
 
@@ -113,6 +131,25 @@ INDEX_PAD_WIDTH = 2
 # 设备间隔不动，各行的列起点会漂移（用户截图点名的"没有对齐"）；间隔归一后
 # 无论软换行从哪断，整列都是齐的。
 CELL_GAP = "   "
+
+# 断线标记：相邻两个电芯压差 ≥ 阈值时（多半是那根采样线断了），插在两者之间
+# （用户 2026-10-24 原话
+# "在两个电芯电压数据之间加入一个显眼的 X 符号，但是不要改变格式"）。
+# ⛔ "不改变格式"的实现要点：X **占用原有的列间隔**——把 CELL_GAP（3 个空格）
+#    换成同样 3 个字符的 " X "，整行字符宽度一格不变，后面每一列的起点都不动。
+#    所以这里绝不能写成 "   X   "（多 1 个字符，整列右移、行宽超出视口封顶）。
+WIRE_BREAK = "X"
+
+
+def _gap_with_break() -> str:
+    """把列间隔换成"中间一个 X"的等宽间隔（"   " -> " X "）。"""
+    left = (len(CELL_GAP) - 1) // 2
+    return " " * left + WIRE_BREAK + " " * (len(CELL_GAP) - 1 - left)
+
+
+WIRE_BREAK_GAP = _gap_with_break()
+# 独立成词的 X（前后是空白或行首尾）—— 数据本身只有 "序号.值"，不会撞。
+WIRE_BREAK_RE = re.compile(r"(?<!\S)" + WIRE_BREAK + r"(?!\S)")
 
 # 整词采样点："12.6553" 是、"V=0.00" 不是。用来识别"整行都是采样点"的**纯数据
 # 行** —— 只有纯数据行参与网格重排，混着别的字的行只做原地补零。
@@ -272,10 +309,57 @@ def _cap_rows(sizes: list[int], fit: int) -> list[int]:
     return out
 
 
+def _wire_breaks(values: list[int], section: str, thr: int) -> set[int]:
+    """按**断线**规则给出该在哪里插 X —— 返回边界集合（``k`` = 第 k 个单元格之前）。
+
+    用户 2026-10-24 两轮定案：
+
+    - 触发：相邻两个电芯的压差 ≥ 阈值（`values[i] - values[i-1]`）。
+    - **谁是断线的那一个**：两者里**离本模组平均值更远**的那个
+      （一号电芯没有左边的邻居，正好由这条覆盖 —— 它的参照就是平均值）。
+    - 位置：**偏低 → X 只在这个低压值的右边；偏高 → 只在这个高压值的左边**。
+      偏高且它就是第一个电芯时，X 落在行首（``k == 0``）。
+    - 断一次只出一个 X：同一根断线两侧的那两对会算到**同一个边界**，进 set 自然去重。
+
+    ⛔ **不要**再加"必须同时偏离平均值 ≥ 阈值"这种第二道闸（2026-10-24 实测踩过）：
+    真机数据 `04.4081 → 05.4520` 相差 439 mV（阈值 300），但两者离模组平均（≈4313）
+    都只差 200 出头 —— 那道闸会把**真实的断线**整个吞掉，用户直接看不到 X。
+    误报（前一个坏电芯把后面正常电芯比成异常）用"谁离平均更远"解决就够了：
+    正常电芯离平均更近 → 它永远不会被判成断线。
+
+    ``values`` 是**整个模组**的采样值（按序号顺序，可跨多行）。温度段一律不插。
+    """
+    if thr <= 0 or section != SECTION_VOLT or len(values) < 2:
+        return set()
+    ordered = sorted(values)
+    median = ordered[len(ordered) // 2]
+    normal = [v for v in values if abs(v - median) <= thr] or list(values)
+    avg = sum(normal) / len(normal)
+
+    breaks: set[int] = set()
+
+    def mark(index: int) -> None:
+        """给第 index 个电芯打标记：偏低标右边，偏高标左边。"""
+        breaks.add(index + 1 if values[index] < avg else index)
+
+    for i in range(1, len(values)):
+        if abs(values[i] - values[i - 1]) < thr:
+            continue
+        far_cur = abs(values[i] - avg)
+        far_prev = abs(values[i - 1] - avg)
+        mark(i if far_cur > far_prev else i - 1)
+    # 一号电芯再独立看一次：它没有左边的邻居，相邻比较可能被旁边的电芯带偏
+    if abs(values[0] - avg) >= thr:
+        mark(0)
+    return breaks
+
+
 def _grid_rows(tokens: list[tuple[str, str]], section: str,
                widths: dict[str, int], index_width: int, cols: int,
                max_row_chars: int = 0, rows_hint: int = 0,
-               cols_hint: int = 0, row_sizes: list[int] | None = None) -> list[str]:
+               cols_hint: int = 0, row_sizes: list[int] | None = None,
+               wire_breaks: set[int] | None = None, wire_base: int = 0,
+               wire_lead: bool = False) -> list[str]:
     """把一组采样点排成等宽网格：值补零到段内最宽；电压段序号补零到
     index_width（0 号点、温度段都不补）；单元格补空格到等宽后以 CELL_GAP 拼接。
 
@@ -324,10 +408,26 @@ def _grid_rows(tokens: list[tuple[str, str]], section: str,
                                cols_hint if cols_hint > 0 else cols)
     rows: list[str] = []
     start = 0
-    for size in sizes:
-        row = cells[start:start + size]
-        rows.append(CELL_GAP.join(cell.ljust(cell_w) for cell in row).rstrip())
+    base = wire_base
+    for index, size in enumerate(sizes):
+        row_cells = cells[start:start + size]
+        parts: list[str] = []
+        if index == 0 and wire_lead:
+            # 一号电芯偏高：X 标在它左边 = 这一行的行首（只有这一行会多 2 个字符，
+            # 里面的每一列仍然整列对齐 —— 格式没被破坏，只是多了个前缀标记）。
+            parts.append(WIRE_BREAK + " ")
+        for i, cell in enumerate(row_cells):
+            if i:
+                gap = CELL_GAP
+                if wire_breaks and (base + i) in wire_breaks:
+                    gap = WIRE_BREAK_GAP
+                parts.append(gap)
+            parts.append(cell.ljust(cell_w))
+        # 行尾：最后一个单元格**之后**那个边界被标记 → 补一个 X（跨行边界就落在这里）
+        tail = " " + WIRE_BREAK if (wire_breaks and (base + size) in wire_breaks) else ""
+        rows.append("".join(parts).rstrip() + tail)
         start += size
+        base += size
     return rows
 
 
@@ -336,7 +436,8 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
                   max_row_chars: int = 0, rows_hint: int = 0,
                   volt_cols_hint: int = 0, temp_cols_hint: int = 0,
                   volt_row_sizes: list[int] | None = None,
-                  temp_row_sizes: list[int] | None = None) -> str:
+                  temp_row_sizes: list[int] | None = None,
+                  wire_mv: int = 0) -> str:
     """采样点排版对齐：电压/温度段的连续数据行按**等宽网格**重排。
 
     - 序号：**只有电压段**补 —— `"1.3820"` -> `"01.3820"`（0 号点除外）；
@@ -372,6 +473,11 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
     ⚠️ 数字本身一个都不动：只在前导位置补数字 0（用户："在前方补零"）、重排
     空白 —— 自测用"摘掉前导 0、压平空白后逐字等于原文"兜底。
     """
+    # ⛔ 先把**上一次排版留下的断线 X 还原成列间隔**（" X " -> "   "）：
+    #    否则这一行不再是"纯采样行"（_is_data_line 要求整行都是数字），
+    #    重排会退化成只补零，改了阈值也去不掉旧的 X。还原后长度一格不变。
+    if WIRE_BREAK in text:
+        text = WIRE_BREAK_RE.sub(" ", text)
     # ⛔ 序号补位宽度 = 这一帧里**最大序号的位数**（下限 INDEX_PAD_WIDTH）。
     #    固定 2 位的话，序号上到 100 以上就多占一格：实测一帧 1..120，小数点
     #    间距是 11,11,11,12,11 —— "100." 那格凸出去，用户的"个位数字上下对齐"
@@ -408,32 +514,80 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
             for match in SAMPLE_RE.finditer(line):
                 widths[sec] = max(widths.get(sec, 0), len(match.group(2)) - 1)
 
-    # 第二遍：连续纯数据行并成一组做网格重排；其余行按老规则原地补零。
+    # 第二遍：**每条设备数据行各自成组**（2026-10-24 用户点名"不要篡改接收的
+    # 数据内容"）：以前把连续的几条数据行并成一组再重排，于是设备发 "4+4" 两行
+    # 温度会被合并成一行 8 个 —— 那是把收到的内容改了个样。现在一行进一行出，
+    # 只做"补零 + 等宽对齐"，行宽超视口时也**只拆这一行**（软换行会甩出孤零零
+    # 的单元格，见 _grid_rows）。
+    #
+    # ⚠️ 断线标记要按**整个模组**算（平均值、以及"一号电芯拿平均值当参照"），
+    #    所以先把属于同一模组的连续数据行收在一起求 marks（横跨多行），
+    #    输出仍然是一行进一行出（只是把边界集合按全局下标喂给 _grid_rows）。
     out: list[str] = []
     current = section
     i = 0
-    while i < len(lines):
+    total = len(lines)
+    while i < total:
         sec, is_data = marks[i]
         current = sec
         if not is_data:
             out.append(_pad_line(lines[i], current, widths, index_width))
             i += 1
             continue
-        tokens: list[tuple[str, str]] = []
-        cols = 1
         j = i
-        while j < len(lines) and marks[j][1]:
-            found = [(m.group(1), m.group(2)[1:])
-                     for m in SAMPLE_RE.finditer(lines[j])]
-            cols = max(cols, len(found))
-            tokens.extend(found)
+        while j < total and marks[j][1] and marks[j][0] == sec:
             j += 1
+        group_tokens = [
+            [(m.group(1), m.group(2)[1:]) for m in SAMPLE_RE.finditer(lines[k])]
+            for k in range(i, j)
+        ]
+        group_vals: list[int] = []
+        for toks in group_tokens:
+            for _idx, val in toks:
+                try:
+                    group_vals.append(int(val))
+                except (TypeError, ValueError):
+                    group_vals.append(0)
+        breaks = _wire_breaks(group_vals, sec, wire_mv)
+        lead = 0 in breaks            # 0 号边界 = 模组第一个电芯的左边 → 行首插 X
         hint = volt_cols_hint if sec == SECTION_VOLT else temp_cols_hint
         sizes = volt_row_sizes if sec == SECTION_VOLT else temp_row_sizes
-        out.extend(_grid_rows(tokens, sec, widths, index_width, cols,
-                              max_row_chars, rows_hint, hint, sizes))
+        base = 0
+        for toks in group_tokens:
+            out.extend(_grid_rows(toks, sec, widths, index_width, len(toks),
+                                  max_row_chars, 0, hint, sizes,
+                                  breaks, base, lead and base == 0))
+            base += len(toks)
         i = j
     return "\n".join(out)
+
+
+def gap_lines(lines, prev: str = "") -> list[str]:
+    """按"空行只出现在模组标题 / BMS 状态 / 时间戳之上"重排空行。
+
+    用户 2026-10-24 点名："每个模组数据之间得有间隔，比如 Voltage1 上面需要有
+    一个空行，Temperature1 上面需要一个空行，BMS 状态上面需要一个空行。"
+
+    规则只有一条，实时与回放共用（``_emit_block`` / ``_enter_replay`` 都调它）：
+      · 原文里的空行**一律丢掉**（设备分包毛刺、老文件没存空行，都不影响）；
+      · 在每个 ``VoltageN:`` / ``TemperatureN:`` / ``BMS …`` / 时间戳行之前插
+        一行空行 —— 除非它前面还没有任何内容（文档/整段开头不留白）。
+
+    ``prev``：这一段**之前已经显示**的最后一行（逐帧追加时用这个跨帧判断），
+    空串表示"前面什么都没有"。实测纯函数、脱离控件可测。
+    """
+    out: list[str] = []
+    last = prev
+    for line in lines:
+        if not line.strip():
+            continue                     # 原空行丢掉，空行由规则生成
+        gap = bool(stamp_span(line)) or any(
+            r.match(line) for r in (VOLT_HEADER_RE, TEMP_HEADER_RE, BMS_LINE_RE))
+        if gap and last.strip():
+            out.append("")
+        out.append(line)
+        last = line
+    return out
 
 
 def _ordered(low, high) -> tuple[int, int]:
@@ -495,6 +649,12 @@ def temp_spans(text: str, low: int, high: int) -> list[tuple[int, int]]:
     """
     spans: list[tuple[int, int]] = []
     for m in SAMPLE_RE.finditer(text):
+        # ⛔ 只判**温度格式**的值：4 位小数的是电压（mV），按 20~60℃ 去比 3858
+        #    会把整排电压数据判成越界、整行标黄（用户 2026-10-23 报的现象）。
+        #    与着色器里那条分支同一口径，避免"染色的行"和"点按钮跳过去的行"
+        #    各按一套规则算。
+        if _is_volt_value(m):
+            continue
         value = int(m.group(2)[1:])
         if value > high or value < low:
             spans.append(_entry_span(m))
@@ -502,15 +662,13 @@ def temp_spans(text: str, low: int, high: int) -> list[tuple[int, int]]:
 
 
 def bms_error_spans(text: str) -> list[tuple[int, int]]:
-    """"BMS ERROR" 字样的染色区间。"""
-    spans = []
-    start = 0
-    while True:
-        index = text.find(BMS_ERROR_TEXT, start)
-        if index < 0:
-            return spans
-        spans.append((index, len(BMS_ERROR_TEXT)))
-        start = index + len(BMS_ERROR_TEXT)
+    """"BMS ERROR" 字样的染色区间（**忽略大小写**，见 ``BMS_ERROR_RE``）。"""
+    return [(m.start(), m.end() - m.start()) for m in BMS_ERROR_RE.finditer(text)]
+
+
+def wire_break_spans(text: str) -> list[tuple[int, int]]:
+    """断线标记 X 的染色区间（只认独立成词的 X，见 ``WIRE_BREAK_RE``）。"""
+    return [(m.start(), 1) for m in WIRE_BREAK_RE.finditer(text)]
 
 
 class RxHighlighter(QSyntaxHighlighter):
@@ -524,18 +682,18 @@ class RxHighlighter(QSyntaxHighlighter):
         self._low_fmt = QTextCharFormat()
         self._bms_fmt = QTextCharFormat()
         self._temp_fmt = QTextCharFormat()
+        self._wire_fmt = QTextCharFormat()
         self._limits = (0, 0)
         self._temp_limits = (0, 0)
         # 推迟着色的开关与节流计时器（见 defer()）
         self._deferred = False
         self._defer_timer: QTimer | None = None
         self._section = SECTION_OTHER
-        # BMS 错误块状态：BMS ERROR 那行起，**后面的错误明细行**（"1.1 Over
-        # Voltage" 这些）也要跟着标橙（用户 2026-10-11 点名），直到下一轮
-        # 时间戳 / 新段标题为止。
-        self._in_bms_error = False
-        # 「高亮异常数据」开关（customization）。关掉只影响**上色**，段状态与
-        # BMS 块状态照常推进 —— 开关拨回来后 refresh() 立刻恢复。
+        # BMS 只给 "BMS Error" 那几个字上色（2026-10-24 用户点名"只标黄
+        # BMS Error"）：**没有**"错误明细整块标橙"的状态机了 —— 那套
+        # （_in_bms_error 开块 → 明细行整行铺橙、序号也染橙）已按用户要求删掉。
+        # 「高亮异常数据」开关（customization）。关掉只影响**上色**，段状态照常
+        # 推进 —— 开关拨回来后 refresh() 立刻恢复。
         self._errors_on = True
         self._recolor()
 
@@ -547,6 +705,9 @@ class RxHighlighter(QSyntaxHighlighter):
         self._low_fmt.setForeground(qcolor("volt_low"))
         self._bms_fmt.setForeground(qcolor("bms_error"))
         self._temp_fmt.setForeground(qcolor("temp_warn"))
+        self._wire_fmt.setForeground(qcolor("wire_break"))
+        # 断线 X 只有一个字符宽，靠颜色+加粗才够"显眼"（用户点名）
+        self._wire_fmt.setFontWeight(QFont.Weight.Bold)
         self._limits = _ordered(customization.get("volt_limit_low"),
                                 customization.get("volt_limit_high"))
         self._temp_limits = _ordered(customization.get("temp_limit_low"),
@@ -606,30 +767,20 @@ class RxHighlighter(QSyntaxHighlighter):
         if stamp:
             self.setFormat(stamp[0], stamp[1], self._stamp_fmt)
 
-        # BMS 错误块：BMS ERROR 开块；下一轮时间戳（新的一轮开始）、温度/电压
-        # 等新段标题、或 BMS OK（这轮没报错）关块。明细行因此整块标橙。
-        # 状态推进与"要不要真的上色"分开（后者看 _errors_on），这样关掉高亮
-        # 开关时状态机照常走，拨回来立刻是对的。
-        if stamp or TEMP_HEADER_RE.match(text) or VOLT_HEADER_RE.match(text) \
-                or OTHER_HEADER_RE.match(text):
-            self._in_bms_error = False
-        if bms_error_spans(text):
-            self._in_bms_error = True
-        elif BMS_LINE_RE.match(text):
-            self._in_bms_error = False        # BMS OK：这轮没报错
-        bms_block_on = self._in_bms_error and self._errors_on
-        if bms_block_on:
-            # 整行铺橙，**序号也在内**（用户点名"高亮要包括序号"）—— 不再把
-            # 序号染回蓝，否则明细行的序号看着跟正常数据一样，认不出是第几点。
-            self.setFormat(0, len(text), self._bms_fmt)
+        # ⛔ **只给 "BMS Error" 这几个字上色**（2026-10-24 用户两次点名：
+        #    "只要 BMS Error 这几个字出现了就标黄" / "只标黄 BMS Error"）。
+        #    以前这里有一套"错误块"状态机：BMS ERROR 开块，之后所有明细行
+        #    （errorTime=… / 5.8 Over Temp / COM0=1 …）整行铺橙、连序号都染成橙。
+        #    用户不要这个效果 —— 明细行现在保持原样（序号照旧蓝、值不判色），
+        #    只有 "BMS Error" 那 9 个字符是橙的。**BMS OK 一个字都不标**。
+        #    块状态机整段删掉（连 _in_bms_error 字段一起），别再引回来。
 
         volt_low, volt_high = self._limits
         temp_low, temp_high = self._temp_limits
         for match in SAMPLE_RE.finditer(text):
-            if not bms_block_on:
-                # 正常项：序号染蓝
-                self.setFormat(match.start(1), match.end(1) - match.start(1),
-                               self._index_fmt)
+            # 序号一律染蓝（"错误明细整行橙"那套已按用户要求删掉，见上）
+            self.setFormat(match.start(1), match.end(1) - match.start(1),
+                           self._index_fmt)
             if not self._errors_on:
                 continue
             # 有问题的那一条：把**序号 + 值**整条覆盖成异常色（用户点名
@@ -644,7 +795,11 @@ class RxHighlighter(QSyntaxHighlighter):
                     self.setFormat(start, length, self._high_fmt)
                 elif value < volt_low:
                     self.setFormat(start, length, self._low_fmt)
-            elif self._section == SECTION_TEMP:
+            elif self._section == SECTION_TEMP and not _is_volt_value(match):
+                # ⛔ 温度阈值**只判温度格式的值**（小数位 != 4）。电压值万一因为
+                #    段状态错位落进温度段（设备不发 VoltageN: 标题那种轮次），
+                #    按 20~60℃ 去比 3858 会让**整排电压数据全被标黄** —— 用户
+                #    2026-10-23 报的"电压区域有一整排电压数据标黄"。
                 value = int(match.group(2)[1:])
                 if value > temp_high or value < temp_low:
                     self.setFormat(start, length, self._temp_fmt)
@@ -652,3 +807,6 @@ class RxHighlighter(QSyntaxHighlighter):
         if self._errors_on:
             for start, length in bms_error_spans(text):
                 self.setFormat(start, length, self._bms_fmt)
+            # 断线标记 X：只有一个字符宽，靠"洋红 + 加粗"才够显眼（用户点名）。
+            for start, length in wire_break_spans(text):
+                self.setFormat(start, length, self._wire_fmt)

@@ -45,8 +45,8 @@ from ui_backdrop import frost_tile, paint_backdrop
 from ui_brand import BrandHeader, CaptionBar
 from ui_highlight import (
     SECTION_OTHER, SECTION_TEMP, SECTION_VOLT, VOLT_HEADER_RE, RxHighlighter,
-    align_indexes, bms_error_spans, section_of, stamp_span, temp_spans,
-    value_spans,
+    align_indexes, bms_error_spans, gap_lines, section_of, stamp_span,
+    temp_spans, value_spans,
 )
 from ui_controls import (
     AlertButton, ChevronComboBox, ChevronSpinBox, FlashLabel, IconButton,
@@ -610,8 +610,9 @@ class MainWindow(QMainWindow):
         self._in_enforce = False
         # 暂停折叠：进暂停时发送区是不是展开的 —— 恢复时只还原它自己动过的
         self._tx_expand_on_resume = False
-        # 同理，工具栏（显示时间戳/HEX/编码那排）暂停前是否可见
-        self._opts_visible_on_resume = False
+        # ⛔ 这里曾有 ``_opts_visible_on_resume``（记"暂停前工具栏是否可见"）：
+        #    这个旗子会跨"进/退全屏"失效，见 ``_sync_opts_row`` 的说明。
+        #    工具栏的显隐现在一律由当前状态现算（_sync_opts_row）。
         # 搜索：命中区间、当前命中序号、上次搜索词
         self._matches: list[tuple[int, int]] = []
         self._match_index = -1
@@ -631,6 +632,8 @@ class MainWindow(QMainWindow):
         self._search_selections: list = []
         # 排版对齐的段状态（跨块延续，规则同着色器，见 ui_highlight.section_of）
         self._align_section = SECTION_OTHER
+        # 空行规则（模组标题/BMS 之上各一行）要跨帧知道"上一行是什么"
+        self._rx_prev_line = ""
 
         self._send_timer = QTimer(self)
         self._send_timer.setTimerType(Qt.PreciseTimer)
@@ -997,7 +1000,9 @@ class MainWindow(QMainWindow):
         # 历史接收数据：加载已有尾巴并启动批量落盘定时器（纯内存入队 +
         # 1s 批量写，接收路径零 IO 开销；详见 rx_history 模块注释）。
         import rx_history
-        rx_history.load()
+        # 历史按**当前车辆**分文件（用户 2026-10-23：不同电池箱的历史数据
+        # 分开放）；没选车时落通用文件（与旧版本同一份）。
+        rx_history.load(customization.current_vehicle() or None)
 
     def _auto_check_update(self) -> None:
         """启动时的自动检查更新（静默失败，绝不打扰）。"""
@@ -1622,8 +1627,7 @@ class MainWindow(QMainWindow):
             if self._tx_expand_on_resume:
                 self._toggle_send_area()
             # 显示时间戳/HEX/编码那排工具栏一并折叠（用户点名）
-            self._opts_visible_on_resume = self._rx_opts_row.isVisible()
-            self._animate_opts_row(False)
+            self._sync_opts_row()
             self._snap_to_round_start()
             self._toast("滚动已暂停，数据仍在后台接收", 3000)
         else:
@@ -1634,9 +1638,8 @@ class MainWindow(QMainWindow):
             if self._tx_expand_on_resume and self._tx_collapsed:
                 self._toggle_send_area()
             self._tx_expand_on_resume = False
-            if self._opts_visible_on_resume:
-                self._animate_opts_row(True)
-            self._opts_visible_on_resume = False
+            # 工具栏要不要回来**现算**（全屏态一律不回来）
+            self._sync_opts_row()
             # 恢复 = 把暂停期间攒下的帧一次性刷进来再追底 —— 视图直接落在
             # 最新读取的数据上（少这一步，新数据全堆在看不见的队列里）。
             self._flush_paused_frames()
@@ -1649,18 +1652,68 @@ class MainWindow(QMainWindow):
 
     # ---- 暂停时工具栏的收展（走补间，不再一步 hide） ----
 
+    #: 「显示时间戳 / HEX / 编码」那一行**可信的最小自然高度**。
+    #: 实测（12.5pt + dpr2）行高 34；被压扁/钉死的值会远小于它。
+    OPTS_MIN_NATURAL_H = 20
+
+    def _heal_opts_content(self) -> None:
+        """把被钉成"一条缝"的工具栏内容解钉。
+
+        ⛔ 这是 2026-10-23 用户报的"全屏看数据时上方有一条 1~2px 小条"的**根因**：
+        老版 ``_rx_capture_full`` 直接量 ``_rx_opts_row.height()``，而**先暂停再
+        进全屏**时这一行正被收成 0 → ``max(1, 0) = 1`` → ``opts_h = 1`` →
+        ``_opts_content.setFixedHeight(1)``。此后行的 sizeHint 就是 1px，恢复
+        滚动（``_finish_opts_anim`` 把 min/max 还给布局）时行只能长到 **1px**
+        —— 于是 Switch 的蓝轨道 + 白滑块被裁成顶部 1~2px 的"小条"，钉在
+        接收区上方不动；再暂停（收到 0 高）就消失，再恢复又出现。
+        像素证据：小条里 x=18..58 是 ``#3482ff``、60..88 是纯白，正是
+        ``Switch("显示时间戳")`` 的轨道 + 滑块。
+        """
+        content = self._opts_content
+        try:
+            if content.maximumHeight() < self.OPTS_MIN_NATURAL_H:
+                content.setMinimumHeight(0)
+                content.setMaximumHeight(WIDGETSIZE_MAX)
+        except RuntimeError:
+            pass
+
+    def _sync_opts_row(self) -> None:
+        """把工具栏行的显隐/高度收口到**当前状态**该有的样子。
+
+        唯一合法终态只有两个：
+          · 普通态 + 未暂停 → 完整展开（自然行高）
+          · 全屏态 **或** 暂停 → 0 高（连一条缝都不许留）
+
+        ⛔ 以前用 ``_opts_visible_on_resume`` 记"暂停那一刻它是否可见"，恢复时照抄。
+        这个旗子跨"进/退全屏"就会失效，两条路都错（探针 ``_probe_strip_matrix``
+        实测）：
+          · 普通态先暂停（旗子=True）→ 再进全屏（全屏本该没有这排）→ 恢复滚动，
+            把**整排工具栏在全屏里拉了出来**：rx_top 从 86 变 130；
+          · 全屏先暂停（旗子=False）→ 退全屏 → 恢复滚动，工具栏**再也回不来**。
+        """
+        want = (not self._expanded) and (not self._paused)
+        self._heal_opts_content()
+        if want:
+            row = self._rx_opts_row
+            if row.isVisible() and row.height() >= self.OPTS_MIN_NATURAL_H:
+                return                       # 已经完整展开，别再抖一次
+            self._animate_opts_row(True)
+        else:
+            self._animate_opts_row(False)
+
     def _opts_row_natural_height(self) -> int:
         """工具栏的自然行高。
 
         行被压扁/隐藏时 ``height()`` 是旧值或 0，所以取内容控件的 sizeHint；
         都拿不到（还没上过屏）就退回实测行高 34。
         """
+        floor = self.OPTS_MIN_NATURAL_H
         for probe in (self._opts_content, self._rx_opts_row):
             try:
                 hint = probe.sizeHint().height()
             except RuntimeError:
                 hint = 0
-            if hint > 4:
+            if hint >= floor:
                 return hint
         return 34
 
@@ -1711,6 +1764,10 @@ class MainWindow(QMainWindow):
             if self._opts_to <= 0:
                 row.setFixedHeight(0)
             else:
+                # ⛔ 展开方向落定前先解钉：内容若被钉成"一条缝"（见
+                #    _heal_opts_content），把 min/max 还给布局后行只会长到 1px，
+                #    于是留下一条钉死不动的细条。
+                self._heal_opts_content()
                 row.setMinimumHeight(0)
                 row.setMaximumHeight(WIDGETSIZE_MAX)
         except RuntimeError:
@@ -2460,13 +2517,23 @@ class MainWindow(QMainWindow):
         self._rx_full = {
             "brand_h": max(1, self.brand_header.height()),
             "config_w": max(1, self._config_card.width()),
-            "opts_h": max(1, self._rx_opts_row.height()),
+            # ⛔ 不能直接用 height()：先暂停（工具栏被 _finish_opts_anim 压成
+            #    0 高）再点最大化时这里会量到 0 → max(1,0)=1，并把内容钉成 1px，
+            #    回到普通态工具栏只剩一条缝（要再最大化/还原一次才恢复）。
+            #    行不可见或已被压扁时改用自然高度。
+            "opts_h": max(1, self._rx_opts_row.height()
+                          if self._rx_opts_row.isVisible()
+                          and self._rx_opts_row.height() >= self.OPTS_MIN_NATURAL_H
+                          else self._opts_row_natural_height()),
             "rail_w": max(1, self._rx_rail.width()),
         }
         # 工具栏内容钉成**普通态的自然高度**：不钉的话行高被压缩时它的布局会跟着
         # 重排（逐帧实测行高 0→34 的过程里，里面的开关相对行顶漂了 29px —— 看着
         # 就是图标在滑）。钉住之后行再矮也只是把内容下沿裁掉。
-        self._opts_content.setFixedHeight(self._rx_full["opts_h"])
+        captured = self._rx_full["opts_h"]
+        # 同上：拿到的是兜底/可疑值时**不要**把内容钉死，交给布局自愈
+        if captured >= self.OPTS_MIN_NATURAL_H:
+            self._opts_content.setFixedHeight(captured)
         if self._pre_send_collapsed:
             self._rx_tx_normal = TX_COLLAPSED_H
         else:
@@ -2492,7 +2559,8 @@ class MainWindow(QMainWindow):
             "rail_w": max(1, self._rx_rail_normal),
         }
         # 同上：内容高度钉死（这条路径没在普通态量过，用 sizeHint 兜底）
-        self._opts_content.setFixedHeight(self._rx_full["opts_h"])
+        if self._rx_full["opts_h"] >= self.OPTS_MIN_NATURAL_H:
+            self._opts_content.setFixedHeight(self._rx_full["opts_h"])
         self._rx_tx_normal = (TX_COLLAPSED_H if self._pre_send_collapsed
                               else max(TX_COLLAPSED_H, self._tx_min_height))
         self._rx_row_w = max(1, self._open_row.sizeHint().width())
@@ -2868,6 +2936,12 @@ class MainWindow(QMainWindow):
             if w not in self._rx_hidden:
                 w.hide()
         self._rx_opts_row.hide()
+        # ⛔ 只 hide 不够：转场每帧 setFixedHeight(oh) 把 min/max 钉在了最后一帧
+        #    的 4~6px 上，收尾不还原的话，后面任何一次"还给布局"的路径都会让这
+        #    一行以 4~6px 的姿态回来（残留约束）。这里和 _rx_finish_normal 同口径，
+        #    把约束一次还给布局；只在落定那一帧执行，零帧率影响。
+        self._rx_opts_row.setMinimumHeight(0)
+        self._rx_opts_row.setMaximumHeight(WIDGETSIZE_MAX)
         self._set_tx_vpolicy(QSizePolicy.Policy.Preferred)
         self._tx_card.setMinimumHeight(0)
         self._tx_card.setMaximumHeight(0)
@@ -2906,6 +2980,9 @@ class MainWindow(QMainWindow):
             self._config_card.show()
         self._rx_opts_row.setMinimumHeight(0)
         self._rx_opts_row.setMaximumHeight(WIDGETSIZE_MAX)
+        # 全屏转场把内容钉过高度（见 _rx_capture_full）；退出时若它被钉成
+        # "一条缝"就解钉，否则回到普通态工具栏仍然是 1~2px 的细条。
+        self._heal_opts_content()
         if not self._paused:
             self._rx_opts_row.show()
         target_h = self._rx_tx_normal
@@ -3704,13 +3781,20 @@ class MainWindow(QMainWindow):
         QSettings（``active_profile`` 内部合并读），这条路径每帧都会走。
         """
         profile = customization.active_profile()
+        # 断线阈值（mV，0 = 关闭）：相邻电芯压差达阈值 → 排版时在那两个值之间插 X
+        wire_mv = int(customization.get("broken_wire_mv") or 0)
         if profile is not None:
             cells, temps = profile
-            return {"volt_row_sizes": cells, "temp_row_sizes": temps}
+            return {"volt_row_sizes": cells, "temp_row_sizes": temps,
+                    "wire_mv": wire_mv}
         return {
-            "rows_hint": int(customization.get("module_count")),
+            # ⛔ 这里**不再传 rows_hint**（模组个数）：2026-10-24 起排版改成
+            #    "一条设备行一行出"（用户点名不许合并/重排行），行数由设备的换行
+            #    决定，不再由"模组个数"推算 —— 传过去也是被忽略，纯冗余。
+            #    该设置仍然决定车辆档案里的逐模组尺寸（见 active_profile）。
             "volt_cols_hint": int(customization.get("cells_per_module")),
             "temp_cols_hint": int(customization.get("temps_per_module")),
+            "wire_mv": wire_mv,
         }
 
     def _schedule_vehicle_relayout(self, delay_ms: int = 200) -> None:
@@ -3814,6 +3898,16 @@ class MainWindow(QMainWindow):
         text = text.strip("\r\n")
         if not text:
             return                      # 空帧（设备只发了个换行）不值得占一行
+        # ⛔ 帧**内部**的空行一律丢掉（2026-10-24 用户点名"不应该空行的地方
+        #    空行了"）：设备分包时偶尔多送一个 \r\n，以前那在接收区里就是一行
+        #    真空白，看着毫无道理。轮与轮之间那一行空行是**我们自己**用
+        #    ``head``（``f"\n{stamp}"``）造的，在下面，不受这条影响 ——
+        #    于是空行的口径收敛成一句：**空行只出现在轮与轮之间（时间戳之前）**。
+        if "\n" in text:
+            kept = [line for line in text.split("\n") if line.strip()]
+            if not kept:
+                return
+            text = "\n".join(kept)
         # 排版对齐（序号补零 + 电压/温度段值补零）需要知道这块属于哪个段 ——
         # 段状态在块间延续（时间戳重置成电压、Temperature1 切温度、BMS 关闭，
         # 规则见 ui_highlight.section_of），所以由主窗口维护、逐块喂给对齐函数。
@@ -3846,6 +3940,15 @@ class MainWindow(QMainWindow):
             display = f"{head}\n{text}"
         else:
             display = text
+        # 空行规则（用户 2026-10-24 点名，与回放共用同一条）：
+        # **每个 VoltageN: / TemperatureN: / BMS 状态之上各空一行**，其它位置
+        # 一个空行都没有。`head` 里那个时间戳前导换行也一并由 gap_lines 生成。
+        # ⛔ 逐帧追加时要跨帧判断"上一行是不是空的"，所以把最后一行记在
+        #    self._rx_prev_line 上（_clear_receive 会重置）。
+        lines = gap_lines(display.split("\n"), prev=self._rx_prev_line)
+        display = "\n".join(lines)
+        if lines:
+            self._rx_prev_line = lines[-1]
         # ⛔ 历史接收数据在**收到数据这一刻**就记，不等"显示"。
         #    以前 feed 挂在 _flush_rx_display 上：暂停期间数据只进 _paused_frames
         #    不喂历史，用户"看了半天数据，历史文件却一直停在暂停那一刻"
@@ -4081,7 +4184,7 @@ class MainWindow(QMainWindow):
         # 一个视觉行（含折行），直接 setValue(时间戳行号 − N)，顶上正好留 N 行
         # —— 像素差去修行单位的滚动值，单位和语义都对不上，文档一大就振出不
         # 收敛的跳变（真机实测：4px 的滚动值对应 71px 的画面跳动）。
-        keep = max(0, int(customization.get("pause_snap_lines")))
+        keep = self._pause_snap_keep()
         # 行高用时间戳块自身的实际高度：fontMetrics().lineSpacing() 与真实
         # 行高差 1px/行（leading 的取舍不同），长文档累计起来定位就漂一行开外
         row_height = self.txt_rx.blockBoundingGeometry(
@@ -4114,6 +4217,16 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(220, self._ensure_pause_cursor_visible)
         else:
             self.txt_rx.ensureCursorVisible()
+
+    def _pause_snap_keep(self) -> int:
+        """暂停定位要在时间戳上方留几行 —— **最大化态单独一份**。
+
+        普通态用「暂停定位行数」（默认 7 行：顶上留一点上一轮的尾巴，一眼
+        能看出"这是哪一轮"）；最大化态用「暂停定位行数（最大化）」（默认
+        **0**，即暂停后视口第一行就是本轮时间戳 —— 用户 2026-10-23 点名）。
+        """
+        key = "pause_snap_lines_max" if self._rx_t >= 0.5 else "pause_snap_lines"
+        return max(0, int(customization.get(key)))
 
     def _ensure_pause_cursor_visible(self) -> None:
         """暂停定位落点之后兜一次光标可见（已恢复滚动就不管了）。"""
@@ -4204,6 +4317,8 @@ class MainWindow(QMainWindow):
         self._reset_matches()
         self._clear_alert_highlight()
         self._align_section = SECTION_OTHER      # 画面清空 = 段状态归零
+        # 空行规则要跨帧判断"上一行空不空"（见 _emit_block 的 gap_lines）
+        self._rx_prev_line = ""
         # 画面清空 = 重新开始数，时间戳的"轮首标记见过没有"也跟着归零；
         # 暂停队列里攒着的帧也作废（清空本身就是"不要之前的东西了"）
         self._paused_frames.clear()
@@ -4413,9 +4528,35 @@ class MainWindow(QMainWindow):
         self._stamp_anchor_seen = False
         self._stamp_last_monotonic = 0.0
         text = "\n".join(rows)
+        # ⛔ 空行与实时**同一条规则**（`ui_highlight.gap_lines`）：每个
+        #    VoltageN: / TemperatureN: / BMS 状态、以及每个时间戳之上各空一行，
+        #    其它位置一个空行都没有。历史文件可能是老版本写的（那时 feed 把空行
+        #    全滤掉了），所以这里**按规则重建**而不是信文件 —— 新老记录一个样子。
+        try:
+            text = "\n".join(gap_lines(text.split("\n")))
+        except Exception as exc:            # noqa: BLE001 - 规整失败就用原行
+            app_log.error(f"历史回放空行规整失败: {exc}")
+        # 历史文件里存的是**接收区当时显示的那一行行**（feed 在 _emit_block 里、
+        # 排版之后才调，见那边的注释），本来就带补零/网格；这里再跑一遍
+        # align_indexes 只是为了兜住"手改过/跨版本/极老的文件"，对正常文件是
+        # 幂等的（逐字比过：4137 行整篇排版 == 逐轮排版）。
+        try:
+            text = align_indexes(text, section=SECTION_OTHER,
+                                 max_row_chars=self._rx_max_row_chars(),
+                                 **self._rx_grid_hints())
+        except Exception as exc:            # noqa: BLE001 - 排版失败就用原文
+            app_log.error(f"历史回放排版失败: {exc}")
         self.txt_rx.setPlainText(text)
-        self.txt_rx.moveCursor(QTextCursor.MoveOperation.Start)
+        # 先把"塞进几千行"的第一帧重排+绘制付掉：下面要按真实的最大滚动值定位，
+        # 布局没落地时 bar.maximum() 还是旧的 0，定位会落空。
         self._settle_rx_layout()
+        # 默认停在**最新**那一轮（用户 2026-10-23 点名"打开读取数据后应该默认
+        # 停留在最新时间戳的位置"）：回放是"看刚刚发生了什么"，不是从头读档案。
+        # 贴底与实时接收同一口径（实时也是一直贴底），最新的一轮就在眼前。
+        self.txt_rx.moveCursor(QTextCursor.MoveOperation.End)
+        self.txt_rx.ensureCursorVisible()
+        bar = self.txt_rx.verticalScrollBar()
+        bar.setValue(bar.maximum())
         self._replay_active = True
         self._refresh_replay_ui()
         self._fade_rx_shot()
@@ -4569,6 +4710,11 @@ class MainWindow(QMainWindow):
             bar.setMinimumHeight(0)
             bar.setMaximumHeight(_WIDGET_MAX)
             bar.show()
+            # ⛔ 提示条长出来 = 接收区视口矮了 50px，滚动条的 maximum 跟着变大：
+            #    打开历史时刚贴好的底会**差出几行**（实测 746/750，最新一行被挤到
+            #    视口外 28px）。视口高度变过就必须重压一次底 —— 和发送区收展那条
+            #    同一个收尾口径（见 _repin_rx_bottom）。
+            self._repin_rx_bottom()
             return
         bar.setMinimumHeight(0)
         bar.setMaximumHeight(0)
@@ -5292,9 +5438,11 @@ class MainWindow(QMainWindow):
             # 起手姿态当场摆一次（不然用户得重启才看得到自己改了什么）
             self._apply_startup_maximized()
         if any(k in custom_changes for k in ("module_count", "cells_per_module",
-                                             "temps_per_module")):
+                                             "temps_per_module", "broken_wire_mv")):
             # 决策-3：排版配置改完，**已显示的旧文本**也要按新网格重排（滚动位置、
             # 光标/选中区、暂停态都保留，见 _relayout_rx_document）
+            # broken_wire_mv：断线 X 也是排版产物 —— 改了阈值要把画面里旧的 X
+            # 按新值重算（align_indexes 会先把旧标记还原成列间隔再重排）。
             if self._relayout_rx_document():
                 app_log.info("接收区已按新排版配置重排")
         self._toast("设置已保存", 2500)
@@ -5333,6 +5481,8 @@ class MainWindow(QMainWindow):
             self._apply_material(str(value))
         elif key == "vehicle":
             self._refresh_vehicle_badge()
+            import rx_history
+            rx_history.switch_target(customization.current_vehicle() or None)
             self._schedule_vehicle_relayout()
 
     def _preview_buttons(self, hidden: list[str]) -> None:

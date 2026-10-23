@@ -981,9 +981,16 @@ def check_animation_engine(app: QApplication) -> None:
     #    节拍是"高帧率"唯一能确定性验证的地方 —— 帧数会受机器负载影响，节拍不会。
     original_hz = frame_hz()
     try:
+        # ⛔ **别把 120 写死**：``set_frame_hz`` 会夹到 ``display_max_hz()``
+        #    （主屏刷新率）。机器插电/省电策略把面板切到 60Hz 时，本机实测
+        #    ``QScreen.refreshRate() = 60`` → 请求 120 被夹成 60，这条断言
+        #    就假挂（2026-10-24 00:20 实测，同一份代码前两次跑是过的）。
+        #    这里要验的是"默认节拍 = min(请求值, 显示器上限)"这条规则本身。
         set_frame_hz(120)
-        assert frame_hz() == 120, frame_hz()
-        assert frame_interval_ms() == 8, frame_interval_ms()
+        want = min(120, display_max_hz())
+        assert frame_hz() == want, (frame_hz(), want, display_max_hz())
+        assert frame_interval_ms() == max(1, round(1000.0 / want)), \
+            frame_interval_ms()
         assert ticker_interval() == frame_interval_ms(), ticker_interval()
         # 显示器上限：不会超过防呆的 240，也不会低于下限 24
         assert 24 <= display_max_hz() <= 240, display_max_hz()
@@ -1007,11 +1014,15 @@ def check_animation_engine(app: QApplication) -> None:
                 time.sleep(0.002)
             return (time.perf_counter() - started) * 1000.0, len(samples)
 
-        slow_ms, slow_n = _measure(60)
-        fast_ms, fast_n = _measure(max(120, display_max_hz()))
+        # ⚠️ 取样用的两档帧率**跟着显示器上限走**（见上）：面板 120Hz 时是
+        #    60 vs 120，省电切到 60Hz 时是 30 vs 60 —— 写死 60/120 会在 60Hz
+        #    机器上测出"两档一样快"而假挂。
+        cap = max(48, display_max_hz())
+        slow_ms, slow_n = _measure(max(24, cap // 2))
+        fast_ms, fast_n = _measure(cap)
         assert abs(fast_ms - slow_ms) <= max(60.0, slow_ms * 0.35), \
-            (f"改帧率把动画时长也改了：60fps {slow_ms:.0f}ms / "
-             f"高帧率 {fast_ms:.0f}ms")
+            (f"改帧率把动画时长也改了：{cap // 2}fps {slow_ms:.0f}ms / "
+             f"{cap}fps {fast_ms:.0f}ms")
         assert fast_n > slow_n, \
             f"高帧率没有采到更多帧：{slow_n} -> {fast_n}（帧率没生效？）"
     finally:
@@ -1237,6 +1248,33 @@ def check_rx_history(app: QApplication) -> None:
         assert len(rx_history.lines()) == 1000, "调大不该复活已被丢掉的行"
         # 恢复默认，后续断言（文件行数）按默认上限算
         rx_history.set_max_lines(cap)
+
+        # 3c) 分车历史（用户 2026-10-23）：不同电池箱 → 不同文件，互不串档；
+        # 未选车落通用文件。用临时目录，绝不碰真实的 接收历史*.log。
+        assert rx_history.file_for(None) == "接收历史.log"
+        assert rx_history.file_for("E74-2026") == "接收历史-E74-2026.log"
+        assert rx_history.file_for('a/b:c*d?e"f<g>h|i') == "接收历史-a_b_c_d_e_f_g_h_i.log"
+        real_resolver = rx_history._resolve_dir
+        rx_history._resolve_dir = lambda: tmp.parent     # 重定向到临时目录
+        try:
+            rx_history.switch_target("E74-2026")
+            rx_history.feed("vehicle A row")
+            rx_history.flush()
+            rx_history.switch_target("X88-2026")
+            rx_history.feed("vehicle B row")
+            rx_history.flush()
+            # 当前是 X88：读到的应是 B 的文件
+            assert "vehicle B row" in rx_history.all_lines()
+            assert "vehicle A row" not in rx_history.all_lines()
+            rx_history.switch_target("E74-2026")
+            assert "vehicle A row" in rx_history.all_lines()
+            assert "vehicle B row" not in rx_history.all_lines()
+            rx_history.switch_target(None)
+            assert rx_history._path is not None \
+                and rx_history._path.name == "接收历史.log"
+        finally:
+            rx_history._resolve_dir = real_resolver
+            rx_history.switch_target(None)   # 恢复通用文件，防污染后续断言
 
         # 4) flush 后无积压；路径为 None 时静默不炸
         rx_history.feed("tail")
@@ -1498,6 +1536,88 @@ def check_history_replay(app: QApplication) -> None:
         app.processEvents()
         assert not window._replay_active, \
             "回放态下再点「打开历史数据」没有关闭回放（开关失效）"
+
+        # ---- 回放的展现形式必须和实时一模一样（2026-10-23 用户点名）----
+        # 历史文件里存的是**设备原文**（未补零、未对齐，见 _on_received 的
+        # rx_history.feed 位置），实时则每帧过 align_indexes。回放若原样灌进
+        # 接收区，序号不补零、列也不齐 —— 跟实时不是一个样子。
+        raw = ("[2026-10-12 22:00:00]\n"
+               "Voltage1:\n"
+               "1.2400 2.3820 3.3900\n"
+               "Temperature1:\n"
+               "1.22 2.95 3.45\n"
+               "BMS OK\n"
+               "[2026-10-12 22:00:02]\n"
+               "Voltage1:\n"
+               "1.3700 2.3800 3.3900\n"
+               "Temperature1:\n"
+               "1.30 2.40 3.50\n"
+               "BMS OK\n")
+        rx_history._lines.clear()
+        rx_history._lines.extend(raw.splitlines())
+        rx_history._file_lines = len(rx_history._lines)
+        window._open_history()
+        app.processEvents()
+        assert window._replay_active, "第二次打开历史没进回放"
+        shown = window.txt_rx.toPlainText().split("\n")
+        volt_shown = [t for t in shown if ".2400" in t]
+        assert volt_shown and volt_shown[0].split()[0] == "01.2400", \
+            f"回放没有走实时那套排版（序号没补零）：{volt_shown[:1]}"
+        temp_shown = [t for t in shown if "1.22" in t]
+        assert temp_shown and not temp_shown[0].startswith("0"), \
+            f"温度段的序号被补零了（用户明确不要）：{temp_shown[:1]}"
+        # 默认停在**最新**那一轮（用户："打开读取数据后应该默认停留在最新时间戳
+        # 的位置"）—— 窗口没 show()，滚动条没有行程，所以用光标位置验：必须
+        # 落在文末，而不是像老版本那样 moveCursor(Start) 钉在文件开头。
+        _text_len = len(window.txt_rx.toPlainText())
+        _pos = window.txt_rx.textCursor().position()
+        assert _pos >= _text_len - 2, \
+            f"打开历史后没有停在最新数据（光标 {_pos} / 全文 {_text_len}）"
+
+        # ---- 空行口径：轮间有、别处没有（2026-10-24 用户点名）----
+        # ① feed 必须**留下**轮间空行：那一行是实时真的占一行的（_emit_block 用
+        #    f"\n{stamp}" 造出来），以前 `if ln.strip()` 把它连同其它空行一起滤掉，
+        #    于是历史里每轮时间戳都紧贴着上一轮数据 —— "该空行的地方没有空行"。
+        rx_history._lines.clear()
+        rx_history._pending.clear()
+        rx_history.feed("\n[2026-10-23 20:00:00]\nVoltage1:\n01.3820")
+        assert list(rx_history._lines) == ["", "[2026-10-23 20:00:00]",
+                                           "Voltage1:", "01.3820"], \
+            f"轮间空行没被记下来：{list(rx_history._lines)}"
+        # ② 回放要按同一条规则**重建**空行（老文件里根本没存）：散空行丢掉，
+        #    每个时间戳前补一行 —— 新老记录看起来才是同一个样子。
+        # ⚠️ 必须写到**文件**里：_open_history → rx_history.all_lines() 优先读
+        #    文件（内存 deque 只是副本），只改 _lines 的话回放拿到的还是旧内容。
+        replay_rows = ["[2026-10-23 20:00:00]", "Voltage1:", "01.3820",
+                       "", "BMS Error",
+                       "[2026-10-23 20:00:05]", "Voltage1:", "01.3820"]
+        tmp.write_text("\n".join(replay_rows) + "\n", encoding="utf-8")
+        rx_history._lines.clear()
+        rx_history._pending.clear()
+        rx_history._lines.extend(replay_rows)
+        rx_history._file_lines = len(replay_rows)
+        window._exit_replay()
+        app.processEvents()
+        window._open_history()
+        app.processEvents()
+        rows = window.txt_rx.toPlainText().split("\n")
+        assert rows and rows[0].startswith("["), f"回放开头不该有空行：{rows[:3]}"
+
+        # 空行规则（2026-10-24 用户点名，实时与回放**同一条**）：
+        # 每个 VoltageN: / TemperatureN: / BMS … / 时间戳**之上**各空一行，
+        # 其它位置一个空行都没有。
+        def _heads(line: str) -> bool:
+            return line.startswith(("[", "Voltage", "Temperature", "BMS"))
+
+        for _i, _t in enumerate(rows):
+            if not _t.strip():
+                _nxt = rows[_i + 1] if _i + 1 < len(rows) else ""
+                assert _nxt and _heads(_nxt), \
+                    f"空行后面不是模组标题/BMS/时间戳：{rows[max(0, _i - 1):_i + 2]!r}"
+            elif _i > 0 and _heads(_t):
+                assert rows[_i - 1] == "", \
+                    f"标题前面缺空行：{rows[max(0, _i - 2):_i + 1]!r}"
+        assert "BMS Error" in rows, f"样例里该有 BMS Error：{rows}"
     finally:
         customization.set("volt_limit_low", saved_limits[0])
         customization.set("volt_limit_high", saved_limits[1])
@@ -2256,6 +2376,65 @@ def check_expand_and_copy_all(app: QApplication) -> None:
                 timeout=3.0), \
                 "反复进出后几何没有精确回到原位"
 
+        # ---- 3c) 暂停 × 全屏：工具栏显隐必须按**当前状态**现算 ----
+        # ⛔ 2026-10-23 用户报"全屏看数据时上方一直有一条 1~2px 小条，开始滚动
+        #    就有、一动不动，暂停就没了、继续又有"。根因两条，都在这里钉住：
+        #    ① 老版把"暂停那刻工具栏是否可见"记进旗子 _opts_visible_on_resume，
+        #       跨进/退全屏后失效：普通态暂停→进全屏→恢复，会把**整排工具栏在
+        #       全屏里拉出来**（探针实测 rx_top 86→130）；
+        #    ② _rx_capture_full 在暂停态直接量 height()=0 → max(1,0)=1 →
+        #       内容 setFixedHeight(1) → 行永远只能长到 1px 那一条缝。
+        #    阳性对照：devtools/_probe_strip_repro.py（旧逻辑 row(h=1 vis=1)，
+        #    新逻辑 vis=0）。
+        def _settle(ms: float = 0.5) -> None:
+            deadline = time.monotonic() + ms
+            while time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(0.01)
+
+        min_h = window.OPTS_MIN_NATURAL_H
+        window.btn_pause.click()                     # 普通态暂停
+        assert wait_for(app, lambda: window._paused), "暂停失败"
+        assert wait_for(app, lambda: window._rx_opts_row.height() <= 1, timeout=2.0), \
+            "暂停后工具栏没有收成 0 高"
+        window.btn_expand.click()                    # 暂停中进全屏
+        assert wait_for(app, lambda: window._expanded, timeout=3.0), \
+            "暂停中进全屏失败"
+        assert wait_for(app, lambda: window._rx_opts_row.isHidden(), timeout=2.0), \
+            "全屏里工具栏必须不可见（哪怕刚暂停过）"
+        window.btn_pause.click()                     # 全屏中恢复滚动
+        assert wait_for(app, lambda: not window._paused), "恢复滚动失败"
+        _settle()
+        assert window._rx_opts_row.isHidden(), (
+            "全屏里恢复滚动后工具栏又冒出来了（用户看到的那条小条）："
+            f"h={window._rx_opts_row.height()} "
+            f"vis={window._rx_opts_row.isVisible()} "
+            f"内容 h={window._opts_content.height()}")
+        assert window._opts_content.height() >= min_h, (
+            "工具栏内容被钉成一条缝了："
+            f"{window._opts_content.height()}px（应为自然高度 {min_h}+）")
+        window.btn_expand.click()                    # 退出全屏
+        assert wait_for(app, lambda: not window._expanded, timeout=3.0), \
+            "退出全屏失败"
+        assert wait_for(app, lambda: window._rx_opts_row.isVisible()
+                        and window._rx_opts_row.height() >= min_h, timeout=3.0), \
+            "回到普通态后工具栏没有恢复完整高度"
+        # 反方向：全屏暂停 → 退全屏 → 恢复，工具栏必须回来（老版永远回不来）
+        window.btn_expand.click()
+        assert wait_for(app, lambda: window._expanded, timeout=3.0)
+        window.btn_pause.click()
+        assert wait_for(app, lambda: window._paused)
+        window.btn_expand.click()
+        assert wait_for(app, lambda: not window._expanded, timeout=3.0), \
+            "暂停中退出全屏失败"
+        _settle(0.3)
+        assert window._rx_opts_row.isHidden(), "暂停中退回普通态，工具栏不该冒出来"
+        window.btn_pause.click()
+        assert wait_for(app, lambda: window._rx_opts_row.isVisible()
+                        and window._rx_opts_row.height() >= min_h, timeout=3.0), \
+            ("全屏暂停→退全屏→恢复：工具栏回不来了"
+             "（老版 _opts_visible_on_resume 旗子失效的第二个方向）")
+
         # 3a-bis) 发送区**展开态**下最大化：也要平滑压到消失（用户 21:12 点名
         #         "展开状态下的发送区折叠压缩到消失的动画还是不行，有跳变"）。
         #         两条状态共用同一条 Reveal，只有满量程不同。
@@ -2755,6 +2934,26 @@ def check_customization(app: QApplication) -> None:
             window._toggle_pause()      # 恢复（顺带验证折叠还原）
             app.processEvents()
         customization.set("pause_snap_lines", 7)
+
+        # ---- 2b) 最大化态用**独立**的一份「暂停定位行数（最大化）」----
+        # 用户 2026-10-23：最大化之后默认暂停第一行就是时间戳（= 保留 0 行）。
+        assert customization.get("pause_snap_lines_max") == 0, \
+            "最大化态的暂停定位行数默认应为 0（第一行就是时间戳）"
+        saved_t, saved_max = window._rx_t, customization.get("pause_snap_lines_max")
+        try:
+            window._rx_t = 1.0
+            customization.set("pause_snap_lines_max", 5)
+            assert window._pause_snap_keep() == 5, \
+                "最大化态应当读「暂停定位行数（最大化）」"
+            customization.set("pause_snap_lines_max", 0)
+            assert window._pause_snap_keep() == 0, \
+                "最大化态设为 0 时落点应不留尾巴"
+            window._rx_t = 0.0
+            assert window._pause_snap_keep() == 7, \
+                "普通态仍应读「暂停定位行数」（默认 7），不能被最大化那份覆盖"
+        finally:
+            window._rx_t = saved_t
+            customization.set("pause_snap_lines_max", saved_max)
 
         # ---- 3) 时钟显示年月日开关（**默认关**；拨开后才有年月日）----
         # 用户点名："默认必须包含时、分、秒……该选项默认关闭"。
@@ -3392,7 +3591,7 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
 
     # ⚠️ 必须放在函数**最开头**：函数里任何一处 `from X import Y` 都会让 Y 变成
     # 整个函数的局部名，在导入语句之前用它就是 UnboundLocalError（这个坑踩过）。
-    from ui_highlight import align_indexes, stamp_span
+    from ui_highlight import align_indexes, wire_break_spans, stamp_span
 
     settings = QSettings("MimoWorks", "SerialAssistant")
     snapshot = {key: settings.value(key) for key in settings.allKeys()}
@@ -3413,8 +3612,11 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
         window._clear_receive()
 
         # ---- 1) 收包合并：一帧按 64 字节切开喂进去，界面上必须只留一条 ----
+        # ⚠️ 模组之间**不再塞空行**（2026-10-24 起：帧内空行一律丢掉，空行只允许
+        #    出现在轮与轮之间，见 _emit_block 的帧内空行过滤与下面 1g⑤ 的断言）。
+        #    这条用例要验的是"合并拼接没吃字节"，与空行无关。
         frame = "".join(f"Voltage{i}:\n"
-                        + " ".join(f"{j}.3820" for j in range(1, 26)) + "\n\n"
+                        + " ".join(f"{j}.3820" for j in range(1, 26)) + "\n"
                         for i in range(1, 4)) + "Temperature1:\n1.22 2.22 3.22 4.25\n"
         payload = frame.encode("utf-8")
         assert len(payload) > 64 * 3, "测试数据太短，切不出好几段"
@@ -3429,14 +3631,15 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
         text = window.txt_rx.toPlainText()
         assert text.count("[") == 1, \
             f"一帧被切成了好几段，每段挂一个时间戳：\n{text[:400]}"
-        # 界面显示 = 时间戳行 + 合并后的帧；去掉时间戳行后应与原始帧一致。
-        # ⚠️ 显示出来的文本比设备发来的多了一层**序号补齐**（"1.3820" -> " 1.3820"，
-        # 见 ui_highlight.align_indexes），所以不能直接逐字比 —— 跟补齐后的原文比。
-        shown = "".join(line + "\n" for line in text.split("\n")
-                        if not line.startswith("["))
+        # 界面显示 = 时间戳行 + 合并后的帧；去掉时间戳行、**去掉空行**后应与
+        # 原始帧一致（空行是 2026-10-24 起按"模组标题之上各一行"生成的排版，
+        # 不属于数据内容，所以两边都滤掉再比 —— 这条用例要验的是合并没吃字节）。
+        shown = "\n".join(line for line in text.split("\n")
+                          if line.strip() and not line.startswith("["))
         # 显示和纯函数要用**同一个**视口封顶折行，否则逐字比必然假挂
-        assert shown.rstrip("\n") == align_indexes(
-            frame, max_row_chars=window._rx_max_row_chars()).rstrip("\n"), \
+        want = "\n".join(line for line in align_indexes(
+            frame, max_row_chars=window._rx_max_row_chars()).split("\n") if line.strip())
+        assert shown == want, \
             "合并之后的内容和原始数据不一致（拼接处被吃掉了字节）"
         # 再钉一遍"值一个字符都没被动过"：补齐**只在序号前面插 0**，把这些前导 0
         # 摘掉之后必须和原文对得上。重排会动空白和折行位置，所以按**全空白压平
@@ -3523,12 +3726,15 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
             " ".join(volt_frame.split("\n", 1)[1].split()), \
             "网格重排动了数字本身"
 
-        # 温度区孤行（分包把 " 4.87" 劈成单独一行）要并回 4 列网格；
+        # ⛔ 2026-10-24 起**不再把短行并回网格**（用户点名"不要篡改接收的数据
+        # 内容"：设备发几行就显示几行，只想补零/对齐，不想被合并或重排）。
+        # 以前这里会把 "3 + 1 + 4" 并成 "4 + 4"，等于把设备的三行变成两行。
+        # （分包造成的半行由 _flush_rx 的"半行缓发"在入口处接回去，不靠这里。）
         # 温度序号保持设备原样（不补 0）
         temp_aligned = align_indexes(
             "Temperature1:\n1.87 2.87 3.87\n 4.87\n5.87 6.87 7.87 8.87")
         assert temp_aligned.split("\n")[1:] == \
-            ["1.87   2.87   3.87   4.87", "5.87   6.87   7.87   8.87"], \
+            ["1.87   2.87   3.87", "4.87", "5.87   6.87   7.87   8.87"], \
             temp_aligned
 
         # ---- 1e) 折行按视口封顶（用户 2026-10-11 截图：13 个一行的网格在只
@@ -3562,6 +3768,158 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
         shown_join = window.txt_rx.toPlainText()
         assert "Over Voltage" in shown_join, f"劈开的一行没有被接回来：{shown_join!r}"
         assert "01.3820" in shown_join and "06.3820" in shown_join, shown_join
+
+        # ---- 1g) 段状态自愈 + 温度阈值只判温度（2026-10-23 用户反馈）----
+        # 用户点名的段边界：电压 = 时间戳 → TemperatureN: 之前；温度 =
+        # TemperatureN: → BMS 之前。设备**有的轮次不发 Voltage1: 标题**，电压
+        # 数据直接接在 BMS 错误明细后面 —— 那种行若还留在"其它段"，就会
+        #   · 整行被铺成 BMS 的橙（"电压区域有一整排数据标黄"）；
+        #   · 电压值不按 mV 判红绿、也不进网格重排。
+        # 判据用 _is_volt_line（整行 4 位小数），温度行（2 位）不会误抢段。
+        from ui_highlight import (
+            SECTION_OTHER as _SO, SECTION_TEMP as _ST, SECTION_VOLT as _SV,
+            RxHighlighter as _RxHl, section_of as _sec, temp_spans as _tspans,
+        )
+        assert _sec("01.3858 02.3859", _SO) == _SV, \
+            "纯电压数据行没有把段状态自愈到电压段（整排标黄的根因）"
+        assert _sec("01.3858 02.3859", _ST) == _SV, \
+            "温度段里的纯电压数据行没有自愈"
+        assert _sec("1.25 2.25 3.25", _SV) == _SV, "温度行不该抢走电压段"
+        assert _sec("Temperature2:", _SV) == _ST
+        assert _sec("BMS OK", _ST) == _SO
+        assert _sec("[2026-10-23 20:00:00]", _ST) == _SV
+        # 温度阈值**只判温度格式**的值：电压值（4 位小数）落在温度段时一个都
+        # 不能被标黄 —— 用户看到的"整排电压数据标黄"就是 3858 被按 20~60℃ 比。
+        assert _tspans("01.3858 02.3859", 20, 60) == [], \
+            "电压值被温度阈值判成越界了（整排标黄的直接原因）"
+        assert len(_tspans("1.15 2.95", 20, 60)) == 2, \
+            f"真实温度越界没被判出来：{_tspans('1.15 2.95', 20, 60)}"
+        # 端到端：漏发 Voltage1: 的电压行接在 BMS 错误块后面时，必须是"按条
+        # 着色"，不能被整行铺色；BMS 明细里的散值（1.99）也不许铺色 ——
+        # 用户 2026-10-24 两次点名"只标黄 BMS Error 那几个字"。
+        from PySide6.QtWidgets import QTextEdit as _QTE
+        from ui_theme import qcolor as _qcolor
+        _bms_color = _qcolor("bms_error").name()
+        _box = _QTE()
+        _hl = _RxHl(_box.document())
+        _box.setPlainText("Temperature1:\n1.22 2.25\nBMS ERROR\nerrorTime=0\n"
+                          "1.99 2.99\n"
+                          "01.3858 02.3859 03.3860 04.3861\n")
+        _hl.rehighlight()
+        _docx = _box.document()
+
+        def _whole_painted(num: int) -> bool:
+            blk = _docx.findBlockByNumber(num)
+            return any(r.length >= max(1, len(blk.text()) - 1)
+                       and r.format.background().color().alpha() > 0
+                       for r in (blk.layout().formats() if blk.layout() else []))
+
+        assert _whole_painted(4) is False, \
+            "BMS 明细行（1.99 2.99）又被整行铺色了（用户只要 BMS Error 那几个字）"
+        assert _whole_painted(5) is False, \
+            (f"漏发 Voltage1: 的电压行被整行铺色了："
+             f"{_docx.findBlockByNumber(5).text()!r}")
+        # 只有 "BMS Error" 那几个字上色（BMS OK 一个字都不标）
+        _bms_row = next((i for i in range(_docx.blockCount())
+                         if "BMS ERROR" in _docx.findBlockByNumber(i).text()), None)
+        assert _bms_row is not None, "样例里没有 BMS ERROR 行"
+        _blk = _docx.findBlockByNumber(_bms_row)
+        _spans = _blk.layout().formats() if _blk.layout() else []
+        assert [(r.start, r.length) for r in _spans
+                if r.format.foreground().color().name() == _bms_color], \
+            f"BMS ERROR 这几个字没有上色：{[(r.start, r.length) for r in _spans]}"
+        _box.deleteLater()
+
+        # ④ BMS 文案**忽略大小写**（2026-10-24 用户点名"出现 BMS Error 得标黄"）：
+        #    真机发的是 "BMS Error"，常量原来写全大写，``text.find`` 一条都匹配
+        #    不上 → BMS 那行不标色、错误明细整块标橙也永远不启动。
+        from ui_highlight import bms_error_spans as _bms
+        for _txt in ("BMS Error", "BMS ERROR", "bms error", "xx BMS  Error yy"):
+            assert _bms(_txt), f"BMS 文案没做大小写不敏感：{_txt!r}"
+        assert _bms("BMS OK") == [] and _bms("COM0=1") == [], \
+            "BMS OK / 普通行不该被当成 BMS 错误"
+
+        # ⑤ 空行只在**模组标题 / BMS / 时间戳之上**，其余位置一个都不许有；
+        #    设备自己的行不许被合并（"03.3820" 单独一行就保持单独一行）。
+        window._clear_receive()
+        window._on_received(b"Voltage1:\n1.3820 2.3820\n\n3.3820\nBMS OK\n")
+        window._flush_rx(force=True)
+        app.processEvents()
+        _rows = window.txt_rx.toPlainText().split("\n")
+        assert _rows[1] == "" and _rows[2] == "Voltage1:", \
+            f"Voltage1: 之上没有空行：{_rows[:3]}"
+        assert "03.3820" in _rows[3:5], f"设备单独一行的数据被并掉了：{_rows}"
+        assert _rows[-2] == "" and _rows[-1] == "BMS OK", \
+            f"BMS 状态之上没有空行：{_rows[-3:]}"
+        assert [i for i, t in enumerate(_rows) if not t.strip()] == \
+            [1, len(_rows) - 2], f"空行出现的位置不对：{_rows}"
+
+        # ---- 1h) 断线阈值：相邻电芯压差达阈值 → 两个值之间插一个显眼的 X ----
+        # 用户 2026-10-24 原话："如果前一个电芯电压值与后一个电芯电压值差值达到了
+        # 阈值，就在两个电芯电压数据之间加入一个显眼的X符号，但是不要改变格式。"
+        # "不改变格式"的硬指标：X 占用原来的 3 空格列间隔（"   "→" X "），
+        # **整行字符数一格不变**，后面每一列的起点都不漂。
+        # ⚠️ 位置规则（2026-10-24 用户二次纠正）：偏低 → X 只在该低压值**右边**，
+        #    偏高 → 只在该高压值**左边**；一号电芯拿模组正常电芯的平均值当参照。
+        _row = "01.3800 02.3800 03.3900 04.3800 05.3790"
+        _plain = align_indexes("Voltage1:\n" + _row)
+        _marked = align_indexes("Voltage1:\n" + _row, wire_mv=50)
+        _p1, _m1 = _plain.split("\n")[1], _marked.split("\n")[1]
+        assert len(_p1) == len(_m1), f"插 X 把行宽改了：{_p1!r} / {_m1!r}"
+        # 规则（2026-10-24 二次定案）：**偏低 → X 只在该值右边；偏高 → 只在该值
+        # 左边**；一次断线只出一个 X（不再在两侧各来一个）。
+        # 这行里 03 比上一个高 100 mV → X 在 03 的**左边**。
+        assert len(wire_break_spans(_m1)) == 1, f"X 的个数不对：{_m1!r}"
+        _x = _m1.index("X")
+        assert _m1[_x + 1:].lstrip().startswith("03.3900"), \
+            f"偏高的值左边该有 X：{_m1!r}"
+        # 偏低：X 落在那个低压值的右边
+        _low = align_indexes("Voltage1:\n01.3800 02.3800 03.2900 04.3800",
+                             wire_mv=50).split("\n")[1]
+        _x = _low.index("X")
+        assert _low[:_x].rstrip().endswith("03.2900"), f"偏低的值右边该有 X：{_low!r}"
+        # 一号电芯没有"上一个"，拿**模组正常电芯的平均值**当参照
+        _first_low = align_indexes("Voltage1:\n01.2900 02.3800 03.3800",
+                                   wire_mv=50).split("\n")[1]
+        assert _first_low.startswith("01.2900 X"), f"一号偏低：{_first_low!r}"
+        _first_high = align_indexes("Voltage1:\n01.4600 02.3800 03.3800",
+                                    wire_mv=50).split("\n")[1]
+        assert _first_high.startswith("X "), f"一号偏高：X 该在它的左边：{_first_high!r}"
+        assert wire_break_spans(_p1) == [], "阈值 0 时不该有 X"
+        assert wire_break_spans(
+            align_indexes("Voltage1:\n" + _row, wire_mv=500).split("\n")[1]) == [], \
+            "差值都没到阈值却插了 X"
+        assert align_indexes(_marked, wire_mv=0) == _plain, "关掉阈值后 X 没被还原"
+        assert align_indexes(_marked, wire_mv=50) == _marked, "断线排版不幂等"
+        # ⛔ 真机数据回归（2026-10-24 用户截图里的 Voltage2，阈值 300）：
+        #    04.4081 → 05.4520 差 439，但两者离模组平均（≈4313）都只差 200 出头。
+        #    曾经加过"必须同时偏离平均 ≥ 阈值"的第二道闸，把这条真实断线整个吞掉
+        #    （用户当场问"我的阈值不是 300 吗，这里怎么没有断线"）—— 千万别再加回来。
+        _real = align_indexes(
+            "Voltage2:\n"
+            "1.4311 2.4307 3.4325 4.4081 5.4520 6.4308 7.4310 8.4311 9.4314 "
+            "10.4310 11.4311 12.4314",
+            wire_mv=300).split("\n")[1]
+        assert len(wire_break_spans(_real)) == 1, f"真实断线没被标出来：{_real!r}"
+        _x = _real.index("X")
+        assert _real[:_x].rstrip().endswith("04.4081") \
+            and _real[_x + 1:].lstrip().startswith("05.4520"), \
+            f"X 没夹在 04.4081 与 05.4520 之间：{_real!r}"
+        assert "X" not in align_indexes("Temperature1:\n1.22 2.22 3.22", wire_mv=1), \
+            "温度段不该插断线 X（温度没有电芯概念）"
+        # 端到端：设了阈值画面里就有 X，改回 0 就干净（沿用的是同一条排版管线）
+        import customization as _cu_short
+        _cu_short.set("broken_wire_mv", 50)
+        window._clear_receive()
+        window._on_received(("Voltage1:\n" + _row + "\nBMS OK\n").encode("utf-8"))
+        window._flush_rx(force=True)
+        app.processEvents()
+        _shown = [t for t in window.txt_rx.toPlainText().split("\n") if "01.3800" in t]
+        assert _shown and "X" in _shown[0], f"设了阈值但画面里没有 X：{_shown}"
+        _cu_short.set("broken_wire_mv", 0)
+        assert window._relayout_rx_document(), "阈值改回 0 之后没有触发重排"
+        _shown2 = [t for t in window.txt_rx.toPlainText().split("\n") if "01.3800" in t]
+        assert _shown2 and "X" not in _shown2[0], f"阈值归零后 X 还在：{_shown2}"
 
         # ---- 2) 暂停 = 冻结显示：画面一个像素都不动，新数据进后台队列；----
         #         继续 = 一次性刷进来并追底（恢复到最新读取的数据位置）
@@ -3728,6 +4086,15 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
     settings = QSettings("MimoWorks", "SerialAssistant")
     snapshot = {key: settings.value(key) for key in settings.allKeys()}
     pin_rx_grid_defaults(settings)
+    # ⛔ 电压阈值必须**钉死**（2026-10-23 补，memory 里那条"判欠压须 <2500、
+    #    用例要钉死阈值"说的就是这件事）：下面 4) 断言"序号染的是主题蓝"，
+    #    而序号只有在电压值**不越界**时才只是蓝的 —— 越界会把"序号+值"整条
+    #    覆盖成红/绿。本机真实配置是 4100~4500 mV，样例值 3820 一进来就算
+    #    欠压、整条变绿 → 断言假挂（实测挂过一次）。判色口径与用户配置无关，
+    #    钉成默认 2500~4500 才是在测"序号蓝"这件事本身。
+    import customization as _cu_pin
+    _cu_pin.set("volt_limit_low", 2500)
+    _cu_pin.set("volt_limit_high", 4500)
     real_ports = mw.list_serial_ports
     fake: list[tuple[str, str]] = [("loop://", "回环端口（假）")]
     mw.list_serial_ports = lambda: list(fake)
@@ -3809,9 +4176,10 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
         import re as _re
         assert _re.fullmatch(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]", stamp_text), \
             f"时间戳不是默认的带日期秒级格式：{stamp_text}"
-        # 时间戳独占一行、本轮首行（Voltage1:）紧贴在它下面；第一帧顶上不留白
-        assert lines[row + 1] == "Voltage1:", \
-            f"时间戳下面要紧贴本轮首行：{lines[row:row + 2]!r}"
+        # 时间戳独占一行；模组标题之上要空一行（2026-10-24 用户点名"每个模组
+        # 数据之间得有间隔，Voltage1 上面需要一个空行"）；第一帧顶上不留白
+        assert lines[row + 1] == "" and lines[row + 2] == "Voltage1:", \
+            f"时间戳与 Voltage1: 之间要空一行：{lines[row:row + 3]!r}"
         assert row == 0, f"第一帧顶上不该有空行：{lines[:2]!r}"
 
         # 下一轮（再喂一个 Voltage1 帧）：时间戳重新出现一轮一个，且**排版
@@ -3823,8 +4191,10 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
         stamp_rows = [i for i, line in enumerate(lines) if line.startswith("[")]
         assert len(stamp_rows) == 2, \
             f"新一轮该有自己的时间戳：{[lines[i][:24] for i in stamp_rows]}"
-        assert lines[stamp_rows[1] + 1] == "Voltage1:", \
-            f"时间戳下面要紧贴本轮首行：{lines[stamp_rows[1]:stamp_rows[1] + 2]!r}"
+        assert lines[stamp_rows[1] + 1] == "" \
+            and lines[stamp_rows[1] + 2] == "Voltage1:", \
+            (f"新一轮时间戳下面要空一行再接 Voltage1:："
+             f"{lines[stamp_rows[1]:stamp_rows[1] + 3]!r}")
         assert lines[stamp_rows[1] - 1] == "", \
             (f"时间戳与上方内容之间要空一行："
              f"{lines[stamp_rows[1] - 2:stamp_rows[1] + 1]!r}")
@@ -3889,9 +4259,16 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
             return [(r.start, r.length, r.format.foreground().color())
                     for r in layout.formats()]
 
-        head = painted_spans(0)      # "[21:47:14]" 时间戳行
-        label = painted_spans(1)     # "Voltage1:" 轮首行
-        data = painted_spans(2)      # " 1.3820   2.3824   3.3827" 那一行
+        # ⚠️ **按内容定位块号**，别写死 1/2：2026-10-24 起模组标题之上会插一行
+        #    空行（用户点名"Voltage1 上面需要一个空行"），块号整体下移。
+        _doc4 = window.txt_rx.document()
+        _blocks4 = [_doc4.findBlockByNumber(i).text()
+                    for i in range(_doc4.blockCount())]
+        i_label = _blocks4.index("Voltage1:")
+        i_data = next(i for i, t in enumerate(_blocks4) if ".3820" in t)
+        head = painted_spans(0)          # "[21:47:14]" 时间戳行
+        label = painted_spans(i_label)   # "Voltage1:" 轮首行
+        data = painted_spans(i_data)     # " 1.3820   2.3824   3.3827" 那一行
         assert head and not label, \
             f"时间戳独占一行（不该染到轮首行上）：{head} / {label}"
         # 时间戳染色覆盖整行（[YYYY-MM-DD HH:MM:SS] 现在是 21 字符，
@@ -3903,7 +4280,7 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
         # ⚠️ 别写死 (1, 1)：序号现在会被**补齐到固定宽度**（"1.3820" -> " 1.3820"，
         # 见 ui_highlight.align_indexes），偏移整体右移。起点一律从块文本现算 ——
         # 这样以后补齐位数改了、分隔符变了，这条断言也不会假挂。
-        data_text = window.txt_rx.document().findBlockByNumber(2).text()
+        data_text = _blocks4[i_data]
         index_offsets = {start for start, _len in index_spans(data_text)}
         assert index_offsets, f"这一行里没认出序号：{data_text!r}"
         assert {s for s, _n, _c in data if s in index_offsets} == index_offsets, \
@@ -4010,19 +4387,15 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
         assert (texts[bms_row].index("BMS ERROR"), 9) in \
             [(s, n) for s, n, c in painted_spans(bms_row) if c.name() == yellow], \
             f"BMS ERROR 没有标黄：{painted_spans(bms_row)}"
-        # ---- 5d) BMS 错误明细行整行标橙（2026-10-11 用户点名"BMS Error
-        #     并没有被标橙色"）：BMS ERROR 起到下一轮时间戳为止都是错误块，
-        #     明细行（"1.1 Over Voltage" 这些）跟着整行标橙 —— **序号也是橙的**
-        #     （2026-10-12 用户点名"高亮要包括序号"，不再把序号染回蓝）。
+        # ---- 5d) **只标 "BMS Error" 这几个字**（2026-10-24 用户两次点名"只要
+        #     BMS Error 这几个字出现了就标黄" / "只标黄 BMS Error"）：
+        #     以前那套"BMS ERROR 起到下一轮为止的明细行整行标橙（连序号都橙）"
+        #     已按用户要求**删掉**，明细行现在保持原样：序号蓝、值不判色。
         detail_row = next(i for i, t in enumerate(texts) if "Over Voltage" in t)
-        detail_text = texts[detail_row]
-        detail_chars = {}
-        for s, n, c in painted_spans(detail_row):
-            for p in range(s, s + n):
-                detail_chars[p] = c.name()
-        assert all(detail_chars.get(p) == yellow
-                   for p in range(len(detail_text))), \
-            f"BMS 错误明细行没有整行标橙（含序号）：{painted_spans(detail_row)}"
+        detail_spans = painted_spans(detail_row)
+        assert not [c for _, _, c in detail_spans if c.name() == yellow], \
+            (f"BMS 错误明细行又被整行标橙了（用户只要 BMS Error 那几个字）："
+             f"{detail_spans}")
 
         # ---- 5c) 温度值落进电压段状态也不能标绿/标红（用户点名"标绿的区间
         #     仅限于电压数据读取部分，不能到温度采集部分去"）：设备不发
@@ -4095,16 +4468,13 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
         assert any(c.name() == qcolor("temp_warn").name()
                    for _, _, c in painted_spans(temp_row_noheader)), \
             f"温度越界没有标黄：{painted_spans(temp_row_noheader)}"
-        # BMS 之后的数值行：作为**错误明细**整行标橙（2026-10-11 用户点名），
-        # 序号也是橙的（2026-10-12 用户点名"高亮要包括序号"）；关键是不能按
-        # 温度判成黄（用户：温度数据只到 BMS 为止）。
-        ab_text = rows[after_bms]
-        ab_chars = {}
-        for s, n, c in painted_spans(after_bms):
-            for p in range(s, s + n):
-                ab_chars[p] = c.name()
-        assert all(ab_chars.get(p) == yellow for p in range(len(ab_text))), \
-            f"BMS 错误明细行没有整行标橙（含序号）：{painted_spans(after_bms)}"
+        # BMS 之后的数值行：**不再整行标橙**（2026-10-24 用户两次点名"只标黄
+        # BMS Error 那几个字"，旧的"错误明细整块标橙"已删）。它现在跟普通行
+        # 一样：序号蓝、值不判色 —— 关键是**也不能**按温度判成黄（用户：
+        # 温度数据只到 BMS 为止）。
+        assert not [c for _, _, c in painted_spans(after_bms) if c.name() == yellow], \
+            (f"BMS 之后的数据行又被整行标橙了（用户只要 BMS Error 那几个字）："
+             f"{painted_spans(after_bms)}")
         assert not any(c.name() == qcolor("temp_warn").name()
                        for _, _, c in painted_spans(after_bms)), \
             "BMS 之后的数值不该再按温度判（用户：温度数据只到 BMS 为止）"
@@ -4953,32 +5323,32 @@ def check_vehicle_profiles(app: QApplication) -> None:
             _dlg.spin_vehicle_season.setValue(2026)
             _dlg.cmb_vehicle_number.setCurrentIndex(
                 _dlg.cmb_vehicle_number.findData("面板车-2026"))
-            _orig_box = ui_settings.QMessageBox.question
+            _orig_confirm = ui_settings.SettingsDialog._confirm_vehicle_delete
             asked = []
 
-            def _yes(*_a, **_k):
-                asked.append(True)
-                return ui_settings.QMessageBox.StandardButton.Yes
+            def _yes(_label):
+                asked.append(_label)
+                return True
 
-            ui_settings.QMessageBox.question = staticmethod(_yes)
+            ui_settings.SettingsDialog._confirm_vehicle_delete = staticmethod(_yes)
             try:
                 _dlg._on_vehicle_delete_requested("面板车-2026")
             finally:
-                ui_settings.QMessageBox.question = _orig_box
-            assert asked, "点 × 必须走二次确认（不能直接删）"
+                ui_settings.SettingsDialog._confirm_vehicle_delete = _orig_confirm
+            assert asked == ["面板车（2026 赛季）"], \
+                f"点 × 必须走二次确认，且弹层文案要带上车名：{asked}"
             assert "面板车-2026" not in customization.vehicle_names(), \
                 f"确认后没删掉：{customization.vehicle_names()}"
             assert customization.current_vehicle() == "", \
                 "删掉当前车后选择要清空（不许替用户挑下一台）"
             # 取消确认时不许动数据：再建一台、确认结果换成 No
             _dlg._create_vehicle("保留车-2026")
-            _orig_no = ui_settings.QMessageBox.question
-            ui_settings.QMessageBox.question = staticmethod(
-                lambda *_a, **_k: ui_settings.QMessageBox.StandardButton.No)
+            ui_settings.SettingsDialog._confirm_vehicle_delete = staticmethod(
+                lambda _label: False)
             try:
                 _dlg._on_vehicle_delete_requested("保留车-2026")
             finally:
-                ui_settings.QMessageBox.question = _orig_no
+                ui_settings.SettingsDialog._confirm_vehicle_delete = _orig_confirm
             assert "保留车-2026" in customization.vehicle_names(), \
                 "点了「取消」却把车删掉了"
         finally:
@@ -5098,6 +5468,18 @@ def main() -> int:
     import customization as _cu_main
     _cu_main.select_vehicle("")
     global_settings.sync()
+    # ⛔ 历史文件也要隔离（2026-10-24 补）：各用例都会构造 MainWindow
+    #    （构造里 rx_history.load() 按车辆取文件）、再用 _emit_block/feed 灌
+    #    测试数据。上面把车辆清空了 → 落到用户的**无车历史**
+    #    `~/.serialassistant/logs/接收历史.log` 里，实测被塞了 889 行
+    #    "ping"/"01.3820…" 测试数据（永久污染，且下次 load 会把它当真实留存）。
+    #    `_resolve_dir()` 是唯一决定"存哪"的地方，指到临时目录即可，
+    #    跑完还原。rx_history 的内存态由各 check 自己快照/还原。
+    import tempfile as _tempfile
+    import rx_history as _rxh
+    _real_resolve_dir = _rxh._resolve_dir
+    _selftest_hist_dir = Path(_tempfile.mkdtemp(prefix="selftest_hist_"))
+    _rxh._resolve_dir = lambda: _selftest_hist_dir
     failed = 0
     for name, func in CHECKS:
         try:
@@ -5125,6 +5507,14 @@ def main() -> int:
     app.processEvents()
     app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     app.processEvents()
+    # 历史文件路径隔离的还原：放在**窗口全部析构之后**（上面那两次 processEvents
+    # 之前都还有对象活着，它们的析构可能触到 rx_history），并且先把内存态清空，
+    # 这样任何迟到的 flush 都写不出东西（flush 见到 _path 为 None 直接返回）。
+    _rxh._path = None
+    _rxh._lines.clear()
+    _rxh._pending.clear()
+    _rxh._file_lines = 0
+    _rxh._resolve_dir = _real_resolve_dir
     for key in global_settings.allKeys():
         if key not in global_snapshot:
             global_settings.remove(key)

@@ -36,7 +36,25 @@ _DROP_BINARIES = {
     # 输入法/触摸/原生样式：程序启动时 app.setStyle("Fusion")，这三类都不加载
     'qtuiotouchplugin.dll', 'qtvirtualkeyboardplugin.dll',
     'qmodernwindowsstyle.dll',
+    # ---- 2026-10-24（2.4 瘦身）----
+    # ① Qt 自带的中文/多语翻译库 qt_*.qm：产品界面全是自己画的，**从来没装过
+    #    QTranslator**（grep 过），这些 .qm 一个都不会被加载 → 全删。
+    # ② Qt 的 **OpenSSL 后端**（qopensslbackend + libcrypto-3-x64 + libssl-3-x64）：
+    #    Windows 上 Qt 默认走系统自带的 **Schannel**，qopensslbackend 只有显式
+    #    指定 QT_TLS_BACKEND=openssl 才会加载。删掉这三块省 6.8MB。
+    #    ⛔ 删完**必须在产物上验联网**：`SerialAssistant.exe --check-net`
+    #    （用 QNetworkAccessManager 取一次 HTTPS，结果写 net_check.txt）——
+    #    这是唯一有联网风险的裁剪，源码里跑 selftest 验证不了它。
+    #    ⚠️ Python 自己的 libcrypto-3.dll / libssl-3.dll（不带 -x64）**不能删**：
+    #    那是 CPython 的 ssl 模块用的，两者名字不同、来源不同。
+    'qopensslbackend.dll', 'libcrypto-3-x64.dll', 'libssl-3-x64.dll',
+    # ③ JPEG 解码插件：assets 里只有 ico / png / svg，程序不接受用户图片，
+    #    按文件名解码的路径根本不存在（png/ico 由 Qt 内置处理）。
+    'qjpeg.dll',
 }
+
+# 数据文件层同样要减：Qt 的翻译目录整块不要（见上"从来没装过 QTranslator"）。
+_DROP_DATA_DIRS = {'pyside6/translations'}
 
 a = Analysis(
     ['main.py'],
@@ -72,6 +90,10 @@ a = Analysis(
 # 见上面 _DROP_BINARIES：Analysis 之后再滤二进制（hook 会把它们抓满）。
 a.binaries = [entry for entry in a.binaries
               if os.path.basename(entry[0]).lower() not in _DROP_BINARIES]
+# datas 里也要滤（translations 是目录形式进来的，按规范化路径前缀匹配）
+a.datas = [entry for entry in a.datas
+           if not any(str(entry[0]).replace("\\", "/").lower().startswith(d)
+                      for d in _DROP_DATA_DIRS)]
 
 pyz = PYZ(a.pure)
 

@@ -317,6 +317,15 @@ class SettingsDialog(QDialog):
         buttons.addWidget(confirm)
         root.addLayout(buttons)
 
+        # ⛔ 560 只是**下限**，不代表够用：模块行（Module N / 电芯数量 /
+        #    温度采集数量）在 560 宽下右侧输入框会被裁掉 —— 实测内容最小宽度
+        #    603，探针数出 38 个控件越界 31~43px（devtools/_probe_settings_clip.py）。
+        #    滚动区是 widgetResizable + 横向滚动条常关，于是越界部分直接被切，
+        #    用户看到的是"温度采集数量那个框只剩一半"。
+        #    这里按 body 的最小宽度把面板撑到刚够，窄屏才由竖向滚动条接管。
+        chrome = 2 * (GAP + 6) + 4          # 外层边距 + 边框余量
+        self.setMinimumWidth(max(560, body.minimumSizeHint().width() + chrome))
+
     def _request_close(self) -> None:
         """按钮要求关闭：确定/取消按发起者区分，其余（Esc / 窗口 X）算取消。"""
         sender = self.sender()
@@ -756,6 +765,28 @@ class SettingsDialog(QDialog):
         self._sync_vehicle_rows()
         self._notify_vehicle_changed()
 
+    @staticmethod
+    def _confirm_vehicle_delete(label: str) -> bool:
+        """删除前的二次确认弹层。返回 True = 用户点了「删除」。
+
+        ⛔ 不要 QMessageBox.question 的现成样式：左边一颗大问号、
+        Yes/No 带助记下划线，用户 2026-10-23 点名"很难看"——
+        改成无图标 + 纯文本按钮（没有 & 助记键，自然没有下划线）。
+        拆成独立方法主要为了**可测**：selftest 把它整个换掉即可模拟
+        确认/取消，不必去拦 QMessageBox 的模态 ``exec()``（实测一拦
+        不到，模态框就会真的弹出来把自测卡死）。
+        """
+        box = QMessageBox(
+            QMessageBox.Icon.NoIcon, "删除车号",
+            f"确定删除「{label}」吗？\n\n只删这套模组结构，已接收的数据不受影响。",
+            parent=None)
+        yes_btn = box.addButton("Yes", QMessageBox.ButtonRole.YesRole)
+        no_btn = box.addButton("No", QMessageBox.ButtonRole.NoRole)
+        # 默认键给 No：回车不能顺手把一台车的模组结构删掉
+        box.setDefaultButton(no_btn)
+        box.exec()
+        return box.clickedButton() is yes_btn
+
     def _on_vehicle_delete_requested(self, name: str) -> None:
         """弹层条目右端的 × 被点了：**二次确认**后才真删。
 
@@ -768,12 +799,7 @@ class SettingsDialog(QDialog):
             return
         season, number = customization.split_vehicle(target)
         label = f"{number}（{season} 赛季）" if season else number
-        answer = QMessageBox.question(
-            self, "删除车号",
-            f"确定删除「{label}」吗？\n\n只删这套模组结构，已接收的数据不受影响。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        if answer != QMessageBox.StandardButton.Yes:
+        if not self._confirm_vehicle_delete(label):
             return
         customization.delete_vehicle(target)
         self._sync_vehicle_rows()
