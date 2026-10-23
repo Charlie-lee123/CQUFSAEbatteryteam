@@ -1416,6 +1416,16 @@ class ChevronSpinBox(QSpinBox):
         """
         if bool(visible) != self._arrows:
             self._arrows = bool(visible)
+            if self._edit is None:
+                self._edit = self.findChild(QLineEdit)
+            # ⛔ 只关绘制不够：Qt 内部布局仍给（已隐藏的）上下按钮**保留 22px**，
+            #    行内编辑框被压窄且靠左 —— 文字的"居中"是在编辑框里居中，
+            #    对整个框来说就是左偏 11px（用户 2026-10-23 截图）。
+            #    横向由 _place_edit 接管（见下）；边距也改成对称，AlignHCenter
+            #    才是真居中。
+            if self._edit is not None:
+                self._edit.setTextMargins(8, 0, 8, 0)
+            self._place_edit()
             self.update()
 
     def wheelEvent(self, event) -> None:
@@ -1471,6 +1481,15 @@ class ChevronSpinBox(QSpinBox):
             else:
                 want_y = (self.height() - self._edit.height()) // 2
             want_y = max(0, min(self.height() - self._edit.height(), want_y))
+            if not self._arrows:
+                # 无箭头：横向**接管** —— Qt 仍给隐藏的上下按钮保留 22px，
+                # 编辑框被压窄且靠左，AlignHCenter 只在编辑框里居中，
+                # 对整框就是左偏 11px（用户 2026-10-23 截图）。铺满整框，
+                # 配合对称 textMargins，AlignHCenter 才是真居中。
+                want = QRect(0, want_y, self.width(), self._edit.height())
+                if self._edit.geometry() != want:
+                    self._edit.setGeometry(want)
+                return
             if self._edit.y() != want_y:
                 self._edit.move(self._edit.x(), want_y)
         finally:
