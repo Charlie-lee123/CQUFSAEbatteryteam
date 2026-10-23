@@ -3061,7 +3061,7 @@ def check_config_parity_clock(app: QApplication) -> None:
     """
     import customization
 
-    from serial_io import PARITY_CHOICES, PARITY_LETTERS
+    from serial_io import PARITY_CHOICES, PARITY_LABELS, PARITY_LETTERS, parity_key
 
     from main_window import (
         DEFAULT_RX_BLOCKS, TX_COLLAPSED_H,
@@ -3071,6 +3071,15 @@ def check_config_parity_clock(app: QApplication) -> None:
     # 1) 校验位：无 -> none。字母表也要对上，否则底部的 8N1 会拼错
     assert "none" in PARITY_CHOICES and PARITY_LETTERS["none"] == "N"
     assert "无" not in PARITY_CHOICES, "校验位里还留着「无」"
+    # 显示名是英文（用户 2026-10-23 要求），且**不能**再拿中文当键
+    assert list(PARITY_LABELS) == list(PARITY_CHOICES), "显示名与存储键没一一对应"
+    assert all(text.isascii() for text in PARITY_LABELS.values()), \
+        f"下拉里还有中文：{PARITY_LABELS}"
+    assert PARITY_LABELS["odd"] == "Odd" and PARITY_LABELS["space"] == "Space"
+    # 老配置存的是中文键 —— 必须能归一，否则升级后校验位全被打回 none
+    assert parity_key("奇") == "odd" and parity_key("空格") == "space"
+    assert parity_key("无") == "none" and parity_key("none") == "none"
+    assert parity_key("乱写") == "none"
 
     settings = QSettings("MimoWorks", "SerialAssistant")
     snapshot = {key: settings.value(key) for key in settings.allKeys()}
@@ -3103,15 +3112,14 @@ def check_config_parity_clock(app: QApplication) -> None:
             "展开发送区没有把高度从接收区还回来"
 
         items = [window.cmb_parity.itemText(i) for i in range(window.cmb_parity.count())]
-        assert items[:1] == ["none"], items
-        assert "无" not in items, items
+        assert items == ["None", "Odd", "Even", "Mark", "Space"], items
 
         # 没存过 -> 默认 none
         settings.remove("parity")
         settings.sync()
         fresh = make_window()
         try:
-            assert fresh.cmb_parity.currentText() == "none", fresh.cmb_parity.currentText()
+            assert fresh.cmb_parity.currentData() == "none", fresh.cmb_parity.currentData()
         finally:
             fresh.close()
 
@@ -3120,14 +3128,16 @@ def check_config_parity_clock(app: QApplication) -> None:
         settings.sync()
         migrated = make_window()
         try:
-            assert migrated.cmb_parity.currentText() == "none", migrated.cmb_parity.currentText()
+            assert migrated.cmb_parity.currentData() == "none", migrated.cmb_parity.currentData()
         finally:
             migrated.close()
+        # 老版本存的是中文「偶」→ 归一成 even，下拉显示 Even
         settings.setValue("parity", "偶")
         settings.sync()
         kept = make_window()
         try:
-            assert kept.cmb_parity.currentText() == "偶", kept.cmb_parity.currentText()
+            assert kept.cmb_parity.currentData() == "even", kept.cmb_parity.currentData()
+            assert kept.cmb_parity.currentText() == "Even", kept.cmb_parity.currentText()
         finally:
             kept.close()
 

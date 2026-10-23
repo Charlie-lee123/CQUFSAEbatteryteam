@@ -23,10 +23,28 @@ BAUD_PRESETS = ["1200", "2400", "4800", "9600", "19200", "38400", "57600",
 BYTESIZE_CHOICES = {"5": 5, "6": 6, "7": 7, "8": 8}
 # 无校验写成 "none" 而不是「无」：串口圈里 N(none) 是通用写法，
 # 中文的「无」放在一排参数里既容易和别的选项混淆，也不好和 8N1 那种记法对上。
-PARITY_CHOICES = {"none": serial.PARITY_NONE, "奇": serial.PARITY_ODD, "偶": serial.PARITY_EVEN,
-                  "标记": serial.PARITY_MARK, "空格": serial.PARITY_SPACE}
+# 校验位：**键是存储值**（写进 QSettings 的就是它），显示名在 PARITY_LABELS。
+# ⚠️ 两者必须分开：老版本直接把中文当键存（"奇"/"偶"/"标记"/"空格"），
+#    显示名一改就会让老配置对不上号（见 parity_key 的归一）。
+PARITY_CHOICES = {"none": serial.PARITY_NONE, "odd": serial.PARITY_ODD,
+                  "even": serial.PARITY_EVEN, "mark": serial.PARITY_MARK,
+                  "space": serial.PARITY_SPACE}
+# 下拉里显示的英文名（用户 2026-10-23：把「奇 / 偶 / 标记 / 空格」改成英文）
+PARITY_LABELS = {"none": "None", "odd": "Odd", "even": "Even",
+                 "mark": "Mark", "space": "Space"}
 # 状态栏里拼串口参数用的字母写法，串口圈约定是 8N1 这种，不写中文
-PARITY_LETTERS = {"none": "N", "奇": "O", "偶": "E", "标记": "M", "空格": "S"}
+PARITY_LETTERS = {"none": "N", "odd": "O", "even": "E", "mark": "M", "space": "S"}
+# 老配置里存过的中文键（还有更老的「无」）。只在读取时用。
+PARITY_LEGACY = {"无": "none", "奇": "odd", "偶": "even", "标记": "mark",
+                 "空格": "space"}
+
+
+def parity_key(value) -> str:
+    """把配置里的值归一成 ``PARITY_CHOICES`` 的键（认不出来的退回 "none"）。"""
+    text = str(value or "").strip()
+    if text in PARITY_CHOICES:
+        return text
+    return PARITY_LEGACY.get(text, "none")
 STOPBIT_CHOICES = {"1": 1, "1.5": 1.5, "2": 2}
 ENCODINGS = ["utf-8", "gbk", "ascii", "latin-1"]
 

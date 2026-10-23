@@ -476,7 +476,9 @@ class SettingsDialog(QDialog):
         combo = self.cmb_vehicle_number
         combo.blockSignals(True)          # 重建期间别触发 currentIndexChanged
         combo.clear()
-        combo.addItem("（未选择）", "")
+        # ⚠️ 占位文字要**短**：560 宽的面板里车号框只有 ~96px，编辑框 48px，
+        #    "（未选择）"会被截成"（未选"。三个字刚好放得下。
+        combo.addItem("未选择", "")
         for name in names:
             combo.addItem(customization.split_vehicle(name)[1], name)
         index = combo.findData(current)
@@ -627,7 +629,7 @@ class SettingsDialog(QDialog):
             row.addWidget(field_cells)
             row.addWidget(field_temps)
             row.addStretch(1)
-            label = self._label(f"模组 {index + 1}")
+            label = self._label(f"Module {index + 1}")
             field = self._row(row)
             self.form.insertRow(self._module_row_base + index, label, field)
             self._module_rows.append((label, field))

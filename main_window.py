@@ -32,7 +32,8 @@ from PySide6.QtWidgets import (
 )
 
 from serial_io import (
-    BAUD_PRESETS, BYTESIZE_CHOICES, ENCODINGS, PARITY_CHOICES, PARITY_LETTERS,
+    BAUD_PRESETS, BYTESIZE_CHOICES, ENCODINGS, PARITY_CHOICES, PARITY_LABELS,
+    PARITY_LETTERS, parity_key,
     STOPBIT_CHOICES, SerialWorker, StreamDecoder, list_serial_ports, parse_hex, to_hex,
 )
 import app_log
@@ -1238,7 +1239,9 @@ class MainWindow(QMainWindow):
 
         self.cmb_parity = ChevronComboBox()
         self.cmb_parity.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self.cmb_parity.addItems(list(PARITY_CHOICES))
+        # 显示英文名（None / Odd / Even / Mark / Space），存储值仍是键
+        for _key, _label in PARITY_LABELS.items():
+            self.cmb_parity.addItem(_label, _key)
 
         # 接收区最多保留多少行日志。原来是设置面板里的一项，挪到了这栏 ——
         # 它和波特率、校验位一样是"整机参数"，放在参数栏里挨着更顺手。
@@ -3361,7 +3364,7 @@ class MainWindow(QMainWindow):
                 port,
                 baudrate=baudrate,
                 bytesize=BYTESIZE_CHOICES[self.cmb_bytesize.currentText()],
-                parity=PARITY_CHOICES[self.cmb_parity.currentText()],
+                parity=PARITY_CHOICES[self.cmb_parity.currentData()],
                 stopbits=STOPBIT_CHOICES[self.cmb_stopbits.currentText()],
             )
         worker.received.connect(self._on_received)
@@ -3412,11 +3415,11 @@ class MainWindow(QMainWindow):
         baudrate = self.cmb_baud.currentText()
         self._set_state(f"已打开 {worker.port} @ {baudrate} · "
                                f"{self.cmb_bytesize.currentText()}"
-                               f"{PARITY_LETTERS[self.cmb_parity.currentText()]}"
+                               f"{PARITY_LETTERS[self.cmb_parity.currentData()]}"
                                f"{self.cmb_stopbits.currentText()}")
         app_log.info(f"串口已打开 {worker.port} @ {baudrate} "
                      f"{self.cmb_bytesize.currentText()}"
-                     f"{PARITY_LETTERS[self.cmb_parity.currentText()]}"
+                     f"{PARITY_LETTERS[self.cmb_parity.currentData()]}"
                      f"{self.cmb_stopbits.currentText()}")
         self.pulse.pulse(1.0)
         # 这里不弹临时提示：图标、状态标签和状态灯已经给了反馈，
@@ -5421,11 +5424,11 @@ class MainWindow(QMainWindow):
         self._apply_button_visibility()
         self.cmb_baud.setCurrentText(str(settings.value("baud", "115200")))
         self.cmb_bytesize.setCurrentText(str(settings.value("bytesize", "8")))
-        # 「无」是旧版无校验的写法，现在叫 none；任何对不上的旧值一并归到 none
-        parity = str(settings.value("parity", "none"))
-        if parity not in PARITY_CHOICES:
-            parity = "none"
-        self.cmb_parity.setCurrentText(parity)
+        # 老配置里存的是中文（"奇"/"偶"/"标记"/"空格"）或更老的「无」——
+        # 一律由 parity_key 归一成键，再按 data 定位（显示名已经换成英文了）
+        parity = parity_key(settings.value("parity", "none"))
+        _parity_index = self.cmb_parity.findData(parity)
+        self.cmb_parity.setCurrentIndex(_parity_index if _parity_index >= 0 else 0)
         self.cmb_stopbits.setCurrentText(str(settings.value("stopbits", "1")))
         self.cmb_encoding.setCurrentText(str(settings.value("encoding", "utf-8")))
         self.chk_timestamp.setChecked(settings.value("timestamp", True, type=bool))
@@ -5463,7 +5466,7 @@ class MainWindow(QMainWindow):
         settings.setValue("hidden_buttons", sorted(self._hidden_buttons))
         settings.setValue("baud", self.cmb_baud.currentText())
         settings.setValue("bytesize", self.cmb_bytesize.currentText())
-        settings.setValue("parity", self.cmb_parity.currentText())
+        settings.setValue("parity", self.cmb_parity.currentData())
         settings.setValue("stopbits", self.cmb_stopbits.currentText())
         settings.setValue("encoding", self.cmb_encoding.currentText())
         settings.setValue("timestamp", self.chk_timestamp.isChecked())
