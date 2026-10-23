@@ -4,7 +4,7 @@
 避免入口模块被反向 import（main 一被 import 就会拉起 MainWindow）。
 """
 
-VERSION = "2.3.1"
+VERSION = "2.3.2"
 
 OWNER_REPO = "Charlie-lee123/CQUFSAEbatteryteam"
 
@@ -30,9 +30,9 @@ SETUP_ASSET_SUFFIX = ".exe"
 # 空串 = 该版本发布时尚未记录（自动更新会退回大小/跳过校验）。
 # ⚠️ 升版本时必须先清空成空串：留着**上一版**的哈希会让"拉到的版本文件没解析出
 #    哈希"时的兜底校验拿旧哈希去比新包，直接把更新卡死。发布完由脚本写回。
-LATEST_EXE_SHA256 = "acd8e83cf1a15e0b3e41696eaa5f8f5f2b1236a14dcf9091f7e6a9e59d076ce7"
+LATEST_EXE_SHA256 = "fcc05a5fea539ac1a238881fda8fb7ea2d75b3614bd871410e52606771aa43bf"
 
 # 当前 Release 里**安装包**的 SHA256（同上，由发布脚本写回）。
 # 空串 = 尚未记录，走大小/跳过校验。
-LATEST_SETUP_SHA256 = "2822aeecbe33bf23be1d41225b461ceb3758cf2d557bcb6415b09ea19772ed38"
+LATEST_SETUP_SHA256 = "49b08d00989896f10e98d2d7bbfa16ea7ce93a0996c7c1daa25d9537d4bf97aa"
 

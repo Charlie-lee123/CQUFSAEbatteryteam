@@ -375,6 +375,9 @@ class SettingsDialog(QDialog):
         # 否则一开面板就是 2000（看着像坏了）。
         self.spin_vehicle_season.setValue(QDate.currentDate().year())
         self.spin_vehicle_season.setFixedWidth(SEASON_SPIN_W)
+        self.spin_vehicle_season.set_arrows_visible(False)
+        # 数字居中（用户 2026-10-23），和下面的电芯/温度数量框同一观感
+        self.spin_vehicle_season.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         self.spin_vehicle_season.setToolTip(
             "赛季 = 车名的后半段年份（E74-2026 的 2026）。\n"
             "改赛季只决定「车号」里列哪些车，不会自动改到别的车。")
@@ -390,6 +393,8 @@ class SettingsDialog(QDialog):
         # 上限让"赛季/车号/模组数"三个框看着是一套的：面板拉宽时余量留给右侧空白，
         # 而不是把车号框拉成一条长条（用户 2026-10-22："优化一下这些框的大小"）。
         self.cmb_vehicle_number.setMaximumWidth(240)
+        # 车号居中（用户 2026-10-23）：显示与输入都居中，和旁边两个框一致
+        self.cmb_vehicle_number.lineEdit().setAlignment(Qt.AlignmentFlag.AlignHCenter)
         # ⛔ 不设这条，sizeHint 会按最宽条目（「（未选择）」）算，把整行顶宽、
         #    右侧「＋」被裁。按"最短 4 个字"算，宽度由 stretch 吃剩余空间。
         self.cmb_vehicle_number.setSizeAdjustPolicy(
@@ -430,6 +435,8 @@ class SettingsDialog(QDialog):
         self.spin_vehicle_modules = ChevronSpinBox()
         self.spin_vehicle_modules.setRange(0, 64)
         self.spin_vehicle_modules.setFixedWidth(MODULE_COUNT_W)
+        self.spin_vehicle_modules.set_arrows_visible(False)
+        self.spin_vehicle_modules.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         self.spin_vehicle_modules.setToolTip(
             "模组个数 = 下面「模组 i」的行数；新增的模组沿用最后一个模组的配置，"
             "缩短则从末尾截断")
@@ -627,6 +634,10 @@ class SettingsDialog(QDialog):
             row = QHBoxLayout()
             row.setSpacing(14)
             row.addWidget(field_cells)
+            # 「电芯数量」和「温度采集数量」是两组，中间多让一些空（用户
+            # 2026-10-23："之间的空可以稍微大一些"）—— 14px 的行距里两组
+            # 标签几乎贴在一起，看不出是两回事。
+            row.addSpacing(36)
             row.addWidget(field_temps)
             row.addStretch(1)
             label = self._label(f"Module {index + 1}")

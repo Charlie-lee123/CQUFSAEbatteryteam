@@ -1122,6 +1122,7 @@ class ChevronComboBox(QComboBox):
                                  | Qt.WindowType.FramelessWindowHint
                                  | Qt.WindowType.NoDropShadowWindowHint)
         container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._round_popup_window(container)
         self._ensure_popup_delegate()
         self._fit_popup_width()
         super().showPopup()
@@ -1164,6 +1165,23 @@ class ChevronComboBox(QComboBox):
                                   target.width(), start_h)
         container.setWindowOpacity(0.0)
         self._animate_popup_open()
+
+    @staticmethod
+    def _round_popup_window(container) -> None:
+        """让系统把弹层窗口当**圆角窗**对待（Win11 的 DWMWCP_ROUND）。
+
+        ⛔ 不加这条，系统给弹层画的是**方角**阴影：深色主题下与卡片同色看不出来，
+        浅色下就是用户截图里那一圈「方框」（2026-10-23 点名）。设成 ROUND 之后
+        阴影跟着圆角走，方框消失；我们自己的 QSS 圆角是 12px、比系统的 8px 更深，
+        卡片不会被裁。Win10 没有这个属性（返回非 0），弹层保持原样即可。
+        """
+        try:
+            import ctypes
+            pref = ctypes.c_int(2)          # DWMWCP_ROUND
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                int(container.winId()), 33, ctypes.byref(pref), 4)
+        except (OSError, AttributeError):   # 非 Windows / 没有 dwmapi
+            pass
 
     def _ensure_popup_delegate(self) -> None:
         """首次弹出时装上条目 delegate（惰性：别在构造期惊动弹层窗口）。"""
@@ -1377,6 +1395,9 @@ class ChevronSpinBox(QSpinBox):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._placing_edit = False
+        # 「上下调节按钮」要不要画（用户 2026-10-23：赛季/模组数这类
+        # "只该手动输入"的框不要箭头 —— 挂在 paintEvent 上，别用 QSS）。
+        self._arrows = True
         self._edit = self.findChild(QLineEdit)
         if self._edit is not None:
             self._edit.setTextMargins(*self.TEXT_MARGIN)
@@ -1385,6 +1406,17 @@ class ChevronSpinBox(QSpinBox):
             # 还会再摆回去** —— 只在 resizeEvent 里挪一次压不住。给它挂一个
             # 事件过滤器：样式每挪一次，立刻纠正回来（y 收敛后是空操作）。
             self._edit.installEventFilter(self)
+
+    def set_arrows_visible(self, visible: bool) -> None:
+        """开关上/下 chevron。
+
+        「赛季」「模组数」这类**只许手动输入**的框不要箭头（用户 2026-10-23
+        点名）—— 箭头暗示"能点着调"，而这两个值调一下就是一套电池箱结构。
+        只影响绘制：步进（键盘上下键）仍然可用，数值语义不变。
+        """
+        if bool(visible) != self._arrows:
+            self._arrows = bool(visible)
+            self.update()
 
     def wheelEvent(self, event) -> None:
         """滚轮**不改数字**（用户点名："禁止通过鼠标滚轮增减输入框内的数字，
@@ -1470,6 +1502,8 @@ class ChevronSpinBox(QSpinBox):
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
+        if not self._arrows:
+            return
         painter = QPainter(self)
         left = float(self.width() - self.ARROW_W)
         half = self.height() / 2.0
