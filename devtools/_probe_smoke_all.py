@@ -38,7 +38,7 @@ if _ROOT not in sys.path:
 os.environ["QT_QPA_PLATFORM"] = "windows"
 
 from PySide6.QtCore import QEvent, QSettings, Qt, QTimer               # noqa: E402
-from PySide6.QtGui import QGuiApplication, QKeyEvent, QTextCursor      # noqa: E402
+from PySide6.QtGui import QGuiApplication, QTextCursor                # noqa: E402
 from PySide6.QtTest import QTest                                       # noqa: E402
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog,      # noqa: E402
                                QMessageBox, QPushButton, QScrollArea)
@@ -393,6 +393,24 @@ def run() -> None:
             value = snapshot[key]
             handle.write(f"{key}\t{'' if value is None else value}\n")
     print(f"[环境] 配置快照 {len(snapshot)} 键；历史目录隔离到 {hist_dir}")
+
+    # 基线比对：_check/config_baseline_repaired.txt 是"人工确认过的干净配置"。
+    # 实测踩过坑 —— 探针被硬杀（exit 127）时会留下脏值，而**下一次运行会把
+    # 脏值当快照**、还原成同一份脏值，于是"还原通过"是个假象。所以先对一眼基线。
+    baseline_path = os.path.join(OUT_DIR, "config_baseline_repaired.txt")
+    if os.path.exists(baseline_path):
+        baseline = {}
+        with open(baseline_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                key, _, value = line.rstrip("\n").partition("\t")
+                baseline[key] = value
+        drift = [key for key in sorted(set(baseline) | set(snapshot))
+                 if baseline.get(key) != ("" if snapshot.get(key) is None
+                                          else str(snapshot.get(key)))]
+        if drift:
+            STATE.append("运行前配置已偏离人工基线（很可能是上一次硬退留下的脏值）："
+                         + "、".join(drift[:8]))
+            print(f"[警告] 运行前配置与基线差 {len(drift)} 项：{drift[:8]}")
 
     # 不联网、不自动开串口（这两条都会把探针带偏，且不是本轮要测的交互）
     from main_window import LINK_BLE, LINK_SERIAL, MainWindow
@@ -1142,19 +1160,30 @@ def run() -> None:
         window.btn_expand.click()
         pump(900)
         early = window._expanded
-        # Esc 是窗口级 QShortcut：必须把按键送到**原生窗口**才过快捷键图
-        # （sendEvent 给控件会绕过 QShortcutMap，那是假阴性）
-        handle = window.windowHandle()
-        if handle is not None:
-            APP.sendEvent(handle, QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape,
-                                            Qt.KeyboardModifier.NoModifier))
-            APP.sendEvent(handle, QKeyEvent(QEvent.Type.KeyRelease, Qt.Key.Key_Escape,
-                                            Qt.KeyboardModifier.NoModifier))
-        pump(900)
-        print(f"        展开={early}，Esc 之后展开={window._expanded}")
+        # Esc 走的是窗口级 QShortcut：QTest.sendEvent 给控件／windowHandle 都
+        # **不过快捷键图**（实测同一段代码有时收有时不收 —— 那正是假阴性的来源）。
+        # 真用户按的是键盘，所以这里用 Win32 PostMessage 往 HWND 投一个真的
+        # WM_KEYDOWN/WM_KEYUP —— 走的就是系统那条路。
+        hwnd = int(window.winId())
+        VK_ESCAPE, WM_KEYDOWN, WM_KEYUP = 0x1B, 0x0100, 0x0101
+        import ctypes
+        user32 = ctypes.windll.user32
+        window.activateWindow()
+        window.raise_()
+        pump(300)
+        user32.PostMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE, 0)
+        user32.PostMessageW(hwnd, WM_KEYUP, VK_ESCAPE, 0xC0000001)
+        hit = wait_until(lambda: not window._expanded, 2.0)
+        pump(400)
+        print(f"        展开={early}，Esc 之后展开={window._expanded}"
+              f"（{'快捷键生效' if hit else '没生效'}）")
         if window._expanded and early:
-            # 不判成异常：QTest 送键不必然过快捷键图，别造一个假 bug
-            STATE.append("按 Esc 没能退出接收区最大化（按键链路或状态有问题，需人工确认）")
+            # 兜底：确认一下"不是用户按 Esc 该走的那条路"，同时把状态收回来，
+            # 免得后面每一步都在全屏里跑
+            STATE.append("按 Esc（Win32 真按键）没能退出接收区最大化，只能靠按钮退出"
+                         " —— 快捷键链路需要人工确认")
+            window._on_escape()
+            pump(700)
         if window._expanded:
             window.btn_expand.click()
             pump(800)
@@ -1440,6 +1469,39 @@ def write_report(log_errors: list[str]) -> None:
     print(f"\n（报告已写入 {REPORT_PATH}）")
 
 
+def restore_from_file(path: str) -> int:
+    """从快照文件还原用户配置（探针被硬杀之后的补救入口）。
+
+    用法：``.venv/Scripts/python.exe devtools/_probe_smoke_all.py --restore
+    _check/smoke_settings_snapshot.txt``
+    """
+    from PySide6.QtCore import QSettings as _S
+    settings = _S("MimoWorks", "SerialAssistant")
+    wanted: dict[str, str] = {}
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            key, _, value = line.rstrip("\n").partition("\t")
+            if key:
+                wanted[key] = value
+    if not wanted:
+        print(f"快照文件是空的：{path}")
+        return 1
+    for key in settings.allKeys():
+        if key not in wanted:
+            settings.remove(key)
+    for key, value in wanted.items():
+        settings.setValue(key, value)
+    settings.sync()
+    reader = _S("MimoWorks", "SerialAssistant")
+    reader.sync()
+    bad = [key for key in wanted
+           if str(reader.value(key)) != value]
+    print(f"已从 {path} 还原 {len(wanted)} 键；不一致 {len(bad)} 项 {bad[:8]}")
+    return 0 if not bad else 1
+
+
 if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--restore":
+        sys.exit(restore_from_file(sys.argv[2]))
     run()
     sys.exit(0)
