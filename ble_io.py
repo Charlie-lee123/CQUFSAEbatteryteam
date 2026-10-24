@@ -90,9 +90,17 @@ class BleBroadcastWorker(QThread):
         self.start()
 
     def stop(self) -> None:
-        """请求停止：置位 + 短暂等待。扫描循环每 POLL_S 醒一次，很快就能收尾。"""
+        """请求停止：置位 + **只等 200ms**（一个轮询周期）。
+
+        ⚠️ 以前 wait(2000)，而它是在**界面线程**调的 —— 扫描正卡在一次 WinRT
+        回调里时界面能冻满 2 秒（切回串口、关窗口都会撞上）。串口那边同样的
+        方法只等 200ms（见 SerialWorker.stop 的注释），这里对齐：
+        没等到也没关系，``run()`` 看到 ``_running`` 已置假会自己收尾，
+        调用方用 ``isRunning()`` 判断并挂 ``finished`` 兜底销毁
+        （见 main_window._close_port 的 _retiring 分支）。
+        """
         self._running = False
-        self.wait(2000)
+        self.wait(200)
 
     # -- 内部 ------------------------------------------------------------
 

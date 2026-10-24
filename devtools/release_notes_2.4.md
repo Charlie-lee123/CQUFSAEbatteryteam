@@ -34,6 +34,36 @@
 - 新增 `SerialAssistant.exe --check-net` 命令行探针：用**产品同一条网络栈**取一次 HTTPS 并把结果写进
   `net_check.txt` —— 这是"去掉 OpenSSL 后端"唯一的联网风险点，每次发布都在产物上实跑一遍。
 
+
+### 全量缺陷排查后修复（10 条，含 4 条必然触发）
+- **安装版自动更新 100% 失败**：`UpdateDialog` 拿**本地**旧常量 `LATEST_SETUP_SHA256`
+  去校验**下一版**的安装包 —— 跨版本必然不符，整条下载源试完报"所有下载源都失败了"。
+  改成按资产取**远端** version.py 里这一版的哈希（`update_asset_and_hash`）。
+- **哈希缺失时更新卡死**：说明文案与实现相反（注释写"退回大小/跳过校验"，代码直接判失败）。
+  现在明确提示"服务端没有提供本版校验值（可能正在发布），请稍后再试"。
+- **断网时"检查更新"能卡几分钟**：代理兜底多跑了整整一轮（层数判断差一），且每层都跑
+  两轮全源（10 源 × 4s × 2 × 3 层）。现在第一层跑两轮、后两层各一轮，最多 3 轮。
+- **只是打开设置点「确定」就会改掉配置**：滑杆会被显示器刷新率夹进量程（存 240、屏 60Hz
+  → 显示 60），旧逻辑拿夹后的值跟存值比 → 判成"用户改过"→ 240 被永久写成 60 并打上
+  chosen 标记。现在以"面板打开时的显示值"为基准，没拖动就不写回。
+- **注册表脏值导致启动即退**：`rx_blocks` 被写成非数字时 `int()` 在启动路径抛异常，
+  exe 无控制台 → 用户看到"双击没反应"。已加兜底 + 日志。
+- 回放条/交叉淡入每次切换都新建补间且不回收（点几十次攒几十个僵尸对象）；
+  历史目录不可写时 `_pending` 无上限增长；可编辑下拉的墨迹测量缺空图保护（横向折叠会崩）；
+  `Tween.destroyed` 把控件对象当 `finished=True` 用（已显式化）；BLE 停止在界面线程
+  等待 2 秒（改成一个轮询周期，调用方用 `finished` 兜底）。
+- 另修两条**测试自身**的缺陷：暂停定位用例误把"恢复"当"暂停"测、默认值断言依赖用户
+  当前配置（用户改过就假挂）；并修掉一个会让自测直接 fail-fast 崩溃的线程生命周期问题。
+
+### 再瘦身：29.5 MB → 28.8 MB（累计 34.5 MB → 28.8 MB，−16.5%）
+- 删 `tarfile` + `lzma/_lzma` + `bz2/_bz2`（唯一引用是 `shutil.unpack_archive`，从没用过）、
+  `unicodedata`（唯一链路 `pathlib → urllib.parse → unicodedata`，且只在解析非 ASCII
+  主机名时触发）、网络状态查询插件 `qnetworklistmanager.dll`（`QNetworkInformation` 没调用过）。
+- 说明：`decimal`、CPython 的 `libcrypto/libssl`、三份 `MSVCP140` 都**查过依赖链/哈希**，
+  删不得（前者被 `random` 真实需要；后两者是 BLE 与 SHA256 校验的基础）。
+- 剩下的体积几乎全是 PySide6 本体（67 MB 载荷里 50.9 MB 是 Qt 的 DLL），再压只能上 UPX，
+  会给杀软误报，不做。
+
 ### 校验值
-- `SerialAssistant.exe`：`44abc2c9dcd5b929ba20fcb2dadc301475fb1d3a34dba75f45816da3c4344c64`
-- `SerialAssistant-setup-2.4.exe`：`4d04afef422aa56752ca7829575ea5414d80a6fafc562c7effa8d8a2fce0dda4`
+- `SerialAssistant.exe`：`268eb716d4e651e639d7a8ae72c48d749bc1642615b21c167d5240e252c93a74`
+- `SerialAssistant-setup-2.4.exe`：`bb7467c4adb75b0ea92cbf88cf47e524c0d6dce465f237e38da1c835a071e27f`

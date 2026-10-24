@@ -1017,7 +1017,7 @@ class MainWindow(QMainWindow):
         checker.start()
 
     def _on_auto_update_checked(self, info: dict) -> None:
-        from updater import UpdateDialog, version_tuple
+        from updater import UpdateDialog, update_asset_and_hash, version_tuple
         from version import VERSION
         if version_tuple(info["version"]) <= version_tuple(VERSION):
             return
@@ -1025,7 +1025,8 @@ class MainWindow(QMainWindow):
             return
         app_log.info(f"自动检查更新：发现新版本 v{info['version']}（源 {info.get('source')}）")
         dialog = UpdateDialog(latest=info["version"], current=VERSION,
-                              sha256=info.get("sha256"),
+                              # 按"安装版/免安装版"挑对应资产的**远端**哈希
+                              sha256=update_asset_and_hash(info)[1],
                               tag=f"v{info['version']}", auto=True, parent=self)
         dialog.dismissed_session.connect(self._on_update_dismissed)
         dialog.exec()
@@ -4784,6 +4785,12 @@ class MainWindow(QMainWindow):
         if start <= 0.001:
             self._finish_rx_xfade()
             return
+        # ⛔ 每段都新建（起点不同），旧的不回收会一直挂在窗口下：回放开关点
+        #    几十次就攒几十个僵尸 Tween，窗口销毁时它们还会各补一次收尾回调。
+        if self._rx_shot_tween is not None:
+            self._rx_shot_tween.stop()
+            self._rx_shot_tween.deleteLater()
+            self._rx_shot_tween = None
         tween = Tween(_RX_XFADE_MS, STANDARD, self._rx_xfade_step,
                       self._finish_rx_xfade, parent=self)
         self._rx_shot_tween = tween
@@ -5548,8 +5555,17 @@ class MainWindow(QMainWindow):
         # 读值之前做，否则界面会先按旧值起一次。
         customization.migrate_defaults()
         self._theme_mode = str(settings.value("theme_mode", "system"))
-        self._rx_blocks = max(RX_LINES_MIN, min(RX_LINES_MAX,
-                                                int(settings.value("rx_blocks", DEFAULT_RX_BLOCKS))))
+        # ⛔ 注册表里可能是"脏值"（手改、老版本残留、别的工具写串）：``int("abc")``
+        #    会在**启动阶段**抛 ValueError，窗口还没建出来就退出 —— exe 是
+        #    console=False，用户只看到"双击没反应"。这里兜住退回默认值。
+        try:
+            _rx_blocks_raw = int(settings.value("rx_blocks", DEFAULT_RX_BLOCKS))
+        except (TypeError, ValueError):
+            _rx_blocks_raw = DEFAULT_RX_BLOCKS
+            app_log.warning(
+                f"rx_blocks 配置非法（{settings.value('rx_blocks')!r}），退回默认 "
+                f"{DEFAULT_RX_BLOCKS}")
+        self._rx_blocks = max(RX_LINES_MIN, min(RX_LINES_MAX, _rx_blocks_raw))
         # 写回下拉框：editTextChanged → _on_rx_lines_text_changed 会把 txt_rx
         # 的上限一并定下来（下面的 setMaximumBlockCount 是无信号时的兜底）。
         # 本地留存行数也在 _on_rx_lines_changed 里同步（无信号时这里补一次）。

@@ -301,6 +301,11 @@ def check_ble_broadcast(app: QApplication) -> None:
         assert wait_for(app, lambda: bool(opened)), "广播通道没有发 opened"
         wait_for(app, lambda: len(got) > 0)
         worker.stop()
+        # ⛔ stop() 只等一个轮询周期（200ms，产品侧不再冻界面 2 秒）。等不到就
+        #    丢引用的话，QThread 会在**线程还在跑**时被析构 → Qt fail-fast
+        #    （实测退出码 127/0xC0000409，什么都不打印）。必须等它真的退干净。
+        assert wait_for(app, lambda: not worker.isRunning(), timeout=3.0), \
+            "BLE 扫描线程没停下来（丢引用会 fail-fast）"
         assert got == [b"Voltage1: 01.3700\n"], f"喂进来的负载不对：{got!r}"
         assert len(found) == 3, f"设备列表没把扫到的都报出来：{len(found)}"
         assert {f["address"] for f in found} == {
@@ -317,6 +322,11 @@ def check_ble_broadcast(app: QApplication) -> None:
         worker.open()
         wait_for(app, lambda: len(got2) > 0)
         worker.stop()
+        # ⛔ stop() 只等一个轮询周期（200ms，产品侧不再冻界面 2 秒）。等不到就
+        #    丢引用的话，QThread 会在**线程还在跑**时被析构 → Qt fail-fast
+        #    （实测退出码 127/0xC0000409，什么都不打印）。必须等它真的退干净。
+        assert wait_for(app, lambda: not worker.isRunning(), timeout=3.0), \
+            "BLE 扫描线程没停下来（丢引用会 fail-fast）"
         assert got2 == [b"FROM_SVC\n"], f"auto 没有回退到 service data：{got2!r}"
 
         # 3) 按**名字片段**匹配（设备地址会变 —— 手机开热点、模块换芯片都会变，
@@ -331,6 +341,11 @@ def check_ble_broadcast(app: QApplication) -> None:
         worker.open()
         wait_for(app, lambda: len(got3) > 0)
         worker.stop()
+        # ⛔ stop() 只等一个轮询周期（200ms，产品侧不再冻界面 2 秒）。等不到就
+        #    丢引用的话，QThread 会在**线程还在跑**时被析构 → Qt fail-fast
+        #    （实测退出码 127/0xC0000409，什么都不打印）。必须等它真的退干净。
+        assert wait_for(app, lambda: not worker.isRunning(), timeout=3.0), \
+            "BLE 扫描线程没停下来（丢引用会 fail-fast）"
         assert got3 == [b"RIGHT\n"], \
             f"名字匹配 / 公司 ID 过滤不对：{got3!r}（应只取 65535 那家公司的负载）"
     finally:
@@ -399,6 +414,11 @@ def check_loopback(app: QApplication) -> None:
         wait_for(app, lambda: sum(len(c) for c in chunks) >= len(sent))
     finally:
         worker.stop()
+        # ⛔ stop() 只等一个轮询周期（200ms，产品侧不再冻界面 2 秒）。等不到就
+        #    丢引用的话，QThread 会在**线程还在跑**时被析构 → Qt fail-fast
+        #    （实测退出码 127/0xC0000409，什么都不打印）。必须等它真的退干净。
+        assert wait_for(app, lambda: not worker.isRunning(), timeout=3.0), \
+            "BLE 扫描线程没停下来（丢引用会 fail-fast）"
 
     assert not worker.isRunning(), "stop() 之后读线程还在跑"
     received = b"".join(chunks)
@@ -1766,6 +1786,34 @@ def check_updater(app: QApplication) -> None:
     # 8) 源链重试轮数（用户要求失败自动重试）
     assert CHECK_PASSES >= 2, "版本检测至少要整链重试一轮"
 
+    # 10) 更新链的两条**必然触发**缺陷（2026-10-24 静态审查揪出来的）
+    #   a) 安装版必须用**远端 version.py 里这一版**的 setup 哈希。曾经在
+    #      UpdateDialog 里拿本地常量 `LATEST_SETUP_SHA256`（= 当前运行版本的值）
+    #      去校验下一个版本的安装包 → 跨版本 100% 不符 → 整条源链试完报
+    #      "所有下载源都失败了"，用户看到的就是"网好好的，就是更新不了"。
+    import updater as _upd
+    _saved_is_installed = _upd.is_installed
+    try:
+        _upd.is_installed = lambda: True
+        _asset, _sha = _upd.update_asset_and_hash(
+            {"version": "9.9", "sha256": "aa" * 32, "setup_sha256": "bb" * 32})
+        assert _asset == "SerialAssistant-setup-9.9.exe", _asset
+        assert _sha == "bb" * 32, f"安装版必须用远端的 setup 哈希，实得 {_sha}"
+    finally:
+        _upd.is_installed = _saved_is_installed
+    _asset, _sha = _upd.update_asset_and_hash(
+        {"version": "9.9", "sha256": "cc" * 32})
+    assert _asset == "SerialAssistant.exe" and _sha == "cc" * 32, (_asset, _sha)
+    #   b) 弹窗不能再用本地常量"纠正"传进来的哈希（它就是那个 bug 的入口）
+    _dlg = _upd.UpdateDialog(latest="9.9", current="2.4", sha256="dd" * 32)
+    assert _dlg._sha256 == "dd" * 32, \
+        f"弹窗把远端哈希覆盖成本地常量了：{_dlg._sha256}"
+    _dlg.deleteLater()
+    #   c) 无校验信息时必须**明确告诉用户**"服务端没给校验值"，不能再笼统地说
+    #      "拿不到" —— 否则排查时分不清是发布没写完还是客户端 bug
+    _ok, _why = _upd.verify_integrity(b"x", None, None)
+    assert _ok is False and "校验" in _why, (_ok, _why)
+
     # 9) **设置面板里那一颗「检查更新」真的会动**（2026-10-24 用户报"点了没反应"）
     #    真因：`version_sources()` 的每一项是 **(名字, url, 解析器, 镜像前缀)** 四元组，
     #    面板里却按三元组解包 → 点下去当场 ValueError；Qt 把槽里的异常吞进 stderr，
@@ -2945,7 +2993,11 @@ def check_customization(app: QApplication) -> None:
                             window._stamp()), "开关拨回默认后格式应复原"
 
         # ---- 2) 暂停定位行数可调（默认 7；改成 3 后应停在 3 行）----
-        assert customization.get("pause_snap_lines") == 7, "默认行数应为 7"
+        # ⚠️ 断言**注册表里的默认值**，不是"当前存储值"：用户自己把它调成 3
+        #    之后 `get()` 返回 3，这条就会假挂（本机就是这么挂的）。
+        _snap_spec = next(sp for sp in customization.specs()
+                          if sp["key"] == "pause_snap_lines")
+        assert _snap_spec["default"] == 7, f"默认行数应为 7：{_snap_spec}"
         window._on_rx_lines_changed(300)
         window._clear_receive()
         # 每轮 4~6 个视觉行、喂 14 轮 —— 两个硬要求：
@@ -2966,6 +3018,22 @@ def check_customization(app: QApplication) -> None:
         bar = window.txt_rx.verticalScrollBar()
         for keep in (3, 7, 0):
             customization.set("pause_snap_lines", keep)
+            # 设进去必须当场读得出来（历史上这条匿名假挂过一次：状态没清干净，
+            # 量到的是上一轮的落点。把它钉死，挂了能立刻看出是"设置没生效"）
+            assert customization.get("pause_snap_lines") == keep, \
+                f"pause_snap_lines 没设进去：期望 {keep} 实得 {customization.get('pause_snap_lines')}"
+            assert window._pause_snap_keep() == keep, \
+                (f"暂停行数取值不对：设置 {keep} / 取值 {window._pause_snap_keep()}"
+                 f"（_rx_t={window._rx_t:.2f}）")
+            # ⛔ `_toggle_pause()` 是**交替**的：上一轮结束后还停在暂停态，这一轮
+            #    再调一次就变成"恢复"，而恢复不定位 —— 量到的是上一轮的位置
+            #    （实测 keep=7 却量到 3 行 = 51px）。所以每轮先确保回到"未暂停"。
+            if window._paused:
+                # 恢复会连带"追底 180ms + 发送区重新展开 240ms"两段补间，
+                # 等不够就暂停，定位会按**还没定下来的视口高度**算，差出好几行。
+                window._toggle_pause()
+                from PySide6.QtTest import QTest as _QT
+                _QT.qWait(450)
             bar.setValue(bar.maximum() // 2)
             app.processEvents()
             window._toggle_pause()

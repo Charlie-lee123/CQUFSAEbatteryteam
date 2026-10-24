@@ -164,6 +164,10 @@ def flush() -> None:
     """
     global _file_lines
     if _path is None:
+        # ⛔ 历史目录建不出来时 load() 会 early-return（_path 保持 None），但
+        #    _emit_block 仍然每帧 feed()。_pending 是普通 list、**没有上限**，
+        #    不清就会随接收时长一路涨（_lines 有 maxlen 兜住，_pending 没有）。
+        _pending.clear()
         return
     dirty = _file_lines > _max_lines + COMPACT_EXTRA
     if not _pending:

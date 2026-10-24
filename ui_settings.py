@@ -187,6 +187,8 @@ class SettingsDialog(QDialog):
         # customization 注册表里的枚举项，但它的行跟着「材质强度」一起摆在上面
         # （见文件头说明），会先于 _build_custom_section 登记进这两张表。
         self._custom_widgets: dict[str, QWidget] = {}
+        # 面板刚建好时每个控件的**显示值**（custom_values 的基准，见 _snapshot_custom_baseline）
+        self._custom_baseline: dict[str, object] = {}
         self._custom_rows: dict[str, tuple[QLabel, QWidget]] = {}
 
         # 材质强度：0~100 无级，**两种材质共用**这一根滑杆。
@@ -246,6 +248,9 @@ class SettingsDialog(QDialog):
         # 「定制功能」：BMS 专用配置的统一管理入口。控件**按注册表动态生成**
         # （customization.specs()），以后加定制配置这里一行都不用改。
         self._build_custom_section(form)
+        # 控件全部建好 → 立刻把"显示值"记成基准（见 _snapshot_custom_baseline：
+        # 滑杆被量程夹小时，不能让"确定"把夹后的值当成用户改动落盘）。
+        self._snapshot_custom_baseline()
         # 车辆一节的**首次同步**必须等「定制功能」建完：选车后要隐藏旧的三件套
         # （module_count / cells_per_module / temps_per_module），那三颗控件是
         # 上面按注册表生成的（见 _build_custom_section 里的 _custom_rows）。
@@ -1100,6 +1105,26 @@ class SettingsDialog(QDialog):
         self._custom_previews[spec["key"]] = label
         return label
 
+    def _snapshot_custom_baseline(self) -> None:
+        """记下**面板刚建好时**每个控件的显示值，供 ``custom_values`` 判断"改没改"。
+
+        ⛔ 不能拿 ``customization.get(key)`` 当基准：滑杆会被 ``maximum_fn`` 夹进
+        量程（``anim_fps`` 存过 240、当前显示器只有 60Hz → 显示 60），拿存的值比
+        就会判定"用户改过"—— 用户只是打开面板看了一眼、点了个确定，
+        240 就被永久改成 60，还打了 chosen 标记（以后换回高刷屏也不恢复）。
+        """
+        self._custom_baseline = {}
+        for spec in customization.specs():
+            widget = self._custom_widgets.get(spec["key"])
+            if widget is None:
+                continue
+            if spec["kind"] == "bool":
+                self._custom_baseline[spec["key"]] = bool(widget.isChecked())
+            elif spec["kind"] == "choice":
+                self._custom_baseline[spec["key"]] = widget.currentData()
+            else:
+                self._custom_baseline[spec["key"]] = int(widget.value())
+
     def custom_values(self) -> dict:
         """「定制功能」区里被**改动过**的项 {key: value}，由主窗口统一落盘。"""
         changes: dict = {}
@@ -1113,7 +1138,9 @@ class SettingsDialog(QDialog):
                 value = widget.currentData()
             else:
                 value = int(widget.value())
-            if value != customization.get(spec["key"]):
+            baseline = self._custom_baseline.get(spec["key"],
+                                                 customization.get(spec["key"]))
+            if value != baseline:
                 changes[spec["key"]] = value
         return changes
 
@@ -1384,9 +1411,15 @@ class SettingsDialog(QDialog):
         if self._update_src_idx >= len(sources):
             self._update_pass += 1
             self._update_src_idx = 0
-            if self._update_pass >= updater.CHECK_PASSES:
-                # 一层跑完（整条源链 + 重试）→ 换下一层代理策略再跑
-                if self._proxy_attempt < len(self._proxy_layers()):
+            # ⛔ 第一层（系统代理）跑 CHECK_PASSES 轮，后面两层各跑 1 轮就够 ——
+            #    以前每层都跑 CHECK_PASSES 轮，10 个源 × 4s × 2 轮 × 3 层 ≈ 4 分钟，
+            #    断网时按钮会一直"检查中…"（用户感知就是"点了没反应"）。
+            budget = updater.CHECK_PASSES if self._proxy_attempt == 0 else 1
+            if self._update_pass >= budget:
+                # 一层跑完 → 换下一层代理策略再跑
+                # ⛔ 这里必须是 "当前层 +1 还有没有"：以前写成 `attempt < len(layers)`，
+                #    attempt 会自增到 == len(layers)，多跑一整轮**重复的最后一层**。
+                if self._proxy_attempt + 1 < len(self._proxy_layers()):
                     self._proxy_attempt += 1
                     self._update_src_idx = 0
                     self._update_pass = 0
@@ -1464,7 +1497,7 @@ class SettingsDialog(QDialog):
         self._handle_update_info(info)
 
     def _handle_update_info(self, info: dict) -> None:
-        from updater import UpdateDialog, version_tuple
+        from updater import UpdateDialog, update_asset_and_hash, version_tuple
         from version import VERSION
         latest = version_tuple(info["version"])
         if latest <= self._local_version():
@@ -1475,7 +1508,8 @@ class SettingsDialog(QDialog):
         self.lbl_version.setText(f"发现新版本 v{latest_str}")
         self._flash_button_result(f"发现 v{latest_str}！")
         dialog = UpdateDialog(latest=latest_str, current=VERSION,
-                              sha256=info.get("sha256"),
+                              # 按"安装版/免安装版"挑对应资产的**远端**哈希
+                              sha256=update_asset_and_hash(info)[1],
                               tag=f"v{latest_str}", auto=False, parent=self)
         dialog.exec()
 

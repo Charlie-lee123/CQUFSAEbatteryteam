@@ -195,7 +195,7 @@ def update_asset_and_hash(info: dict) -> tuple[str | None, str | None]:
     import version
     if is_installed():
         return (setup_asset_name(info.get("version", "")),
-                info.get("setup_sha256") or version.LATEST_SETUP_SHA256 or None)
+                info.get("setup_sha256") or None)
     return (version.ASSET_NAME, info.get("sha256") or None)
 
 
@@ -249,7 +249,7 @@ def verify_integrity(data: bytes, sha256: str | None = None,
         if len(data) != size:
             return (False, f"大小不符（期望 {size:,} B，实得 {len(data):,} B）")
         return (True, "大小校验通过")
-    return (False, "没有可用的校验信息（哈希与大小都拿不到）")
+    return (False, "服务端没有提供本版的校验值（可能正在发布），请稍后再试")
 
 
 def parse_apply_update_args(argv) -> str | None:
@@ -410,11 +410,14 @@ class UpdateDialog(QDialog):
         self._frozen = bool(getattr(sys_frozen(), "frozen", False))
         # 安装版 → 下载安装包、交安装向导接管；免安装版 → 下载 exe 静默替换。
         self._is_setup = self._frozen and is_installed()
-        # 校验口径跟着资产走：安装版比 setup 哈希，免安装版比 exe 哈希。
-        self._sha256 = sha256
-        if self._is_setup:
-            from version import LATEST_SETUP_SHA256
-            self._sha256 = LATEST_SETUP_SHA256 or None
+        # ⛔ 校验口径 = **远端 version.py 里这一版的哈希**（调用方经
+        #    `update_asset_and_hash(info)` 按"安装版/免安装版"挑好传进来）。
+        #    这里曾经在安装版分支覆盖成 `version.LATEST_SETUP_SHA256` —— 那是
+        #    **当前运行版本**的常量，拿它校验"下一版"的安装包必然不符：整条下载
+        #    源链试完一遍后报"所有下载源都失败了"（2026-10-24 静态审查揪出来的
+        #    必然触发缺陷）。本地常量只在本版本自己发布时等于正确值，永远不能
+        #    用来校验新版本。
+        self._sha256 = sha256 or None
         self._nam = QNetworkAccessManager(self)
         self._reply = None
         self._download_pass = 0

@@ -67,7 +67,15 @@ def _edit_ink_offset(edit: QLineEdit) -> float | None:
     gray = edit.grab().toImage().convertToFormat(
         QImage.Format.Format_Grayscale8)
     width, ih = gray.width(), gray.height()
-    data = gray.constBits().tobytes()
+    # ⚠️ 与下面 `_combo_label_ink_offset` 同一套保护：控件被压窄时 grab 出来是
+    #    无效图，``constBits()`` 返回 None，下一行就 AttributeError（在 paintEvent
+    #    链路里被 Qt 吞掉 → 控件不刷新）。这种尺寸本来也量不出墨迹。
+    if gray.isNull() or width < 8 or ih < 4:
+        return None
+    bits = gray.constBits()
+    if bits is None:
+        return None
+    data = bits.tobytes()
     bpl = gray.bytesPerLine()
     rows = []
     for y in range(ih):

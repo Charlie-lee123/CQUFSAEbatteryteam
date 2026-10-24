@@ -51,6 +51,9 @@ _DROP_BINARIES = {
     # ③ JPEG 解码插件：assets 里只有 ico / png / svg，程序不接受用户图片，
     #    按文件名解码的路径根本不存在（png/ico 由 Qt 内置处理）。
     'qjpeg.dll',
+    # ④ 网络状态查询插件（QNetworkInformation 专用）：全项目没调用过这个 API，
+    #    Qt 也不会自动加载它（只在显式 backend 查询时才载入）。
+    'qnetworklistmanager.dll',
 }
 
 # 数据文件层同样要减：Qt 的翻译目录整块不要（见上"从来没装过 QTranslator"）。
@@ -81,6 +84,16 @@ a = Analysis(
         # ---- 标准库里明显用不到的大件 ----
         'tkinter', 'unittest', 'pydoc', 'doctest', 'sqlite3', 'xmlrpc',
         'distutils', 'setuptools', 'pip',
+        # ---- 2026-10-24（2.4 二次瘦身；每条都查过 import 链）----
+        # tarfile 只被 `shutil.unpack_archive` 引用（本项目只用 shutil.copyfile
+        # 干"覆盖 exe"那件事，从不解压），连带 _lzma/_bz2 一起省 0.36MB。
+        'tarfile', 'lzma', '_lzma', 'bz2', '_bz2',
+        # unicodedata（1.1MB）：唯一引用链是 pathlib→urllib.parse→unicodedata，
+        # 而 urllib.parse 里那是**函数内**的 import（只在解析非 ASCII 主机名时才走）。
+        # 本程序所有 URL 都是 ASCII 常量、且从不解析用户输入的主机名 → 不会触发。
+        'unicodedata',
+        # 注：decimal/_decimal（0.28MB）**不能删** —— random→statistics→fractions→
+        #     decimal 是一条真实链，random 是刚需。
     ],
     noarchive=False,
     # 1 = 去掉 assert 与 __debug__ 分支（产品代码没有依赖 assert 的逻辑）

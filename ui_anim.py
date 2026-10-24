@@ -329,6 +329,13 @@ class Tween(QObject):
         return self
 
     def stop(self, finished: bool = False) -> None:
+        # ⚠️ ``parent.destroyed`` 是 ``destroyed(QObject*)``：Qt 会把**被销毁的
+        #    控件**传进 ``finished``（不是 bool）。这里显式把"非 bool"当成 True ——
+        #    宿主都没了，这段动画等同于"结束"，收尾回调该走一次
+        #    （main_window._finish_rx_xfade / _apply_settings_result 依赖这个语义：
+        #    拆窗口时补一次收尾，否则关闭途中改的设置不会被落盘）。
+        if not isinstance(finished, bool):
+            finished = True
         if not self._running:
             return
         self._running = False
