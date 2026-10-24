@@ -1766,6 +1766,65 @@ def check_updater(app: QApplication) -> None:
     # 8) 源链重试轮数（用户要求失败自动重试）
     assert CHECK_PASSES >= 2, "版本检测至少要整链重试一轮"
 
+    # 9) **设置面板里那一颗「检查更新」真的会动**（2026-10-24 用户报"点了没反应"）
+    #    真因：`version_sources()` 的每一项是 **(名字, url, 解析器, 镜像前缀)** 四元组，
+    #    面板里却按三元组解包 → 点下去当场 ValueError；Qt 把槽里的异常吞进 stderr，
+    #    而 exe 是 console=False，屏幕上一个字都不变。下面用**假网络**把整条 UI 反馈
+    #    链路跑一遍（不联网）：按钮必须从"检查中…"走到"✓ 已是最新"。
+    from PySide6.QtCore import QObject, QTimer, Signal
+    from PySide6.QtNetwork import QNetworkReply
+
+    from ui_settings import SettingsDialog
+
+    class _FakeReply(QObject):
+        finished = Signal()
+
+        def __init__(self, body: bytes) -> None:
+            super().__init__()
+            self._body = body
+
+        def error(self):
+            return QNetworkReply.NetworkError.NoError
+
+        def readAll(self) -> bytes:
+            return self._body
+
+        def abort(self) -> None:
+            pass
+
+        def deleteLater(self) -> None:      # noqa: N802 - 对齐 Qt 命名
+            pass
+
+    class _FakeNam:
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def get(self, _request):
+            reply = _FakeReply(self._body)
+            QTimer.singleShot(10, reply.finished.emit)
+            return reply
+
+    from version import VERSION as _ver
+    dialog = SettingsDialog("system", 60, parent=None)
+    try:
+        dialog._nam = _FakeNam(f'VERSION = "{_ver}"\n'.encode())
+        dialog._check_update()                # ⛔ 这里曾经抛 ValueError（三元组解包）
+        assert wait_for(app, lambda: "最新" in dialog.btn_check_update.text()
+                        or "失败" in dialog.btn_check_update.text(), timeout=5.0), \
+            (f"点了「检查更新」按钮毫无反馈（一直停在 "
+             f"{dialog.btn_check_update.text()!r}）")
+        assert "最新" in dialog.btn_check_update.text(), \
+            f"版本相同却没报「已是最新」：{dialog.btn_check_update.text()!r}"
+        assert "已是最新" in dialog.lbl_version.text(), \
+            f"版本行没跟着更新：{dialog.lbl_version.text()!r}"
+        assert dialog.btn_check_update.isEnabled(), "检查结束后按钮该恢复可点"
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        app.processEvents()
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
+
 
 def check_mcp_payload(app: QApplication) -> None:
     """MCP 接入入口（2.1）：源码随包走 + 接入包自包含 + 文件出口可用。

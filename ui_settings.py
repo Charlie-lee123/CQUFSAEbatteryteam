@@ -1385,27 +1385,56 @@ class SettingsDialog(QDialog):
             self._update_pass += 1
             self._update_src_idx = 0
             if self._update_pass >= updater.CHECK_PASSES:
-                if self._proxy_attempt == 0:
-                    # 整条链直连都不通：换本机代理把链再跑一遍（代理开着的用户）
-                    self._proxy_attempt = 1
+                # 一层跑完（整条源链 + 重试）→ 换下一层代理策略再跑
+                if self._proxy_attempt < len(self._proxy_layers()):
+                    self._proxy_attempt += 1
                     self._update_src_idx = 0
                     self._update_pass = 0
                 else:
                     self._finish_update_check()
                     self._update_failed()
                     return
-        if self._proxy_attempt == 1 and self._update_src_idx == 0 \
-                and self._update_pass == 0:
-            from PySide6.QtNetwork import QNetworkProxy
-            QNetworkProxy.setApplicationProxy(QNetworkProxy(
-                QNetworkProxy.ProxyType.HttpProxy, *self.FALLBACK_PROXY))
-        _name, url, parser = sources[self._update_src_idx]
+        if self._update_src_idx == 0 and self._update_pass == 0:
+            self._apply_proxy_layer()
+        # ⛔ 源元组是 **(名字, url, 解析器, 镜像前缀)** 四项（镜像前缀给下载测速用），
+        #    这里只取前三项 —— 曾经写成 `_name, url, parser = sources[i]` 三元组解包，
+        #    点「检查更新」当场抛 ValueError。Qt 会把这个异常吞进 stderr，而 exe 是
+        #    console=False → 用户看到的就是"点了完全没反应"（2026-10-24 用户报）。
+        #    自测里有一条直接驱动 _check_update() 的回归用例钉住它。
+        _name, url, parser = sources[self._update_src_idx][:3]
         self._update_parser = parser
         self.btn_check_update.setEnabled(False)
         self.btn_check_update.setText("检查中…")
         self._pending_reply = self._nam.get(QNetworkRequest(QUrl(url)))
         self._pending_reply.finished.connect(self._on_update_reply)
         self._update_timer.start(updater.SOURCE_TIMEOUT_MS)
+
+    def _proxy_layers(self) -> tuple:
+        """检查更新的代理策略层：**系统代理 → 本机 Clash → 直连**。
+
+        2026-10-24 实测出的坑：本机系统代理指向 Clash（127.0.0.1:7897），
+        但 **Qt 走它连不上**（RemoteHostClosedError），`curl` 走同一个端口却正常；
+        而**直连通**。以前只有"系统代理 + 本机代理"两层，两层其实是同一个死端口，
+        于是整条链必然失败 —— 用户看到"检查更新没反应/网络失败"。
+        所以必须补上最后一层**直连**兜底。
+        """
+        return (("system", None), ("clash", self.FALLBACK_PROXY), ("direct", None))
+
+    def _apply_proxy_layer(self) -> None:
+        """按当前层设置 QNetworkProxy（层序见 ``_proxy_layers``）。"""
+        from PySide6.QtNetwork import QNetworkProxy
+        layers = self._proxy_layers()
+        kind = layers[min(self._proxy_attempt, len(layers) - 1)][0]
+        if kind == "clash":
+            QNetworkProxy.setApplicationProxy(QNetworkProxy(
+                QNetworkProxy.ProxyType.HttpProxy, *self.FALLBACK_PROXY))
+        elif kind == "direct":
+            QNetworkProxy.setApplicationProxy(
+                QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
+        else:
+            # 系统代理（默认策略）—— 显式还原，别把上一次检查设的留在全局
+            QNetworkProxy.setApplicationProxy(
+                QNetworkProxy(QNetworkProxy.ProxyType.DefaultProxy))
 
     def _on_update_reply(self) -> None:
         reply = self.sender()
@@ -1480,6 +1509,11 @@ class SettingsDialog(QDialog):
         self._pending_reply = None
         self.btn_check_update.setEnabled(True)
         self.btn_check_update.setText("检查更新")
+        # 把全局代理策略还原成"跟随系统"：检查过程中可能被切到 Clash / 直连，
+        # 留在进程里会影响之后的下载与其它请求（QNetworkProxy 是**全局**的）。
+        from PySide6.QtNetwork import QNetworkProxy
+        QNetworkProxy.setApplicationProxy(
+            QNetworkProxy(QNetworkProxy.ProxyType.DefaultProxy))
 
     # ------------------------------------------------------------ 杂项
 
