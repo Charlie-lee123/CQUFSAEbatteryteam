@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import hashlib
 import tempfile
-import time
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -33,13 +32,24 @@ from PySide6.QtWidgets import (
     QApplication, QDialog, QHBoxLayout, QLabel, QProgressBar, QVBoxLayout, QWidget,
 )
 
+import app_log
 from ui_controls import InkButton
 from ui_theme import GAP, ui_font
 
 SOURCE_TIMEOUT_MS = 4000         # 版本检测**单源**超时（并行测速，不用等满）
 CHECK_PASSES = 2                 # 整条源链的重试轮数
+# 第一条有效结果回来后再等这么久，把同期到达的答案收集齐，取**版本号最高**的那条。
+# 为什么要窗口（2026-10-25）：jsDelivr 的边沿缓存会滞后几分钟到几小时（发布后仍返回
+# 上一版的 version.py），而它的响应往往最快 —— "先回者胜"就会拿到陈旧版本号，
+# 用户点检查更新看到"已是最新"却拉不到包。窗口只有 300ms，代价远小于收益。
+PICK_GRACE_MS = 300
+# 代理策略层：系统代理 → 本机 Clash → 直连。全并行仍拿不到版本时逐层切，
+# 每层只跑 CHECK_PASSES 轮；最坏 ≈ 3 × 4.8s，典型 1s 内。
+CLASH_PROXY = ("127.0.0.1", 7897)
 DOWNLOAD_PASSES = 1              # 下载源链重试轮数（源多了，一轮足够）
 STALL_MS = 8000                  # 下载"多久没有任何新字节"就换源
+# 同时抢跑的下载源数：2 条（内存峰值 ≈ 2×包体）。再大收益递减、峰值内存翻倍。
+RACERS_PER_BATCH = 2
 SLOW_BYTES_PER_S = 40_000        # 慢于这个速度且已下 >8s，也换源（镜像限速时用）
 
 
@@ -294,7 +304,10 @@ class UpdateChecker(QObject):
         self._nam = QNetworkAccessManager(self)
         self._replies: list = []
         self._pass = 0
+        self._layer = 0
         self._done = False
+        self._candidates: list = []      # [(version_tuple, info, 到达序号)]
+        self._seq = 0
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._on_timeout)
@@ -303,10 +316,80 @@ class UpdateChecker(QObject):
         self._grace = QTimer(self)
         self._grace.setSingleShot(True)
         self._grace.timeout.connect(self._abort_all)
+        # 结果选择窗口：收齐同期答案，取版本号最高的那条（见 PICK_GRACE_MS）
+        self._pick = QTimer(self)
+        self._pick.setSingleShot(True)
+        self._pick.timeout.connect(self._emit_best)
 
     def start(self) -> None:
         self._pass = 0
+        self._layer = 0
+        self._candidates = []
+        self._layer = self._first_usable_layer()
+        self._apply_proxy_layer()
         self._launch_pass()
+
+    @staticmethod
+    def _proxy_alive(host: str, port: int, timeout_ms: int = 350) -> bool:
+        """TCP 探一下本机代理端口还活着没（最坏阻塞 timeout_ms）。"""
+        from PySide6.QtNetwork import QTcpSocket
+        if not host or port <= 0:
+            return False
+        sock = QTcpSocket()
+        sock.connectToHost(host, int(port))
+        ok = sock.waitForConnected(timeout_ms)
+        sock.abort()
+        return ok
+
+    def _first_usable_layer(self) -> int:
+        """跳过"系统代理指向一个死掉的本机端口"这一层。
+
+        这台机器上极常见：Clash 关了，但系统代理设置还指着 127.0.0.1:7897 ——
+        Qt 对每条源都要等满 4s 才超时，整整白等一轮（4.8s）才轮到下一层。
+        开跑前花 ≤350ms 探一下端口，死了就直接从下一层开始。
+        """
+        try:
+            from PySide6.QtNetwork import (QNetworkProxyFactory,
+                                           QNetworkProxyQuery)
+            proxy = QNetworkProxyFactory.systemProxyForQuery(
+                QNetworkProxyQuery(QUrl("https://cdn.jsdelivr.net")))[0]
+        except Exception:                 # noqa: BLE001 - 取不到就按"系统代理"跑
+            return 0
+        if proxy.type() != 0 and proxy.hostName():   # 0 = NoProxy
+            if not self._proxy_alive(proxy.hostName(), proxy.port()):
+                # 死代理：本机 Clash 若是同一个端口也一并跳过，直接直连
+                clash = CLASH_PROXY
+                if (proxy.hostName(), int(proxy.port())) == (clash[0], clash[1]):
+                    return 2
+                return 1
+        return 0
+
+    # -- 代理分层 --------------------------------------------------------
+
+    @staticmethod
+    def proxy_layers() -> tuple:
+        """(层名, 是否指定代理)。0=跟随系统，1=本机 Clash，2=直连。"""
+        return (("system", None), ("clash", CLASH_PROXY), ("direct", "no"))
+
+    def _apply_proxy_layer(self) -> None:
+        from PySide6.QtNetwork import QNetworkProxy
+        _, proxy = self.proxy_layers()[min(self._layer,
+                                           len(self.proxy_layers()) - 1)]
+        if proxy == "no":
+            QNetworkProxy.setApplicationProxy(
+                QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
+        elif proxy is None:
+            QNetworkProxy.setApplicationProxy(
+                QNetworkProxy(QNetworkProxy.ProxyType.DefaultProxy))
+        else:
+            QNetworkProxy.setApplicationProxy(QNetworkProxy(
+                QNetworkProxy.ProxyType.HttpProxy, *proxy))
+
+    def _restore_proxy(self) -> None:
+        """检查结束把全局代理还原成"跟随系统"（QNetworkProxy 是全局状态）。"""
+        from PySide6.QtNetwork import QNetworkProxy
+        QNetworkProxy.setApplicationProxy(
+            QNetworkProxy(QNetworkProxy.ProxyType.DefaultProxy))
 
     # -- 内部 ------------------------------------------------------------
 
@@ -346,29 +429,47 @@ class UpdateChecker(QObject):
             return
         data = bytes(reply.readAll())
         error = reply.error()
-        if error == QNetworkReply.NetworkError.NoError and data:
-            try:
-                info = parser(data.decode("utf-8", errors="replace"))
-            except Exception:
-                info = None
-            if info and info.get("version"):
-                self._done = True
-                self._timer.stop()
-                info.setdefault("sha256", None)
-                info["source"] = name
-                note_best_prefix(prefix)
-                self.checked.emit(info)
-                # 先发结果（用户不必等），镜像再留 400ms 的报到窗口：
-                # 第一条回来的镜像就是下载该用的那条（见 note_best_prefix）。
-                if prefix is None:
-                    self._grace.start(400)
-                else:
-                    self._abort_all()
-                return
+        if error != QNetworkReply.NetworkError.NoError or not data:
+            return                      # 这条不行：等别的源，全部失败由 _on_timeout 收尾
+        try:
+            info = parser(data.decode("utf-8", errors="replace"))
+        except Exception:
+            info = None
+        if not (info and info.get("version")):
             if prefix:
-                note_best_prefix(prefix)     # 镜像活着就算数（即使还没解析出结果）
-                return
-        # 这条不行（超时/空/解析失败）：等别的源；全部失败由 _on_timeout 收尾
+                note_best_prefix(prefix)   # 活着就算数（即使这一版解析不出）
+            return
+        info.setdefault("sha256", None)
+        info.setdefault("setup_sha256", None)
+        info["source"] = name
+        if prefix:
+            note_best_prefix(prefix)
+        # 不立刻发射：开一个 PICK_GRACE_MS 的窗口把同期答案收齐，再取版本号最高的
+        # 那条（jsDelivr 边沿缓存滞后时，靠这个窗口让镜像的正确答案盖过它）。
+        self._candidates.append((version_tuple(info["version"]), info,
+                                 self._seq, prefix))
+        self._seq += 1
+        self._timer.stop()               # 已有结果，别让"整轮兜底"再来打断
+        if not self._pick.isActive():
+            self._pick.start(PICK_GRACE_MS)
+
+    def _emit_best(self) -> None:
+        """窗口到点：取版本号最高者（同版本取先到的），发结果。"""
+        if self._done or not self._candidates:
+            return
+        self._done = True
+        self._pick.stop()
+        self._timer.stop()
+        _vt, info, _seq, prefix = max(self._candidates,
+                                      key=lambda c: (c[0], -c[2]))
+        self._candidates = []
+        self._restore_proxy()
+        self.checked.emit(info)
+        # 镜像再留 400ms 的报到窗口：赢家若不是镜像，还得靠它认一条最快的下载源
+        if prefix is None:
+            self._grace.start(400)
+        else:
+            self._abort_all()
 
     def _on_timeout(self) -> None:
         if self._done:
@@ -376,8 +477,16 @@ class UpdateChecker(QObject):
         self._pass += 1
         self._abort_all()
         if self._pass >= CHECK_PASSES:
+            # 这一层（系统代理）跑完还没结果 → 换下一层：本机 Clash → 直连
+            if self._layer + 1 < len(self.proxy_layers()):
+                self._layer += 1
+                self._pass = 0
+                self._apply_proxy_layer()
+                self._launch_pass()
+                return
             self._done = True
-            self.failed.emit("所有版本源都不可达（已并行尝试全部镜像与直连）")
+            self._restore_proxy()
+            self.failed.emit("所有版本源都不可达（镜像、直连、本机代理都试过）")
             return
         self._launch_pass()
 
@@ -419,16 +528,17 @@ class UpdateDialog(QDialog):
         #    用来校验新版本。
         self._sha256 = sha256 or None
         self._nam = QNetworkAccessManager(self)
-        self._reply = None
         self._download_pass = 0
-        self._url_idx = 0
-        self._data = bytearray()
+        # 多源抢跑：urls 是本次源链，racers/recv 每条在跑源各一份缓冲与计数
+        self._urls: tuple = ()
+        self._next_idx = 0
+        self._racers: dict = {}
+        self._recv: dict = {}
         # 卡源看门狗：镜像"连上了但不给数据"是最常见的坑（TCP 通、字节不来），
         # 没有它的话下载会一直挂在那条源上，用户只能看着进度条不动。
         self._stall = QTimer(self)
         self._stall.setSingleShot(True)
         self._stall.timeout.connect(self._on_stall)
-        self._dl_started = 0.0
 
         root = QVBoxLayout(self)
         root.setContentsMargins(GAP + 6, GAP + 6, GAP + 6, GAP + 6)
@@ -493,70 +603,86 @@ class UpdateDialog(QDialog):
         if not self._frozen:
             return
         self._download_pass = 0
-        self._url_idx = 0
-        self._data.clear()
+        self._urls = release_download_urls(
+            self._tag,
+            setup_asset_name(self._latest) if self._is_setup else None)
+        self._next_idx = 0
+        self._racers = {}                # QNetworkReply -> bytearray（各源独立缓冲）
+        self._recv = {}                  # QNetworkReply -> 已收字节数（给进度条挑"领先者"）
         self._btn_now.setEnabled(False)
         self._btn_later.setEnabled(False)
         self._btn_repo.setEnabled(False)
         self._progress.show()
         self._progress.setValue(0)
-        self._status.setText("正在下载更新包（镜像加速）…")
-        self._try_download()
+        self._progress.setRange(0, 100)
+        self._status.setText("正在下载更新包（多源并行抢跑）…")
+        self._start_batch()
 
-    # -- 下载 ------------------------------------------------------------
+    # -- 下载：多源并行抢跑 ------------------------------------------------
 
-    def _try_download(self) -> None:
-        urls = release_download_urls(
-            self._tag,
-            setup_asset_name(self._latest) if self._is_setup else None)
-        if self._url_idx >= len(urls):
+    def _start_batch(self) -> None:
+        """从源链里取下一批（最多 RACERS_PER_BATCH 条）同时开跑。
+
+        ⚠️ 为什么并行（2026-10-25，用户："不开代理也要快"）：镜像之间速度能差
+        一个数量级，而"谁快"事先不知道（测速只覆盖版本文件、不代表 30MB 资产的
+        吞吐）。串行时一旦第一条慢，用户就得盯着进度条干等（旧逻辑靠 8 秒看门狗
+        兜，仍然要浪费 8 秒）。现在同时起两条、谁先下完谁算数，另一条立即中断。
+        内存代价：2 × 包体（约 60MB）峰值，下完立刻释放。
+        """
+        if self._next_idx >= len(self._urls):
             self._download_pass += 1
-            self._url_idx = 0
+            self._next_idx = 0
             if self._download_pass >= DOWNLOAD_PASSES:
                 self._download_failed("所有下载源都失败了（镜像与直连都试过）")
                 return
             self._status.setText("下载失败，正在自动重试…")
-        self._url = urls[self._url_idx]
-        host = self._url.split("/")[2]
-        request = QNetworkRequest(QUrl(self._url))
+        batch = self._urls[self._next_idx:self._next_idx + RACERS_PER_BATCH]
+        self._next_idx += len(batch)
+        for url in batch:
+            self._launch_racer(url)
+
+    def _launch_racer(self, url: str) -> None:
+        host = url.split("/")[2]
+        request = QNetworkRequest(QUrl(url))
         request.setTransferTimeout(0)            # 大文件不设整体超时，靠看门狗换源
         request.setAttribute(QNetworkRequest.RedirectPolicyAttribute,
                              QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy)
-        self._reply = self._nam.get(request)
-        self._reply.downloadProgress.connect(self._on_progress)
-        self._reply.finished.connect(self._on_download_finished)
-        self._data.clear()                       # ⛔ 换源必须清空：否则上一源的半截
-        #    字节会和这一源的拼在一起，哈希永远对不上（旧版就是这么"所有源都失败"的）
-        self._dl_started = time.perf_counter()
+        reply = self._nam.get(request)
+        self._racers[reply] = bytearray()
+        self._recv[reply] = 0
+        reply.downloadProgress.connect(
+            lambda got, total, r=reply: self._on_racer_progress(r, got, total))
+        reply.finished.connect(lambda r=reply: self._on_racer_finished(r))
         self._stall.start(STALL_MS)
-        self._status.setText(f"正在下载更新（{host}）…")
+        self._status.setText(
+            f"正在下载更新（{len(self._racers)} 路并行 · {host}）…")
 
-    def _on_progress(self, received: int, total: int) -> None:
-        self._stall.start(STALL_MS)              # 有字节进来 = 这条源还活着
-        if total > 0:
-            self._progress.setValue(int(received * 100 / total))
-            self._status.setText(f"正在下载更新… {received / 1e6:.1f} / "
-                                 f"{total / 1e6:.1f} MB")
+    def _on_racer_progress(self, reply, received: int, total: int) -> None:
+        if reply not in self._racers:
+            return
+        self._recv[reply] = max(received, self._recv.get(reply, 0))
+        self._stall.start(STALL_MS)              # 有字节进来 = 至少一条活着
+        lead = max(self._recv.values())
+        lead_total = total if received >= lead else 0
+        if lead_total > 0:
+            self._progress.setValue(int(lead * 100 / lead_total))
+            self._status.setText(f"正在下载更新… {lead / 1e6:.1f} / "
+                                 f"{lead_total / 1e6:.1f} MB"
+                                 f"（{len(self._racers)} 路并行）")
         else:
             self._progress.setRange(0, 0)
-            self._status.setText(f"正在下载更新… {received / 1e6:.1f} MB")
-        # 限速型镜像：连得上、也在动，但慢得离谱 —— 与其让用户等两分钟，
-        # 不如换下一条（剩下的源里大概率有快的）。
-        elapsed = time.perf_counter() - self._dl_started
-        if elapsed > 8.0 and received > 0 and received / elapsed < SLOW_BYTES_PER_S:
-            self._switch_source(f"当前镜像太慢（{received / elapsed / 1024:.0f} KB/s）")
+            self._status.setText(f"正在下载更新… {lead / 1e6:.1f} MB")
 
     def _on_stall(self) -> None:
-        """看门狗：连续 STALL_MS 没有新字节 → 判这条源卡死，换下一条。"""
-        if self._reply is None:
+        """看门狗：整批连续 STALL_MS 没有新字节 → 全部放弃，换下一批。"""
+        if not self._racers:
             return
-        self._switch_source("下载停滞")
+        app_log.info("下载停滞，换下一批源")
+        self._abort_racers()
 
-    def _switch_source(self, reason: str) -> None:
-        """放弃当前源，换下一条镜像（清掉半截数据，进度归零重来）。"""
+    def _abort_racers(self) -> None:
         self._stall.stop()
-        reply, self._reply = self._reply, None
-        if reply is not None:
+        for reply in list(self._racers):
             try:
                 reply.downloadProgress.disconnect()
                 reply.finished.disconnect()
@@ -564,38 +690,36 @@ class UpdateDialog(QDialog):
                 reply.deleteLater()
             except (RuntimeError, TypeError):
                 pass
-        self._data.clear()
-        self._progress.setValue(0)
-        self._progress.setRange(0, 100)
-        self._status.setText(f"{reason}，正在换源重试…")
-        self._url_idx += 1
-        self._try_download()
+        self._racers.clear()
+        self._recv.clear()
 
-    def _on_download_finished(self) -> None:
-        reply = self.sender()
-        if reply is not getattr(self, "_reply", None):
-            return
-        self._stall.stop()
+    def _on_racer_finished(self, reply) -> None:
+        if reply not in self._racers:
+            return                        # 已被别人胜出后清掉
+        buf = self._racers.pop(reply)
+        self._recv.pop(reply, None)
         error = reply.error()
-        self._data += bytes(reply.readAll())
+        tail = bytes(reply.readAll()) if error == QNetworkReply.NetworkError.NoError else b""
         reply.deleteLater()
-        self._reply = None
-        if error != QNetworkReply.NetworkError.NoError:
-            # 该源失败：换下一条（_switch_source 会清数据，别在这儿再 +=）
-            self._url_idx += 1
-            self._data.clear()
-            self._try_download()
+        if error == QNetworkReply.NetworkError.NoError:
+            buf += tail
+        host = reply.url().host() if hasattr(reply, "url") else "?"
+        ok, why = ((False, "空响应") if not buf
+                   else verify_integrity(bytes(buf), self._sha256, self._size))
+        if ok:
+            self._stall.stop()
+            self._abort_racers()
+            self._progress.setRange(0, 100)
+            self._progress.setValue(100)
+            self._status.setText("校验通过，正在准备安装…")
+            self._apply(bytes(buf))
             return
-        ok, why = verify_integrity(bytes(self._data), self._sha256, self._size)
-        if not ok:
-            # 完整性不过：换一个源重新下（镜像可能回的是错误页而不是 exe）
-            self._url_idx += 1
-            self._data.clear()
-            self._try_download()
-            return
-        self._progress.setValue(100)
-        self._status.setText("校验通过，正在准备安装…")
-        self._apply(bytes(self._data))
+        app_log.info(f"更新包这条源不可用（{host}：{why}），继续等/换下一批")
+        if not self._racers:             # 本批全部失败 → 下一批
+            self._progress.setValue(0)
+            self._progress.setRange(0, 100)
+            self._start_batch()
+
 
     def _download_failed(self, reason: str) -> None:
         self._progress.hide()

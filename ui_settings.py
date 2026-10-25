@@ -21,7 +21,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QDate, QTimer, Qt
 from PySide6.QtNetwork import (
-    QNetworkAccessManager, QNetworkReply, QNetworkRequest,
+    QNetworkAccessManager,
 )
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QGridLayout,
@@ -298,13 +298,10 @@ class SettingsDialog(QDialog):
         body_layout.addWidget(repo_label)
 
         # 检查更新的网络会话：复用同一个 manager（QNetworkAccessManager 应当
-        # 常驻而不是每次现建）。超时兜底 8 秒 —— GitHub 连不上（代理没开、
-        # 内网）时不能让按钮永远停在"检查中…"。
+        # 常驻而不是每次现建）。并发/超时/代理分层统一交给 updater.UpdateChecker
+        # （见 _check_update），这里不再自己维护一套计时器。
         self._nam = QNetworkAccessManager(self)
-        self._update_timer = QTimer(self)
-        self._update_timer.setSingleShot(True)
-        self._update_timer.setInterval(8000)
-        self._update_timer.timeout.connect(self._update_timed_out)
+        self._checker = None
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -1393,108 +1390,39 @@ class SettingsDialog(QDialog):
         return parts + (0,) * (3 - len(parts))
 
     def _check_update(self) -> None:
-        """多源检查更新（源链见 updater.version_sources）。
+        """多源检查更新：**全部源并行发**，先回者参与、取版本号最高者胜。
 
-        无代理的网络走 jsDelivr/镜像（国内可直连）；开着代理的用户走链尾的
-        GitHub 直连。整条链失败且还没试过本机代理时，把同一条链经本机代理
-        再跑一遍。发现新版本 → 弹更新对话框（立即更新/暂不更新/前往仓库），
-        不再直接跳浏览器。
+        2026-10-25 用户要求"不开代理也要快速更新"：这里原本是"逐源串行 + 每源
+        4s + 整链 2 轮 + 代理 3 层"，最坏 10×4×2×3 ≈ 4 分钟（断网时按钮一直转）。
+        改成复用自动检查那条并行实现（``updater.UpdateChecker``）：典型 0.3~1.5s，
+        代理解析（系统 → 本机 Clash → 直连）与"取最新而非取最先"都在它里面，
+        两条入口从此只有一份实现。
         """
-        self._proxy_attempt = 0
-        self._update_src_idx = 0
-        self._update_pass = 0
-        self._start_update_request()
-
-    def _start_update_request(self) -> None:
-        import updater
-        sources = updater.version_sources()
-        if self._update_src_idx >= len(sources):
-            self._update_pass += 1
-            self._update_src_idx = 0
-            # ⛔ 第一层（系统代理）跑 CHECK_PASSES 轮，后面两层各跑 1 轮就够 ——
-            #    以前每层都跑 CHECK_PASSES 轮，10 个源 × 4s × 2 轮 × 3 层 ≈ 4 分钟，
-            #    断网时按钮会一直"检查中…"（用户感知就是"点了没反应"）。
-            budget = updater.CHECK_PASSES if self._proxy_attempt == 0 else 1
-            if self._update_pass >= budget:
-                # 一层跑完 → 换下一层代理策略再跑
-                # ⛔ 这里必须是 "当前层 +1 还有没有"：以前写成 `attempt < len(layers)`，
-                #    attempt 会自增到 == len(layers)，多跑一整轮**重复的最后一层**。
-                if self._proxy_attempt + 1 < len(self._proxy_layers()):
-                    self._proxy_attempt += 1
-                    self._update_src_idx = 0
-                    self._update_pass = 0
-                else:
-                    self._finish_update_check()
-                    self._update_failed()
-                    return
-        if self._update_src_idx == 0 and self._update_pass == 0:
-            self._apply_proxy_layer()
-        # ⛔ 源元组是 **(名字, url, 解析器, 镜像前缀)** 四项（镜像前缀给下载测速用），
-        #    这里只取前三项 —— 曾经写成 `_name, url, parser = sources[i]` 三元组解包，
-        #    点「检查更新」当场抛 ValueError。Qt 会把这个异常吞进 stderr，而 exe 是
-        #    console=False → 用户看到的就是"点了完全没反应"（2026-10-24 用户报）。
-        #    自测里有一条直接驱动 _check_update() 的回归用例钉住它。
-        _name, url, parser = sources[self._update_src_idx][:3]
-        self._update_parser = parser
+        if self._checker is not None:
+            return                       # 已经在查了：别叠第二条，也别重入
         self.btn_check_update.setEnabled(False)
         self.btn_check_update.setText("检查中…")
-        self._pending_reply = self._nam.get(QNetworkRequest(QUrl(url)))
-        self._pending_reply.finished.connect(self._on_update_reply)
-        self._update_timer.start(updater.SOURCE_TIMEOUT_MS)
+        checker = self._make_checker()
+        self._checker = checker
+        checker.checked.connect(self._on_update_checked)
+        checker.failed.connect(self._on_update_check_failed)
+        checker.start()
 
-    def _proxy_layers(self) -> tuple:
-        """检查更新的代理策略层：**系统代理 → 本机 Clash → 直连**。
+    def _make_checker(self):
+        """工厂：自测里换成"假网络"的 Checker（见 selftest 的检查更新用例）。"""
+        import updater
+        return updater.UpdateChecker(self)
 
-        2026-10-24 实测出的坑：本机系统代理指向 Clash（127.0.0.1:7897），
-        但 **Qt 走它连不上**（RemoteHostClosedError），`curl` 走同一个端口却正常；
-        而**直连通**。以前只有"系统代理 + 本机代理"两层，两层其实是同一个死端口，
-        于是整条链必然失败 —— 用户看到"检查更新没反应/网络失败"。
-        所以必须补上最后一层**直连**兜底。
-        """
-        return (("system", None), ("clash", self.FALLBACK_PROXY), ("direct", None))
-
-    def _apply_proxy_layer(self) -> None:
-        """按当前层设置 QNetworkProxy（层序见 ``_proxy_layers``）。"""
-        from PySide6.QtNetwork import QNetworkProxy
-        layers = self._proxy_layers()
-        kind = layers[min(self._proxy_attempt, len(layers) - 1)][0]
-        if kind == "clash":
-            QNetworkProxy.setApplicationProxy(QNetworkProxy(
-                QNetworkProxy.ProxyType.HttpProxy, *self.FALLBACK_PROXY))
-        elif kind == "direct":
-            QNetworkProxy.setApplicationProxy(
-                QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
-        else:
-            # 系统代理（默认策略）—— 显式还原，别把上一次检查设的留在全局
-            QNetworkProxy.setApplicationProxy(
-                QNetworkProxy(QNetworkProxy.ProxyType.DefaultProxy))
-
-    def _on_update_reply(self) -> None:
-        reply = self.sender()
-        if reply is not getattr(self, "_pending_reply", None):
-            return                      # 超时后迟到的回应，忽略
-        self._update_timer.stop()
-        error = reply.error()
-        data = bytes(reply.readAll())
-        reply.deleteLater()
-        self._pending_reply = None
-        if error != QNetworkReply.NetworkError.NoError:
-            # 该源失败：回退下一源 / 下一轮 / 本机代理层
-            self._update_src_idx += 1
-            self._start_update_request()
-            return
-        try:
-            info = self._update_parser(data.decode("utf-8", errors="replace"))
-        except Exception:
-            import traceback
-            app_log.error("检查更新解析异常: " + traceback.format_exc(limit=3))
-            info = None
-        if not info or not info.get("version"):
-            self._update_src_idx += 1   # 解析不出当源失败，回退下一源
-            self._start_update_request()
-            return
+    def _on_update_checked(self, info: dict) -> None:
+        self._checker = None
         self._finish_update_check()
         self._handle_update_info(info)
+
+    def _on_update_check_failed(self, reason: str) -> None:
+        self._checker = None
+        self._finish_update_check()
+        self.lbl_version.setText(f"检查失败：{reason}")
+        self._flash_button_result("网络失败")
 
     def _handle_update_info(self, info: dict) -> None:
         from updater import UpdateDialog, update_asset_and_hash, version_tuple
@@ -1513,19 +1441,6 @@ class SettingsDialog(QDialog):
                               tag=f"v{latest_str}", auto=False, parent=self)
         dialog.exec()
 
-    def _update_timed_out(self) -> None:
-        if getattr(self, "_pending_reply", None) is None:
-            return
-        self._pending_reply.disconnect(self)
-        self._pending_reply.abort()
-        self._pending_reply = None
-        self._update_src_idx += 1       # 单源超时 → 回退下一源/下一轮/代理层
-        self._start_update_request()
-
-    def _update_failed(self) -> None:
-        self.lbl_version.setText("检查失败：所有更新源都不可达（已尝试直连与本机代理）")
-        self._flash_button_result("网络失败")
-
     def _flash_button_result(self, text: str) -> None:
         """结果在**按钮上**原地显示 4 秒再复原。
 
@@ -1540,14 +1455,10 @@ class SettingsDialog(QDialog):
             self.btn_check_update.setText("检查更新")
 
     def _finish_update_check(self) -> None:
-        self._pending_reply = None
         self.btn_check_update.setEnabled(True)
         self.btn_check_update.setText("检查更新")
-        # 把全局代理策略还原成"跟随系统"：检查过程中可能被切到 Clash / 直连，
-        # 留在进程里会影响之后的下载与其它请求（QNetworkProxy 是**全局**的）。
-        from PySide6.QtNetwork import QNetworkProxy
-        QNetworkProxy.setApplicationProxy(
-            QNetworkProxy(QNetworkProxy.ProxyType.DefaultProxy))
+        # 注：全局代理策略由 UpdateChecker 自己还原（QNetworkProxy 是全局状态，
+        # 检查过程中可能切到 Clash / 直连，留着会影响随后的大文件下载）。
 
     # ------------------------------------------------------------ 杂项
 

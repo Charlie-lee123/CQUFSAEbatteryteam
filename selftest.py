@@ -1668,6 +1668,7 @@ def check_updater(app: QApplication) -> None:
         parse_version_file, release_download_urls, verify_integrity,
         version_sources, version_tuple,
     )
+    import updater as _upd     # 下面几段要直接构造 Checker / UpdateDialog
 
     # 1) 版本文件解析：VERSION + 哈希（仓库里 version.py 的真实格式）
     sample = ('"""软件版本号"""\nVERSION = "1.6"\n\n'
@@ -1786,34 +1787,6 @@ def check_updater(app: QApplication) -> None:
     # 8) 源链重试轮数（用户要求失败自动重试）
     assert CHECK_PASSES >= 2, "版本检测至少要整链重试一轮"
 
-    # 10) 更新链的两条**必然触发**缺陷（2026-10-24 静态审查揪出来的）
-    #   a) 安装版必须用**远端 version.py 里这一版**的 setup 哈希。曾经在
-    #      UpdateDialog 里拿本地常量 `LATEST_SETUP_SHA256`（= 当前运行版本的值）
-    #      去校验下一个版本的安装包 → 跨版本 100% 不符 → 整条源链试完报
-    #      "所有下载源都失败了"，用户看到的就是"网好好的，就是更新不了"。
-    import updater as _upd
-    _saved_is_installed = _upd.is_installed
-    try:
-        _upd.is_installed = lambda: True
-        _asset, _sha = _upd.update_asset_and_hash(
-            {"version": "9.9", "sha256": "aa" * 32, "setup_sha256": "bb" * 32})
-        assert _asset == "SerialAssistant-setup-9.9.exe", _asset
-        assert _sha == "bb" * 32, f"安装版必须用远端的 setup 哈希，实得 {_sha}"
-    finally:
-        _upd.is_installed = _saved_is_installed
-    _asset, _sha = _upd.update_asset_and_hash(
-        {"version": "9.9", "sha256": "cc" * 32})
-    assert _asset == "SerialAssistant.exe" and _sha == "cc" * 32, (_asset, _sha)
-    #   b) 弹窗不能再用本地常量"纠正"传进来的哈希（它就是那个 bug 的入口）
-    _dlg = _upd.UpdateDialog(latest="9.9", current="2.4", sha256="dd" * 32)
-    assert _dlg._sha256 == "dd" * 32, \
-        f"弹窗把远端哈希覆盖成本地常量了：{_dlg._sha256}"
-    _dlg.deleteLater()
-    #   c) 无校验信息时必须**明确告诉用户**"服务端没给校验值"，不能再笼统地说
-    #      "拿不到" —— 否则排查时分不清是发布没写完还是客户端 bug
-    _ok, _why = _upd.verify_integrity(b"x", None, None)
-    assert _ok is False and "校验" in _why, (_ok, _why)
-
     # 9) **设置面板里那一颗「检查更新」真的会动**（2026-10-24 用户报"点了没反应"）
     #    真因：`version_sources()` 的每一项是 **(名字, url, 解析器, 镜像前缀)** 四元组，
     #    面板里却按三元组解包 → 点下去当场 ValueError；Qt 把槽里的异常吞进 stderr，
@@ -1855,7 +1828,10 @@ def check_updater(app: QApplication) -> None:
     from version import VERSION as _ver
     dialog = SettingsDialog("system", 60, parent=None)
     try:
-        dialog._nam = _FakeNam(f'VERSION = "{_ver}"\n'.encode())
+        # 检测实现已合并到 updater.UpdateChecker（并行），假网络挂在 Checker 上
+        _fake_checker = _upd.UpdateChecker(dialog)
+        _fake_checker._nam = _FakeNam(f'VERSION = "{_ver}"\n'.encode())
+        dialog._make_checker = lambda: _fake_checker
         dialog._check_update()                # ⛔ 这里曾经抛 ValueError（三元组解包）
         assert wait_for(app, lambda: "最新" in dialog.btn_check_update.text()
                         or "失败" in dialog.btn_check_update.text(), timeout=5.0), \
@@ -1873,6 +1849,62 @@ def check_updater(app: QApplication) -> None:
         app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         app.processEvents()
 
+
+    # 10) 更新链的两条**必然触发**缺陷（2026-10-24 静态审查揪出来的）
+    #   a) 安装版必须用**远端 version.py 里这一版**的 setup 哈希。曾经在
+    #      UpdateDialog 里拿本地常量 `LATEST_SETUP_SHA256`（= 当前运行版本的值）
+    #      去校验下一个版本的安装包 → 跨版本 100% 不符 → 整条源链试完报
+    #      "所有下载源都失败了"，用户看到的就是"网好好的，就是更新不了"。
+    _saved_is_installed = _upd.is_installed
+    try:
+        _upd.is_installed = lambda: True
+        _asset, _sha = _upd.update_asset_and_hash(
+            {"version": "9.9", "sha256": "aa" * 32, "setup_sha256": "bb" * 32})
+        assert _asset == "SerialAssistant-setup-9.9.exe", _asset
+        assert _sha == "bb" * 32, f"安装版必须用远端的 setup 哈希，实得 {_sha}"
+    finally:
+        _upd.is_installed = _saved_is_installed
+    _asset, _sha = _upd.update_asset_and_hash(
+        {"version": "9.9", "sha256": "cc" * 32})
+    assert _asset == "SerialAssistant.exe" and _sha == "cc" * 32, (_asset, _sha)
+    #   b) 弹窗不能再用本地常量"纠正"传进来的哈希（它就是那个 bug 的入口）
+    _dlg = _upd.UpdateDialog(latest="9.9", current="2.4", sha256="dd" * 32)
+    assert _dlg._sha256 == "dd" * 32, \
+        f"弹窗把远端哈希覆盖成本地常量了：{_dlg._sha256}"
+    _dlg.deleteLater()
+    #   d) 多条源同时报到时**取版本号最高的那条**：jsDelivr 的边沿缓存会在发布后
+    #      继续返回上一版（实测滞后 12 小时），而它往往最先返回 —— "先回者胜"会让
+    #      用户看到"已是最新"却拉不到包。下面用"慢一点但更新"的镜像验证覆盖逻辑。
+    class _UrlAwareNam:
+        def __init__(self, mapping: dict) -> None:
+            self.mapping = mapping
+
+        def get(self, request):
+            url = request.url().toString()
+            body = next((v for k, v in self.mapping.items() if k in url), b"")
+            reply = _FakeReply(body)
+            # jsDelivr 那条 30ms 就回，镜像晚 150ms（模拟"最快的是旧的"）
+            delay = 30 if "jsdelivr" in url else 150
+            QTimer.singleShot(delay, reply.finished.emit)
+            return reply
+
+    _ck = _upd.UpdateChecker()
+    _ck._nam = _UrlAwareNam({
+        "cdn.jsdelivr.net": b'VERSION = "2.4"\n',          # 旧
+        "ghfast.top": b'VERSION = "2.5"\n',                # 新（镜像）
+    })
+    _got: list = []
+    _ck.checked.connect(_got.append)
+    _ck.start()
+    assert wait_for(app, lambda: bool(_got), timeout=6.0), "并行检测 6s 内没出结果"
+    assert _got[0]["version"] == "2.5", \
+        f"多条源同时报到时必须取最高的版本，实得 {_got[0]['version']}（源 {_got[0].get('source')}）"
+    assert _got[0]["source"] == "ghfast.top", _got[0].get("source")
+
+    #   c) 无校验信息时必须**明确告诉用户**"服务端没给校验值"，不能再笼统地说
+    #      "拿不到" —— 否则排查时分不清是发布没写完还是客户端 bug
+    _ok, _why = _upd.verify_integrity(b"x", None, None)
+    assert _ok is False and "校验" in _why, (_ok, _why)
 
 def check_mcp_payload(app: QApplication) -> None:
     """MCP 接入入口（2.1）：源码随包走 + 接入包自包含 + 文件出口可用。

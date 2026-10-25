@@ -53,55 +53,94 @@ def _run_apply_update(target: str) -> int:
 
 
 def _run_check_net(argv: list[str]) -> int:
-    """`--check-net [url]`：不进界面，用**产品同一条网络栈**取一次 HTTPS。
+    """`--check-net [url]`：不进界面，用**产品同一条网络栈**逐个探版本源。
 
-    为什么需要它：2.4 起打包去掉了 Qt 的 OpenSSL 后端（改用 Windows 自带的
-    Schannel），"更新检查还能不能连上"必须**在产物上**验，而不是在源码里想当然。
-    这里刻意用 ``QNetworkAccessManager``（updater / 设置面板用的就是它），
-    结果写进文件再退出 —— exe 是 console=False，控制台看不到输出。
+    为什么不是"取一个 URL 试一下"：这台机器上 cdn.jsdelivr.net 的 **HTTPS 被墙**
+    （同址 HTTP 200），而镜像 ghfast.top / GitHub API 都正常 —— 单测一条会得出
+    "联网坏了"的错误结论。所以默认把 `updater.version_sources()` 里的源**逐个**
+    探一遍，如实列出谁通谁不通；产品里的检查更新就是从这些源里并行取胜者。
+
+    结果写进 exe 同目录的 `net_check.txt`（exe 是 console=False，控制台看不到）。
+    退出码：有一条通 = 0，全不通 = 1。
     """
     import app_log
 
     rest = [a for a in argv[1:] if not a.startswith("--")]
-    url = rest[0] if rest else (
-        "https://cdn.jsdelivr.net/gh/Charlie-lee123/CQUFSAEbatteryteam@main/version.py")
+    explicit = rest[0] if rest else None
     out = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "net_check.txt")
 
     app = QApplication([])                     # QNetworkAccessManager 要 QCoreApplication
-    result: dict[str, object] = {}
+    from PySide6.QtNetwork import QNetworkProxy
+    QNetworkProxy.setApplicationProxy(
+        QNetworkProxy(QNetworkProxy.ProxyType.DefaultProxy))
 
-    def _done(reply) -> None:
-        result["status"] = reply.attribute(
-            QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-        # ⚠️ PySide6 的 reply.error() 返回的是 NetworkError 枚举，**不能** int() 硬转
-        #    （实测 TypeError: int() argument must be ... not 'NetworkError'），
-        #    它自带 .value。取不到就退回字符串比较。
-        err = reply.error()
-        result["err"] = getattr(err, "value", err)
-        body = bytes(reply.readAll())
-        result["bytes"] = len(body)
-        result["head"] = body[:40].decode("utf-8", "replace").replace("\n", " ")
-        reply.deleteLater()
-        app.quit()
+    def _probe(url: str, timeout_ms: int = 8000) -> dict:
+        box: dict[str, object] = {}
+        done = {"flag": False}
 
-    nam = QNetworkAccessManager()
-    request = QNetworkRequest(QUrl(url))
-    request.setTransferTimeout(15000)
-    nam.finished.connect(_done)
-    nam.get(request)
-    QTimer.singleShot(20000, app.quit)         # 兜底：不联网/被墙时别挂死
-    app.exec()
+        def _finish(reply) -> None:
+            box["status"] = reply.attribute(
+                QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+            err = reply.error()
+            box["err"] = getattr(err, "value", err)
+            body = bytes(reply.readAll())
+            box["bytes"] = len(body)
+            box["head"] = body[:32].decode("utf-8", "replace").replace("\n", " ")
+            reply.deleteLater()
+            done["flag"] = True
+            app.quit()
 
-    ok = result.get("err") == 0 and (result.get("status") or 0) == 200
-    text = (f"{'OK' if ok else 'FAIL'} url={url} "
-            f"status={result.get('status')} err={result.get('err')} "
-            f"bytes={result.get('bytes')} head={result.get('head')!r}\n")
+        nam = QNetworkAccessManager()
+        request = QNetworkRequest(QUrl(url))
+        request.setTransferTimeout(timeout_ms)
+        nam.finished.connect(lambda r: _finish(r))
+        nam.get(request)
+        # ⛔ 兜底计时器必须能停：单次 singleShot 会泄漏到下一次 app.exec()，
+        #    把下一次探测提前掐断（实测会把"通"误报成"超时"）。
+        guard = QTimer()
+        guard.setSingleShot(True)
+        guard.timeout.connect(app.quit)
+        guard.start(timeout_ms + 2000)
+        app.exec()
+        guard.stop()
+        if not done["flag"]:
+            box.update({"status": None, "err": "timeout", "bytes": 0, "head": ""})
+        return box
+
+    if explicit:
+        targets = [("自定义", explicit)]
+    else:
+        try:
+            import updater
+            seen: set[str] = set()
+            targets = []
+            for src in updater.version_sources():
+                name, url = src[0], src[1]
+                if url in seen:
+                    continue
+                seen.add(url)
+                targets.append((name, url))
+        except Exception:                      # noqa: BLE001 - 退化成单条探测
+            targets = [("jsDelivr", "https://cdn.jsdelivr.net/gh/Charlie-lee123/"
+                                    "CQUFSAEbatteryteam@main/version.py")]
+
+    lines, ok_count = [], 0
+    for name, url in targets:
+        box = _probe(url)
+        good = box.get("err") == 0 and (box.get("status") or 0) == 200
+        ok_count += 1 if good else 0
+        lines.append(f"{'OK  ' if good else 'FAIL'} {name:16s} "
+                     f"status={box.get('status')} err={box.get('err')} "
+                     f"bytes={box.get('bytes')}")
+    head = (f"{'OK' if ok_count else 'FAIL'} 版本源连通性 "
+            f"{ok_count}/{len(targets)} 可用\n")
+    text = head + "\n".join(lines) + "\n"
     try:
         with open(out, "w", encoding="utf-8") as fh:
             fh.write(text)
     except OSError as exc:
         app_log.error(f"--check-net 写结果失败: {exc}")
-    return 0 if ok else 1
+    return 0 if ok_count else 1
 
 
 def _run_ble_scan(argv: list[str]) -> int:
