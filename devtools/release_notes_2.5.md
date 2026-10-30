@@ -2,7 +2,7 @@
 
 > Windows 10 / 11（64 位）· 免安装单文件 **27.5 MB** · 安装包 **29.3 MB**
 
-本次三件事：**改名**、**结构化导出（CSV / JSON）**、**更新链路提速**（上一轮已并入）。
+本次三件事`SerialAssistant.exe``SerialAssistant-setup-2.5.exe`：`21693e3c9ce3c91d815683148ff4f9f850a137f54471cde02c3634d2badf8b7b``95c99c4fb533e7ed6315ee58b3b7804a67b384fe3d738d8104a6488d646cceda`**改名**、**结构化导出（CSV / JSON）**、**更新链路提速**（上一轮已并入）。
 
 ---
 
@@ -41,6 +41,26 @@
   （否则你会导出到空文件却不知道原因）
 - 只保留最近 **500 轮**（约 2 MB），长时间跑不会吃内存
 
+## 3. 新增：MCP「手动填写参数」面板
+
+位置：**设置 → MCP Service → 「手动填写参数」**
+
+客户端的「连接至自定义 MCP」是**逐项填**的（名称 / 类型 / 命令 / 参数 / 环境变量），
+以前软件只给"一整段丢给 Agent"的接入包，手填的人还得自己从文字里抠路径。现在：
+
+| 项 | 值（本机实测） |
+|---|---|
+| 名称 | `serial-assistant` |
+| 类型 | `stdio` |
+| 命令 | `C:\Users\<你>\.serialassistant\mcp\venv\Scripts\python.exe` |
+| 参数 | `C:\Users\<你>\.serialassistant\mcp\serial_assistant_mcp.py` |
+| 环境变量 | （留空） |
+
+- 每项**单独一个复制按钮**，长路径中间省略、完整值在 tooltip 里
+- 「重新导出服务文件」把 MCP 服务源码重写到「参数」那个路径（升级后代码会变）
+- 保留「复制接入配置」：仍然可以整段丢给 Agent 让它自动装
+- 没建过 venv 时，「命令」会退回普通 python 并在面板上提示先 `pip install mcp pyserial`
+
 ## 3. 上一轮的更新提速（已在 2.4 收尾时并入）
 
 - 检查更新**全源并行 + 取版本号最高**（300ms 收敛窗口），直连约 **1 秒**出结果
@@ -63,7 +83,7 @@
 
 ## 校验值
 
-- `SerialAssistant.exe`：`a5e2ef114f0feebb7cf6564b49c9536f26f8291dbd18ce73abc6fc8f61795761`
-- `SerialAssistant-setup-2.5.exe`：`3d6c55715ecf27427f2aa6d2ed1bb9496e4c157d461bf2e7525b3621c059ca1c`
+- `SerialAssistant.exe`：`95c99c4fb533e7ed6315ee58b3b7804a67b384fe3d738d8104a6488d646cceda`
+- `SerialAssistant-setup-2.5.exe`：`21693e3c9ce3c91d815683148ff4f9f850a137f54471cde02c3634d2badf8b7b`
 
 > 2.4 及更早版本点「检查更新」能直接升到 2.5（2.4 已经带上并行检测与抢跑下载）。

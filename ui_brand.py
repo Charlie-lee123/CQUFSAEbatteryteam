@@ -361,7 +361,7 @@ class BrandHeader(QWidget):
                              self._product)
             if show_sub:
                 # 副标题**居中在标题的中轴线上**（用户 2026-10-22："中轴线和
-                # 串口调试助手中轴线对齐"）—— 不是各自右对齐：两行长短不同，
+                # 产品名中轴线对齐"）—— 不是各自右对齐：两行长短不同，
                 # 右对齐时副标题看着往右飘。
                 painter.setFont(self._vehicle_face)
                 painter.setPen(qcolor("ink_3"))

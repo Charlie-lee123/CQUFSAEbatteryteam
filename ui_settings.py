@@ -115,6 +115,147 @@ class _NameDialog(QDialog):
 
 
 
+
+class McpManualDialog(QDialog):
+    """「连接至自定义 MCP」那种**逐项手填**的对话框，把本机真实值直接给出。
+
+    用户 2026-10-31 的原话：客户端里那个「连接至自定义 MCP」要一项一项填
+    （名称 / 类型 / 命令 / 参数 / 环境变量），而软件原来只给"一整段丢给 Agent"的
+    接入包 —— 手填的人还得自己从那段文字里抠路径。这里把每一项**单独一行、
+    单独一个复制按钮**，照着填即可。
+    """
+
+    def __init__(self, scheme: str = "dark", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        import mcp_bridge
+
+        self.setWindowTitle("MCP 手动填写参数")
+        self.setModal(True)
+        self.setMinimumWidth(620)
+        self._scheme = scheme
+        self._fields = mcp_bridge.manual_fields()
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(GAP + 6, GAP + 6, GAP + 6, GAP + 6)
+        root.setSpacing(GAP)
+
+        tip = QLabel("照下面逐项填进客户端的「连接至自定义 MCP」对话框；"
+                     "每一项都能单独复制。")
+        tip.setFont(ui_font(11))
+        tip.setObjectName("groupCaption")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
+
+        form = QFormLayout()
+        form.setSpacing(GAP)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft
+                               | Qt.AlignmentFlag.AlignVCenter)
+        rows = (
+            ("名称", self._fields["name"], "客户端里显示的名字，随便改，但建议保持一致"),
+            ("类型", self._fields["transport"], "本服务走 stdio（由客户端拉起，不占端口）"),
+            ("命令", self._fields["command"] or "python",
+             "装有 mcp + pyserial 的 python.exe 绝对路径"),
+            ("参数", self._fields["args"][0], "服务脚本的绝对路径（点「+ 参数」逐条填，只有 1 条）"),
+            ("环境变量", "", "本服务不需要环境变量 —— 那个对话框里保持为空即可"),
+        )
+        for label, value, tip_text in rows:
+            # ⛔ 必须用两参数 addRow(标签, 控件)：单参数那版控件会横跨两列，
+            #    标签列直接空掉（第一版就是这样，"名称/类型/命令"全没显示）。
+            lab = QLabel(label)
+            lab.setFont(ui_font(11.5))
+            lab.setObjectName("groupCaption")
+            lab.setMinimumWidth(58)
+            form.addRow(lab, self._manual_row(value, tip_text))
+        root.addLayout(form)
+
+        if self._fields["notes"]:
+            note = QLabel("\n".join(self._fields["notes"]))
+            note.setFont(ui_font(10.5))
+            note.setObjectName("groupCaption")
+            note.setWordWrap(True)
+            root.addWidget(note)
+
+        row = QHBoxLayout()
+        row.setSpacing(GAP)
+        self.btn_json = InkButton("复制整段 JSON", variant="ghost")
+        self.btn_json.setToolTip("给能直接读配置文件的客户端用（Claude / Cursor / WorkBuddy 的 mcp.json）")
+        self.btn_json.clicked.connect(self._copy_json)
+        row.addWidget(self.btn_json)
+        self.btn_service = InkButton("重新导出服务文件", variant="ghost")
+        self.btn_service.setToolTip(
+            "把 MCP 服务源码重新写到「参数」那个路径（升级后代码可能变了）")
+        self.btn_service.clicked.connect(self._re_export)
+        row.addWidget(self.btn_service)
+        row.addStretch(1)
+        close = InkButton("关闭", variant="primary")
+        close.clicked.connect(self.accept)
+        row.addWidget(close)
+        root.addLayout(row)
+
+    # -- 内部 ------------------------------------------------------------
+
+    def _manual_row(self, value: str, tip_text: str):
+        """一行：标签 + 只读取值框 + 复制按钮。值太长就中间省略，完整值在 tooltip。"""
+        box = QWidget()
+        lay = QHBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        edit = QLineEdit(value)
+        edit.setReadOnly(True)
+        edit.setFont(ui_font(11.5))
+        edit.setMinimumWidth(1)
+        if not value:
+            shown = "（留空）"
+        elif len(value) <= 56:
+            shown = value
+        else:
+            shown = value[:26] + "…" + value[-26:]
+        edit.setText(shown)
+        edit.setToolTip(value or "（留空）")
+        edit.setCursorPosition(0)            # 别把光标甩到末尾（只显示尾巴）
+        lay.addWidget(edit, 1)
+        copy = InkButton("复制", variant="ghost")
+        copy.setToolTip(tip_text)
+        copy.clicked.connect(lambda _=False, v=value, b=copy: self._copy(v, b))
+        lay.addWidget(copy)
+        return box
+
+    def _copy(self, value: str, button) -> None:
+        clipboard = QGuiApplication.clipboard()
+        clipboard.setText(value)
+        if value and clipboard.text() == value:
+            self._flash(button, "✓")
+        else:
+            # 空值（环境变量那一行）也要给反馈，否则用户以为没点上
+            self._flash(button, "✓ 空")
+
+    def _flash(self, button, text: str) -> None:
+        button.setText(text)
+        QTimer.singleShot(1200, lambda b=button: b.setText("复制"))
+
+    def _copy_json(self) -> None:
+        import json
+
+        from PySide6.QtGui import QGuiApplication as _QGui  # noqa: N814 - 局部别名
+        cfg = {"mcpServers": {"serial-assistant": {
+            "command": self._fields["command"] or "python",
+            "args": list(self._fields["args"]),
+            "env": dict(self._fields["env"]),
+        }}}
+        text = json.dumps(cfg, ensure_ascii=False, indent=2)
+        _QGui.clipboard().setText(text)
+        self._flash(self.btn_json, "✓ 已复制")
+
+    def _re_export(self) -> None:
+        import mcp_bridge
+        path, wrote = mcp_bridge.ensure_service()
+        self._flash(self.btn_service, "✓ 已更新" if wrote else "✓ 已是最新")
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        apply_titlebar_theme(self, self._scheme)
+
+
 class SettingsDialog(QDialog):
     """应用设置。确定后由调用方读 values() / hidden_buttons() 落盘并生效。
 
@@ -1255,8 +1396,21 @@ class SettingsDialog(QDialog):
             "它会自动装依赖、写服务、注册 MCP 并自检")
         self.btn_mcp_copy.clicked.connect(self._copy_mcp_payload)
         row.addWidget(self.btn_mcp_copy)
+        # 手动填写（2026-10-31 用户要求）：客户端那个「连接至自定义 MCP」是
+        # 逐项填的（名称/类型/命令/参数/环境变量），光给"一整段给 Agent"不够用。
+        self.btn_mcp_manual = InkButton("手动填写参数", variant="ghost")
+        self.btn_mcp_manual.setToolTip(
+            "打开一张逐项参数表（名称/类型/命令/参数/环境变量），每项可单独复制，"
+            "照着填进客户端的自定义 MCP 对话框")
+        self.btn_mcp_manual.clicked.connect(self._open_mcp_manual)
+        row.addWidget(self.btn_mcp_manual)
         row.addStretch(1)          # 按钮紧挨文字，空白推到行尾（同日志行）
         form.addRow(self._row(row))
+
+    def _open_mcp_manual(self) -> None:
+        """打开「MCP 手动填写参数」表（模态，与主面板同一套样式）。"""
+        dialog = McpManualDialog(self._scheme, parent=self)
+        dialog.exec()
 
     def _copy_mcp_payload(self) -> None:
         """把接入包塞进剪贴板；剪贴板不可用时落到文件并告诉用户路径。

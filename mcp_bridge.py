@@ -57,6 +57,91 @@ def server_source() -> str:
         return ""
 
 
+# ---------------------------------------------------------------- 手动填写
+
+# 服务文件的落盘位置（与「复制接入配置」里给 Agent 的指令保持一致）
+MCP_HOME = os.path.join(os.path.expanduser("~"), ".serialassistant", "mcp")
+SERVICE_NAME = "serial_assistant_mcp.py"
+
+
+def service_path() -> str:
+    """服务源码应该存在的绝对路径（不保证已存在，见 ``ensure_service()``）。"""
+    return os.path.join(MCP_HOME, SERVICE_NAME)
+
+
+def ensure_service() -> tuple[str, bool]:
+    """把服务源码写到 ``service_path()``；返回 (路径, 是否本次新写/更新)。
+
+        内容与内置源码**逐字节比对**：一致就不动（别每次开面板都写盘），
+        不一致（版本升级）才覆盖 —— 用户手改过也会被覆盖，这是刻意的：
+        这份文件是"软件的一部分"，不是用户配置。
+    """
+    target = service_path()
+    source = server_source()
+    if not source:
+        return (target, False)
+    try:
+        if os.path.isfile(target):
+            with open(target, encoding="utf-8") as handle:
+                if handle.read() == source:
+                    return (target, False)
+        os.makedirs(MCP_HOME, exist_ok=True)
+        with open(target, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(source)
+        return (target, True)
+    except OSError:
+        return (target, False)
+
+
+def _venv_python() -> str:
+    """优先指向本机安装时建的那个 venv（它里面一定有 mcp + pyserial）。"""
+    candidate = os.path.join(MCP_HOME, "venv", "Scripts", "python.exe")
+    return candidate if os.path.isfile(candidate) else ""
+
+
+def _current_python() -> str:
+    """没装 venv 时给一个"大概率能用"的 python。
+
+    打包后 ``sys.executable`` 就是 SerialAssistant.exe 自己（不能用）；开发环境
+    下它就是 venv 里的 python（装了 mcp 吗？不一定）—— 所以只是兜底，UI 里会
+    写清楚"这个 python 得先 pip install mcp pyserial"。
+    """
+    if getattr(sys, "frozen", False):
+        return ""
+    return sys.executable or ""
+
+
+def manual_fields() -> dict:
+    """「连接至自定义 MCP」对话框**逐项要填的值**（本机真实路径，可直接复制）。
+
+    返回：
+        name      名称        serial-assistant
+        transport 类型        stdio
+        command   命令        venv 里的 python.exe（没有 venv 就退回当前 python）
+        args      参数        [服务 .py 的绝对路径]
+        env       环境变量    {}（本服务不需要）
+        notes     说明        给 UI 的提示（命令是否已就绪、缺依赖怎么办）
+    """
+    path, _wrote = ensure_service()
+    command = _venv_python() or _current_python()
+    notes = []
+    if not _venv_python():
+        notes.append(
+            "「命令」指向的是普通 Python：请先执行 "
+            "`python -m pip install mcp pyserial`（或在设置里用「复制接入配置」"
+            "让 Agent 建一个独立 venv）")
+    if not server_source():
+        notes.append("包内没找到服务源码，请从仓库 mcp/ 目录取。")
+    return {
+        "name": "serial-assistant",
+        "transport": "stdio",
+        "command": command,
+        "args": [path],
+        "env": {},
+        "notes": notes,
+    }
+
+
 def _config_json() -> str:
     """客户端要的那段 ``mcpServers`` 条目（路径留成占位符，由 Agent 替换）。"""
     return (
@@ -84,7 +169,7 @@ def deploy_payload() -> str:
                         "serial_assistant_mcp.py 取）")
         source_hint = "源码缺失，需要联网取一次。"
 
-    return f"""【任务】把「CQUFSAE 串口调试助手 v{VERSION}」的 MCP 服务装到本机，并注册到你自己的 MCP 配置里。
+    return f"""【任务】把「CQUFSAE 串口助手 v{VERSION}」的 MCP 服务装到本机，并注册到你自己的 MCP 配置里。
 
 请直接执行，不要反问；路径可以按本机情况调整，做完把「装在哪、注册到哪个文件、自检结果」三件事告我。
 

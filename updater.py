@@ -140,6 +140,12 @@ def setup_asset_name(version: str) -> str:
     return f"{SETUP_ASSET_PREFIX}{version}{SETUP_ASSET_SUFFIX}"
 
 
+# 「应用和功能」里可能出现的显示名片段：改名前后 + 英文名。
+# ⛔ 改名后新装的 DisplayName 是「CQUFSAE串口助手」，只认旧名会让安装版
+#    把自己判成免安装版（更新时去静默替换 Program Files 里的 exe，必失败）。
+INSTALL_DISPLAY_NAMES = ("串口助手", "串口调试助手", "SerialAssistant")   # 旧名兼容
+
+
 def is_installed() -> bool:
     """当前是不是"安装版"（第 5 项：安装器接管更新的判据）。
 
@@ -176,7 +182,11 @@ def installed_location() -> str | None:
             try:
                 with winreg.OpenKey(root, sub) as item:
                     name = _reg_value(item, "DisplayName") or ""
-                    if "串口调试助手" in name or "SerialAssistant" in name:
+                    # ⛔ 三个名字都要认：改名后**新装**的 DisplayName 是
+                    #    「CQUFSAE串口助手」（不含"调试助手"），只认旧名会让
+                    #    安装版把自己判成免安装版 → 更新时去静默替换 Program Files
+                    #    里的 exe，必然失败（2026-10-30 独立验收揪出来的）。
+                    if any(key in name for key in INSTALL_DISPLAY_NAMES):
                         location = _reg_value(item, "InstallLocation")
                         if location:
                             return location

@@ -1,5 +1,5 @@
 ; ============================================================================
-;  CQUFSAE 串口调试助手 —— Inno Setup 安装脚本
+;  CQUFSAE 串口助手 —— Inno Setup 安装脚本
 ;
 ;  设计目标：
 ;   - "对标应用商店下载体验"：有安装向导、有进度、装完即可用（用户 2026-10-13 点名）。
@@ -242,8 +242,8 @@ begin
   // 旧快捷方式（桌面 + 开始菜单文件夹），新装会重新建
   // ⚠️ 2026-10-30 改名（CQUFSAE串口调试助手 → CQUFSAE串口助手）：老快捷方式是
   //    **旧名字**，不显式删就会和新的并存在桌面上（用户看到两个图标）。
-  DeleteFile(ExpandConstant('{autodesktop}\CQUFSAE串口调试助手.lnk'));
-  DeleteFile(ExpandConstant('{userprograms}\CQUFSAE串口调试助手.lnk'));
+  DeleteFile(ExpandConstant('{autodesktop}\CQUFSAE串口调试助手.lnk'));   // 旧名，改名后清理
+  DeleteFile(ExpandConstant('{userprograms}\CQUFSAE串口调试助手.lnk'));   // 旧名，改名后清理
   DeleteFile(ExpandConstant('{autodesktop}\{#AppName}.lnk'));
   DeleteFile(ExpandConstant('{userprograms}\{#AppName}.lnk'));
   DelTree(ExpandConstant('{userprograms}\{#AppName}'), True, True, True);

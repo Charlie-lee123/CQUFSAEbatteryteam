@@ -5518,10 +5518,10 @@ def check_vehicle_profiles(app: QApplication) -> None:
 
 
 def check_export_data(app: QApplication) -> None:
-    """结构化导出（CSV 宽表 / JSON 嵌套）：**数值与分模组必须逐项对**。
+    """结构化导出（CSV 宽表 / JSON 嵌套）：数值与分模组必须逐项对。
 
-    这一条是"数据资产"的地基 —— 导出的列错一位，后面的放电曲线/最弱电芯
-    全是错的，而且没人看得出来。所以断言写在**具体数值**上。
+    ⛔ 数据一律用**真机格式**：``Voltage590: 01.3851`` 是"序号 01、值 3851 mV"，
+    不是"1.385 伏"（第一版用例按浮点写，把真实协议测成了错的，独立验收当场抓出来）。
     """
     import csv
     import json
@@ -5529,24 +5529,23 @@ def check_export_data(app: QApplication) -> None:
 
     import rx_export
 
-    # 1) 纯解析：电压**分包**（每帧都带 Voltage1:）+ 温度 + BMS 收尾
+    # 1) 真机格式：一帧 = 一个模组；帧 2 序号重新从 1 开始 = 下一个模组
     sess = rx_export.Session()
-    sess.configure([4, 4], [2, 2])
-    sess.feed("Voltage1:\n 1.1000 1.2000")
-    sess.feed("Voltage1:\n 1.3000 1.4000")          # 同一轮的第二帧，不能算新一轮
-    sess.feed("Voltage1:\n 2.1000 2.2000 2.3000 2.4000")
-    sess.feed("Temperature1:\n 21.5 22.5 23.5 24.5")
+    sess.configure([25, 25], [8, 8])
+    sess.feed("Voltage590: 01.3851 02.3849 03.3850\n")
+    sess.feed("Voltage591: 01.3848 02.3847 03.3846 04.3845\n")
+    sess.feed("Temperature1: 01.25 02.26 03.24 04.25\n")
     sess.feed("BMS OK")
     rounds = sess.rounds()
-    assert len(rounds) == 1, f"分包帧被当成多轮了：{len(rounds)} 轮"
+    assert len(rounds) == 1, f"多帧电压被当成多轮了：{len(rounds)} 轮"
     assert len(rounds[0]["volt"]) == 2, f"模组切分不对：{rounds[0]['volt']}"
-    assert rounds[0]["volt"][0] == [1.1, 1.2, 1.3, 1.4], rounds[0]["volt"][0]
-    assert rounds[0]["volt"][1] == [2.1, 2.2, 2.3, 2.4], rounds[0]["volt"][1]
-    assert rounds[0]["temp"] == [[21.5, 22.5], [23.5, 24.5]], rounds[0]["temp"]
+    assert rounds[0]["volt"][0] == [3851, 3849, 3850], rounds[0]["volt"][0]
+    assert rounds[0]["volt"][1] == [3848, 3847, 3846, 3845], rounds[0]["volt"][1]
+    assert rounds[0]["temp"] == [[25, 26, 24, 25]], rounds[0]["temp"]
 
-    # 2) CSV：一行 = 一轮里的一个模组；电芯按 mV **整数**落盘
-    out_csv = os.path.join("_check", "selftest_export.csv")
+    # 2) CSV：一行 = 一轮里的一个模组；电芯写 mV 整数
     os.makedirs("_check", exist_ok=True)
+    out_csv = os.path.join("_check", "selftest_export.csv")
     rows = sess.write_csv(out_csv)
     assert rows == 2, f"行数应为 2（2 模组 × 1 轮），实得 {rows}"
     with open(out_csv, encoding="utf-8-sig", newline="") as fh:
@@ -5556,28 +5555,29 @@ def check_export_data(app: QApplication) -> None:
     assert "电芯1(mV)" in head and "温度1(℃)" in head, head
     i_cell = head.index("电芯1(mV)")
     assert table[1][2] == "1" and table[2][2] == "2", "模组号不对"
-    assert table[1][i_cell] == "1100", f"电芯1 应为 1100mV，实得 {table[1][i_cell]}"
-    assert table[2][i_cell] == "2100", f"模组2 电芯1 应为 2100mV，实得 {table[2][i_cell]}"
+    assert table[1][i_cell] == "3851", f"模组1 芯1 应为 3851mV，实得 {table[1][i_cell]}"
+    assert table[2][i_cell] == "3848", f"模组2 芯1 应为 3848mV，实得 {table[2][i_cell]}"
+    assert table[1][i_cell + 1] == "3849", "同一模组内电芯顺序错了"
     assert len({r[0] for r in table[1:]}) == 1, "同一轮的各模组必须共用同一个时间戳"
 
-    # 3) JSON：嵌套结构 + 单位
+    # 3) JSON：整数 mV / ℃ + 单位
     out_json = os.path.join("_check", "selftest_export.json")
     n = sess.write_json(out_json, meta={"app": "CQUFSAE串口助手"})
     doc = json.load(open(out_json, encoding="utf-8"))
     assert n == 1 and len(doc["rounds"]) == 1
     assert doc["unit"] == {"volt": "mV", "temp": "℃"}, doc["unit"]
     mod0 = doc["rounds"][0]["modules"][0]
-    assert mod0["cells"] == [1100, 1200, 1300, 1400], mod0["cells"]
-    assert mod0["temps"] == [21.5, 22.5], mod0["temps"]
+    assert mod0["cells"] == [3851, 3849, 3850], mod0["cells"]
+    assert mod0["temps"] == [25, 26, 24, 25], mod0["temps"]
 
-    # 4) 配置与设备对不上时**保留残缺模组**（不能整轮丢掉，否则用户导出空文件）
+    # 4) 分段/异常行都不能串位：标题与数据同行的混合帧、BMS Error、空行
     sess2 = rx_export.Session()
-    sess2.configure([25, 25], [8, 8])
-    sess2.feed("Voltage1:\n 3.1000 3.2000 3.3000")
-    sess2.feed("BMS OK")
+    sess2.configure([4, 4], [2, 2])
+    sess2.feed("Voltage590: 01.3851 02.3849\n03.3850 04.3852\n")
+    sess2.feed("BMS Error: 0x01\n")
     r2 = sess2.rounds()
-    assert len(r2) == 1 and r2[0]["volt"] == [[3.1, 3.2, 3.3]], \
-        f"残缺模组被丢了：{r2}"
+    assert len(r2) == 1, f"BMS Error 应结束本轮：{len(r2)}"
+    assert r2[0]["volt"] == [[3851, 3849, 3850, 3852]], r2[0]["volt"]
 
     # 5) 主窗口那条真实链路：_emit_block 喂的是**原始**文本
     from main_window import MainWindow
@@ -5586,18 +5586,17 @@ def check_export_data(app: QApplication) -> None:
     try:
         cells, temps = window._export_profile_now()
         if cells and temps:
-            name = "".join(f"{3.5 + m * 0.1 + c * 0.001:.4f} "
-                           for m in range(len(cells)) for c in range(cells[0]))
-            window._emit_block("Voltage1:\n " + name.strip())
-            tname = " ".join(f"{20 + m + t * 0.1:.1f}"
-                             for m in range(len(temps)) for t in range(temps[0]))
-            window._emit_block("Temperature1:\n " + tname)
+            n_cells = cells[0]
+            frame = " ".join(f"{i + 1:02d}.{3800 + i}" for i in range(n_cells))
+            window._emit_block(f"Voltage590: {frame}")
+            tframe = " ".join(f"{i + 1:02d}.{20 + i}" for i in range(temps[0]))
+            window._emit_block(f"Temperature1: {tframe}")
             window._emit_block("BMS OK")
             got = rx_export.session().rounds()
             assert len(got) == 1, f"主窗口没把数据喂进导出缓存：{len(got)} 轮"
-            assert len(got[0]["volt"]) == len(cells), \
-                f"模组数应为 {len(cells)}，实得 {len(got[0]['volt'])}"
-            assert len(got[0]["volt"][0]) == cells[0], "第一个模组的电芯数不对"
+            assert len(got[0]["volt"]) == 1, f"应 1 个模组，实得 {len(got[0]['volt'])}"
+            assert got[0]["volt"][0][:3] == [3800, 3801, 3802], got[0]["volt"][0][:3]
+            assert len(got[0]["volt"][0]) == n_cells, "电芯数不对"
     finally:
         window.close()
         window.deleteLater()
@@ -5605,6 +5604,125 @@ def check_export_data(app: QApplication) -> None:
         app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         app.processEvents()
         rx_export.reset_for_tests()
+
+
+def check_mcp_manual(app: QApplication) -> None:
+    """MCP「手动填写参数」：给客户端逐项填的值必须是**本机真实可用**的。
+
+    背景（2026-10-31 用户要求）：客户端的「连接至自定义 MCP」要一项项填
+    （名称/类型/命令/参数/环境变量），所以软件必须把真实绝对路径交出来，
+    而不是"一整段丢给 Agent"。这里钉住三件事：
+      ① 五个字段齐全且类型正确；
+      ② 服务源码能落到约定路径，且**重复调用不重写**（幂等）；
+      ③ 面板能真的构造出来（布局/取值不抛异常）。
+    """
+    import os
+
+    import mcp_bridge
+
+    # ① 字段齐全
+    fields = mcp_bridge.manual_fields()
+    assert fields["name"] == "serial-assistant", fields["name"]
+    assert fields["transport"] == "stdio", fields["transport"]
+    assert isinstance(fields["args"], list) and len(fields["args"]) == 1, fields["args"]
+    assert fields["args"][0].endswith("serial_assistant_mcp.py"), fields["args"][0]
+    assert fields["env"] == {}, fields["env"]
+    # 命令要么是真实存在的 python.exe，要么留空由 UI 提示（不能给一串占位符）
+    cmd = fields["command"]
+    assert not cmd or cmd.lower().endswith(".exe"), f"命令不是可执行路径：{cmd!r}"
+
+    # ② 落盘幂等（把 MCP_HOME 指到 _check 下，别动用户真实安装）
+    saved_home = mcp_bridge.MCP_HOME
+    # ⛔ 目录必须**每次唯一**：固定名字会在第二次跑时命中上次留下的文件，
+    #    `wrote` 变成 False（内容一致就不重写）→ 断言假挂。用 pid + 时间戳。
+    tmp_home = os.path.join("_check", f"mcp_home_{os.getpid()}_{int(time.time())}")
+    try:
+        mcp_bridge.MCP_HOME = tmp_home
+        path, wrote = mcp_bridge.ensure_service()
+        assert wrote and os.path.isfile(path), f"服务源码没写出来：{path}"
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read()
+        assert body == mcp_bridge.server_source(), "写出来的源码与包内不一致"
+        assert "\ufeff" not in body[:1], "源码不该带 BOM"
+        _path2, wrote2 = mcp_bridge.ensure_service()
+        assert wrote2 is False, "内容一致时不该重复写盘（每次开面板都写会闪盘）"
+        # 内容被改坏 → 应该重新覆盖（这份文件属于软件，不是用户配置）
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("\n# tampered\n")
+        _p3, wrote3 = mcp_bridge.ensure_service()
+        assert wrote3 is True, "内容不一致时必须覆盖回内置版本"
+    finally:
+        mcp_bridge.MCP_HOME = saved_home
+        import shutil
+        shutil.rmtree(tmp_home, ignore_errors=True)
+
+    # ③ 面板能构造
+    from ui_settings import McpManualDialog
+    dialog = McpManualDialog("system", parent=None)
+    try:
+        assert dialog._fields["name"] == "serial-assistant"
+        assert dialog.windowTitle() == "MCP 手动填写参数", dialog.windowTitle()
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        app.processEvents()
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
+
+
+def check_rename_and_install(app: QApplication) -> None:
+    """改名之后的两件事：**产品里没有旧名残留** + **安装版仍认得自己**。
+
+    第二件是硬伤级别的：`updater.is_installed()` 原来只认
+    DisplayName 里含"串口调试助手"/"SerialAssistant"。改名后新装的 DisplayName
+    是"串口助手"，两个都不含 → 安装版把自己判成免安装版 → 更新时去静默替换
+    Program Files 里的 exe（必然失败）。这里把三种名字都钉住。
+    """
+    import os
+    import re
+
+    import updater
+
+    # ① 产品文件里不能残留旧显示名（devtools/ 与历史快照目录不算）
+    roots = ["main.py", "main_window.py", "ui_settings.py", "ui_brand.py",
+             "ui_controls.py", "ui_theme.py", "ui_surface.py", "ui_anim.py",
+             "ui_highlight.py", "ui_backdrop.py", "customization.py",
+             "updater.py", "rx_export.py", "rx_history.py", "serial_io.py",
+             "ble_io.py", "mcp_bridge.py", "app_log.py", "version.py",
+             os.path.join("installer", "SerialAssistant.iss")]
+    bad = []
+    for rel in roots:
+        if not os.path.isfile(rel):
+            continue
+        with open(rel, encoding="utf-8") as fh:
+            text = fh.read()
+        if "串口调试助手" in text:
+            # 允许出现在"兼容旧名"的注释/判定里：必须同时出现"兼容|旧名|曾经"之类
+            for line_no, line in enumerate(text.split("\n"), start=1):
+                if "串口调试助手" in line and not re.search(
+                        r"旧名|改名|兼容|曾经|2026-10", line):
+                    bad.append(f"{rel}:{line_no}: {line.strip()[:50]}")
+    assert not bad, "产品里还残留旧显示名：\n" + "\n".join(bad[:5])
+
+    # ② 界面上真的用新名
+    from main_window import MainWindow
+    window = MainWindow()
+    try:
+        assert window.windowTitle() == "CQUFSAE串口助手", window.windowTitle()
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
+
+    # ③ is_installed 的判定词表必须覆盖三种写法（用注册表桩验证，不碰真机）
+    names = tuple(getattr(updater, "INSTALL_DISPLAY_NAMES", ()))
+    for token in ("串口助手", "串口调试助手", "SerialAssistant"):
+        assert token in names, \
+            f"is_installed 不再识别 {token!r}（安装版会判成免安装，更新必失败）"
+    # 改名后的真实 DisplayName 必须能被认出来
+    assert any(k in "CQUFSAE串口助手" for k in names), "新显示名认不出来"
 
 
 CHECKS = [
@@ -5625,6 +5743,8 @@ CHECKS = [
     ("校验位/保留行数/时钟/发送区一排", check_config_parity_clock),
     ("自动更新模块", check_updater),
     ("结构化导出（CSV/JSON）", check_export_data),
+    ("MCP 手动填写参数", check_mcp_manual),
+    ("改名无残留与安装版判定", check_rename_and_install),
     ("MCP 接入入口", check_mcp_payload),
     ("安装包脚本", check_installer_script),
     ("历史接收数据", check_rx_history),
