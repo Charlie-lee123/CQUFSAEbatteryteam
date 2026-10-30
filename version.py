@@ -4,7 +4,7 @@
 避免入口模块被反向 import（main 一被 import 就会拉起 MainWindow）。
 """
 
-VERSION = "2.4"
+VERSION = "2.5"
 
 OWNER_REPO = "Charlie-lee123/CQUFSAEbatteryteam"
 
@@ -27,12 +27,13 @@ SETUP_ASSET_SUFFIX = ".exe"
 
 # 当前 Release 里 exe 的 SHA256 —— **由发布脚本在发布时写回本文件**；
 # 运行中的旧版本从版本源拉到这里，用来校验下载下来的新 exe。
-# 空串 = 该版本发布时尚未记录（自动更新会退回大小/跳过校验）。
+# 空串 = 该版本发布时尚未记录 → 自动更新会**明确报错**"服务端没提供本版
+#        校验值，请稍后再试"，而不是拿旧哈希硬比、也不是静默跳过校验。
 # ⚠️ 升版本时必须先清空成空串：留着**上一版**的哈希会让"拉到的版本文件没解析出
 #    哈希"时的兜底校验拿旧哈希去比新包，直接把更新卡死。发布完由脚本写回。
-LATEST_EXE_SHA256 = "e96ea0b7753cce3a44dc734a8634d23c587a765bd210f376933a3457910115eb"
+LATEST_EXE_SHA256 = "a5e2ef114f0feebb7cf6564b49c9536f26f8291dbd18ce73abc6fc8f61795761"
 
 # 当前 Release 里**安装包**的 SHA256（同上，由发布脚本写回）。
-# 空串 = 尚未记录，走大小/跳过校验。
-LATEST_SETUP_SHA256 = "df3c7286d433cf10088d9b9eb2c09c4d329a4e530175c251dfc2ea2a89d37d56"
+# 空串 = 尚未记录（同上：更新会明确报错而不是静默跳过）。
+LATEST_SETUP_SHA256 = "3d6c55715ecf27427f2aa6d2ed1bb9496e4c157d461bf2e7525b3621c059ca1c"
 

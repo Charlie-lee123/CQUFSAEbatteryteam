@@ -76,7 +76,7 @@ def find_window():
             n = user32.GetWindowTextLengthW(hwnd)
             buf = ctypes.create_unicode_buffer(n + 1)
             user32.GetWindowTextW(hwnd, buf, n + 1)
-            if buf.value.strip() == "CQUFSAE串口调试助手":
+            if buf.value.strip() == "CQUFSAE串口助手":
                 found.append(hwnd)
         return True
 

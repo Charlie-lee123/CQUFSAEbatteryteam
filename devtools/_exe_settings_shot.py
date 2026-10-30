@@ -40,7 +40,7 @@ def wait_main_window(timeout: float = 20.0):
             if length:
                 buf = ctypes.create_unicode_buffer(length + 1)
                 user32.GetWindowTextW(hwnd, buf, length + 1)
-                if buf.value.strip() == "CQUFSAE串口调试助手":
+                if buf.value.strip() == "CQUFSAE串口助手":
                     found.append(hwnd)
             return True
 

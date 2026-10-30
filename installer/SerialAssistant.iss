@@ -21,7 +21,7 @@
 ;     python devtools\_build_installer.py       ; 再出包（版本号从 version.py 现读）
 ; ============================================================================
 
-#define AppName        "CQUFSAE串口调试助手"
+#define AppName        "CQUFSAE串口助手"
 #define AppShortName   "SerialAssistant"
 #define AppPublisher   "重庆大学方程式赛车队 (CQUFSAE)"
 #define AppURL         "https://github.com/Charlie-lee123/CQUFSAEbatteryteam"
@@ -240,6 +240,10 @@ begin
     'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8F3C1B42-7A6E-4D91-9C15-2E7B4A0D5F31}_is1');
 
   // 旧快捷方式（桌面 + 开始菜单文件夹），新装会重新建
+  // ⚠️ 2026-10-30 改名（CQUFSAE串口调试助手 → CQUFSAE串口助手）：老快捷方式是
+  //    **旧名字**，不显式删就会和新的并存在桌面上（用户看到两个图标）。
+  DeleteFile(ExpandConstant('{autodesktop}\CQUFSAE串口调试助手.lnk'));
+  DeleteFile(ExpandConstant('{userprograms}\CQUFSAE串口调试助手.lnk'));
   DeleteFile(ExpandConstant('{autodesktop}\{#AppName}.lnk'));
   DeleteFile(ExpandConstant('{userprograms}\{#AppName}.lnk'));
   DelTree(ExpandConstant('{userprograms}\{#AppName}'), True, True, True);

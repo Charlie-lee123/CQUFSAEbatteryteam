@@ -161,9 +161,9 @@ def render_chrome(material: str, strength: int, scheme: str) -> QImage:
     set_glass_strength(strength)
 
     width = 900
-    bar = CaptionBar("CQUFSAE 串口调试助手")
+    bar = CaptionBar("CQUFSAE 串口助手")
     bar.resize(width, CAPTION_H)
-    header = BrandHeader("串口调试助手")
+    header = BrandHeader("串口助手")
     header_h = header.sizeHint().height()
     header.resize(width, header_h)
     gap = 10

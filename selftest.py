@@ -3160,7 +3160,7 @@ def check_customization(app: QApplication) -> None:
             from version import VERSION as _VERSION
             from PySide6.QtWidgets import QLabel as _QVerLabel, QPushButton as _QBtn
             _ver_labels = [c for c in dialog.findChildren(_QVerLabel)
-                           if c.text() == f"CQUFSAE 串口调试助手 v{_VERSION}"]
+                           if c.text() == f"CQUFSAE 串口助手 v{_VERSION}"]
             assert _ver_labels, \
                 f"设置面板没有显示版本号 v{_VERSION}"
             assert (_ver_labels[0].alignment()
@@ -5517,6 +5517,96 @@ def check_vehicle_profiles(app: QApplication) -> None:
         settings.sync()
 
 
+def check_export_data(app: QApplication) -> None:
+    """结构化导出（CSV 宽表 / JSON 嵌套）：**数值与分模组必须逐项对**。
+
+    这一条是"数据资产"的地基 —— 导出的列错一位，后面的放电曲线/最弱电芯
+    全是错的，而且没人看得出来。所以断言写在**具体数值**上。
+    """
+    import csv
+    import json
+    import os
+
+    import rx_export
+
+    # 1) 纯解析：电压**分包**（每帧都带 Voltage1:）+ 温度 + BMS 收尾
+    sess = rx_export.Session()
+    sess.configure([4, 4], [2, 2])
+    sess.feed("Voltage1:\n 1.1000 1.2000")
+    sess.feed("Voltage1:\n 1.3000 1.4000")          # 同一轮的第二帧，不能算新一轮
+    sess.feed("Voltage1:\n 2.1000 2.2000 2.3000 2.4000")
+    sess.feed("Temperature1:\n 21.5 22.5 23.5 24.5")
+    sess.feed("BMS OK")
+    rounds = sess.rounds()
+    assert len(rounds) == 1, f"分包帧被当成多轮了：{len(rounds)} 轮"
+    assert len(rounds[0]["volt"]) == 2, f"模组切分不对：{rounds[0]['volt']}"
+    assert rounds[0]["volt"][0] == [1.1, 1.2, 1.3, 1.4], rounds[0]["volt"][0]
+    assert rounds[0]["volt"][1] == [2.1, 2.2, 2.3, 2.4], rounds[0]["volt"][1]
+    assert rounds[0]["temp"] == [[21.5, 22.5], [23.5, 24.5]], rounds[0]["temp"]
+
+    # 2) CSV：一行 = 一轮里的一个模组；电芯按 mV **整数**落盘
+    out_csv = os.path.join("_check", "selftest_export.csv")
+    os.makedirs("_check", exist_ok=True)
+    rows = sess.write_csv(out_csv)
+    assert rows == 2, f"行数应为 2（2 模组 × 1 轮），实得 {rows}"
+    with open(out_csv, encoding="utf-8-sig", newline="") as fh:
+        table = list(csv.reader(fh))
+    head = table[0]
+    assert head[:3] == ["时间", "轮次", "模组"], head[:3]
+    assert "电芯1(mV)" in head and "温度1(℃)" in head, head
+    i_cell = head.index("电芯1(mV)")
+    assert table[1][2] == "1" and table[2][2] == "2", "模组号不对"
+    assert table[1][i_cell] == "1100", f"电芯1 应为 1100mV，实得 {table[1][i_cell]}"
+    assert table[2][i_cell] == "2100", f"模组2 电芯1 应为 2100mV，实得 {table[2][i_cell]}"
+    assert len({r[0] for r in table[1:]}) == 1, "同一轮的各模组必须共用同一个时间戳"
+
+    # 3) JSON：嵌套结构 + 单位
+    out_json = os.path.join("_check", "selftest_export.json")
+    n = sess.write_json(out_json, meta={"app": "CQUFSAE串口助手"})
+    doc = json.load(open(out_json, encoding="utf-8"))
+    assert n == 1 and len(doc["rounds"]) == 1
+    assert doc["unit"] == {"volt": "mV", "temp": "℃"}, doc["unit"]
+    mod0 = doc["rounds"][0]["modules"][0]
+    assert mod0["cells"] == [1100, 1200, 1300, 1400], mod0["cells"]
+    assert mod0["temps"] == [21.5, 22.5], mod0["temps"]
+
+    # 4) 配置与设备对不上时**保留残缺模组**（不能整轮丢掉，否则用户导出空文件）
+    sess2 = rx_export.Session()
+    sess2.configure([25, 25], [8, 8])
+    sess2.feed("Voltage1:\n 3.1000 3.2000 3.3000")
+    sess2.feed("BMS OK")
+    r2 = sess2.rounds()
+    assert len(r2) == 1 and r2[0]["volt"] == [[3.1, 3.2, 3.3]], \
+        f"残缺模组被丢了：{r2}"
+
+    # 5) 主窗口那条真实链路：_emit_block 喂的是**原始**文本
+    from main_window import MainWindow
+    rx_export.reset_for_tests()
+    window = MainWindow()
+    try:
+        cells, temps = window._export_profile_now()
+        if cells and temps:
+            name = "".join(f"{3.5 + m * 0.1 + c * 0.001:.4f} "
+                           for m in range(len(cells)) for c in range(cells[0]))
+            window._emit_block("Voltage1:\n " + name.strip())
+            tname = " ".join(f"{20 + m + t * 0.1:.1f}"
+                             for m in range(len(temps)) for t in range(temps[0]))
+            window._emit_block("Temperature1:\n " + tname)
+            window._emit_block("BMS OK")
+            got = rx_export.session().rounds()
+            assert len(got) == 1, f"主窗口没把数据喂进导出缓存：{len(got)} 轮"
+            assert len(got[0]["volt"]) == len(cells), \
+                f"模组数应为 {len(cells)}，实得 {len(got[0]['volt'])}"
+            assert len(got[0]["volt"][0]) == cells[0], "第一个模组的电芯数不对"
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
+        rx_export.reset_for_tests()
+
+
 CHECKS = [
     ("HEX 编解码", check_hex_codec),
     ("增量文本解码", check_stream_decoder),
@@ -5534,6 +5624,7 @@ CHECKS = [
     ("定制功能注册表", check_customization),
     ("校验位/保留行数/时钟/发送区一排", check_config_parity_clock),
     ("自动更新模块", check_updater),
+    ("结构化导出（CSV/JSON）", check_export_data),
     ("MCP 接入入口", check_mcp_payload),
     ("安装包脚本", check_installer_script),
     ("历史接收数据", check_rx_history),

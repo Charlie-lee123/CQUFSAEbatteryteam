@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import shutil
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QTimer, Qt
@@ -275,7 +276,7 @@ class SettingsDialog(QDialog):
         version_row = QHBoxLayout()
         version_row.setSpacing(10)
         version_row.addStretch(1)
-        self.lbl_version = QLabel(f"CQUFSAE 串口调试助手 v{VERSION}")
+        self.lbl_version = QLabel(f"CQUFSAE 串口助手 v{VERSION}")
         self.lbl_version.setFont(ui_font(10.5))
         self.lbl_version.setObjectName("groupCaption")
         version_row.addWidget(self.lbl_version)
@@ -1173,6 +1174,21 @@ class SettingsDialog(QDialog):
         self.btn_export_log.setToolTip("把日志文件另存为一份，方便发给别人排查问题")
         self.btn_export_log.clicked.connect(self._export_log)
         row.addWidget(self.btn_export_log)
+        # 结构化导出（2026-10-30 用户要求："本轮数据 → CSV/JSON，而不是只有日志文本"）：
+        # 日志是给人看的，这两颗按钮是给 Excel / pandas 用的 —— 数据从
+        # rx_export 的采集缓存来（主窗口在 _emit_block 里喂原始文本）。
+        self.btn_export_csv = InkButton("数据 CSV", variant="ghost")
+        self.btn_export_csv.setToolTip(
+            "把已接收的数据导出成**宽表**：一行 = 某一轮的某个模组，"
+            "电芯/温度各自展开成列，直接进 Excel 或 pandas")
+        self.btn_export_csv.clicked.connect(lambda: self._export_data("csv"))
+        row.addWidget(self.btn_export_csv)
+        self.btn_export_json = InkButton("数据 JSON", variant="ghost")
+        self.btn_export_json.setToolTip(
+            "把已接收的数据导出成**嵌套结构**：rounds → modules → cells/temps，"
+            "带单位，适合脚本二次处理")
+        self.btn_export_json.clicked.connect(lambda: self._export_data("json"))
+        row.addWidget(self.btn_export_json)
         open_button = InkButton("打开文件夹", variant="ghost")
         open_button.clicked.connect(
             lambda: QDesktopServices.openUrl(
@@ -1318,6 +1334,53 @@ class SettingsDialog(QDialog):
         app_log.info(f"日志已导出: {target}")
         self.btn_export_log.setText("✓ 已导出")
         QTimer.singleShot(4000, self._restore_export_text)
+
+    def _export_data(self, kind: str) -> None:
+        """导出已接收数据的 CSV（宽表）/ JSON（嵌套）。
+
+        数据来源是 ``rx_export.session()``（模块级单例，主窗口每帧喂），所以
+        **不依赖接收区里显示着什么** —— 暂停、清空显示、翻历史都不会丢数据。
+        """
+        import rx_export
+        session = rx_export.session()
+        rounds = session.rounds()
+        if not rounds:
+            QMessageBox.information(
+                self, "导出数据",
+                "还没有解析到可导出的数据。\n\n"
+                "需要有 Voltage1: / Temperature1: 这两类帧进来（BMS 行标志一轮结束）。")
+            return
+        stamp = datetime.now().strftime("%Y%m%d-%H%M")
+        desktop = Path.home() / "Desktop"
+        folder = desktop if desktop.is_dir() else Path.home()
+        default = str(folder / f"serial-{stamp}-data.{kind}")
+        if kind == "csv":
+            caption, filt = "导出数据（CSV 宽表）", "CSV 表格 (*.csv)"
+        else:
+            caption, filt = "导出数据（JSON）", "JSON 文件 (*.json)"
+        path, _ = QFileDialog.getSaveFileName(self, caption, default, filt)
+        if not path:
+            return
+        try:
+            if kind == "csv":
+                rows = session.write_csv(path)
+                msg = f"✓ 已导出 {rows} 行"
+            else:
+                from version import VERSION as _ver
+                meta = {"app": "CQUFSAE串口助手", "version": _ver}
+                n = session.write_json(path, meta=meta)
+                msg = f"✓ 已导出 {n} 轮"
+        except OSError as exc:
+            QMessageBox.warning(self, "导出失败", f"写文件失败：{exc}")
+            return
+        button = self.btn_export_csv if kind == "csv" else self.btn_export_json
+        self._flash_btn(button, msg)
+
+    def _flash_btn(self, button, text: str, ms: int = 3200) -> None:
+        """在按钮上原地显示结果，几秒后复原（和「检查更新」同一套反馈）。"""
+        original = button.text()
+        button.setText(text)
+        QTimer.singleShot(ms, lambda b=button, o=original: b.setText(o))
 
     def _restore_export_text(self) -> None:
         self.btn_export_log.setText("导出日志")

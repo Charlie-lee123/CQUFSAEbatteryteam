@@ -36,7 +36,7 @@ def find_window():
             n = user32.GetWindowTextLengthW(hwnd)
             buf = ctypes.create_unicode_buffer(n + 1)
             user32.GetWindowTextW(hwnd, buf, n + 1)
-            if "串口调试助手" in buf.value:
+            if "串口助手" in buf.value:
                 found.append(hwnd)
         return True
 

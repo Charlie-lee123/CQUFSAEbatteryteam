@@ -86,7 +86,7 @@ def check_standalone(scheme: str, material: str, strength: int) -> None:
     flags = QWidget.RenderFlag.DrawChildren   # 只跑 paintEvent + 子控件，不铺窗底色
 
     # ---- CaptionBar：整条中段（标题在左端、三键在右端，中段必然空白）----
-    bar = CaptionBar("CQUFSAE 串口调试助手")
+    bar = CaptionBar("CQUFSAE 串口助手")
     bar.resize(width, CAPTION_H)
     canvas = QImage(int(width * dpr), int(CAPTION_H * dpr),
                     QImage.Format.Format_ARGB32_Premultiplied)
@@ -99,7 +99,7 @@ def check_standalone(scheme: str, material: str, strength: int) -> None:
     bar.deleteLater()
 
     # ---- BrandHeader：队标（左）与产品名（右）之间的中段 ----
-    header = BrandHeader("串口调试助手")
+    header = BrandHeader("串口助手")
     header_h = header.sizeHint().height()
     header.resize(width, header_h)
     canvas = QImage(int(width * dpr), int(header_h * dpr),

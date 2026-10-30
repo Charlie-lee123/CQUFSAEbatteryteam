@@ -169,9 +169,9 @@ def uninstall_entries() -> list[str]:
 
 def has_shortcut() -> bool:
     paths = [os.path.join(os.environ.get("USERPROFILE", ""), "Desktop",
-                          "CQUFSAE串口调试助手.lnk"),
+                          "CQUFSAE串口助手.lnk"),
              os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
-                          "Start Menu", "Programs", "CQUFSAE串口调试助手")]
+                          "Start Menu", "Programs", "CQUFSAE串口助手")]
     return any(os.path.exists(p) for p in paths)
 
 

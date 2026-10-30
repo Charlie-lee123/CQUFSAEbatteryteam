@@ -1,4 +1,4 @@
-"""串口调试助手 —— 程序入口。"""
+"""CQUFSAE 串口助手 —— 程序入口。"""
 
 from __future__ import annotations
 
@@ -257,7 +257,7 @@ def main() -> int:
     app_log.info("=" * 8 + f" 软件启动 v{__version__} " + "=" * 8)
 
     app = QApplication(sys.argv)
-    app.setApplicationName("CQUFSAE串口调试助手")
+    app.setApplicationName("CQUFSAE串口助手")
     app.setOrganizationName("MimoWorks")
     # 窗口与任务栏图标。这一步不能省：--icon 只设了 exe 文件自身的图标，
     # 运行时的窗口图标要在这里显式给。

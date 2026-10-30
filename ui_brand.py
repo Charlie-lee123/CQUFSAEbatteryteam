@@ -252,7 +252,7 @@ class BrandHeader(QWidget):
     也才不会在窗口顶部堆出两层框。
     """
 
-    def __init__(self, product: str = "串口调试助手", parent=None) -> None:
+    def __init__(self, product: str = "串口助手", parent=None) -> None:
         super().__init__(parent)
         self._product = product
         self._product_face = ui_font(13.5)

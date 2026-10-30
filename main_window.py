@@ -1,4 +1,4 @@
-"""串口调试助手 —— 主界面。
+"""CQUFSAE 串口助手 —— 主界面。
 
 界面只做三件事：把控件上的配置交给 SerialWorker、把 worker 的信号渲染出来、
 把用户的操作变成对 worker 的调用。串口本身的逻辑都在 serial_io.py。
@@ -37,6 +37,7 @@ from serial_io import (
     STOPBIT_CHOICES, SerialWorker, StreamDecoder, list_serial_ports, parse_hex, to_hex,
 )
 import app_log
+import rx_export
 import customization
 from ui_anim import (EASE, STANDARD, Reveal, Tween, animations_enabled,
                      in_out_quint, out_cubic)
@@ -460,7 +461,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("CQUFSAE串口调试助手")
+        self.setWindowTitle("CQUFSAE串口助手")
         self.resize(1060, 920)
 
         self._worker: SerialWorker | None = None
@@ -540,6 +541,9 @@ class MainWindow(QMainWindow):
         self._rx_full: dict = {}
         self._rx_total = 900
         self._rx_tx_normal = 0
+        # 结构化导出（CSV/JSON）用的「每模组电芯/温度数」缓存：
+        # 只在档位变了才重新 configure，别每帧重建列表。
+        self._rx_export_profile: tuple | None = None
         self._rx_rail_normal = 48
         self._rx_rail_expanded = 48
         self._rx_row_w = 40
@@ -832,7 +836,7 @@ class MainWindow(QMainWindow):
                                  GAP - SHADOW_PAD, GAP - SHADOW_PAD)
         inner.setSpacing(GAP - SHADOW_PAD * 2)
 
-        self.brand_header = BrandHeader("串口调试助手")
+        self.brand_header = BrandHeader("串口助手")
         inner.addWidget(self.brand_header)
         self._refresh_vehicle_badge()
 
@@ -3892,6 +3896,37 @@ class MainWindow(QMainWindow):
         self._rx_highlighter.refresh()
         return True
 
+    def _export_profile_now(self) -> tuple:
+        """导出用的逐模组尺寸 —— 与显示层同源（``_rx_grid_hints``）。
+
+        有车辆档案 → 逐模组（各模组点数可不同）；老配置 → 只有一个「每模组电芯数」，
+        用它乘模组个数展开；都没有 → 空列表，导出层退回「跟着设备分帧切」。
+        """
+        hints = self._rx_grid_hints()
+        if "volt_row_sizes" in hints:
+            return (list(hints["volt_row_sizes"]), list(hints["temp_row_sizes"]))
+        n = int(hints.get("volt_cols_hint") or 0)
+        m = int(hints.get("temp_cols_hint") or 0)
+        if n <= 0:
+            return ([], [])
+        mods = int(customization.get("module_count") or 0)
+        return ([n] * mods, [m] * mods if m > 0 else [])
+
+    def _feed_export(self, text: str) -> None:
+        """把一块原始分帧文本喂给结构化导出缓存。
+
+        ⚠️ 这里出任何异常都不能影响接收：落盘是附赠功能，接收是主功能。
+        """
+        try:
+            profile = self._export_profile_now()
+            if profile != self._rx_export_profile:
+                self._rx_export_profile = profile
+                rx_export.session().configure(*profile)
+            rx_export.session().feed(text)
+        except Exception:                     # noqa: BLE001 - 绝不影响接收
+            import traceback
+            app_log.error("导出采集异常: " + traceback.format_exc(limit=2))
+
     def _emit_block(self, text: str) -> None:
         # 一整帧显示成一条：整块去掉首尾换行后交给 appendPlainText，块内的
         # 换行仍会正常折成多行。首尾换行必须掐掉 —— 分包抖动会把一帧劈成
@@ -3914,6 +3949,10 @@ class MainWindow(QMainWindow):
         # 规则见 ui_highlight.section_of），所以由主窗口维护、逐块喂给对齐函数。
         # 放在这个**唯一入口**上，时间戳判断、着色、复制、暂停队列拿到的都是
         # 补齐后的同一份文本。
+        # 结构化导出（CSV/JSON）：喂**原始**文本，必须在 align_indexes 之前 ——
+        # 对齐会补零、把电压重排成「一排一个模组」的网格、在断线处插 X，
+        # 那些都会让「第几个电芯」算错（见 rx_export 模块注释）。
+        self._feed_export(text)
         text = align_indexes(text, section=self._align_section,
                              max_row_chars=self._rx_max_row_chars(),
                              **self._rx_grid_hints())
@@ -5544,7 +5583,7 @@ class MainWindow(QMainWindow):
 
     def _warn(self, message: str) -> None:
         app_log.error(message.splitlines()[0] if message else "")
-        QMessageBox.warning(self, "串口调试助手", message)
+        QMessageBox.warning(self, "串口助手", message)
 
     # -------------------------------------------------------- 配置持久化
 

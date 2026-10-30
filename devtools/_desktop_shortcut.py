@@ -36,7 +36,7 @@ RELEASE_DIR = os.path.dirname(EXE)
 # 文件，超时就退化成白纸（用户报"桌面图标变成一张白纸"就是这个）。指到
 # 旁边这个小 ico 上是即取即得。
 ICON = os.path.join(RELEASE_DIR, "app.ico")
-LINK_NAME = "CQUFSAE串口调试助手.lnk"
+LINK_NAME = "CQUFSAE串口助手.lnk"
 
 ole32 = ctypes.oledll.ole32
 shell32 = ctypes.windll.shell32
@@ -174,7 +174,7 @@ def main() -> int:
             print(f"  图标已就位 {ICON}")
 
     before = read_target(link_path) if os.path.exists(link_path) else "（不存在）"
-    write_shortcut(link_path, EXE, RELEASE_DIR, ICON, "CQUFSAE 串口调试助手")
+    write_shortcut(link_path, EXE, RELEASE_DIR, ICON, "CQUFSAE 串口助手")
     after = read_target(link_path)
     print(f"桌面快捷方式: {link_path}")
     print(f"  改前 -> {before}")
