@@ -628,6 +628,37 @@ QLineEdit#countEdit:focus {
     border: 1px solid @line_strong@;
 }
 
+/* ---- 通用单行文本框（MCP 手动参数表 / 车辆命名）----
+   与 searchEdit、countEdit 同一族谱：surface_2 底 + line 描边 + CONTROL_RADIUS。
+   ⛔ 为什么又开一个 objectName 而不是直接改裸 ``QLineEdit``：可编辑下拉框
+   （串口名 / 波特率）内部各藏一层 QLineEdit，裸规则会把它们一起改掉、把下拉框
+   的圆角撑成两层（见上面 searchEdit 那段注释）。只给"我们自己搭的输入框"
+   打 fieldEdit 标记，作用面才可控。 */
+QLineEdit#fieldEdit {
+    background: @surface_2@;
+    border: 1px solid @line@;
+    border-radius: @CONTROL_RADIUS@px;
+    padding: 6px 10px;
+    color: @ink@;
+    selection-background-color: rgba(@sel_rgb@,0.18);
+    selection-color: @ink@;
+}
+
+QLineEdit#fieldEdit:hover {
+    background: @surface_hover@;
+}
+
+QLineEdit#fieldEdit:focus {
+    border: 1px solid @line_strong@;
+}
+
+/* 只读态（MCP 手动参数表里的值）：不置灰 —— 它是要被"读"和"复制"的内容，
+   变灰会被当成不可用；只把底色压一档表示不可编辑。 */
+QLineEdit#fieldEdit[readOnly="true"] {
+    background: @bg@;
+    color: @ink@;
+}
+
 QLabel#searchCount {
     color: @ink_2@;
 }

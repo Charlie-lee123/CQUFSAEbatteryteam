@@ -2,7 +2,7 @@
 
 > Windows 10 / 11（64 位）· 免安装单文件 **27.5 MB** · 安装包 **29.3 MB**
 
-本次三件事`SerialAssistant.exe``SerialAssistant-setup-2.5.exe`：`21693e3c9ce3c91d815683148ff4f9f850a137f54471cde02c3634d2badf8b7b``95c99c4fb533e7ed6315ee58b3b7804a67b384fe3d738d8104a6488d646cceda`**改名**、**结构化导出（CSV / JSON）**、**更新链路提速**（上一轮已并入）。
+本次三件事`SerialAssistant.exe``SerialAssistant-setup-2.5.exe`：`4100396d1b2e2ecf243e466050ac38a0e8c8c7f7436a2e00193b316d5afd2dfd``95c99c4fb533e7ed6315ee58b3b7804a67b384fe3d738d8104a6488d646cceda`**改名**、**结构化导出（CSV / JSON）**、**更新链路提速**（上一轮已并入）。
 
 ---
 
@@ -60,6 +60,11 @@
 - 「重新导出服务文件」把 MCP 服务源码重写到「参数」那个路径（升级后代码会变）
 - 保留「复制接入配置」：仍然可以整段丢给 Agent 让它自动装
 - 没建过 venv 时，「命令」会退回普通 python 并在面板上提示先 `pip install mcp pyserial`
+- 表里的单行文本框与设置面板其它输入框**同一套外观**（`surface_2` 底 + 描边 + 16px 圆角），
+  只读态用更深一档的底表示"可复制但不可编辑"
+- ⛔ 顺带加了一条自测守卫：全局 QSS 里**任何一个 token 拼错**都会让它之后的样式整段
+  静默失效（按钮丢透明底、图标多出红点），现在 `stylesheet()` 生成完会断言"无残留
+  `@token@` 且首尾规则都在"
 
 ## 3. 上一轮的更新提速（已在 2.4 收尾时并入）
 
@@ -83,7 +88,7 @@
 
 ## 校验值
 
-- `SerialAssistant.exe`：`95c99c4fb533e7ed6315ee58b3b7804a67b384fe3d738d8104a6488d646cceda`
+- `SerialAssistant.exe`：`108d5ffd033b0685f610da8cfc6377143ac5d5ce4e6cb2210659d6cd0d488f29`
 - `SerialAssistant-setup-2.5.exe`：`21693e3c9ce3c91d815683148ff4f9f850a137f54471cde02c3634d2badf8b7b`
 
 > 2.4 及更早版本点「检查更新」能直接升到 2.5（2.4 已经带上并行检测与抢跑下载）。

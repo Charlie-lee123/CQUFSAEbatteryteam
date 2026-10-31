@@ -5725,6 +5725,33 @@ def check_rename_and_install(app: QApplication) -> None:
     assert any(k in "CQUFSAE串口助手" for k in names), "新显示名认不出来"
 
 
+def check_qss_tokens(app: QApplication) -> None:
+    """全局 QSS 必须**全部 token 都能替换**，且没被中途截断。
+
+    背景：``stylesheet()`` 是把 ``@token@`` 替换成颜色/尺寸的。写错一个 token
+    （如 2026-10-31 的 ``@surface_1@``）不会抛异常，而是让**它之后的全部规则**
+    静默失效 —— 表现为"按钮忽然有了底色""图标多出几个红点"这类毫不相干的怪象。
+    这里直接钉死三件事：
+      ① 生成的 QSS 里不能再残留 ``@``；
+      ② 首尾规则都在（证明没被截断）；
+      ③ 本次新增的输入框样式确实进了 QSS。
+    """
+    import re
+
+    import ui_theme
+
+    qss = ui_theme.stylesheet()
+    assert qss.strip(), "stylesheet() 返回空"
+    leftovers = sorted(set(re.findall(r"@[A-Za-z_0-9]*@?", qss)))
+    assert not leftovers, f"QSS 里有未替换的 token（会让其后样式整段失效）：{leftovers[:6]}"
+    # 末尾规则必须还在 —— 截断最常见的症状就是"后面全没了"
+    assert "QMessageBox QLabel" in qss, "QSS 末尾规则不见了（样式被截断）"
+    # 首条规则也在
+    assert qss.lstrip().startswith(("QWidget", "/*", "*")), qss[:40]
+    # 输入框圆角那条（2026-10-31 加的）必须真的进了样式表
+    assert "QLineEdit#fieldEdit" in qss, "输入框圆角样式没进 QSS"
+
+
 CHECKS = [
     ("HEX 编解码", check_hex_codec),
     ("增量文本解码", check_stream_decoder),
@@ -5745,6 +5772,7 @@ CHECKS = [
     ("结构化导出（CSV/JSON）", check_export_data),
     ("MCP 手动填写参数", check_mcp_manual),
     ("改名无残留与安装版判定", check_rename_and_install),
+    ("QSS token 全量可替换", check_qss_tokens),
     ("MCP 接入入口", check_mcp_payload),
     ("安装包脚本", check_installer_script),
     ("历史接收数据", check_rx_history),

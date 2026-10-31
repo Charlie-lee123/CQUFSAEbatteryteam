@@ -86,6 +86,7 @@ class _NameDialog(QDialog):
         root.setSpacing(GAP)
 
         self.edit = QLineEdit(value)
+        self.edit.setObjectName("fieldEdit")  # 与设置面板其它输入框同一套外观
         self.edit.setFont(ui_font(12.5))
         self.edit.selectAll()               # 预填名整段选中：直接打字就是替换
         self.edit.returnPressed.connect(self.accept)
@@ -201,6 +202,7 @@ class McpManualDialog(QDialog):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
         edit = QLineEdit(value)
+        edit.setObjectName("fieldEdit")      # 圆角/描边走全局 QSS 那一族
         edit.setReadOnly(True)
         edit.setFont(ui_font(11.5))
         edit.setMinimumWidth(1)
