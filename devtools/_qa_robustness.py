@@ -120,7 +120,7 @@ def main() -> int:
             dialog = SettingsDialog("dark", 55)
             dialog.show()
             pump(app, 300)
-            print(f"  坏 JSON 下建设置面板 → 下拉={dialog.cmb_vehicle.currentText()!r} "
+            print(f"  坏 JSON 下建设置面板 → 下拉={dialog.cmb_vehicle_number.currentText()!r} "
                   f"逐模组行={len(dialog._module_rows)} 旧三件套可见="
                   f"{[dialog._custom_rows[k][1].isVisibleTo(dialog) for k in dialog._LEGACY_GRID_KEYS]}")
             dialog.close()

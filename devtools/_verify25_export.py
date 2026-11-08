@@ -17,7 +17,6 @@ r"""v2.5 验收探针 A：结构化导出（CSV/JSON）—— **证伪向**，�
 from __future__ import annotations
 
 import csv
-import io
 import json
 import os
 import sys

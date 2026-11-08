@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """历史接收数据：自动保存最近的接收内容（含时间戳行）。
 
-- **存哪**：与日志文件同一目录（``app_log`` 的 logs 目录，跟着软件走）。
+- **存哪**：默认与日志文件同一目录（``app_log`` 的 logs 目录，跟着软件走）；
+  用户在设置面板选了别的目录就用那个（``set_directory`` 持久化到
+  ``custom/rx_history_dir``，``directory()`` 是唯一读入口）。
 - **存什么**：接收区实际显示的行——已含时间戳行、段重排后的数据行；
   HEX 视图存的就是 HEX 文本。逐帧喂 ``feed()``，尾部换行由这里统一收口。
 - **存多少**：**跟随接收区的「保留行数」**（用户 2026-10-13 点名："本地留存行数
@@ -30,11 +32,15 @@ COMPACT_EXTRA = 500      # 文件比上限多出这么多行才整体重写一�
 FLUSH_MS = 1000          # 批量刷盘周期
 FILE_NAME = "接收历史.log"
 
+_ORG, _APP = "MimoWorks", "SerialAssistant"
+DIR_KEY = "custom/rx_history_dir"      # 用户手动指定的历史目录（空 = 跟日志同目录）
+
 _max_lines = DEFAULT_MAX_LINES
 _lines: deque[str] = deque(maxlen=_max_lines)
 _pending: list[str] = []
 _file_lines = 0          # 文件当前有多少行（内存记账，免得反复数文件）
 _path: Path | None = None
+_current_key: str | None = None         # load() 记住的车号，切目录时用它重新定位
 _timer = None            # QTimer，惰性创建（要等 QApplication 存在）
 
 
@@ -73,8 +79,142 @@ def _resolve_dir() -> Path:
     return Path.home() / ".serialassistant" / "logs"
 
 
+# 原函数备份：``directory()`` 靠它判断"这个函数有没有被自测替换过"（见那里的说明）。
+_DEFAULT_RESOLVER = _resolve_dir
+
+
+def _settings():
+    """QSettings("MimoWorks","SerialAssistant") —— 与 customization 同一个存储。"""
+    from PySide6.QtCore import QSettings
+    return QSettings(_ORG, _APP)
+
+
+def custom_directory() -> str | None:
+    """用户手动指定的历史目录；没设过（或写成了 null）返回 None。"""
+    try:
+        value = _settings().value(DIR_KEY, "")
+    except Exception:                   # noqa: BLE001 - 读不到配置就当没设过
+        return None
+    if value is None:
+        return None                     # 显式写成 null（快照恢复会这样）→ 当没设过
+    text = str(value).strip()
+    return text or None
+
+
+def directory() -> str | None:
+    """当前历史目录的绝对路径（**默认值保持现状**：跟日志同目录）。
+
+    手动选过目录就走用户那个（``set_directory``），否则原样返回 ``_resolve_dir()``。
+    ⚠️ 每次现调 ``_resolve_dir()``（不要在 import 期缓存）：selftest 就是靠临时
+    替换这个函数把历史写到隔离目录的。
+    """
+    # ⛔ 自测会把 ``_resolve_dir`` 指到临时目录（MEMORY：「历史污染」是硬约定）。
+    #    被换过 = **隔离优先**，无视用户的自定义目录 —— 否则跑一次自测就把测试帧
+    #    写进用户真正的历史文件夹里了。
+    if _resolve_dir is not _DEFAULT_RESOLVER:
+        try:
+            return str(_resolve_dir())
+        except OSError:
+            return None
+    custom = custom_directory()
+    if custom:
+        return custom
+    try:
+        return str(_resolve_dir())
+    except OSError:
+        return None
+
+
+def set_directory(path: str) -> bool:
+    """切换历史目录并持久化。返回 True = 成功；不可写 / 存不下 → False（一个字不改）。
+
+    传空串 = 清掉自定义目录、回到默认（日志同目录）。切换时先把当前文件的尾巴
+    落盘，再按**当前车号**在新目录里重新定位文件 —— 用户换目录之后接着收包，
+    新数据就落在新目录下；旧目录里的老历史**原样留着**，不会被搬走或删掉。
+    """
+    text = str(path or "").strip()
+    target: Path | None = Path(text) if text else None
+    if target is not None:
+        probe = target / f".write_test{os.getpid()}"
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            probe.write_bytes(b"")
+            probe.unlink()
+        except OSError:
+            return False
+    flush()                             # 旧目录里的待写行先落盘，别丢最后一秒
+    try:
+        settings = _settings()
+        if target is None:
+            settings.remove(DIR_KEY)
+        else:
+            settings.setValue(DIR_KEY, str(target))
+        settings.sync()
+    except Exception:                   # noqa: BLE001 - 写配置失败 = 切换失败
+        return False
+    load(_current_key)
+    return True
+
+
+def labels_of(folder: str | Path | None) -> list[tuple[str, str]]:
+    """某个目录下的历史文件 → ``[(标签, 绝对路径)]``（**新的在前**）。
+
+    标签取自文件名：``接收历史-E74-2026.log`` → ``E74-2026``；没有后缀的
+    ``接收历史.log``（未选车那本）→ ``默认``。
+    """
+    if not folder:
+        return []
+    base = Path(folder)
+    found: list[tuple[str, str, float]] = []
+    try:
+        entries = list(base.glob("接收历史*.log"))
+    except OSError:
+        return []
+    for entry in entries:
+        try:
+            if not entry.is_file():
+                continue
+            stamp = entry.stat().st_mtime
+            full = str(entry.resolve())
+        except OSError:
+            continue
+        found.append((label_of(entry.name), full, stamp))
+    found.sort(key=lambda item: (-item[2], item[0]))
+    return [(label, full) for label, full, _stamp in found]
+
+
+def label_of(filename: str) -> str:
+    """历史文件名 → 显示标签（``接收历史-X.log`` → ``X``；通用文件 → ``默认``）。"""
+    stem = Path(str(filename)).name
+    if stem.endswith(".log"):
+        stem = stem[: -len(".log")]
+    if stem.startswith("接收历史"):
+        stem = stem[len("接收历史"):]
+    stem = stem.lstrip("-").strip(" .")
+    return stem or "默认"
+
+
+def available_labels() -> list[tuple[str, str]]:
+    """当前历史目录里可选的历史文件（新的在前）。"""
+    return labels_of(directory())
+
+
+def path_for_label(label: str) -> str | None:
+    """标签 → 该历史文件的绝对路径；找不到返回 None。"""
+    want = str(label or "").strip() or "默认"
+    for name, full in available_labels():
+        if name == want:
+            return full
+    return None
+
+
 def path() -> str | None:
     return str(_path) if _path else None
+
+
+def current_key() -> str | None:
+    """当前历史文件对应的车号（未选车 = None）。"""
+    return _current_key
 
 
 def _safe_key(key: str | None) -> str:
@@ -105,15 +245,17 @@ def load(key: str | None = None) -> str | None:
 
     ``key`` = 当前车辆名（"E74-2026" 这种）或 None（未选车 → 通用文件）。
     """
-    global _path, _file_lines, _timer
+    global _path, _file_lines, _timer, _current_key
     _pending.clear()
     _lines.clear()
     _file_lines = 0
-    directory = _resolve_dir()
+    _current_key = key
+    folder = directory()                 # 自定义目录优先，默认仍是"跟日志同目录"
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        _path = directory / file_for(key)
-    except OSError:
+        base = Path(folder) if folder else _resolve_dir()
+        base.mkdir(parents=True, exist_ok=True)
+        _path = base / file_for(key)
+    except (OSError, TypeError):
         _path = None
         return None
     try:

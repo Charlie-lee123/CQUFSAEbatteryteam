@@ -20,15 +20,17 @@ from datetime import datetime
 # 建链挪进 SerialWorker 之后，界面层不再直接调 serial.* 了；这个 import 留着
 # 是因为串口异常的**语义**仍来自这个模块（后续在界面层写 except serial.SerialException
 # 时不必再想起来补 import）。
-from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSettings, Qt, QTimer
+from PySide6.QtCore import (
+    QElapsedTimer, QEvent, QPoint, QPointF, QRect, QRectF, QSettings, Qt, QTimer,
+)
 from PySide6.QtGui import (
-    QColor, QFontMetricsF, QGuiApplication, QImage, QKeySequence, QPainter,
-    QPixmap, QShortcut, QTextCharFormat, QTextCursor,
+    QColor, QEnterEvent, QFontMetricsF, QGuiApplication, QImage, QKeySequence,
+    QPainter, QPixmap, QShortcut, QTextCharFormat, QTextCursor,
 )
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLayout, QLineEdit,
-    QMainWindow, QMessageBox, QPlainTextEdit, QSizePolicy, QSplitter, QTextEdit,
-    QVBoxLayout, QWidget,
+    QApplication, QBoxLayout, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLayout,
+    QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QSizePolicy, QSplitter,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
 from serial_io import (
@@ -37,10 +39,12 @@ from serial_io import (
     STOPBIT_CHOICES, SerialWorker, StreamDecoder, list_serial_ports, parse_hex, to_hex,
 )
 import app_log
+
 import rx_export
+import rx_store
 import customization
 from ui_anim import (EASE, STANDARD, Reveal, Tween, animations_enabled,
-                     in_out_quint, out_cubic)
+                     in_out_cubic, in_out_quint, out_cubic)
 import ui_anim
 from ui_backdrop import frost_tile, paint_backdrop
 from ui_brand import BrandHeader, CaptionBar
@@ -67,6 +71,8 @@ from ui_theme import (
     material, mono_font, num_font, qcolor, set_glass_strength, set_material,
     set_scheme_mix, ui_font,
 )
+# od47i：后台窗口快照采集线程（消除最大化/还原覆盖层的「卡」与「闪」，见 _snap_worker）。
+from _snap_worker import SnapWorker
 
 # ``ble_io`` 只在**真的要连蓝牙**时才导入：它会连带拉起 ``asyncio``
 # （实测冷启动 +76ms，占全部 import 时间的 1/4），而串口用户一辈子用不到。
@@ -120,6 +126,61 @@ PORT_WATCH_MS = 1000
 # 无边框窗口"边缘缩放"的命中带宽（逻辑 px）。6 是本机 2x 缩放下的手感值：
 # 再窄要点得很准，再宽会吃掉页面外圈那 12px 留白里本该给卡片/标题栏的点击。
 RESIZE_BAND = 6
+
+# ---------------------------------------------------------------- 分屏（Snap）适配
+# 用户 2026-10-31：「我还需要串口软件可以适配 windows 的两分屏三分屏和四分屏」。
+# 1920 宽的屏幕上 1/2 = 960、1/3 = 640、1/4 = 480 —— 窗口的最小宽度必须先让开，
+# 否则 Windows 做 Snap 时只能把窗口夹回最小值（表现为"拖到边上弹不进去"）。
+#
+# 最小宽度是**布局算出来的**（各控件 minimumSizeHint 之和），光调 setMinimumWidth
+# 没用。所以按窗口宽度分四档，逐档收边距、收配置卡、把工具栏改成竖排：
+#   0 档（≥980）：现在的版式，一点不动
+#   1 档（720~980）：边距/间距收一半，配置卡 310→268（= 表单自己的最小宽度）
+#   2 档（460~720）：配置卡 228，两条选项行由横排改**竖排**（横排本来就是最宽的项），
+#                   表单标签列 64→56、字段下限压到 66
+#   3 档（<460）：配置卡 164，标签列整列收起（文字改挂字段 tooltip）
+# 阈值带回滞（往宽了走要多走 24px）：正好在门槛上拖动时不会来回重排 ——
+# 每换一档要重设十几处尺寸，抖起来是肉眼可见的。
+COMPACT_L1_W = 980
+COMPACT_L2_W = 720
+COMPACT_L3_W = 460
+# 窗口"长大/缩小"快照覆盖层总开关（2026-11-01 暂时关闭）。
+# ⛔ 真机上点「还原」会卡死，进程内三种复现路径都测不出来；覆盖层是唯一"在窗口
+#    状态切换期间再开一个顶层窗口"的机制，先整体关掉保证不卡 —— 没动画也比卡死好。
+#    重启这个功能前必须先复现并定位卡死，别直接改回 True。
+_WINDOW_MORPH = False
+COMPACT_HYST = 24
+
+# 每一档的具体数值。``config_w`` 是**整个卡片**的宽（含卡片自己 2×(SHADOW_PAD+CARD_PAD)
+# 的内衬），``field_w`` 是表单里字段的下限（0 = 保持各控件自己的最小宽度）。
+# 卡片绘制面到窗口边的留白（**悬停浮起**需要这点缓冲）。
+# ⛔ 不能是 0：Card.paintEvent 的浮起是"绘制面上移 2px"，而 Qt 会把超出控件
+#    矩形的绘制裁掉 —— 留白 0 = 浮起动画直接消失（用户 2026-11-02：
+#    "怎么我选中浮起的动画没了"）。
+# 取 **3** 而不是 2：浮起 2px 正好用尽缓冲时，顶部圆角的抗锯齿边缘会被裁掉
+# 半像素（用户 2026-11-02："浮起来后还是有一点点挡住了"）——多留 1px 余量。
+CARD_LIFT_ROOM = 3
+
+COMPACT_SPECS = {
+    # 0 档（普通窗口）的 margin 也收成 0（用户 2026-11-02：「四周有空隙，很早
+    # 之前就修过」）：GAP-SHADOW_PAD=12 的窗口边距 + 卡片内 6px 阴影留白 =
+    # 四周 18px 黑缝，在 1134 宽的窗口里非常显眼。窗口边距收 0 只留卡片自己的
+    # 6px 阴影留白（抬升动画需要这点空间，见 Card.paintEvent 的 lift 上限）。
+    0: {"margin": 0, "body": GAP - SHADOW_PAD * 2, "area": 12,
+        "left": 10, "opts": 14, "config_w": 310, "label_w": 64, "field_w": 0,
+        "vertical": False, "rx_min_h": 230, "log_w": 0},
+    1: {"margin": 9, "body": 5, "area": 10, "left": 8, "opts": 10,
+        "config_w": 268, "label_w": 64, "field_w": 0,
+        "vertical": False, "rx_min_h": 210, "log_w": 70},
+    2: {"margin": 6, "body": 4, "area": 6, "left": 4, "opts": 4,
+        "config_w": 228, "label_w": 56, "field_w": 66,
+        "vertical": True, "rx_min_h": 140, "log_w": 56},
+    # 3 档：1600 逻辑宽的屏幕上 1/4 分屏只有 400px —— 表单标签列（56px）整列收起，
+    # 文字挂到字段的 tooltip 上（见 _apply_compact）。不收这一列怎么都塞不进 400。
+    3: {"margin": 3, "body": 3, "area": 4, "left": 4, "opts": 4,
+        "config_w": 164, "label_w": 0, "field_w": 76,
+        "vertical": True, "rx_min_h": 130, "log_w": 48},
+}
 
 # 收包合并（串口没有"帧"的概念，一次 read 给的往往只是一帧里的一小段）。
 # 每来一段就显示一行的话，数据会被切成碎块、数字还会被拦腰截断（"12.382" 和
@@ -201,6 +262,21 @@ BUTTON_SPECS: tuple[tuple[str, str, str], ...] = (
 # 抓设置面板快照时把它挪到这里的坐标：屏幕外，用户看不见，但窗口对 DWM 仍是
 # "可见"状态（PrintWindow 要靠 DWM 重定向才有内容，见 _capture_native_window）。
 _SETTINGS_OFFSCREEN = -4000
+
+# ---- 设置面板放大/缩小动画的三个数（od56：用户「设置动画会跳一下」）----
+# 时长：260 → 300ms。263 倍面积差（28×28 → 544×661）在 260ms 里走完，收尾段
+# 速度仍然偏快；300ms 让边缘速度降下来，观感更"沉"。
+_SETTINGS_ANIM_MS = 300
+# 起步放大：从按钮矩形往外扩 12px（边长 28 → 52）。⛔ 直接用按钮矩形会出现
+# "一个小方块里塞着整块面板"的缩略图，第一帧就是一下"啪"；外扩后起步更软。
+_SETTINGS_START_INFLATE = 12
+# ⛔⛔ 换帧收尾**不要尝试"交叉溶解撒快照"**（2026-11-07 实测证伪）：真面板被快照
+#    整块遮住时 DWM **根本不合成它**，快照 alpha 一降，屏幕露出的是**后面的主窗**
+#    （整窗均亮 33 → 40~42，比落定后的 32 亮一大截）= 一处新的闪，且非确定性
+#    （同一参数三次跑分别 41.8/40.0/41.2）。露边 2px 暖机 48ms 也救不了。
+#    所以仍然**硬切**：快照全程 alpha=1.0，先压 50ms 等真面板首帧合成完，再同一拍撤掉。
+_SETTINGS_SWAP_DELAY_MS = 50
+_SETTINGS_SWAP_FADE_MS = 0
 
 # 历史回放提示条展开/收起的高度补间时长（ms）。和搜索条那套（Reveal 200ms）
 # 同一量级：一帧里凭空多出 50px 会把下面的日志框猛地顶下去，必须有一条坡。
@@ -356,7 +432,32 @@ class _SettingsShot(QWidget):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         # ⚠️ 这里**不再** setOpacity：透明度已经由窗口级合成负责（见 set_alpha）。
         #    两处都做的话会被乘两次（alpha²），淡出比曲线快得多。
-        painter.drawPixmap(self.rect(), self._shot)
+        # ⛔⛔ 2026-11-07 修「打开/关闭设置时整块面板拉伸变形」：旧代码
+        #    ``drawPixmap(self.rect(), self._shot)`` 是**整块非均匀拉伸** —— 起手矩形
+        #    是设置按钮(~30x30, 比例≈1.0)、终点是面板(~560x700, 比例≈0.8)，两个比例
+        #    不等，于是整段动画里面板内容一直被横向压扁/拉宽（本类 docstring 明明写的
+        #    是"整块**均匀**放大"，实现却没按比例）。改为**保持快照自身比例**统一缩放、
+        #    居中：起手小矩形里等比缩小（两侧留一点透明），到终点矩形正好铺满 → 真正
+        #    的"鼓大"，任何时刻都不畸变。
+        rect = self.rect()
+        sw, sh = self._shot.width(), self._shot.height()
+        if sw <= 0 or sh <= 0:
+            return
+        shot_ar = sw / float(sh)
+        rect_ar = rect.width() / max(1.0, float(rect.height()))
+        if rect_ar > shot_ar:
+            # 外框更宽 → 按高度等比，左右居中
+            h = rect.height()
+            w = int(round(h * shot_ar))
+            x = rect.x() + (rect.width() - w) // 2
+            y = rect.y()
+        else:
+            # 外框更窄/等高 → 按宽度等比，上下居中
+            w = rect.width()
+            h = int(round(w / shot_ar))
+            x = rect.x()
+            y = rect.y() + (rect.height() - h) // 2
+        painter.drawPixmap(QRect(x, y, w, h), self._shot)
 
 
 class _RxShot(QWidget):
@@ -438,11 +539,172 @@ class ReplayBar(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         # 内缩 0.5：1px 描边正好落在控件边界之内（半像素压在边界上会被裁掉一半）
         box = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        # 走材质入口（和卡片同一条路）：换材质时回放条也跟着变，
-        # 底色仍用次级面 surface_2，只用 fill/border override 顶掉材质主体色。
+        # 走材质入口（和卡片同一条路）：fill/border override 顶掉材质主体色，
+        # 底色用次级面 surface_2。frosted 下**没有颗粒**（_paint_frost_rim 在
+        # fill_override 分支之外，只补描边与上缘 rim），liquid 才补中心高光。
         paint_glass(painter, box, self.RADIUS,
                     fill_override=qcolor("surface_2"),
                     border_override=qcolor("line"))
+
+
+_BUILD_PUMP = False
+_LAST_PUMP = 0.0
+_PUMP_SLICE = 0.03        # 每 30ms 让出一次：让出越频繁，开屏重绘越多，构造反而更久
+
+
+def _pump_build() -> None:
+    """构造期让出事件循环（只在开屏期间启用，见 main._build_window）。
+
+    ⛔ 光在三个大块之间让出**不够**：每个子构建本身就有 200~300ms，切完每段
+    还是「中间卡顿时间过长」（用户 2026-11-04 实测反馈）。所以改成**时间片**：
+    距上次让出满 30ms 就还一次主线程，调用点可以密集插，代价只有一次
+    ``perf_counter``。
+
+    ⛔ 只处理定时器/绘制，**排除用户输入**：构造中途收到点击会碰上半初始化的
+    控件。主窗此时还没 show，不会触发自己的 paint。
+    """
+    global _LAST_PUMP
+    if not _BUILD_PUMP:
+        return
+    from time import perf_counter
+
+    now = perf_counter()
+    if (now - _LAST_PUMP) < _PUMP_SLICE:
+        return
+    _LAST_PUMP = now
+    try:
+        from PySide6.QtCore import QEventLoop
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.processEvents(
+            QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+    except Exception:                     # noqa: BLE001 - 让出失败不该拖垮构造
+        pass
+
+
+class _SwitchFade(QWidget):
+    """分屏恢复时串口开关的淡出层（顶层半透明窗口）。
+
+    只画一张预抓取的位图，按 alpha 淡出 —— **不**用被项目铁律禁用的
+    ``QGraphicsOpacityEffect``（控件级离屏合成会抽搐）。真控件在动画期间藏着，
+    落定时插回卡片，做到「开关直接淡出消失」而非缩放 / 瞬切。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(None)
+        self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint
+                           | Qt.WindowStaysOnTopHint | Qt.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self._pix: QPixmap | None = None
+        self._alpha = 1.0
+
+    def set_pix(self, pix: QPixmap) -> None:
+        self._pix = pix
+        self.update()
+
+    def set_alpha(self, alpha: float) -> None:
+        a = max(0.0, min(1.0, float(alpha)))
+        if a != self._alpha:
+            self._alpha = a
+            self.update()
+
+    def paintEvent(self, event) -> None:           # noqa: N802 - Qt 命名
+        pix = self._pix
+        if pix is None or pix.isNull():
+            return
+        painter = QPainter(self)
+        try:
+            painter.setOpacity(self._alpha)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+            painter.drawPixmap(QRect(0, 0, self.width(), self.height()),
+                               pix, QRect(0, 0, pix.width(), pix.height()))
+        finally:
+            painter.end()
+
+
+class _CoverLabel(QLabel):
+    """覆盖层窗口：每次 paintEvent 把源图按控件矩形**快速缩放**画出来。
+
+    ⛔ 不再每帧生成一张 phys 尺寸的 QPixmap：QLabel 持有 pixmap 时对同名
+    QPixmap 调 QPainter 会触发隐式共享 detach（25MB 深拷贝/帧），实测每 tick
+    多出 20~30ms，300ms 只剩 8 帧。这里只保留预缩放源图（A，溶解段另存 B），
+    几何变化由 Qt 重绘，paintEvent 里 drawPixmap 只读源、不修改 → 不 detach。
+
+    ⛔⛔ S2（2026-11-07）：单覆盖层内交叉溶解。``set_source`` 保持「单张源图」
+    语义（起手帧 / B=None 退化 / w≥1 用），``set_blend(a, b, w)`` 存两张源 +
+    权重，paintEvent 在**同一 painter** 内先画不透明 A 铺满、再
+    ``setOpacity(w)`` 画 B（A/B 各自按自身 src_ar 算裁边矩形）。w 是**像素
+    混合权重**，不是窗口透明度；覆盖层全程 ``setWindowOpacity(1.0)``。
+    od55 禁的是「双顶层窗 + 窗口级 alpha」混合，与此处单窗单 painter 不同。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(None)
+        self._src = None          # A（起手版式）
+        self._src_b = None        # B（目标版式），None = 单图模式
+        self._blend_w = 0.0       # 溶解权重 w∈[0,1]
+
+    def set_source(self, pix) -> None:
+        # 单图语义：顺带清掉上一次的 blend 状态，避免从溶解段切回时残留 B。
+        self._src = pix
+        self._src_b = None
+        self._blend_w = 0.0
+        self.update()
+
+    def set_blend(self, pix_a, pix_b, w) -> None:
+        # S2：同一覆盖层内交叉溶解。pix_a 不透明铺满，pix_b 按 w 叠加。
+        self._src = pix_a
+        self._src_b = pix_b
+        self._blend_w = float(w)
+        self.update()
+
+    def paintEvent(self, event) -> None:      # noqa: N802 - Qt 命名
+        a = self._src
+        if a is None or a.isNull():
+            return
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(
+                QPainter.RenderHint.SmoothPixmapTransform, True)
+            rect = self.rect()
+
+            def draw_keep_aspect(painter, rect, src):
+                # ⛔⛔ 修「拉伸变形」：统一缩放铺满 + 对称裁切溢出边
+                #    （KeepAspectRatioByExpanding），内容宽高比恒 = 源图比例。
+                #    ⚠️ A/B 尺寸不同，**必须各自按自身 src 的 sw/sh 算裁边矩形**，
+                #    绝不能复用 A 的矩形画 B（否则 B 被非等比拉伸）。
+                sw, sh = src.width(), src.height()
+                if sw <= 0 or sh <= 0:
+                    return
+                src_ar = sw / sh
+                rect_ar = rect.width() / max(1, rect.height())
+                if src_ar > rect_ar:
+                    # 源更宽：按高度铺满，左右对称裁掉
+                    dh = rect.height()
+                    dw = int(round(dh * src_ar))
+                    x = (rect.width() - dw) // 2
+                    painter.drawPixmap(QRect(x, 0, dw, dh), src)
+                else:
+                    # 源更窄/等高：按宽度铺满，上下对称裁掉
+                    dw = rect.width()
+                    dh = int(round(dw / src_ar))
+                    y = (rect.height() - dh) // 2
+                    painter.drawPixmap(QRect(0, y, dw, dh), src)
+
+            b = self._src_b
+            w = self._blend_w
+            if b is not None and not b.isNull() and w >= 1.0:
+                draw_keep_aspect(painter, rect, b)       # 只画 B
+            else:
+                draw_keep_aspect(painter, rect, a)       # A 不透明铺满
+                if (b is not None and not b.isNull()
+                        and 0.0 < w < 1.0):
+                    painter.setOpacity(w)                # 像素级权重
+                    draw_keep_aspect(painter, rect, b)   # B 按自身比例铺满
+                    painter.setOpacity(1.0)              # 复位全局 painter 状态
+        finally:
+            painter.end()
 
 
 class MainWindow(QMainWindow):
@@ -483,6 +745,8 @@ class MainWindow(QMainWindow):
         self._rx_bytes = 0
         self._tx_bytes = 0
         self._history: list[str] = []
+        # 时钟宽度是否已经精确量过（见 _arm_clock；构造期量要 580ms）
+        self._clock_ready = False
         self._settings = QSettings("MimoWorks", "SerialAssistant")
         self._cards: list[Card] = []
         # 主题过渡（见 _animate_theme）：补间惰性创建，起止方案记在这里
@@ -512,6 +776,8 @@ class MainWindow(QMainWindow):
         # 入场落定时"同一拍真面板上屏、撤快照"的临时目标。硬切是**同步**的
         # （落定即清），正常不会停在非空；保留它只是给诊断探针一个可读状态。
         self._settings_swap_target = None
+        # od56：换帧收尾的交叉溶解补间（1 → 0 撤快照），见 _start_settings_swap_fade。
+        self._settings_swap_tween = None
         # 面板**静止态**的最小尺寸（尺寸对象，见 _open_settings / A3）。
         # 入场动画期间必须把 min 放开成 (0, 0) 才缩得到按钮那一小块；落定时要
         # 把整份 minimumSize 还回去 —— 只还宽度会留下高度那一半的坑（面板内容
@@ -550,6 +816,9 @@ class MainWindow(QMainWindow):
         self._rx_row_h = 30
         self._rx_hidden: set = set()
         self._rx_switch_active = False
+        # 分屏恢复：开关"淡出"收尾的状态（见 _rx_transition / _SwitchFade）。
+        self._rx_switch_fade = False
+        self._switch_fade: QWidget | None = None
         # 开关飞走期间占住它在配置卡里的那一格（见 _rx_place_home_gap）：
         # 有它，卡内版式整段零位移；没它，开关进出会让下面控件整体上下窜 41px。
         self._rx_home_gap: QWidget | None = None
@@ -610,6 +879,16 @@ class MainWindow(QMainWindow):
         # 的区别是"持久"——后者只在一次程序性 showNormal 期间有效。延迟核对
         # （_verify_fullscreen）靠它分辨"这次没铺满"是用户主动退出还是被 shell 吃掉了。
         self._want_fullscreen = True
+        # ⚠️ "最小化→还原"后 Qt 会丢掉全屏标志、窗口以普通态短暂回来，这段时间
+        #    要让 padding 收 0（避免四周出现 3px 缝）。这个旗子**只在这 220ms 瞬时**
+        #    为真：由 changeEvent 还原分支置真、startup_fullscreen / _on_escape / 真正
+        #    进入全屏时清零。⛔ 绝不能把持久的 _want_fullscreen 直接并进 full 判定——
+        #    它默认就是 True（启动即全屏），普通浮动窗口若没被清成 False 会被误判成
+        #    "铺满"、吃掉卡片浮起余量、浮起动画消失（用户 2026-11-02："选中浮起的动画没了"）。
+        self._pending_restore_fs = False
+        # 全屏意图代次：延迟核对（_verify_fullscreen）带它一起排队，意图一变
+        # 就作废旧定时器（见 _schedule_verify）。0 = 还没进过全屏。
+        self._verify_token = 0
         # 全屏几何收敛核对的重入保护（event 钩子 ↔ _enforce_native_fullscreen）
         self._in_enforce = False
         # 暂停折叠：进暂停时发送区是不是展开的 —— 恢复时只还原它自己动过的
@@ -671,6 +950,142 @@ class MainWindow(QMainWindow):
         self._port_watch.setInterval(PORT_WATCH_MS)
         self._port_watch.timeout.connect(self._poll_ports)
 
+        # 分屏（Snap）适配的紧凑档位：-1 = 还没算过（第一次 resizeEvent 现算）。
+        # 0 = 满版式 / 1 = 收边距 / 2 = 竖排工具栏（见 COMPACT_SPECS）。
+        self._compact_level = -1
+        # 重入保护：_apply_compact 里改尺寸/边距会再触发 resizeEvent
+        self._in_compact = False
+        # 配置表单里"宽屏要留宽度"的两组控件（窄档要整组收口，见 _apply_compact）
+        self._config_tags: list[QLabel] = []
+        self._config_fields: list[tuple[QWidget, int]] = []
+        # 每个字段原本的 tooltip（窄档会把标签文字挂上去，退出时要还原）
+        self._config_tips: dict[QWidget, str] = {}
+        # 窗口整体淡入淡出的补间（DWM 合成，**不是** QGraphicsOpacityEffect）
+        self._win_fade: Tween | None = None
+        # 上一次的窗口状态：用来分辨"从最小化还原"（见 changeEvent）
+        self._last_window_state = Qt.WindowState.WindowNoState
+        # 刚进入过最小化：showEvent 里用来在"从任务栏还原"后立刻重做全屏覆盖
+        # （changeEvent 的定时器在 200% DPI 上可能漏拍，showEvent 是更稳的钩子）。
+        self._was_minimized = False
+        # 最大化键当前是不是"系统悬停"态（见 nativeEvent 的 HTMAXBUTTON）
+        self._max_btn_hot = False
+        # 窗口几何补间（最大化/还原的"长大/缩小"）：预留标志。
+        # ⚠️ 2026-10-31：几何长大**不能**延迟 showFullScreen()（状态必须立刻落地），
+        #    真正的"长大"要走快照覆盖层（尚未实现）；这里保留守卫供将来使用。
+        self._geo_animating = False      # 动画期禁止 _remember_normal_geometry 记中间矩形
+        # 进入全屏的**真窗口几何补间**（不是快照）：补间期间 isFullScreen 仍是 False，
+        # 所有"是否铺满"的判定都要把它并进去（见 _sync_fullscreen_padding /
+        # _refresh_caption_ui）。补间结束才 showFullScreen() —— 那时几何已经等于
+        # 显示器矩形，状态切换无跳变。这是用户要的"位置/尺寸连续变化"。
+        self._fs_animating = False
+        self._fs_target: QRect | None = None
+        self._closing = False            # 关闭淡出的重入闸
+        self._snap_zoom = False          # 分屏窄档自动"最大化接收区"是否由我们接管
+        self._snap_pending = False       # 已预约一次延迟重算（防 resizeEvent 自激）
+        self._in_snap_apply = False      # 正在切显隐（重入闸）
+        self._card_pad = SHADOW_PAD      # 卡片阴影留白（全屏时收成 0）
+        self._state_ts = 0.0             # 最近一次窗口状态切换的时刻（分屏判定冷却）
+        # 安全版窗口动画：**不抓图、不开顶层窗**（那两样是卡死源头）
+        self._geo_animating = False
+        # 退出全屏的真窗口几何补间（见 _win_geo_morph）：连续缩回普通几何
+        self._win_geo_tween = None
+        self._win_geo_from: QRect | None = None
+        self._win_geo_to: QRect | None = None
+        # 补间期间挂起整窗重绘（2026-11-04 实测把 27fps 提到 163fps，见
+        # _win_geo_morph 的说明）；任何打断/收尾路径都必须对称解冻。
+        self._morph_frozen = False
+        # 原生还原动画的无闪窗口期：WM_NCCALCSIZE 临时返回 WVR_ALIGNTOP|LEFT
+        # 让 resize 保留旧客户内容（见 nativeEvent）；只在 showNormal 后 ~450ms
+        # 内为真，不影响日常拖拽 resize。
+        self._nccalc_preserve = False
+        # 全屏态空闲快照（还原覆盖层的「旧画面」；点击现场零抓屏，杜绝 od15
+        # 时代 90~143ms 的同步卡）。guard 未就绪时 60ms 自重试，见
+        # _build_fs_idle_pix / _schedule_fs_idle_snap。
+        self._fs_idle_pix: QPixmap | None = None
+        # S2：B 层（目标全屏版式）的抓图时刻（time.monotonic）。进全屏传 B
+        #    前按 ≤450ms 年龄闸校验，超闸退化全程 A，避免 100ms 溶解暴露旧内容。
+        self._fs_idle_ts = 0.0
+        # 空闲快照自重试：最多 20 次 / 总时限 1.5s；单发成员 QTimer 的
+        # start() 重启语义天然防重入，不会堆积定时器。
+        self._fs_idle_retry_n = 0
+        self._fs_idle_retry_t0 = 0.0
+        # od55：内容校验失败的次数（纯黑快照最多容忍 3 次，避免无限重试）
+        self._fs_idle_bad_n = 0
+        self._fs_idle_retry_timer = QTimer(self)
+        self._fs_idle_retry_timer.setSingleShot(True)
+        self._fs_idle_retry_timer.timeout.connect(self._fs_idle_retry_tick)
+        # DWM 原生还原动画抑制标记（还原覆盖层动画期间关，收尾恢复）。
+        self._dwm_transition_off = False
+        self._snap_zoom_saved = None     # 自动隐藏前的可见性，恢复时按它还原
+        # 最大化/还原的"长大/缩小"快照覆盖层（ToolTip 级窗口：不吃输入、不抢焦点）
+        self._morph_label = None
+        self._morph_tween: Tween | None = None
+        self._morph_from: QRect | None = None
+        self._morph_to: QRect | None = None
+        # 「进入全屏 / 全屏→分屏」的**真·长大/缩小**覆盖层（见 _play_window_cover）。
+        # ⛔ 为什么不用 Tween：实测覆盖层的 Tween 在进全屏那一拍只走 4 帧/300ms
+        #    （主窗重建版式把共享 ticker 挤掉了），观感等于没动画。这里用**独立**
+        #    QTimer(8ms, PreciseTimer) + QElapsedTimer 按墙钟现算进度，帧数只受
+        #    主线程重绘能力限制；覆盖层不做 opacity 渐变（那会把 300ms 的动画
+        #    在 4 帧里淡没 = 闪）。
+        self._cover_label = None
+        self._cover_pix = None
+        # 2026-11-07 od55：**单窗单 painter**。旧实现用 A/B 两个不透明顶层窗做
+        # 窗口级交叉溶解，两窗黑底互相遮挡 → 双影 + 亮度塌陷（实测最长 250ms）。
+        # 现在只有一个窗口：`_cover_pix`=旧画面(A)、`_cover_pix_b`=目标版式(B)。
+        # ⛔⛔ S2：末段（默认 [0.90,1.0]，B 陈旧压到 [0.99,1.0]）在**同一
+        #    _CoverLabel 的同一 paintEvent** 里按 smoothstep 权重做像素级
+        #    交叉溶解（详见 _on_cover_tick）；
+        #    这是单窗单 painter 混合，不是 od55 禁的双窗/窗口级 alpha 混合。
+        self._cover_pix_b = None
+        # S2 溶解窗口起点：正常 0.90；进全屏方向 B 陈旧（超 _fs_idle_ts 的
+        #    450ms 年龄闸）时压到 0.99 → 陈旧内容只在最后 1~2 帧可见，末帧
+        #    仍是 B（全屏版式，收尾与真窗同版式 → 无缝）。见 startup_fullscreen。
+        self._cover_blend_start = 0.90
+        # 兼容旧探针/日志：这两个名字不再承载窗口，恒为 None。
+        self._cover_bg = None
+        self._cover_label_b = None
+        # 普通版式空闲快照（还原方向覆盖层的「目标画面」；进全屏抓图时顺手存）。
+        self._normal_idle_pix = None
+        self._cover_opacity_pending = False
+        # od47i：后台快照采集线程（见 _snap_worker）。它按 ~160ms 周期在独立线程抓
+        # 当前窗口，提供「≤160ms 前」的新鲜快照；主线程随时可取，零阻塞。
+        # 彻底替代旧的「现场同步抓（卡）」与「1.5s 前空闲缓存（闪）」两种坏方案。
+        self._hwnd = 0
+        self._bg_img: "QImage | None" = None
+        self._bg_img_ts = 0.0                  # 抓图时刻（time.monotonic）
+        self._bg_is_fs = False                 # 后台抓图标记当前是否全屏态
+        self._snap_worker = SnapWorker(
+            hwnd_getter=lambda: self._hwnd,
+            fs_getter=lambda: self._bg_is_fs,
+            parent=self)
+        self._snap_worker.captured.connect(self._on_snap)
+        # ⛔ 不在 __init__ 启动：开屏动画期间主窗已建出，抓图线程会和开屏抢 CPU
+        #    （用户明确要求「开屏不压帧率」）。延后到开屏结束后再启，见
+        #    _start_snap_worker / apply_startup_state / showEvent。
+        self._snap_started = False
+        self._cover_timer = QTimer(self)
+        self._cover_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._cover_timer.setInterval(8)
+        self._cover_timer.timeout.connect(self._on_cover_tick)
+        self._cover_clock = QElapsedTimer()
+        self._cover_from = QRect()
+        self._cover_to = QRect()
+        self._cover_duration = 300
+        # 全屏时的真实矩形（全屏→分屏的覆盖层起点）。只在 isFullScreen() 期间更新。
+        self._fs_rect: QRect | None = None
+        # "刚从全屏被系统直接改成别的几何"的一次性记录（见 changeEvent /
+        # _apply_snap_zoom）：全屏→分屏要拿它当覆盖层起点。
+        self._fs_left_rect: QRect | None = None
+        self._fs_left_ts = 0.0
+        # 几何轨迹（时间戳, 矩形）：用来分辨"几何是被系统**动画**过去的"
+        # 还是"一帧跳过去的" —— 前者不再叠我们的覆盖层（会双重动画）。
+        self._geo_trace: list[tuple[float, QRect]] = []
+        # （2026-11-04 撤销）全屏快照分片缓存：退出方向已改走冻结版真窗口
+        # 补间（见 _on_escape 的说明），不再需要任何屏幕抓图 —— 整套
+        # _refresh_fs_snap_cache/_on_fs_snap_strip 机制随之删除（省掉每次
+        # 全屏落定后 ~250ms 的空闲分片 BitBlt 开销）。
+
         # 无边框：系统标题栏交给自绘的 CaptionBar（见 ui_brand.CaptionBar 的说明）。
         # 三个理由必须一起成立才走这条路：
         # 1) 全屏要藏任务栏 → shell 只对**无边框**且覆盖整屏的窗口这么做；
@@ -679,10 +1094,16 @@ class MainWindow(QMainWindow):
         # ⚠️ 必须在窗口创建之前设：改窗口 flag 会让 Qt 重建原生窗口。
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
 
+        _t0 = time.perf_counter()
         self._build_ui()
+        app_log.info(f"[build] _build_ui {1000 * (time.perf_counter() - _t0):.0f}ms")
+        _t0 = time.perf_counter()
         self._tick_clock()
         self._clock_timer.start()
         self._wire_shortcuts()
+        app_log.info(f"[build] clock+shortcuts "
+                     f"{1000 * (time.perf_counter() - _t0):.0f}ms")
+        _t0 = time.perf_counter()
         # 空格暂停要挂在应用级：焦点落在按钮/接收区上时也能按
         QApplication.instance().installEventFilter(self)
         self._restore_settings()
@@ -756,7 +1177,15 @@ class MainWindow(QMainWindow):
 
     def _apply_theme(self, scheme: str) -> None:
         app_log.info(f"主题应用: {scheme}")
-        """换主题：重设 token、重刷样式表、让自绘控件重绘、同步系统标题栏。"""
+        """换主题：重设 token、重刷样式表、让自绘控件重绘、同步系统标题栏。
+
+        ⛔⛔ od53 实测记录（别再试）：这句 + 下面的全树 unpolish/polish 合成 **145ms**，
+        时间轴上落在开屏 t=0.19~0.33。但两者**都不能省** ——
+        · 省掉 ``apply_scheme``（setStyleSheet）→ ``_refresh_tx_min_height`` 量到没
+          套样式的高度，自测「折叠态发送区内容还露着」直接挂；
+        · 省掉 unpolish/polish 循环 → 自测同样挂。
+        它们落在**全黑空白段**（设计上 0~0.30s 无任何画面），不可见，别再优化。
+        """
         apply_scheme(scheme)
         # 磨砂贴图是按主题缓存的，第一次要用时才生成（约 40ms，含一道无缝模糊）。
         # 那一下会落在首帧绘制上、和入场动画抢时间 —— 所以在换主题这一步就先把
@@ -769,6 +1198,12 @@ class MainWindow(QMainWindow):
         # 这类）会保留旧主题的渲染结果，而调色板驱动的文字色已经更新了 ——
         # 症状就是浅色主题下按钮变成"深底 + 深色字"，看着像只错了一部分。
         # 所以这里给每个控件补一遍 unpolish/polish，强制样式表重新求值。
+        # ⛔⛔ od53：真换主题才 unpolish+polish；启动时（_fresh=False）**只 polish**。
+        #    ⚠️ 不能整段跳过 —— QSS 里的 padding/min-width 是在 **polish** 时才落到
+        #    控件上的，而本窗口后面要紧跟着量 sizeHint（_refresh_tx_min_height、
+        #    下拉框墨迹居中）。跳过 polish 会让这些测量拿到未套样式的值：
+        #    实测自测里「停止位文字上留白 16/下留白 6」「折叠态发送区内容还露着」
+        #    三个用例当场挂。polish 本身幂等且很便宜（已 polished 只查标志位）。
         style = self.style()
         for widget in self.findChildren(QWidget):
             style.unpolish(widget)
@@ -782,6 +1217,11 @@ class MainWindow(QMainWindow):
         self._align_send_button()
         # 接收区着色的蓝是分主题的，换主题要按新颜色重刷一遍
         self._rx_highlighter.refresh()
+        # ⚠️ polish 会把控件的 min-width 重置回样式表里的值（例如「打开历史数据」
+        # 那颗按钮 146px）—— 窄档收口过的宽度要按当前档位重新落一遍，否则在
+        # 1/4 分屏下换一次主题，配置卡又被这 44px 顶回去。
+        if self._compact_level >= 0:
+            self._apply_compact(self._compact_level)
         if self._titlebar_scheme != scheme:
             self._titlebar_scheme = scheme
             # 全屏时必须是**方角**（圆角会在四角切出四块桌面，见 apply_titlebar_theme）
@@ -816,39 +1256,48 @@ class MainWindow(QMainWindow):
         # 容器（下面那个 content）。白边值不变，仍是为了卡片自带的那圈阴影空隙。
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(GAP - SHADOW_PAD * 2)
+        # 布局句柄留给 _apply_compact：分屏收窄时这些边距/间距要整档改
+        self._root_lay = root
 
         # 自绘标题栏：三颗窗口键 + 可拖拽区。**不进任何会被隐藏的分组**——
         # 接收区展开时页头/配置卡/发送卡都会藏，标题栏必须留着（用户要求
         # "最大化与还原两种状态下保持一致的可点击性和显示效果"）。
+        _pump_build()
         self._caption_bar = CaptionBar(self.windowTitle())
         root.addWidget(self._caption_bar)
-        self._caption_bar.btn_min.clicked.connect(self.showMinimized)
+        self._caption_bar.btn_min.clicked.connect(self._minimize_animated)
         self._caption_bar.btn_max.clicked.connect(self._toggle_fullscreen)
         self._caption_bar.btn_close.clicked.connect(self.close)
 
         # 标题栏以下的内容容器：左右/下边距还是原来的 GAP - SHADOW_PAD
         # （卡片自己带了 SHADOW_PAD 的阴影空隙，所以外间距要相应收小，
         # 否则视觉上会比设定的 GAP 宽出一圈）。
+        _pump_build()
         content = QWidget()
         root.addWidget(content, 1)
         inner = QVBoxLayout(content)
         inner.setContentsMargins(GAP - SHADOW_PAD, 0,
                                  GAP - SHADOW_PAD, GAP - SHADOW_PAD)
         inner.setSpacing(GAP - SHADOW_PAD * 2)
+        self._inner_lay = inner
 
         self.brand_header = BrandHeader("串口助手")
+        _pump_build()
         inner.addWidget(self.brand_header)
         self._refresh_vehicle_badge()
 
         # 主体：左侧收发区 + 右侧串口配置栏（配置固定宽度，收发区吃掉剩余空间）
         body = QHBoxLayout()
         body.setSpacing(GAP - SHADOW_PAD * 2)
+        self._body_lay = body
 
+        _pump_build()
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.setChildrenCollapsible(False)
         # 卡片自带 5px 阴影空隙，手柄 4px 时视觉间距约 14px，正好
         splitter.setHandleWidth(4)
 
+        _pump_build()
         self._rx_card = self._new_card("接收区")
         self._rx_card.setMinimumHeight(230)
         # 接收区右上角挂一只实时时钟（精确到秒）。放进卡片标题栏右侧 ——
@@ -863,20 +1312,30 @@ class MainWindow(QMainWindow):
         # 写法**量（带日期是 19 个字符），见 ``_clock_width``；高是因为标题栏里的
         # 按钮是按 box 手工摆的（add_header_button 只 move 不改尺寸），不钉死会
         # 拿到无父控件时的默认高度 480px，一摆就跑出卡片外。
+        # ⛔⛔ 构造期**绝不量字体宽度**：首次 ``horizontalAdvance`` 要 **580ms**
+        #    （字体引擎冷启动），这一句就是主窗构造 1.1s 里的全部大头，开屏被它
+        #    卡住。这里先按字符数估，``show`` 之后 ``_tick_clock`` 第 3 拍会精确
+        #    量一次并 ``setFixedWidth``（宽度变化只会让时钟宽度修正一次，不可见）。
+        _clock_date = bool(customization.get("clock_show_date"))
         self.lbl_clock.setFixedSize(
-            self._clock_width(bool(customization.get("clock_show_date"))),
+            9 * len("0000-00-00 00:00:00" if _clock_date else "00:00:00") + 8,
             self.lbl_clock.fontMetrics().height() + 2)
         self._rx_card.add_header_button(self.lbl_clock)
-        self._rx_card.body.addLayout(self._build_receive_area())
+        _pump_build()
+        _rx_body_lay = self._build_receive_area()
+        self._rx_card.body.addLayout(_rx_body_lay)
 
         self._tx_card = self._new_card("发送区")
         # 把发送区的整块内容包成一个容器：最小化时只隐藏这一个控件，
         # 布局就会自动把卡片压到只剩标题栏的高度，不用去手工改一堆控件的可见性
+        _pump_build()
         self._tx_content = QWidget()
         tx_body = QVBoxLayout(self._tx_content)
         tx_body.setContentsMargins(0, 0, 0, 0)
         tx_body.setSpacing(GAP - SHADOW_PAD)
-        tx_body.addLayout(self._build_send_area(), 1)
+        _pump_build()
+        _tx_body_lay = self._build_send_area()
+        tx_body.addLayout(_tx_body_lay, 1)
         self._tx_card.body.addWidget(self._tx_content, 1)
         # 发送区展开时只留"一排中文"的高度。先给输入框定下一行的高度，再按
         # 实际最小尺寸把卡片锁住 —— 数字自己数出来，不写死 190 那种拍脑袋的值。
@@ -925,6 +1384,7 @@ class MainWindow(QMainWindow):
         self._config_content = QWidget()
         self._config_content.setFixedWidth(
             310 - 2 * (SHADOW_PAD + CARD_PAD))
+        _pump_build()
         panel = self._build_config_panel()
         self._config_content.setLayout(panel)
         # ⚠️ setLayout 会把布局内边距改成样式默认值（本机 9px，白撑 18px）。原来的
@@ -1047,6 +1507,8 @@ class MainWindow(QMainWindow):
     def _field_label(self, text: str) -> QLabel:
         label = QLabel(text)
         label.setFont(ui_font(10.5))
+        # 登记给 _apply_compact：分屏收窄时这一列标签要整列改宽（见 COMPACT_SPECS）
+        self._config_tags.append(label)
         return label
 
     def _clock_width(self, with_date: bool) -> int:
@@ -1063,6 +1525,16 @@ class MainWindow(QMainWindow):
         pattern = "0000-00-00 00:00:00" if with_date else "00:00:00"
         return self.lbl_clock.fontMetrics().horizontalAdvance(pattern) + 2
 
+    def _arm_clock(self) -> None:
+        """``show`` 之后第一次精确量时钟宽度，并清掉构造期的估算值。
+
+        ⛔ 构造期**绝不调用** ``_clock_width``：首次 fontMetrics 的
+        ``horizontalAdvance`` 要 **580ms**（字体引擎冷启动），一次就够把开屏
+        卡死；``_build_ui`` 里两次调用合计 1.159s，占主窗构造的 90%。
+        """
+        self._clock_ready = True
+        self._tick_clock()
+
     def _tick_clock(self) -> None:
         """把接收区右上角的时钟刷到当前时刻，精确到秒。
 
@@ -1074,7 +1546,13 @@ class MainWindow(QMainWindow):
         # 开关一拨，文本长度会在 8 / 19 字符之间跳，框宽跟着换一档；
         # 标题栏里的控件是按 box 手工摆的（只有尺寸变化不触发重排），所以换宽
         # 之后要显式请卡片重排一次。宽度没变就什么都不做（每秒一次的常态）。
-        width = self._clock_width(with_date)
+        self._clock_ticks = getattr(self, "_clock_ticks", 0) + 1
+        # ⛔ 构造期不量字体宽度（首次 horizontalAdvance 要 580ms，字体引擎冷
+        #    启动）；等定时器跑到第 3 拍（那时早已 show）再精确量一次。
+        ready = self._clock_ready or self._clock_ticks > 2
+        width = (self._clock_width(with_date) if ready
+                 else 9 * len("0000-00-00 00:00:00" if with_date
+                              else "00:00:00") + 8)
         if width != self.lbl_clock.width():
             self.lbl_clock.setFixedWidth(width)
             self._rx_card.relayout_header()
@@ -1167,6 +1645,11 @@ class MainWindow(QMainWindow):
         """右侧串口配置栏：竖排表单，标签在左、控件在右（参考常见串口助手布局）。"""
         col = QVBoxLayout()
         col.setSpacing(12)
+        # 窄档（分屏 1/3、1/4）要收的两组东西：
+        #   _config_tags  —— 标签列（宽屏 64px，窄档 56px）
+        #   _config_fields —— (控件, 宽屏时的最小宽度)，窄档统一压到 66px
+        # 不收口的话表单最小宽度是 220，配置卡就永远钉在 268 上，1/4 屏进不去。
+        # ⚠️ 这两个表在 __init__ 里就建好：发送区比配置卡先建，它也要往里登记字段。
 
         # 打开/关闭串口是这一栏的主操作，放**最顶上一行**。用和「显示时间戳」
         # 同款的拨动开关（用户点名换的）—— 通=已打开、断=已关闭，状态不用猜。
@@ -1175,6 +1658,8 @@ class MainWindow(QMainWindow):
         self.btn_open = Switch("串口开关")
         self.btn_open.setToolTip("打开/关闭串口")
         self.btn_open.toggled.connect(self._on_power_toggled)
+        # 分屏工具栏那颗小开关跟着主开关走（chk_snap_power 在接收区建好时就有了）
+        self.btn_open.toggled.connect(self._sync_snap_power)
         open_row = QHBoxLayout()
         open_row.setSpacing(10)
         open_row.addWidget(self.btn_open)
@@ -1197,11 +1682,13 @@ class MainWindow(QMainWindow):
         self.cmb_link.setToolTip(
             "串口：普通有线/蓝牙虚拟串口，需要配对或插线\n"
             "蓝牙广播：只被动扫描广播包，不配对不连接（只能读，发不了）")
+        self._config_fields.append((self.cmb_link, 0))
         self.cmb_link.currentTextChanged.connect(self._on_link_mode_changed)
         link_row = QHBoxLayout()
         link_row.setSpacing(10)
         link_tag = self._field_label("连接方式")
         link_tag.setFixedWidth(64)
+        link_tag.setBuddy(self.cmb_link)      # 窄档藏标签时靠它把文字挂到字段上
         link_row.addWidget(link_tag)
         link_row.addWidget(self.cmb_link, 1)
         col.addLayout(link_row)
@@ -1215,7 +1702,9 @@ class MainWindow(QMainWindow):
         # 可编辑：没有物理串口时也能手输端口名，或直接输入 loop:// 做无硬件回环演示
         self.cmb_port.setEditable(True)
         # 宽度由侧栏给出，这里只保底。可编辑下拉框宽度不足会滚动显示，波特率显示错位的老坑
+        self._config_fields.append((self.cmb_port, 140))
         self.cmb_port.setMinimumWidth(140)
+        self._port_label.setBuddy(self.cmb_port)   # 窄档藏标签时文字挂到字段上
         self.btn_rescan = IconButton(GLYPH_REFRESH, "重新扫描串口", size=30, glyph_size=15)
         # 用 lambda 而不是直接连接：clicked 会带一个 checked=False 传进来，
         # 会把 announce 形参顶掉。走 _refresh_targets：按当前连接方式刷对应列表
@@ -1235,6 +1724,7 @@ class MainWindow(QMainWindow):
         self.cmb_baud.setCurrentText("115200")
         # 宽度必须给够：可编辑下拉框内部是个行内编辑框，宽度不足时它会滚动以
         # 保证光标可见，把开头那位数字滚出可视区 —— 波特率会显示成错的数
+        self._config_fields.append((self.cmb_baud, 108))
         self.cmb_baud.setMinimumWidth(108)
         self.cmb_baud.setFont(num_font(11.5))
 
@@ -1264,6 +1754,7 @@ class MainWindow(QMainWindow):
         self.cmb_rx_lines.addItems(str(n) for n in RX_LINE_PRESETS)
         self.cmb_rx_lines.setCurrentText(str(DEFAULT_RX_BLOCKS))
         self.cmb_rx_lines.setFont(num_font(11.5))
+        self._config_fields.append((self.cmb_rx_lines, 0))
         self.cmb_rx_lines.setToolTip(
             "接收区最多保留的行数，超出后最早的会被丢弃；可选预设，也可直接输入")
         self.cmb_rx_lines.editTextChanged.connect(self._on_rx_lines_text_changed)
@@ -1282,6 +1773,7 @@ class MainWindow(QMainWindow):
             row.setSpacing(10)
             tag = self._field_label(label)
             tag.setFixedWidth(64)
+            tag.setBuddy(widget)
             row.addWidget(tag)
             row.addWidget(widget, 1)
             params_col.addLayout(row)
@@ -1291,6 +1783,7 @@ class MainWindow(QMainWindow):
         line_row.setSpacing(10)
         line_tag = self._field_label("保留行数")
         line_tag.setFixedWidth(64)
+        line_tag.setBuddy(self.cmb_rx_lines)
         line_row.addWidget(line_tag)
         line_row.addWidget(self.cmb_rx_lines, 1)
         col.addLayout(line_row)
@@ -1302,6 +1795,9 @@ class MainWindow(QMainWindow):
         #    /「关闭历史数据」之间切（见 _refresh_replay_ui）。两个文案都是 6 个字，
         #    切换时按钮宽度不变，布局不会抖。
         self.btn_open_history = InkButton("打开历史数据", variant="ghost")
+        # ⚠️ 这一颗**不进** _config_fields：它的最小宽度（102）来自文字，压到 66
+        #    会让"打开历史数据"六个字戳出按钮的圆角底板（1/4 屏截图里量到过）。
+        #    窄档的表单内容有 172px，56+10+102=168 放得下。
         self.btn_open_history.setToolTip(
             "在接收区打开本地留存的接收数据；回放中再点一次返回实时"
             "（格式与实时一致，可搜索 / 定位异常 / 复制）")
@@ -1310,6 +1806,9 @@ class MainWindow(QMainWindow):
         hist_row.setSpacing(10)
         spacer = QWidget()
         spacer.setFixedWidth(64)
+        # 这一格是"标签列"的占位（按钮左对齐到字段那一列）。窄档标签列收起时
+        # 它也要跟着收，否则 64px 白占着，「打开历史数据」被挤成「打开历…」。
+        self._hist_spacer = spacer
         hist_row.addWidget(spacer)
         hist_row.addWidget(self.btn_open_history, 1)
         col.addLayout(hist_row)
@@ -1322,18 +1821,23 @@ class MainWindow(QMainWindow):
         """接收区 = 左侧（选项行 + 日志）+ 右侧竖排功能键。"""
         area = QHBoxLayout()
         area.setSpacing(12)
+        self._rx_area = area
 
         left = QVBoxLayout()
         left.setSpacing(10)
+        self._rx_left = left
 
         opts = QHBoxLayout()
         opts.setSpacing(14)
+        # 分屏收窄时这一行要整条改成竖排（见 _set_opts_vertical）
+        self._rx_opts_lay = opts
         self.chk_timestamp = Switch("显示时间戳")
         self.chk_timestamp.setChecked(True)
         self.chk_hex_view = Switch("HEX 显示")
         self.cmb_encoding = ChevronComboBox()
         self.cmb_encoding.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.cmb_encoding.addItems(ENCODINGS)
+        self._config_fields.append((self.cmb_encoding, 90))
         self.cmb_encoding.setMinimumWidth(90)
         self.cmb_encoding.currentTextChanged.connect(self._on_encoding_changed)
         # 标签 + 下拉框绑成一行：设置里要隐藏"编码"时得整行一起藏
@@ -1342,6 +1846,13 @@ class MainWindow(QMainWindow):
         opts.addWidget(self.chk_hex_view)
         opts.addWidget(self.encoding_box)
         opts.addStretch(1)
+        # 分屏最大化时的串口开关：用户 2026-11-01 点名"放到接收区右侧竖栏（图#3）"，
+        # **只保留开关、不保留文字**（空文字的 Switch 只剩那颗药丸）。
+        # 它常驻竖栏（默认隐藏），分屏接管时再亮出来，不再塞进顶部 opts 行。
+        self.chk_snap_power = Switch("")
+        self.chk_snap_power.setToolTip("串口开关（分屏最大化时只留这个）")
+        self.chk_snap_power.toggled.connect(self._on_snap_power_toggled)
+        self.chk_snap_power.setVisible(False)
         # 包一层容器：接收区全屏时要把这排工具栏**整体**藏掉（用户点名）。
         # ⚠️ setLayout 会把布局内边距设成样式默认值（本机 9px，白撑 18px），
         # 必须紧跟一句归零；竖直方向锁死，别让分割条把它拉高。
@@ -1443,6 +1954,9 @@ class MainWindow(QMainWindow):
 
         rail = QVBoxLayout()
         rail.setSpacing(10)
+        # 分屏接管时亮出的串口开关：常驻竖栏顶部（普通态隐藏），见 _apply_snap_zoom。
+        # 放在 7 颗功能图标之上，AlignLeft 与它们保持一致。
+        rail.addWidget(self.chk_snap_power, 0, Qt.AlignmentFlag.AlignLeft)
         rail.addStretch(1)
         # ⛔ **2026-10-17 用户口径（最终版）**：图标**贴列的左边**（AlignLeft）——
         #    "距离左边框的距离不要改变，改变距离右边框的距离"：最大化态开关进列顶、
@@ -1534,9 +2048,11 @@ class MainWindow(QMainWindow):
         """发送区 = 左侧（输入框 + 选项行）+ 右侧竖排功能键（发送）。"""
         area = QHBoxLayout()
         area.setSpacing(12)
+        self._tx_area = area
 
         left = QVBoxLayout()
         left.setSpacing(10)
+        self._tx_left = left
 
         self.txt_tx = QPlainTextEdit()
         # objectName 是给 QSS 用的：这个框的上下内边距和接收区不一样，见 ui_theme 里
@@ -1552,6 +2068,7 @@ class MainWindow(QMainWindow):
 
         opts = QHBoxLayout()
         opts.setSpacing(14)
+        self._tx_opts_lay = opts
         self.chk_hex_send = Switch("HEX 发送")
         self.chk_append_crlf = Switch("换行")
         self.chk_append_crlf.setChecked(True)
@@ -1562,11 +2079,13 @@ class MainWindow(QMainWindow):
         self.spin_interval.setRange(TIMER_MIN_MS, 600000)
         self.spin_interval.setValue(1000)
         self.spin_interval.setSuffix(" ms")
+        self._config_fields.append((self.spin_interval, 108))
         self.spin_interval.setMinimumWidth(108)
         self.spin_interval.setFont(num_font(11.5))
         self.spin_interval.valueChanged.connect(self._on_interval_changed)
 
         self.cmb_history = ChevronComboBox()
+        self._config_fields.append((self.cmb_history, 170))
         self.cmb_history.setMinimumWidth(170)
         self.cmb_history.setToolTip("点选可回填到发送框")
         self.cmb_history.addItem("— 发送历史 —")
@@ -2074,25 +2593,200 @@ class MainWindow(QMainWindow):
         if self._expanded:
             self._collapse_receive()
             return
+        if (self._fs_animating
+                and self._win_geo_tween is not None
+                and self._win_geo_tween.running):
+            # 进全屏补间中途按 Esc：从**当前矩形**直接折返缩小（几何连续）。
+            # 原先这里什么都不做 —— 窗口会自己长完全屏，Esc"失灵"一次。
+            self._reverse_enter_to_normal()
+            return
         if self.isFullScreen():
             # 普通几何平时由 _remember_normal_geometry 持续记忆（在全屏状态
             # 调 saveGeometry 存下来的是满屏矩形，不能用），直接退出即可
             # ⚠️ 先把"想要全屏"降下来：启动时排的那两次延迟核对可能还没跑，
             # 不降的话它会把用户刚退出的窗口又拽回全屏。
+            # 连点"最大化/还原"时先掐掉在途的进入全屏覆盖层，否则它会盖着
+            # 正在缩小的真窗口，露出两个不同大小的窗口。
+            self._finish_window_cover()
+            # 连点：进入全屏的真窗口补间可能还在跑，停掉后状态位必须一起清
+            # （Tween.stop() 不触发 on_finished，不清会让 _fs_animating 永久残留）。
+            self._fs_animating = False
+            self._fs_target = None
+            # ⛔⛔ 2026-11-04 录屏+关键帧目检三轮迭代**定案**：退出方向分两级。
+            #    【主路径：覆盖层快照缩放】进入全屏 ~600ms 后已空闲缓存全屏快照
+            #    （_fs_idle_pix，点击现场零抓屏）→ 先铺覆盖层（此刻主窗仍是带
+            #    内容的全屏，垫底不怕覆盖层首帧合成滞后）→ 延迟 ~32ms（等覆盖层
+            #    合成 2 帧）→ DWMWA_TRANSITIONS_FORCEDISABLED 压掉系统原生还原
+            #    动画 → showNormal → 覆盖层带内容从满屏矩形缩到普通矩形。
+            #    弃用方案（教训存档）：
+            #    ① 快照覆盖层（≤od15）：点击现场抓屏 90~143ms 同步卡死 = "卡"；
+            #    ② 冻结真窗补间（od16~17）：setUpdatesEnabled(False) 使 resize
+            #       丢弃 backing store 后无人重绘，动画全程一块纯色空白 + 与
+            #       DWM 原生还原动画（弹簧过冲回弹）打架 —— 关键帧实测动画中段
+            #       是无内容灰矩形过冲到 1068x820 再弹回 = "还原闪"；
+            #    ③ 纯原生动画：画面大部分有内容，但 Qt 的 WM_SIZE 异步处理使
+            #       动画首段（~60-80ms）只能拍到失效表面（三招 repaint/WVR/
+            #       WA_StaticContents 都拦不住）= 开头仍闪一下。
             self._want_fullscreen = False
+            self._pending_restore_fs = False
+            self._fs_rect = None
+            self._fs_left_rect = None
+            fs_rect = QRect(self.geometry())      # 此刻仍是全屏矩形
+            # ⛔ od47i：起手画面改用后台线程的**新鲜**全屏快照（≤160ms 前）。
+            #    旧实现用 _fs_idle_pix（进入全屏 1.5s 后才抓的空闲缓存）——
+            #    与实时滚动的串口数据差太多，Esc 一按上去就是内容跳变 = 用户
+            #    说的「还原开头闪/跳」。后台抓图零主线程阻塞，既不卡也新鲜。
+            # ⛔⛔ S2：这张帧是**全屏版式**（此刻 isFullScreen() 为真、覆盖层尚未
+            #    建立，_fresh_snapshot_pixmap 返回 ≤450ms 的新鲜帧），顺手存为
+            #    _fs_idle_pix，供**下一次进全屏**当 B 层（目标=全屏版式）。
+            #    时序已验证：startup_fullscreen 4389 读它在 4455 清空之前，且
+            #    _begin_window_cover 3235 已把 B 固化进 _cover_pix_b。
+            fs_pix = self._fresh_snapshot_pixmap()
+            if fs_pix is not None and not fs_pix.isNull():
+                self._fs_idle_pix = fs_pix
+                self._fs_idle_ts = time.monotonic()
+            # 本次还原动画走正常 S2 窗口 [0.90,1.0]（restore 方向 B 优先用
+            #    _normal_idle_pix；首轮缺它时由 _run_window_cover(inject_b=True)
+            #    状态落地后 grab 目标版式补建，不做进全屏方向那套陈旧度压缩）；
+            #    顺带把上次进全屏可能残留的 0.99 复位。
+            self._cover_blend_start = 0.90
+            # 意图变了：进全屏时排的延迟核对一律作废（否则它会把刚退出的
+            # 窗口又钉回全屏 —— 自测「普通态没落下去」就是这条竞态）。
+            self._verify_token += 1
+            token = self._verify_token
+            self._state_ts = time.monotonic()
             self._expect_normal = True
-            self.showNormal()
-            # ⚠️ 必须**自己**把几何还回去：有系统边框时 ShowWindow(SW_SHOWNORMAL)
-            # 会替我们把窗口摆回全屏前的位置，窗口一改成无边框（WS_POPUP 系）
-            # Windows 就不再记这个"普通态矩形"了 —— 实测退全屏后窗口仍停在
-            # 满屏尺寸上。平时一直在记的 _normal_geometry 正好用在这儿。
-            if self._normal_geometry is not None:
-                self.setGeometry(self._normal_geometry)
-            self._expect_normal = False
-            self._set_corner_preference(int(self.winId()), round_=True)
+
+            def _do_restore() -> None:
+                if token != self._verify_token:
+                    return          # 延迟期间意图又变了（连点），作废
+                if cover is not None:
+                    # ⛔ 覆盖层已合成（上面等了 100ms），此刻把主窗**藏掉**再
+                    #    showNormal —— 否则全屏时代被 _enforce_native_fullscreen
+                    #    钉进 TOPMOST 带的主窗在 showNormal 激活后仍压着同带
+                    #    的覆盖层（v9 录屏实证：覆盖层建了却全程不可见，看到
+                    #    的是主窗自己的空白弹簧）。藏掉的另一收益：layered 窗
+                    #    口 DWM 不播还原动画，弹簧彻底消失。t>0.7 交叉淡出时
+                    #    由 _cover_opacity_pending 机制恢复主窗可见。
+                    self.setWindowOpacity(0.0)
+                self.showNormal()
+                if self._normal_geometry is None:
+                    # 最后防线（2026-11-03）：showEvent + startup_fullscreen
+                    # 双保险之后理论上不会再是 None；真发生时绝不能"原地满屏 +
+                    # 淡入"假还原。从 QSettings geometry 键取回；仍拿不到就按
+                    # 工作区比例居中，保证还原有明确落点。
+                    saved = self._settings.value("geometry")
+                    if isinstance(saved, QRect):
+                        # od53：同样要夹 —— 这台机器上存下来的矩形可能是换屏/改
+                        # 缩放之前量的，直接落位会让窗口比屏幕高（底部卡片被切）。
+                        self._normal_geometry = self._fit_rect_to_screen(QRect(saved))
+                    else:
+                        av = self.screen().availableGeometry()
+                        self._normal_geometry = QRect(
+                            av.x() + av.width() * 15 // 100,
+                            av.y() + av.height() * 9 // 100,
+                            av.width() * 70 // 100, av.height() * 82 // 100)
+                    app_log.info(f"[escape] _normal_geometry 兜底恢复："
+                                 f"{self._normal_geometry}")
+                if self._normal_geometry is not None:
+                    # Windows 没把窗口摆回普通矩形（记错/没记住）才手动落位；
+                    # 摆对了就绝不多手 —— 动画期间的 setGeometry 会打断动画。
+                    if QRect(self.geometry()) != QRect(self._normal_geometry):
+                        self.setGeometry(self._normal_geometry)
+                self._expect_normal = False
+                self._sync_fullscreen_padding()
+                self._set_corner_preference(int(self.winId()), round_=True)
+                if cover is not None:
+                    # 状态已落地：覆盖层带内容从满屏矩形缩到普通矩形。终点主窗
+                    # 已是普通版式（showNormal 之后事件循环已跑 ~200ms，重排
+                    # 早就完成），末段 30% 交叉淡出溶进真实界面。
+                    self._cover_opacity_pending = True
+                    end = (QRect(self._normal_geometry)
+                           if self._normal_geometry is not None
+                           else QRect(self.geometry()))
+                    self._run_window_cover(cover, fs_rect, end, 260,
+                                           inject_b=True)
+
+            use_cover = (animations_enabled() and fs_pix is not None
+                         and not fs_pix.isNull() and self.isVisible()
+                         and self.screen() is not None)
+            cover = None
+            if use_cover:
+                # od47i：B 层给「目标版式」= 普通态快照（_normal_idle_pix，进全屏
+                #    时抓到的普通版式；布局正确、内容略旧，但只在末段全显且被真窗
+                #    盖住）。为 None（startup_maximized 启动即全屏 → 第一次还原：
+                #    _skip_startup_anim 早退分支走不到 4493 赋值）时**不再**退化
+                #    单快照 —— 由下面 _do_restore 里 _run_window_cover(inject_b=True)
+                #    在 showNormal 状态落地后 grab 目标版式真窗补建 B。
+                _pb = getattr(self, "_normal_idle_pix", None)
+                cover = self._begin_window_cover(
+                    fs_pix, fs_rect, with_bg=False,
+                    pixmap_b=_pb, end=self._normal_geometry)
+            if cover is not None:
+                # 压掉系统原生还原动画：覆盖层在播自己的，双重动画 = 抖。
+                self._set_dwm_transitions(int(self.winId()), True)
+                # ⚠️ 覆盖层是**新顶层窗**，show() 到 DWM 首次合成实测要
+                #    ~70-100ms（32ms 不够，v7 录屏 f0050 仍拍到主窗空白弹簧）
+                #    —— showNormal 必须等它合成完再执行（否则主窗先变空白 =
+                #    露空白/桌面，od15 教训）。延迟期间主窗是带内容的全屏垫底。
+                # od55：100→48ms（DWM 首帧 p95 21ms，48ms≈2.3×p95）。
+                # 72ms 版本探针已确认塌陷帧=0，按授权再降一档；若复测出现
+                # 塌陷立即回退 72。
+                QTimer.singleShot(48, _do_restore)
+            else:
+                # 回退（连点/快照未就绪）：纯原生动画 + 无闪窗口期。
+                # ⛔ 压掉系统原生还原弹簧（对齐主路径的 _set_dwm_transitions）
+                #    —— od18 实证不压会过冲回弹 = 开头一帧硬切。这条路径没有
+                #    覆盖层收尾，由 _clear_nccalc_preserve 在 450ms 后对称恢复。
+                self._set_dwm_transitions(int(self.winId()), True)
+                self._nccalc_preserve = True
+                # ⛔ Qt 的 WM_SIZE 走事件循环异步处理：repaint() 此刻仍在旧尺
+                #    寸上画，真正的重排+重绘要等回到事件循环（实测 ~40-80ms）
+                #    —— WA_StaticContents 让 Qt 在 resize 时保留旧位图（钉左
+                #    上裁切 = 原生缩放的样子）。
+                self.setAttribute(Qt.WA_StaticContents, True)
+                QTimer.singleShot(0, _do_restore)
+                QTimer.singleShot(450, self._clear_nccalc_preserve)
             return
         if self._search_bar.isVisible():
             self._close_search()
+
+    def _reverse_enter_to_normal(self) -> None:
+        """进全屏补间中途点中间键/Esc：从**当前矩形**直接折返缩小回普通窗口。
+
+        旧行为是再调一次 ``startup_fullscreen()``（继续往全屏走、且 260ms 缓动
+        起手重置）—— 连点时窗口"爬"不到全屏还一直重置起手，用户感知就是卡。
+        折返让中间键在任何时刻都表现为"切换意图"：几何从当前值连续反向，
+        不跳变、不重播。窗口此刻仍处于**普通态**（全屏状态要到补间收尾才落），
+        所以这里没有 showNormal/state 切换，也就没有跳变风险 —— 纯几何补间。
+        """
+        if self._win_geo_tween is not None and self._win_geo_tween.running:
+            self._win_geo_tween.stop()
+        # ⛔ 折返把在途补间掐了：若它冻着整窗重绘，必须在这里解冻（stop 不走
+        #    on_finished）；后面要么再起一段 morph（重新冻结），要么直接返回。
+        self._morph_unfreeze()
+        self._geo_animating = False
+        self._fs_animating = False
+        self._fs_target = None
+        self._want_fullscreen = False
+        self._pending_restore_fs = False
+        self._fs_rect = None
+        self._fs_left_rect = None
+        # 意图变了：进全屏时排的延迟核对一律作废（同 _on_escape 的 token 竞态）
+        self._verify_token += 1
+        self._state_ts = time.monotonic()
+        self._expect_normal = False
+        target = self._normal_geometry
+        if target is None:
+            # 理论不可达：startup_fullscreen 进补间前必已记录普通几何（入口处
+            # _remember）。真发生时绝不能把**补间中间矩形**记成普通几何
+            # （此刻 _geo_animating 已清、窗口在半路），直接放弃折返即可。
+            return
+        self._sync_fullscreen_padding()
+        self._set_corner_preference(int(self.winId()), round_=True)
+        cur = QRect(self.geometry())
+        if cur != QRect(target):
+            self._win_geo_morph(cur, QRect(target))
 
     def _toggle_fullscreen(self) -> None:
         """自绘标题栏中间那颗键：全屏（铺满+藏任务栏）⇄ 普通窗口。
@@ -2102,17 +2796,830 @@ class MainWindow(QMainWindow):
         展开时直接 showNormal 会留下一个"窗口是普通态、卡片却全不见了"的破页面。
         Esc 的优先级顺序（展开 → 全屏 → 搜索条）就是为这件事定的。
         """
-        if self._expanded or self.isFullScreen():
+        if self._expanded:
             self._on_escape()
         else:
-            self.startup_fullscreen()
+            tween = self._win_geo_tween
+            in_flight = (tween is not None and tween.running
+                         and bool(self._geo_animating))
+            if in_flight and self._fs_animating:
+                # 连点：进全屏补间在途 → 从当前矩形直接折返缩小（不重播起手）
+                self._reverse_enter_to_normal()
+            elif in_flight:
+                # 连点：还原补间在途 → 折返长大。startup_fullscreen 本就从
+                # **当前矩形**起跑（几何连续），直接复用。
+                self.startup_fullscreen()
+            elif self.isFullScreen():
+                # 2026-11-02 用户第七轮：「算了，分屏状态下点击右上角最大化还是恢复成
+                # 整个软件最大化」—— 分屏态不再切成接收区最大化，仍走整窗全屏
+                # （startup_fullscreen 内部会先 _leave_snap_zoom 还原分屏藏起的卡片）。
+                self._on_escape()
+            else:
+                self.startup_fullscreen()
         self._refresh_caption_ui()
+
+    # ------------------------------------------------------- 窗口级淡入 / 淡出
+    #
+    # 用户 2026-10-31：「打开软件、最小化、还原的时候不要一帧直接变了，要连续和
+    # 软件内动画一样流畅」。这三处动的都是**窗口本身**，控件级透明度那条路走不了
+    # （⛔ 铁律：QGraphicsOpacityEffect 每帧离屏合成会抽搐），所以走 DWM 的窗口
+    # opacity（``setWindowOpacity``）—— 由合成器插值，和高刷屏上的软件内动画一样连续。
+    #
+    # ⚠️ opacity < 1 会让窗口变成 layered，DWM 就不再给它画阴影。所以每一段淡入的
+    #    **终点必须是 1.0**，收尾再显式置一次 1.0（Qt 只在 <1 时维持 layered）。
+    # ⚠️ 淡入淡出都走 ``ui_anim`` 的 Tween，可随时打断 —— 连着点最小化/还原时
+    #    从当前不透明度折返，不会先跳一下再动。
+
+    def _fade_window(self, target: float, duration: int = 120, curve=STANDARD) -> None:
+        """把窗口不透明度补间到 target（0~1）。"""
+        if self._win_fade is None:
+            self._win_fade = Tween(duration, curve, self._on_window_fade, parent=self)
+        self._win_fade.start(self.windowOpacity(),
+                             max(0.0, min(1.0, float(target))), duration)
+
+    def _on_window_fade(self, value) -> None:
+        self.setWindowOpacity(max(0.0, min(1.0, float(value))))
+
+    # -- 最大化/还原：快照覆盖层做"长大/缩小" ------------------------------
+    #
+    # 用户 2026-10-31（第四次）：「最大化/最小化仍然没有流畅的连续动画」。
+    # 主窗口的全屏状态必须**立刻**落地（延迟 showFullScreen → isFullScreen()
+    # 动画期为 False → 边缘缩放/标题栏/自测全挂），不能给主窗口做几何补间。
+    # 解法：把切换**前**的画面铺在一个 `Qt.ToolTip` 级窗口上（工具提示窗口天然
+    # 不吃鼠标、不抢焦点、不进任务栏），让它连续缩放+淡出，露出下面已切换好的
+    # 真窗口 —— 观感就是窗口在长大/缩小。
+    # ⛔ 失败安全：覆盖层不显示时最多等于"没有动画"，主窗口始终可见/已切换。
+
+    def _begin_window_morph(self, pixmap, start: QRect):
+        """把切换**前**的画面铺到置顶小窗上。
+
+        ⛔ 必须在**状态切换之前**调用：先 showFullScreen 再建覆盖层，中间会有一帧
+        新布局裸露出来 —— 逐帧看在用户眼里就是"闪"。
+        """
+        if not _WINDOW_MORPH:
+            return None
+        if pixmap is None or not animations_enabled() or not self.isVisible():
+            return None
+        from PySide6.QtWidgets import QLabel
+        label = QLabel(None)
+        label.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint
+                             | Qt.WindowStaysOnTopHint
+                             | Qt.NoDropShadowWindowHint)
+        label.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        label.setPixmap(pixmap)
+        label.setScaledContents(True)
+        label.setGeometry(start)
+        label.setWindowOpacity(1.0)
+        label.show()
+        label.raise_()
+
+        old, self._morph_label = self._morph_label, label
+        if old is not None:
+            try:
+                old.hide()
+                old.deleteLater()
+            except Exception:        # noqa: BLE001 - 覆盖层清理失败不该影响主流程
+                pass
+        return label
+
+    def _run_window_morph(self, label, start: QRect, end: QRect,
+                          duration: int = 240) -> None:
+        """状态切换完成后启动覆盖层缩放+淡出（label 由 _begin_window_morph 建）。"""
+        if label is None or not animations_enabled() or start == end:
+            return
+        label.raise_()               # 状态切换后可能被主窗盖住，抬回最上层
+        if self._morph_tween is None:
+            self._morph_tween = Tween(duration, out_cubic, self._on_morph_frame,
+                                      self._on_morph_finished, parent=self)
+        self._morph_from = QRect(start)
+        self._morph_to = QRect(end)
+        self._morph_tween.start(0.0, 1.0, duration)
+
+    def _play_window_morph(self, pixmap, start: QRect, end: QRect,
+                           duration: int = 240) -> None:
+        """兼容入口：先建再跑（两步合一）。"""
+        label = self._begin_window_morph(pixmap, start)
+        self._run_window_morph(label, start, end, duration)
+
+    def _on_morph_frame(self, t: float) -> None:
+        label, a, b = self._morph_label, self._morph_from, self._morph_to
+        if label is None or a is None or b is None:
+            return
+        label.setGeometry(
+            int(round(a.x() + (b.x() - a.x()) * t)),
+            int(round(a.y() + (b.y() - a.y()) * t)),
+            int(round(a.width() + (b.width() - a.width()) * t)),
+            int(round(a.height() + (b.height() - a.height()) * t)))
+        label.setWindowOpacity(max(0.0, 1.0 - t))
+
+    def _on_morph_finished(self) -> None:
+        label, self._morph_label = self._morph_label, None
+        if label is not None:
+            label.hide()
+            label.deleteLater()
+
+    def _reveal_window(self, from_alpha: float, duration: int = 150) -> None:
+        """从不透明度 from_alpha 淡到 1.0（打开软件 / 最大化 / 还原用）。
+
+        从本体透明度起步而不是从 0：这几处是"窗口尺寸变了"，不是"窗口出现"，
+        从 0 起会黑一帧再亮；从 0.55~0.8 起是把**几何跳变**盖住，观感是"落定"。
+        """
+        if not animations_enabled():
+            self.setWindowOpacity(1.0)
+            return
+        self.setWindowOpacity(max(0.0, min(1.0, float(from_alpha))))
+        self._fade_window(1.0, duration, STANDARD)
+
+    def _minimize_animated(self) -> None:
+        """最小化：交给 Windows **原生动画**。
+
+        2026-11-01：去掉 `WS_POPUP` + 补回标准窗口样式后，DWM 会自己播放
+        "缩进任务栏"的动画（连续、走真实几何）。⛔ 不要再自己淡出 —— 那会盖住
+        原生动画，反而显得断（用户："我要连续的符合逻辑的流畅的动画"）。
+        ⚠️ 用 Win32 `ShowWindow(SW_MINIMIZE)` 而不是 Qt 的 `showMinimized()`：
+        全屏态下 Qt 那条会"犹豫"（实测全屏时 isMinimized 一直是 False）。
+        """
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                hwnd = int(self.winId())
+                if hwnd:
+                    ctypes.windll.user32.ShowWindow(hwnd, 6)   # SW_MINIMIZE
+                    return
+            except Exception:
+                pass
+        self.showMinimized()
+
+    def _clear_nccalc_preserve(self) -> None:
+        """结束还原动画的无闪窗口期 + 对称恢复 DWM 抑制（幂等）。
+
+        回退分支（无快照）里也压了系统弹簧，但那条路径没有覆盖层收尾，
+        只能在这里恢复；与 ``_finish_window_cover`` 共享 ``_dwm_transition_off``
+        标志 —— 谁先到谁恢复，后者看到 False 就跳过，不会打架。
+        """
+        if self._dwm_transition_off:
+            self._set_dwm_transitions(int(self.winId()), False)
+        if self._nccalc_preserve:
+            self._nccalc_preserve = False
+            self.setAttribute(Qt.WA_StaticContents, False)
+            self.repaint()      # 同步收尾，别留一帧旧内容
+
+    def _build_fs_idle_pix(self) -> None:
+        """全屏态空闲快照（还原覆盖层的「旧画面」）。可重入、幂等、自重试。
+
+        ⛔ guard 不成立（非全屏 / 覆盖层动画还在跑 / 进全屏补间中）或抓图异常时
+        **不再永久放弃**：60ms 后自重试，最多 20 次 / 总时限 1.5s；用单发成员
+        ``QTimer``（``start()`` 重启语义）防重入，绝不堆积定时器。
+        ⚠️ 整屏 BitBlt 51~130ms 主线程阻塞：本方法只允许落在定时器回调 /
+        冻结期 / 空闲期，绝不进点击同步路径。
+        """
+        if self._fs_idle_pix is not None:      # 幂等：已有有效快照，直接收工
+            self._fs_idle_retry_n = 0
+            self._fs_idle_retry_t0 = 0.0
+            self._fs_idle_retry_timer.stop()
+            return
+        # ⛔⛔ od53：开屏还在播 → 一律不抓。抓到的画面是开屏本身（废数据），
+        #    而且整屏 BitBlt 130~190ms 会砸在开屏前 0.5s（splash_perf.log 的
+        #    big_gaps 实锤）。`_schedule_fs_idle_snap` 已有同样的门禁，但这个
+        #    方法还能被 60ms 单发定时器 / 外部直接调用触发 —— 门禁要放在这里。
+        #    开屏结束后 main._on_splash_done 会自己再排一次，不会漏。
+        if getattr(self, "_skip_startup_anim", False):
+            self._fs_idle_retry_n = 0
+            self._fs_idle_retry_t0 = 0.0
+            self._fs_idle_retry_timer.stop()
+            return
+        if not self.isFullScreen():            # 已退回普通态：本轮作废，停止重试
+            self._fs_idle_retry_n = 0
+            self._fs_idle_retry_t0 = 0.0
+            return
+        if (self.isVisible() and not self._fs_animating
+                and self._cover_label is None):
+            # ⛔ od47i：改用后台线程的**新鲜帧**（零主线程阻塞）。旧实现恒现场抓
+            #    整屏（51~130ms 主线程阻塞）= 进全屏约 1.5s 后的一次明显卡顿。
+            #    后台帧 ≤160ms 前、内容几乎同步；缺失时 _fresh_snapshot_pixmap
+            #    内部才回退现场抓（仅首帧边界）。
+            try:
+                pix = self._fresh_snapshot_pixmap()
+            except Exception:      # noqa: BLE001 - 抓失败就走自重试
+                pix = None
+            # ⛔ od55：内容校验。覆盖层撤掉后主窗还没重绘时抓到的是一张
+            #    接近纯黑的图（实测 luma 0.06，正常 23.47），当 B 层用 = 黑闪。
+            #    连续 3 次都拿不到有效帧就放弃（等下一次 60ms 重试链/收尾补建）。
+            if (pix is not None and not pix.isNull()
+                    and self._image_has_content(pix.toImage())):
+                self._fs_idle_pix = pix
+                self._fs_idle_ts = time.monotonic()   # S2：B 层新鲜度时间戳
+                self._fs_idle_retry_n = 0
+                self._fs_idle_retry_t0 = 0.0
+                self._fs_idle_bad_n = 0
+                self._fs_idle_retry_timer.stop()
+                return
+            self._fs_idle_bad_n += 1
+            if self._fs_idle_bad_n >= 3:
+                self._fs_idle_retry_n = 0
+                self._fs_idle_retry_t0 = 0.0
+                return
+        # guard 未成立 / 抓图失败：60ms 自重试（20 次 / 1.5s 上限，防重入）
+        now = time.monotonic()
+        if not self._fs_idle_retry_t0:
+            self._fs_idle_retry_t0 = now
+        if (self._fs_idle_retry_n >= 20
+                or (now - self._fs_idle_retry_t0) * 1000.0 >= 1500):
+            return
+        self._fs_idle_retry_n += 1
+        self._fs_idle_retry_timer.start(60)   # 已运行则重启，天然不堆积
+
+    def _fs_idle_retry_tick(self) -> None:
+        self._build_fs_idle_pix()
+
+    def _schedule_fs_idle_snap(self) -> None:
+        """排一次全屏空闲快照（还原方向的覆盖层「旧画面」）。
+
+        ⛔⛔ 开屏期间（``main.py`` 设 ``_skip_startup_anim``）**一律不排**：抓到的
+        是开屏画面（废数据），且整屏 BitBlt 118~129ms 会砸在开屏动画尾部。
+        ⛔ 不要 1500ms 定时猜（更不要改 200ms）：进全屏覆盖层从 ``_land()``
+        (100ms) 跑到 +300ms，固定延迟落在覆盖层上 guard 必假、直接不建。
+        改为「60ms 起手 + 自重试」，并在覆盖层收尾（``_finish_window_cover``
+        的 ``from_tick=True``）即时补建 —— 此刻无覆盖层、guard 全成立。
+        """
+        if getattr(self, "_skip_startup_anim", False):
+            return
+        self._fs_idle_retry_n = 0
+        self._fs_idle_retry_t0 = 0.0
+        self._fs_idle_bad_n = 0
+        self._fs_idle_retry_timer.stop()
+        QTimer.singleShot(60, self._build_fs_idle_pix)
+
+    def _set_dwm_transitions(self, hwnd: int, disabled: bool) -> None:
+        """DWMWA_TRANSITIONS_FORCEDISABLED：关掉系统给这扇窗播的状态切换动画。
+
+        还原方向用覆盖层播自己的缩放动画，系统的原生还原动画（DWM 弹簧、
+        带过冲回弹）会在覆盖层底下再播一遍 —— 两层动画叠加 = 抖。只在
+        覆盖层动画期间关，收尾必须恢复（_finish_window_cover 统一做）。
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+            val = ctypes.c_int(1 if disabled else 0)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                wt.HWND(hwnd), 3, ctypes.byref(val), ctypes.sizeof(val))
+            self._dwm_transition_off = disabled
+        except Exception:          # noqa: BLE001 - 关不掉就让它播，不致命
+            pass
+
+    def _morph_freeze(self) -> None:
+        """补间期间挂起整窗重绘（幂等）—— 见 _win_geo_morph 的性能说明。"""
+        if not self._morph_frozen:
+            self._morph_frozen = True
+            self.setUpdatesEnabled(False)
+
+    def _morph_unfreeze(self) -> None:
+        """解冻并立即安排一次完整重绘（幂等）。收尾/被打断都必须调。"""
+        if self._morph_frozen:
+            self._morph_frozen = False
+            self.setUpdatesEnabled(True)
+            self.update()
+
+    def _win_geo_morph(self, start: QRect, end: QRect, duration: int = 260) -> None:
+        """对**真窗口**做几何补间（退出全屏用）：从满屏矩形连续缩到普通矩形。
+
+        用户 2026-11-01：「还原还是没有动画」—— 之前的 opacity 淡入不是
+        "位置/尺寸连续变化"。快照覆盖层方案（_WINDOW_MORPH）会被
+        showFullScreen/showNormal 阻塞卡住 = 闪，已弃用；这里直接对真窗口
+        setGeometry：状态已落地（showNormal 已返回），剩下的只是画面在缩。
+        ⛔ 补间期间 ``_geo_animating=True``：_remember_normal_geometry 不记
+        中间矩形、_apply_snap_zoom 不判分屏（收尾的最后一次 resize 会补判）。
+        ⛔⛔ 2026-11-04 进程内实测：morph 每帧 ``setGeometry`` 触发整窗重排 +
+        全部子控件重绘（~36ms/帧），165Hz 的共享 ticker 被挤到 **27fps**
+        —— 用户报的"最大化/还原动画卡得不行"。修复：补间期间
+        ``setUpdatesEnabled(False)``（帧距实测 36.5→6.1ms，163fps），画面
+        钉左上随窗口裁切（和系统原生缩放一致），收尾在 _on_win_geo_done
+        解冻、一次回流到终版式。
+        """
+        self._morph_unfreeze()      # 折返/重入：上一段若还冻着，先对称解冻
+        self._win_geo_from = QRect(start)
+        self._win_geo_to = QRect(end)
+        self._geo_animating = True
+        if self._win_geo_tween is None:
+            self._win_geo_tween = Tween(duration, out_cubic,
+                                        self._on_win_geo_frame,
+                                        self._on_win_geo_done, parent=self)
+        self._morph_freeze()
+        self._win_geo_tween.start(0.0, 1.0, duration)
+
+    def _on_win_geo_frame(self, t: float) -> None:
+        a, b = self._win_geo_from, self._win_geo_to
+        if a is None or b is None or self.isFullScreen():
+            return
+        # ⛔ 2026-11-03 用户：「不要压画质和帧率」—— 不做 60fps 节流，窗口补间
+        # 跟着 ui_anim 的节拍（本机 165Hz）逐帧走。
+        self.setGeometry(int(round(a.x() + (b.x() - a.x()) * t)),
+                         int(round(a.y() + (b.y() - a.y()) * t)),
+                         int(round(a.width() + (b.width() - a.width()) * t)),
+                         int(round(a.height() + (b.height() - a.height()) * t)))
+
+    def _on_win_geo_done(self) -> None:
+        self._geo_animating = False
+        self._morph_unfreeze()      # 补间收尾：解冻、回流到终版式（一次重绘）
+        # 60fps 节流可能把最后一帧跳掉：收尾时按目标矩形补齐（差几像素会看得见）
+        target = self._win_geo_to
+        self._win_geo_from = self._win_geo_to = None
+        if target is not None:
+            try:
+                self.setGeometry(target)
+            except RuntimeError:
+                pass
+        if self._fs_animating:
+            # 进入全屏的补间收尾：窗口已经长到显示器矩形，这时才切全屏状态 ——
+            # 几何不变，状态切换本身没有可见跳变（任务栏在这一下被盖掉）。
+            self._fs_animating = False
+            self._want_fullscreen = True
+            self.showFullScreen()
+            self._enforce_native_fullscreen()
+            self._sync_fullscreen_padding()
+            self._fs_rect = (self.screen().geometry() if self.screen()
+                             else QRect(self.geometry()))
+            self._fs_target = None
+            self._refresh_caption_ui()
+            for delay in (180, 600):
+                self._schedule_verify(delay)
+        # ⛔ 收尾**不再 setGeometry**：Tween 最后一帧 t=1.0 已经把窗口设到终点，
+        #    再补一次是冗余；而且那是**异步**回调——selftest/探针的 finally 已
+        #    还原 QSettings 之后它才跑，会把测试窗口几何写回真实配置
+        #    （2026-11-01 实测 geometry 被写成 800x762，用户看到窗口位置/大小
+        #    不对、卡片顶部被裁）。
+
+    # -- 进入全屏 / 全屏→分屏：真·长大/缩小 ---------------------------------
+    #
+    # 用户 2026-11-02：「从窗口最大化的时候没有动画」「从分屏到全屏也没有动画」。
+    # ⛔ 真窗口做不了：实测 `showFullScreen()` 之后 `setGeometry()` 会立刻把
+    #    `isFullScreen` 打成 False；全屏态下原生 `SetWindowPos` 也被系统忽略。
+    #    所以全屏状态必须**立刻落地**，几何的"长大"只能交给**快照覆盖层**：
+    #    ① 切换前把当前画面抓到一张 Qt.ToolTip 级窗口上（不吃输入、不抢焦点）；
+    #    ② 立刻 showFullScreen（状态落地）；
+    #    ③ 覆盖层从旧矩形连续"长"到满屏矩形，收尾正好铺满 → 隐藏覆盖层，
+    #       下面已经是同矩形的真全屏窗口，无跳变。
+    # ⚠️ 覆盖层**不做 opacity 淡出**：Tween 版实测 300ms 只更新 4 帧，淡出一叠加
+    #    就是"闪"（[0.46, 0.99, 1.0] 三帧淡完）。这里只在收尾 hide，全程不透明。
+    # ⚠️ 帧源用**独立 QTimer(8ms)+QElapsedTimer**，不用 ui_anim.Tween：进全屏那一拍
+    #    主窗要重建整份版式，共享 ticker 会被挤到 4 帧/300ms。
+
+    def _grab_window_screen(self) -> QPixmap:
+        """抓窗口**在屏幕上真实的样子**（含自绘玻璃卡），给覆盖层当"旧画面"。
+
+        ⛔ 不能用 ``self.grab()``：自绘玻璃卡走离屏渲染时抓不到 —— 实测整张图只有
+        窗口底色 ``(13,13,15)``、非底色像素占比 **0%**，覆盖层就是一块纯色在长大，
+        用户看到的就是"闪"。
+        ⛔ 也不能用 ``_capture_native_window()``：主窗为了淡入是**分层窗口**
+        （``setWindowOpacity``），``PrintWindow`` 同样只拿到底色（实测 0%）。
+        唯一可靠的是抓**屏幕**再按窗口矩形裁剪 —— 覆盖层要的本来就是"用户看到的
+        那一帧"。
+        """
+        scr = self.screen()
+        if scr is None:
+            return QPixmap()
+        try:
+            shot = scr.grabWindow(0)
+        except Exception:                 # noqa: BLE001 - 抓屏失败就当没有覆盖层
+            return QPixmap()
+        if shot.isNull():
+            return QPixmap()
+        dpr = self.devicePixelRatioF() or 1.0
+        g = self.geometry()
+        pix = shot.copy(int(round(g.x() * dpr)), int(round(g.y() * dpr)),
+                        int(round(g.width() * dpr)), int(round(g.height() * dpr)))
+        if pix.isNull():
+            return QPixmap()
+        pix.setDevicePixelRatio(dpr)
+        return pix
+
+    def _grab_window_rect(self) -> QPixmap:
+        """只抓**窗口矩形**那块屏幕（2026-11-04）：进全屏覆盖层的"旧画面"。
+
+        ⛔ 整屏 `grabWindow(0)` 实测 82~114ms；按窗口矩形抓（1134x820）实测
+        ~51ms。⛔ 2026-11-04 od20：曾有一个"普通态空闲缓存"（resize 后 250ms
+        抓一次）来省这 51ms，但进全屏改成延迟落地后覆盖层要在主窗上方**静态
+        停留 100ms**，旧缓存的内容会明显过期（串口数据在滚），已整套删除 ——
+        现在恒现场抓。
+        """
+        scr = self.screen()
+        if scr is None:
+            return QPixmap()
+        g = self.geometry()
+        try:
+            shot = scr.grabWindow(0, g.x(), g.y(), g.width(), g.height())
+        except Exception:                 # noqa: BLE001 - 抓屏失败就当没有覆盖层
+            return QPixmap()
+        if shot.isNull():
+            return QPixmap()
+        dpr = self.devicePixelRatioF() or 1.0
+        shot.setDevicePixelRatio(dpr)
+        return shot
+
+    def _raise_window_cover(self) -> None:
+        """把覆盖层重新抬到最上层（2026-11-07 od55：只有一层合成窗）。
+
+        ``showFullScreen`` / 状态切换之后，主窗可能被系统提到最前，覆盖层被盖住
+        —— 逐帧截图实证：切换后第一帧看到的是真实全屏界面（内容还没画完 = 黑屏）。
+        每次状态落地后重抬一次即可。
+        """
+        widget = self._cover_label
+        if widget is None:
+            return
+        try:
+            widget.raise_()
+        except RuntimeError:
+            pass
+
+    def _cover_prescale(self, pix, start, end):
+        """一次性把快照预缩放到动画期间会出现的最大物理尺寸（整屏物理像素）。
+
+        od47h 依据 apple-design §11：窗口覆盖层动画**绝不在每帧做位图缩放**。旧实现
+        每帧对 3200×2000(dpr=2) 快照 scaled()+setPixmap，≈25MB/帧、165fps 下≈500
+        次/秒分配 = 卡顿根因。改为进覆盖层时把快照平滑缩放到整屏物理尺寸（动画能达到
+        的最大尺寸），之后每帧只动 geometry+opacity（合成器友好）；QLabel 用
+        setScaledContents(True) 把这张固定大图按当前窗口尺寸**下采样**显示——
+        下采样比上采样便宜，且末帧 full 时恰好 1:1 原画质。零每帧位图分配 → 丝滑。
+        """
+        if pix is None or pix.isNull():
+            return pix
+        dpr = self.devicePixelRatioF() or 1.0
+        scr = self.screen()
+        if scr is not None and scr.geometry() is not None:
+            mw = max(1, int(round(scr.geometry().width() * dpr)))
+            mh = max(1, int(round(scr.geometry().height() * dpr)))
+        else:
+            rects = [start]
+            if end is not None:
+                rects.append(end)
+            mw = max(1, int(round(max(r.width() for r in rects) * dpr)))
+            mh = max(1, int(round(max(r.height() for r in rects) * dpr)))
+        # ⛔⛔ 2026-11-07 用户点名「最大化/还原拉伸变形」：旧实现用 IgnoreAspectRatio
+        #    把快照硬拉成整屏比例（1134x820 → 6400x4000），内容被非均匀缩放 =
+        #    窗口越大内容越被横向拉宽/压窄。改成**保源图自身宽高比**：只把分辨率
+        #    放大到足以覆盖整屏，比例交给 paintEvent 用 KeepAspectRatioByExpanding
+        #    统一缩放铺满（裁掉溢出边），内容永不被拉伸。
+        sw, sh = pix.width(), pix.height()
+        if sw <= 0 or sh <= 0:
+            return pix
+        scale = max(mw / sw, mh / sh)
+        nw, nh = max(1, int(round(sw * scale))), max(1, int(round(sh * scale)))
+        if nw == pix.width() and nh == pix.height():
+            return pix
+        return pix.scaled(nw, nh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+    def _begin_window_cover(self, pixmap, start: QRect,
+                            with_bg: bool = True, pixmap_b=None, end=None,
+                            want_crossfade: bool = True):
+        """把切换**前**的画面铺到一个置顶小窗上（不进任务栏、不抢焦点）。
+
+        2026-11-07 od55：**单窗单张绘制**（取代 od46 的 A/B/bg 三个顶层窗）。
+        旧结构每帧对两个不透明顶层窗各做一次 `setPixmap` + 一次
+        `setWindowOpacity` + 一次 `setGeometry`，两个黑底窗口在交叉溶解时互相
+        遮挡 —— 逐帧实测：双影（两套版式同屏）、亮度塌陷（最长 250ms）。
+        现在只有一个窗口、`paintEvent` 里按控件矩形保比例缩放绘制：
+          · `_cover_pix`  = 旧画面（A，预缩放到整屏物理尺寸）；
+          · `_cover_pix_b` = 目标版式（B，可为 None）。「最大化/还原」首轮 B
+            缺失时由 _run_window_cover(inject_b=True) 状态落地后 grab 补建，
+            ⛔ 分屏接管等其它覆盖层路径不传 inject_b、B 仍为 None（全程 A）；
+          · `_on_cover_tick` 只改几何 + 末段（默认 [0.90,1.0]，B 陈旧压到
+            [0.99,1.0]）在单窗单 painter 内按 smoothstep 权重交叉溶解
+            （set_source / set_blend，不逐帧分配位图）。
+        ⛔ 不做**窗口级**交叉溶解：od55 的双顶层窗 + 窗口级 alpha 已被否决；
+           单覆盖层 paintEvent 内的 `painter.setOpacity` 像素混合在末段允许
+           （A/B 全不透明 RGB32、线性混合成立、覆盖层全程 setWindowOpacity(1.0)）。
+        ⛔ 也不每帧生成 phys 尺寸 QPixmap（QLabel 持有时 paint 会 detach 深拷贝）。
+        """
+        self._finish_window_cover()
+        if pixmap is None or not animations_enabled() or not self.isVisible():
+            return None
+        # 一次性预缩放到整屏物理尺寸（动画能达到的最大尺寸），之后每帧只在
+        # paintEvent 里做一次 FastTransformation 绘制。
+        self._cover_pix = self._cover_prescale(pixmap, start, end)
+        self._cover_pix_b = (self._cover_prescale(pixmap_b, start, end)
+                            if (pixmap_b is not None
+                                and not pixmap_b.isNull()) else None)
+        label = _CoverLabel()
+        label.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint
+                             | Qt.WindowStaysOnTopHint
+                             | Qt.NoDropShadowWindowHint)
+        label.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        # ⛔ 覆盖层每帧整块重绘：必须告诉 Qt「我自己画满每个像素」，否则
+        #    Qt 会先用 palette 背景刷一遍整窗（4K 下 ~5~10ms/帧），再进 paintEvent。
+        label.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        label.setAttribute(Qt.WA_NoSystemBackground, True)
+        label.setAutoFillBackground(False)
+        label.set_source(self._cover_pix)
+        label.setGeometry(start)
+        label.setWindowOpacity(1.0)
+        label.show()
+        label.raise_()
+        self._cover_label = label
+        return label
+
+    def _image_has_content(self, img, min_mean: float = 5.0) -> bool:
+        """粗判一张快照不是「纯黑 / 未绘制」。
+
+        覆盖层可见时桌面 DC 抓到的是覆盖层自己，末段 A 透明 / B 缺失就是纯黑；
+        实测黑图 luma≈0.06，正常界面 ≈13~23。这里按 32×32 采样均值判断，
+        成本 ~1ms，只在取快照的边界调用。
+        """
+        if img is None or img.isNull():
+            return False
+        try:
+            small = img.scaled(32, 32, Qt.IgnoreAspectRatio,
+                               Qt.FastTransformation)
+        except Exception:                 # noqa: BLE001
+            return False
+        total = 0
+        for yy in range(32):
+            for xx in range(32):
+                c = small.pixelColor(xx, yy)
+                total += max(c.red(), c.green(), c.blue())
+        return (total / 1024.0) >= min_mean
+
+    def _fresh_snapshot_pixmap(self):
+        """取后台线程最近一帧**新鲜**窗口快照（≤160ms 前），零主线程阻塞。
+
+        od47i：覆盖层的起手画面必须「接近实时」—— 串口数据一直在滚，旧快照
+        （旧实现 1.5s 前缓存）一上屏就是内容跳变＝「闪/跳」。后台 SnapWorker
+        已把抓图搬到独立线程，这里只做一次 QImage→QPixmap 转换（几毫秒）。
+        ⛔ od55：加两道闸 ——
+          ① 年龄：>450ms 的帧不要（覆盖层刚撤掉时后台可能整段被丢弃）；
+          ② 内容：纯黑帧直接判废（实测黑图 luma 0.06 被当成 A 层 = 283ms 黑闪）。
+        两道任一不过就回退现场抓一帧（~51ms，仅边界情况）。
+        """
+        img = self._bg_img
+        dpr = self.devicePixelRatioF() or 1.0
+        if (img is not None and not img.isNull()
+                and (time.monotonic() - self._bg_img_ts) <= 0.45
+                and self._image_has_content(img)):
+            pix = QPixmap.fromImage(img)
+            if not pix.isNull():
+                pix.setDevicePixelRatio(dpr)
+                return pix
+        return self._grab_window_rect()
+
+    def _start_snap_worker(self) -> None:
+        """启动后台抓图线程（幂等）。只在开屏结束后调，避免和开屏动画抢 CPU。"""
+        if getattr(self, "_snap_started", False):
+            return
+        self._snap_started = True
+        try:
+            self._snap_worker.start()
+        except Exception:                 # noqa: BLE001 - 起不来就退化为现场抓
+            pass
+
+    def _stop_snap_worker(self) -> None:
+        """停掉后台抓图线程并等它退出（幂等，关窗路径多处调用）。
+
+        ⛔ 必须 wait 到线程真的结束：QThread 在 isRunning() 为真时被析构会
+        qFatal，进程静默退出（无 traceback）。wait 超时也不放弃 —— 再等一轮，
+        最坏情况是关窗慢几百毫秒，远好于整个进程崩掉。
+        """
+        worker = getattr(self, "_snap_worker", None)
+        if worker is None:
+            return
+        try:
+            worker.stop()
+            if not worker.wait(2000):
+                worker.wait(2000)
+        except Exception:                 # noqa: BLE001 - 关窗绝不能被它卡住
+            pass
+
+    def _on_snap(self, img, is_fs: bool) -> None:
+        """后台线程送来的新鲜窗口快照（GUI 线程槽）：只缓存最新帧供**起手 A 层**用。
+
+        ⛔ 不用它做「目标版式 B 层」：桌面 DC 抓的是**屏幕画面**，动画期间覆盖层
+        在最上层，抓到的会是覆盖层自己（= A 拉伸），不是重排好的真窗口。B 层仍用
+        缓存的目标版式快照（_fs_idle_pix / _normal_idle_pix）。
+        ⛔⛔ od55：覆盖层存在期间**一律丢弃**。旧实现把"覆盖层末段 A 透明、
+        B 缺失"的那一帧缓存下来，还原时当 A 层用 → 纯黑（实测 luma 0.06，
+        造成 283ms 黑闪）。丢弃后下一次点击取到的是动画前/收尾后的真窗口帧。
+        """
+        if img is None or img.isNull():
+            return
+        if self._cover_label is not None or self._cover_timer.isActive():
+            return
+        self._bg_img = img
+        self._bg_img_ts = time.monotonic()
+        self._bg_is_fs = bool(is_fs)
+
+    def _inject_target_cover_b(self, label, start, end) -> None:
+        """S2 首轮兜底：B 缺失时抓「目标版式真窗」注入 _cover_pix_b。
+
+        两个「首轮」路径的目标版式 B 物理上拿不到预存快照：
+          · 进全屏首轮（普通启动 → 第一次最大化）：目标=全屏版式，此前窗口
+            一直是普通态，_fs_idle_pix 要求 isFullScreen() 才有值 → None；
+          · 还原首轮（startup_maximized 启动即全屏 → 第一次还原）：目标=普通
+            版式，startup_fullscreen 的 _skip_startup_anim 早退分支走不到
+            4451 的 _normal_idle_pix 赋值 → None（真机已确认）。
+        这两处的「目标版式真窗」只在**状态落地之后**才第一次出现：
+        _do_restore / _land 里 showNormal / showFullScreen 已跑完，此刻主窗
+        opacity=0、覆盖层垫在上面显示 A。⛔ 不能用 _grab_window_rect（屏幕
+        DC 抓到的是覆盖层 A，不是真窗）；改用 QWidget.grab()：widget 自绘
+        render 不走屏幕合成，不受覆盖层遮挡 / 主窗 windowOpacity 影响，拿到
+        的就是重排好的目标版式。真机 _check/window_s2/：grab 12~20ms，落在
+        48ms 延迟回调里（非点击现场、非开屏尾部），enter1 收尾 0.149 /
+        0.201% / −0.066、restore_startupfs 0.361 / 0.048% / +0.073。
+        """
+        if self._cover_pix_b is not None or label is None:
+            return                       # 已有 B / 无覆盖层：维持原逻辑
+        try:
+            pix = self.grab()
+        except Exception:                # noqa: BLE001 - 抓失败退化为全程 A
+            return
+        if (pix is None or pix.isNull()
+                or not self._image_has_content(pix.toImage())):
+            return                       # 纯黑/未绘制帧判废（od55 黑闪教训）
+        try:
+            pix.setDevicePixelRatio(self.devicePixelRatioF() or 1.0)
+            self._cover_pix_b = self._cover_prescale(pix, start, end)
+        except Exception:                # noqa: BLE001
+            self._cover_pix_b = None
+
+    def _run_window_cover(self, label, start: QRect, end: QRect,
+                          duration: int = 400,
+                          inject_b: bool = False) -> None:
+        """状态切换完成后启动覆盖层缩放（label 由 _begin_window_cover 建）。
+
+        inject_b=True 仅用于「最大化/还原」两条覆盖层路径：状态已落地，若 B
+        缺失则用 widget 自绘抓目标版式补建（见 _inject_target_cover_b）。
+        ⛔ 分屏接管（3844）等其它覆盖层路径不传，行为完全不变。
+        """
+        if label is None:
+            return
+        if start == end or not animations_enabled():
+            self._finish_window_cover()
+            return
+        if inject_b:
+            self._inject_target_cover_b(label, start, end)
+        self._cover_from = QRect(start)
+        self._cover_to = QRect(end)
+        self._cover_duration = max(1, int(duration))
+        # ⛔ 覆盖层动画帧率**跟随设置**（2026-11-06 用户要求：帧率须与设置
+        #    一致，本机 165Hz 不应被压到 60fps）。frame_hz() 已是「设置→动画
+        #    帧率」生效值（anim_fps==120 在 main.py 替换为 display_max_hz()）。
+        #    节拍与开屏路径统一用 max(1, round(1000/hz)-4)。
+        #    od55：每 tick 只改窗口几何 + paintEvent 绘制（无位图分配）；实际
+        #    上限由 DWM 合成/窗口重绘决定，跑不到 165fps 属正常。
+        try:
+            from ui_anim import frame_hz
+            _hz = int(frame_hz())
+            self._cover_timer.setInterval(max(1, int(round(1000.0 / _hz)) - 4))
+        except Exception:                 # noqa: BLE001
+            self._cover_timer.setInterval(16)
+        self._raise_window_cover()   # 状态切换后可能被主窗盖住
+        label.setGeometry(self._cover_from)
+        self._cover_clock.restart()
+        self._cover_timer.start()
+        # P1-1：restart 后**同步**跑一帧。旧实现等第一个 timer 回调，期间主线程
+        # 被 showFullScreen/enforce 挡住 40~100ms，第一个可见帧已经在 t=0.10~0.21
+        # —— 用户看到的第一眼就是"跳一段"。这里先把 t=0 的起手帧画上去。
+        self._on_cover_tick()
+
+    def _on_cover_tick(self) -> None:
+        label = self._cover_label
+        if label is None:
+            self._cover_timer.stop()
+            return
+        try:
+            elapsed = self._cover_clock.elapsed()
+            t = min(1.0, elapsed / float(self._cover_duration))
+            # ⛔⛔ 2026-11-07（用户：最大化/还原「还会跳变」）几何用 in_out_cubic：
+            #    两端速度为 0（消除起步/收尾跳变），单帧几何步长更均匀。
+            # ⛔⛔ S2 单窗内交叉溶解（取代 t≥0.99 的 A→B 硬切）：真机逐帧取证
+            #    （_check/evidence_window/）+ 离屏量化（_check/transition_lab/）证明
+            #    「拉伸/跳变/闪」的真相是 A（起手版式）与 B（目标版式）两套不同版式在
+            #    t≥0.99 一帧内硬换（w035→w036 mean 8.10 / >25面积 4.70% /
+            #    Δluma +1.88）；进全屏方向 B 常年 None 则收尾 hide 露重排真窗 =
+            #    7.82 / 4.55% / Δluma −2.60 亮度塌陷。现改为末段（默认
+            #    [0.90,1.0]，B 陈旧压到 [0.99,1.0]）在**同一 _CoverLabel 的
+            #    同一 painter** 里按 smoothstep 权重交叉溶解：
+            #    blend_w≤0 画 A、≥1 画 B、中间 A 铺满后 setOpacity(blend_w) 画 B。
+            #    od55 禁的是「双顶层窗 + 窗口级透明度」混合（双影 + 250ms 亮度塌陷），
+            #    与本次单窗单 painter 的像素混合不同；A/B 全不透明（RGB32）已验证
+            #    线性混合成立。覆盖层全程 setWindowOpacity(1.0) 不变（od62 教训）。
+            #    B 为 None（inject_b 抓失败等极边界）时 blend_w 恒 0 →
+            #    退化为全程 A（安全）；首轮缺 B 已由 _inject_target_cover_b 补建。
+            e = in_out_cubic(t)
+            a, b = self._cover_from, self._cover_to
+            x = int(round(a.x() + (b.x() - a.x()) * e))
+            y = int(round(a.y() + (b.y() - a.y()) * e))
+            w = max(1, int(round(a.width() + (b.width() - a.width()) * e)))
+            h = max(1, int(round(a.height() + (b.height() - a.height()) * e)))
+            # 权重用原始线性进度 t（不是几何缓动 e）；窗口 [start, 1.0]，
+            # start 正常 0.90、B 陈旧时 0.99（startup_fullscreen 设），
+            # smoothstep = 3p²−2p³。⚠️ 几何宽度变量已占用 w，权重另命名。
+            blend_w = 0.0
+            if self._cover_pix_b is not None:
+                start = self._cover_blend_start
+                blend_p = min(1.0, max(0.0, (t - start)
+                                       / max(1e-6, 1.0 - start)))
+                blend_w = blend_p * blend_p * (3.0 - 2.0 * blend_p)
+            if blend_w <= 0.0:
+                label.set_source(self._cover_pix)
+            elif blend_w >= 1.0:
+                label.set_source(self._cover_pix_b)
+            else:
+                label.set_blend(self._cover_pix, self._cover_pix_b, blend_w)
+            label.setGeometry(x, y, w, h)
+            # ⛔ 覆盖层全程保持不透明：收尾只靠 _finish_window_cover 的
+            #    singleShot(16) 把整张满屏快照藏掉再露真窗，绝不在 tick 里淡出。
+            #    od62 曾在末段 15% 把覆盖层淡出 → 还原方向会先露出桌面/壁纸
+            #    （真窗还没长大到满屏）= 用户感知的「闪」。此路已封死。
+            # P1-3：末段**连续**恢复主窗 opacity（旧实现二值跳变，且要等某一拍）。
+            # 缩小方向（还原）从 t=0.55 起；放大方向（进全屏）从 t=0.80 起 ——
+            # 进全屏时真窗比覆盖层大，过早露出会在四周出现第二套版式（双影）。
+            if self._cover_opacity_pending:
+                start = (0.55 if a.width() > b.width() else 0.80)
+                if t >= start:
+                    k = min(1.0, (t - start) / max(1e-6, 1.0 - start))
+                    self.setWindowOpacity(k)
+                    if k >= 1.0:
+                        self._cover_opacity_pending = False
+        except RuntimeError:         # 覆盖层已被 Qt 销毁（窗口关闭途中）
+            self._cover_timer.stop()
+            self._cover_label = None
+            return
+        if t >= 1.0:
+            self._cover_timer.stop()
+            if self._cover_opacity_pending:
+                self._cover_opacity_pending = False
+                try:
+                    self.setWindowOpacity(1.0)
+                except RuntimeError:
+                    pass
+            # 末帧先上屏，再延迟 16ms 撤覆盖层：DWM 合成本帧需要一拍，
+            # 同一个事件循环里 hide 会留一帧硬切（实测收尾闪）。
+            QTimer.singleShot(16, lambda: self._finish_window_cover(
+                from_tick=True))
+
+    def _finish_window_cover(self, from_tick: bool = False) -> None:
+        """收尾：覆盖层正好铺满目标矩形，隐藏后露出下面同矩形的真窗口。"""
+        self._cover_timer.stop()
+        if self._dwm_transition_off:
+            # 还原动画的"压系统动画"到此结束（幂等；进全屏路径此标记本就为假）
+            try:
+                self._set_dwm_transitions(int(self.winId()), False)
+            except RuntimeError:
+                self._dwm_transition_off = False
+        if self._cover_opacity_pending:      # 动画被提前打断：别把主窗留在透明态
+            self._cover_opacity_pending = False
+            self.setWindowOpacity(1.0)
+        self._cover_pix = None
+        self._cover_pix_b = None
+        label, self._cover_label = self._cover_label, None
+        if label is not None:
+            try:
+                # ⛔ 先 hide 再复位 opacity：旧顺序在**可见状态**下把
+                #    opacity 从 0 拉回 1.0，DWM 有一帧把整张旧版式快照
+                #    重新显示 = 用户说的「最大化最后还是会闪」。
+                label.hide()
+                label.setWindowOpacity(1.0)
+                label.deleteLater()
+            except RuntimeError:
+                pass
+        # 覆盖层动画收尾（定时器回调，非点击同步路径）：此刻 label 已
+        # hide()+deleteLater()、_cover_label 已置 None，guard 全成立 —— 仅当
+        # 仍在全屏态时补建空闲快照。
+        # ⛔ from_tick 闸：_begin_window_cover 开头也会调本函数（点击同步路径），
+        #    那里绝不能同步抓整屏（51~130ms 阻塞点击，od15 教训）。
+        # ⛔ od55：延迟 200ms 再抓。本函数在覆盖层撤掉后立刻执行时，主窗的
+        #    setWindowOpacity(1.0) 刚落、**还没重绘**，抓到的是一张接近纯黑的
+        #    图（实测 luma 0.06，正常 23.47）；下一轮把它当 B 层就是一次黑闪。
+        if from_tick and self.isFullScreen():
+            QTimer.singleShot(200, self._build_fs_idle_pix)
+
+    def _leave_snap_zoom(self) -> None:
+        """把分屏接管的显隐还原（进全屏前用，见 startup_fullscreen）。
+
+        分屏态下页头/配置卡/发送卡/顶部 opts 行都藏着；如果直接
+        ``showFullScreen``，窗口会停在"分屏版式"的全屏（用户看到界面像坏了）。
+        """
+        if not self._snap_zoom:
+            return
+        blocks = [self.brand_header, self._config_card, self._tx_card,
+                  self._rx_opts_row]
+        saved = self._snap_zoom_saved or [True, True, True, True]
+        self._in_snap_apply = True
+        try:
+            for widget, visible in zip(blocks, saved):
+                widget.setVisible(bool(visible))
+            self.chk_snap_power.setVisible(False)
+        finally:
+            self._in_snap_apply = False
+        self._snap_zoom = False
+        self._snap_zoom_saved = None
+        self._sync_fullscreen_padding()
 
     def _refresh_caption_ui(self) -> None:
         """标题栏中间那颗键跟着窗口状态换面孔（最大化 ⇄ 还原）+ 刷新提示语。"""
         bar = getattr(self, "_caption_bar", None)
         if bar is not None:
-            bar.set_maximized(self.isFullScreen())
+            bar.set_maximized(self.isFullScreen() or self._fs_animating)
 
     def _remember_normal_geometry(self) -> None:
         """窗口处于**普通态**时持续记忆几何 —— 退出全屏/还原展开要靠它。
@@ -2124,32 +3631,602 @@ class MainWindow(QMainWindow):
         ``setGeometry`` 不会漂。
         """
         if (self.isVisible() and not self.isFullScreen()
-                and not self.isMaximized() and not self._expect_normal):
+                and not self.isMaximized() and not self._expect_normal
+                and not self._geo_animating):
             self._normal_geometry = self.geometry()
+
+    def _note_geometry(self) -> None:
+        """把当前窗口矩形记进轨迹（见 _geo_steps_since）。
+
+        ⚠️ 只记**非补间**的几何：我们自己 `_win_geo_morph` 的每帧 setGeometry
+        也在这里，若一并记下，"系统动画检测"会把自己的补间误当成系统动画。
+        """
+        if self._geo_animating or not self.isVisible():
+            return
+        now = time.monotonic()
+        g = self.geometry()
+        self._geo_trace.append((now, QRect(g)))
+        if len(self._geo_trace) > 40:
+            del self._geo_trace[:len(self._geo_trace) - 40]
+        if self.isFullScreen():
+            self._fs_rect = QRect(g)
+
+    def _geo_steps_since(self, ts: float) -> int:
+        """`ts` 之后出现过多少个**不同**的窗口矩形（用来认"系统动画"）。"""
+        floor = ts - 0.02
+        seen = {(r.x(), r.y(), r.width(), r.height())
+                for t, r in self._geo_trace if t >= floor}
+        return len(seen)
 
     def moveEvent(self, event) -> None:
         self._remember_normal_geometry()
+        self._note_geometry()
         super().moveEvent(event)
 
     def resizeEvent(self, event) -> None:
         self._remember_normal_geometry()
+        self._note_geometry()
         # 窗口尺寸变过之后，最大化态 rail 落点的缓存就过期了 —— 清掉，下次展开
         # 落定时重新量（缓存未命中时退化成就地现算，不会更差）。
         self._rx_rail_rect_expanded = None
+        # 分屏：窗口一窄就把版式换成紧凑档（见 _sync_compact）
+        self._sync_compact()
+        # ⛔ 每次 resize 都重算一次内容边距：_sync_compact 只在**档位变化**时
+        #    才走 _apply_compact → 那条路径不跑就一直沿用旧边距。最大化/全屏
+        #    的切换是纯尺寸变化（档位可能不变），漏算就会留一圈普通态边距
+        #    —— 这正是用户报的「最大化后四周缝隙**偶发**」的来源。
+        self._sync_fullscreen_padding()
+        # 分屏自动"最大化接收区"（1/3、1/4 窄档）
+        self._sync_snap_zoom()
         super().resizeEvent(event)
+
+    # ------------------------------------------------- 分屏（Snap）紧凑版式
+    #
+    # 用户 2026-10-31：「我还需要串口软件可以适配 windows 的两分屏三分屏和四分屏」。
+    # 1920 屏上 1/2=960、1/3=640、1/4=480，而窗口当时的最小宽度是**布局算出来的**
+    # 839（发送区展开时 1134）—— 光调 setMinimumWidth 没用，因为 Qt 会用布局的
+    # minimumSizeHint 把窗口钉住。这里两头一起做：
+    #   ① 窗口自身的最小宽度显式钉成 1（见 _sync_compact 末尾），Snap 才压得进去；
+    #   ② 真压窄之后，版式按档位收（边距/间距/配置卡/工具栏横竖排），
+    #      收完的布局最小宽度必须**小于**当档的门槛 —— 否则会被自己夹住，
+    #      表现为"怎么拖都停在上一档的宽度上"。
+    # ⛔ 别只改阈值不改布局：档位的门槛必须大于该档布局算出来的最小宽度。
+
+    def _compact_level_for(self, width: int) -> int:
+        """按窗口宽度算紧凑档位（带回滞，免得在门槛上反复重排）。"""
+        if width < COMPACT_L3_W:
+            target = 3
+        elif width < COMPACT_L2_W:
+            target = 2
+        elif width < COMPACT_L1_W:
+            target = 1
+        else:
+            target = 0
+        level = self._compact_level
+        if level < 0 or target == level:
+            return target
+        if target > level:
+            # 往**窄**走立刻生效：用户把窗口拖窄时不该有迟滞感
+            return target
+        # 往**宽**走要越过上一档门槛 + 24px，否则正好卡在门槛上会来回抖
+        threshold = {0: COMPACT_L1_W, 1: COMPACT_L2_W, 2: COMPACT_L3_W}
+        return target if width >= threshold[target] + COMPACT_HYST else level
+
+    def _sync_compact(self) -> None:
+        """resizeEvent 里调：档位变了就重排，并重申窗口最小宽度。"""
+        # 建窗过程中（_build_ui 还没把布局挂齐）也会收到 resizeEvent，直接跳过
+        if getattr(self, "_body_lay", None) is None or self._in_compact:
+            return
+        self._in_compact = True
+        try:
+            level = self._compact_level_for(self.width())
+            if level != self._compact_level:
+                self._apply_compact(level)
+            # ⛔ 窗口最小宽度必须自己钉住，不能听布局的（原因见上面那段注释）。
+            #    MEMORY：setMinimumWidth(0) 等于没设，要设 1。
+            if self.minimumWidth() != 1:
+                self.setMinimumWidth(1)
+        finally:
+            self._in_compact = False
+
+    def _on_snap_power_toggled(self, checked: bool) -> None:
+        """分屏工具栏里的开关被拨：转发给主开关（真正的开/关逻辑只有一处）。"""
+        if self.btn_open.isChecked() != bool(checked):
+            self.btn_open.setChecked(bool(checked))
+
+    def _sync_snap_power(self, checked: bool) -> None:
+        """主开关变了：同步工具栏那颗（屏蔽信号，免得来回触发）。"""
+        if self.chk_snap_power.isChecked() != bool(checked):
+            self.chk_snap_power.blockSignals(True)
+            self.chk_snap_power.setChecked(bool(checked))
+            self.chk_snap_power.blockSignals(False)
+
+    def _sync_snap_zoom(self) -> None:
+        """resizeEvent 里只是**预约**一次重算；显隐切换放到下一拍事件循环。
+
+        ⛔ 绝不能在 resizeEvent 里直接 setVisible：切卡片显隐会触发重新布局，
+           分屏贴边时窗口可能因此再 resize → 又回到这里 → **自激卡死**
+           （用户 2026-11-01 点「还原」直接卡死，就是这条）。
+        """
+        if self._snap_pending:
+            return
+        self._snap_pending = True
+        QTimer.singleShot(0, self._apply_snap_zoom)
+
+    def _apply_snap_zoom(self) -> None:
+        """真正执行分屏最大化 / 还原（由 _sync_snap_zoom 延迟调度）。"""
+        self._snap_pending = False
+        if getattr(self, "_body_lay", None) is None or not self.isVisible():
+            return                     # 建窗/未显示阶段先跳过（否则会把"未显示"当初始状态记下）
+        if (self._expanded or self.isFullScreen() or self._geo_animating
+                or self._in_snap_apply):
+            # ⛔ _expect_normal 不再直接挡：从全屏/最大化拖出到 Snap 位置时 Qt
+            #    可能留下 _expect_normal=True（系统直接改几何、没走退出全屏路径），
+            #    一旦几何已命中分屏比例就该放行，否则分屏永远接不上管。
+            #    _expect_normal 终会被落地逻辑清掉，这里兜底再排一拍即可。
+            if self._geo_animating or self._expect_normal:
+                if not self._snap_pending:
+                    self._snap_pending = True
+                    QTimer.singleShot(140, self._apply_snap_zoom)
+            return
+        # 状态切换（最大化/还原）刚落地的那 0.35s 内不判分屏：这时窗口几何还在
+        # 收敛，切卡片显隐最容易和 showNormal 的落地过程打架（用户点"还原"卡死）。
+        if time.monotonic() - self._state_ts < 0.35:
+            if not self._snap_pending:
+                self._snap_pending = True
+                QTimer.singleShot(140, self._apply_snap_zoom)
+            return
+        # ⛔ **任意分屏**（用户 2026-11-01："Windows 有这些分屏方式，每一种都要接收区
+        #    最大化"）：判定 = 窗口**贴着屏幕的边/角**（左右上下任一方向齐平）且
+        #    **不是满尺寸**。1/2、1/3、1/4、2/3、3/4 与**上下/四宫格**贴靠全都覆盖；
+        #    全屏窗口是满尺寸 → 不算分屏。不要只看宽度（四宫格是半高）。
+        #
+        # ⚠️ 2026-11-02 用户第四轮：「进入分屏状态不能稳定显示接收区最大化」——
+        #    根因是判定是**单点硬阈值**：resize 收敛、DPI 取整、进分屏时
+        #    _set_corner_preference 去圆角/描边都会让窗口矩形抖 1~2px，一旦
+        #    抖出 ±0.025 的比例带 / 8px 的贴边带，want 就翻成 False → 接收区
+        #    被还原、下一拍又接管，来回闪。改成**滞回（hysteresis）**：
+        #      未接管 → 收紧（8px / 2.5%，防把普通窗口拖到左上角误判成分屏）；
+        #      已接管 → 放宽（24px / 5%，几何小抖动一律保持接管）。
+        #    真正离开分屏（拖回正常窗口 / 最大化 / 全屏）比例和贴边都跑出放宽带，
+        #    自然退出。
+        snapped = self._snap_zoom
+        flush_tol = 24 if snapped else 8
+        ratio_tol = 0.05 if snapped else 0.025
+        scr = self.screen().availableGeometry() if self.screen() else None
+        g = QRect(self.geometry())
+        if scr is not None and scr.width() > 0 and scr.height() > 0:
+            flush_x = (g.x() <= scr.x() + flush_tol
+                       or g.right() >= scr.right() - flush_tol)
+            flush_y = (g.y() <= scr.y() + flush_tol
+                       or g.bottom() >= scr.bottom() - flush_tol)
+            # ⛔ 光"贴边 + 不满尺寸"会把**普通窗口拖到左上角**也判成分屏
+            #    （实测 1134×820 @ (0,0) 就中招 → 配置卡被藏、串口都选不了）。
+            #    用户也明确说过"不要简单当作窗口大小变化"。所以再加一条：
+            #    **宽高必须同时命中 Windows 分屏的标准比例**才认。
+            rw = g.width() / scr.width()
+            rh = g.height() / scr.height()
+            std_w = any(abs(rw - f) <= ratio_tol
+                        for f in (0.25, 1 / 3, 0.5, 2 / 3, 0.75, 1.0))
+            std_h = any(abs(rh - f) <= ratio_tol for f in (0.5, 1.0))
+            # 满尺寸 = 全屏/最大化，不算分屏（这条**不放宽**：接管期间被拉到
+            # 满屏就该退出，否则"接收区最大化"会盖着整窗却不铺满）。
+            full = rw >= 0.97 and rh >= 0.97
+            want = flush_x and flush_y and std_w and std_h and not full
+            # 诊断（真机排查用）：记录每次判定的几何、容差与结果。
+            app_log.info(
+                f"[snap] g={g.x()},{g.y()},{g.width()}x{g.height()} "
+                f"scr={scr.width()}x{scr.height()} rw={rw:.3f} rh={rh:.3f} "
+                f"tol={flush_tol}/{ratio_tol:.3f} "
+                f"flush=({flush_x},{flush_y}) std=({std_w},{std_h}) "
+                f"full={full} want={want} snapped={snapped}")
+        else:
+            want = self.width() < COMPACT_L2_W    # 拿不到屏幕就退回像素阈值
+        if want == self._snap_zoom:
+            return
+        # 分屏最大化：藏品牌页头 / 配置卡 / 发送卡 / 顶部 opts 工具栏行，接收区占满；
+        # 串口开关亮出（已在右侧竖栏，无文字，见 chk_snap_power）。
+        blocks = [self.brand_header, self._config_card, self._tx_card,
+                  self._rx_opts_row]
+        cover_from: QRect | None = None
+        cover_pix = None
+        if want:
+            # 全屏 → 分屏：Qt 的全屏窗口不参与 Windows 的 Snap 动画，系统会把
+            # 满屏矩形**一帧**改成 Snap 矩形，观感就是硬跳。用覆盖层从满屏矩形
+            # 连续缩到当前矩形把这一下补上（见 _begin_window_cover）。
+            # ⚠️ 若系统自己**动画**过（轨迹里有多个中间矩形），就不要再叠一层，
+            #    否则会双重动画（先到 Snap、又跳回满屏再缩一次）。
+            # ⚠️ 两条来源：①changeEvent 收到过"离开全屏"（_fs_left_rect）；
+            #    ②Qt 有时**根本不发** WindowStateChange 就把全屏窗口改小
+            #    （实测 setGeometry / Win+方向键），这时 _last_window_state 里
+            #    还留着 FullScreen 位 —— 用它兜底。
+            _fs_src, _fs_ts = None, 0.0
+            if self._fs_left_rect is not None:
+                _fs_src, _fs_ts = QRect(self._fs_left_rect), self._fs_left_ts
+            elif ((self._last_window_state & Qt.WindowState.WindowFullScreen)
+                    and not self._expect_normal and self._fs_rect is not None):
+                _fs_src, _fs_ts = QRect(self._fs_rect), time.monotonic()
+            self._fs_left_rect = None
+            self._last_window_state = self.windowState()
+            if (_fs_src is not None and time.monotonic() - _fs_ts < 3.0
+                    and self._geo_steps_since(_fs_ts) <= 2):
+                cover_from = _fs_src
+            # ⚠️ 抓图要在**藏卡片之前**：覆盖层内容应是切换前的样子。
+            if cover_from is not None and animations_enabled() and self.isVisible():
+                # ⛔ 必须屏幕抓图：self.grab() 对自绘玻璃只拿到纯底色（=黑块长大）
+                cover_pix = self._grab_window_screen()
+            # ⛔ 分屏接管 = 用户明确"不要全屏"。从全屏/最大化拖出到 Snap 位置时
+            #    _want_fullscreen 可能残留 True（系统直接改几何、没走退出全屏路径），
+            #    不清的话：①changeEvent 还原分支会在 220ms 把窗口拽回全屏；②
+            #    startup_fullscreen 里排的 _verify_fullscreen(180/600ms) 也会钉回全屏。
+            #    把意图降下来分屏才稳得住；_expect_normal 同样在此清掉（见上面守卫）。
+            self._want_fullscreen = False
+            self._expect_normal = False
+            self._snap_zoom_saved = [not w.isHidden() for w in blocks]
+            self._in_snap_apply = True
+            try:
+                for widget in blocks:
+                    widget.setVisible(False)
+                self.chk_snap_power.setVisible(True)
+            finally:
+                self._in_snap_apply = False
+        else:
+            saved = self._snap_zoom_saved or [True, True, True, True]
+            self._in_snap_apply = True
+            try:
+                for widget, visible in zip(blocks, saved):
+                    widget.setVisible(bool(visible))
+                self.chk_snap_power.setVisible(False)
+            finally:
+                self._in_snap_apply = False
+            self._snap_zoom_saved = None
+        self._snap_zoom = want
+        # 分屏接管/退出都要重算内容边距：snap 既不是全屏也不是最大化，
+        # 不主动重算就会沿用进 snap 前的边距（普通态 12px / 卡 6px）→ 那圈缝隙。
+        self._sync_fullscreen_padding()
+        # 全屏 → 分屏 的收尾动画（见上面 cover_from 的说明）。必须放在
+        # _sync_fullscreen_padding 之后：覆盖层终点是最终版式的窗口矩形。
+        if want and cover_from is not None and cover_pix is not None:
+            _end = QRect(self.geometry())
+            if cover_from != _end:
+                _cover = self._begin_window_cover(cover_pix, cover_from, end=_end)
+                self._run_window_cover(_cover, cover_from, _end, 400)
+
+    def _set_opts_vertical(self, vertical: bool) -> None:
+        """两条工具栏（显示时间戳那排 / HEX 发送那排）在横排与竖排之间切换。
+
+        竖排是窄档最有效的一刀：横排时这两行的最小宽度分别是 391px 和 672px，
+        几乎就是"窗口压不下去"的全部原因。竖排后只剩最宽的那一颗（~128 / ~110），
+        每一颗控件都还在、都完整可见 —— 不是把谁藏进菜单里。
+        """
+        direction = (QBoxLayout.Direction.TopToBottom if vertical
+                     else QBoxLayout.Direction.LeftToRight)
+        for lay in (self._rx_opts_lay, self._tx_opts_lay):
+            if lay.direction() == direction:
+                continue
+            lay.setDirection(direction)
+            lay.invalidate()
+        self._opts_content.updateGeometry()
+        self._rx_opts_row.updateGeometry()
+        self._tx_opts_row.updateGeometry()
+
+    def _sync_fullscreen_padding(self) -> None:
+        """全屏/最大化时内容铺满屏幕；普通态留紧凑档边距。
+
+        用户 2026-11-01：「有概率最大化后四周有空隙」—— 根因就是窗口进入
+        **最大化**（还没转全屏）的那段里，边距还是普通态的 12px，四周露出底色。
+        """
+        spec = COMPACT_SPECS.get(self._compact_level, COMPACT_SPECS[0])
+        # 分屏接管（_snap_zoom）也算"铺满"：半屏贴边既不是全屏也不是最大化，
+        # 否则内容四周仍留 12px 外边距 + 6px 卡阴影 → 用户报的"分屏四周缝隙（概率性）"。
+        # ⚠️ 2026-11-02：Qt 在「全屏→最小化→从任务栏还原」链上会**丢掉全屏标志**，
+        #    窗口以"普通态"回来（isFullScreen/isMaximized 都 False），但用户仍想要全屏
+        #    （_want_fullscreen 在点最大化时就置真、退出全屏才清）。那段 220ms 的还原瞬时期
+        #    用 _pending_restore_fs 兜底（见 changeEvent），**不要**把持久的 _want_fullscreen
+        #    直接并进 full —— 它默认就是 True，普通浮动窗口若没被清成 False 会被误判成
+        #    "铺满"、吃掉卡片浮起余量、浮起动画消失（用户 2026-11-02："选中浮起的动画没了"）。
+        full = (self.isFullScreen() or self.isMaximized()
+                or self._snap_zoom or self._pending_restore_fs
+                or self._fs_animating)
+        # 2026-11-02 用户（第五轮）：「在卡片和软件边框之间也留一点距离，留得和
+        # 卡片之间的距离一样」。视觉上：
+        #   卡片之间   = 布局 spacing(spec["body"]) + 两侧各 card_pad(CARD_LIFT_ROOM)
+        #   边框到卡片 = margin + card_pad
+        # 两者相等 → margin = spec["body"] + CARD_LIFT_ROOM。
+        # 普通 / 全屏 / 最大化 / 分屏**统一**用这个值（不再按 full 归零）——
+        # 用户之前报的"缝隙"真身是 DWM 描边（已由 _set_corner_preference 去掉），
+        # 不是这圈内容留白；现在他明确要留白，且要求与卡片间距等宽。
+        margin = spec["body"] + CARD_LIFT_ROOM
+        self._inner_lay.setContentsMargins(margin, 0, margin, margin)
+        # 2026-11-02 用户第三轮：「分屏状态下软件四周还是有空隙」——和全屏同一个来源：
+        # Win11 给带 WS_THICKFRAME 的窗口在窗口**内侧**画 1 逻辑像素描边，分屏贴边时
+        # 那圈描边就是"四周缝隙"；圆角还会在贴角处切掉一块露出壁纸。
+        # full（全屏/最大化/分屏/还原瞬时）统一按"铺满"处理：去描边 + 方角。
+        # 普通窗口（round_=True）恢复系统默认描边与圆角。
+        self._set_corner_preference(int(self.winId()), round_=not full)
+        # ⚠️ 卡片浮起余量**始终保留 CARD_LIFT_ROOM(3)**：悬停浮起要把绘制面上移
+        #    最多 2px，没有这圈缓冲就会被控件矩形裁掉、浮起动画直接消失（用户
+        #    2026-11-02：「选中浮起的动画没了」）。之前为消全屏缝把 card_pad 也随
+        #    full 归零，连带把浮起杀了 —— 不可取。
+        #    真正的"四周缝隙"是**窗口级边距**（上面 margin=0 已收掉）；卡片这 3px
+        #    在平面单色底上几乎不可见，却换来全屏/普通窗口都有的悬停浮起反馈。
+        # ⛔ full 判定里**不能**放持久的 _want_fullscreen：它默认就是 True，普通
+        #    浮动窗口若没被清成 False 会被误判成"铺满"、吃掉浮起余量。最小化→还原
+        #    那 220ms 的瞬时缝由 _pending_restore_fs 单独兜底（见 changeEvent）。
+        card_pad = CARD_LIFT_ROOM
+        self._card_pad = card_pad
+        for card in getattr(self, "_cards", []):
+            card.set_shadow_pad(card_pad)
+        # ⛔ 窗口一旦真的进全屏/最大化/分屏，那 220ms 的"还原瞬时"就结束了，
+        #    把旗子落下，免得它卡在 True 把后续普通窗口的浮起余量也吃掉。
+        if self._pending_restore_fs and (self.isFullScreen()
+                                        or self.isMaximized()
+                                        or self._snap_zoom):
+            self._pending_restore_fs = False
+
+    def _apply_compact(self, level: int) -> None:
+        """把版式切到指定档位（幂等；只改尺寸，不动控件树）。"""
+        spec = COMPACT_SPECS.get(level, COMPACT_SPECS[0])
+        self._compact_level = level
+        # 全屏时内容**铺满**屏幕（用户 2026-11-01："最大化后有空隙"）：四周边距收 0；
+        # 普通态才留紧凑档的边距（卡片阴影需要余量）。
+        self._sync_fullscreen_padding()
+        self._inner_lay.setSpacing(spec["body"])
+        self._body_lay.setSpacing(spec["body"])
+        self._rx_area.setSpacing(spec["area"])
+        self._tx_area.setSpacing(spec["area"])
+        self._rx_left.setSpacing(spec["left"])
+        self._tx_left.setSpacing(spec["left"])
+        self._rx_opts_lay.setSpacing(spec["opts"])
+        self._tx_opts_lay.setSpacing(spec["opts"])
+
+        # 配置表单：标签列整列改宽 + 字段下限收口。不收的话表单最小宽度钉在 220，
+        # 配置卡就下不去（卡宽 = 表单宽 + 2×(SHADOW_PAD+CARD_PAD)）。
+        field_w = spec["field_w"]
+        for tag in self._config_tags:
+            tag.setFixedWidth(spec["label_w"])
+            # 3 档（1/4 分屏）整列标签收起：留 0 宽也会占掉 10px 行间距，
+            # 直接 hide —— 隐藏的控件布局会整个跳过，那一格间距也一起收走。
+            tag.setVisible(spec["label_w"] > 0)
+            # 标签藏了以后，字段靠 tooltip 认名字（先存下各字段原本的提示语，
+            # 退出窄档要原样还回去 —— 例如「连接方式」那条两行说明）
+            buddy = tag.buddy()
+            if buddy is not None:
+                if buddy not in self._config_tips:
+                    self._config_tips[buddy] = buddy.toolTip()
+                buddy.setToolTip(tag.text() if spec["label_w"] <= 0
+                                 else self._config_tips[buddy])
+        for widget, base in self._config_fields:
+            if field_w <= 0:
+                widget.setMinimumWidth(base)
+            else:
+                widget.setMinimumWidth(min(base, field_w) if base else field_w)
+        # 「历史」下拉在窄档单独给 90 的下限：跟着统一压到 66 时框里只剩
+        # 「一发」两个字，看不出这是个历史列表（1/4 屏截图里量到过）。
+        if field_w > 0:
+            self.cmb_history.setMinimumWidth(90)
+        # 「打开历史数据」的下限是 QSS 给的（实测 146px），不是 sizeHint 的 102 ——
+        # 窄档压到 104：六个字（84px）+ 圆角底板的左右留白，再小就会戳出底板
+        # （1/4 屏截图里量到过：文字比底色块还宽）。
+        self.btn_open_history.setMinimumWidth(146 if field_w <= 0 else 104)
+        self._hist_spacer.setFixedWidth(spec["label_w"])
+
+        # 工具栏横/竖排。切换会改变内容自然高度，把"量过的高度"和"钉住的高度"一起
+        # 作废 —— 否则下一次全屏转场会按旧行高插值（展开那一帧工具栏会被裁）。
+        self._set_opts_vertical(spec["vertical"])
+        if not self._rx_transition_busy():
+            self._heal_opts_content()
+        if self._rx_full:
+            self._rx_full["opts_h"] = self._opts_row_natural_height()
+        self._refresh_tx_min_height()
+
+        # 日志框最小宽/接收卡最小高：宽屏保持控件自己的下限（100/230），
+        # 窄档放开，否则 1/4 屏的可用高度全被下限吃掉。
+        self.txt_rx.setMinimumWidth(spec["log_w"])
+        self._rx_card.setMinimumHeight(spec["rx_min_h"])
+
+        # 配置卡宽度：转场（接收区展开）期间宽度由 _rx_transition 每帧钉，
+        # 这里不抢 —— 抢了会把那 260ms 的连续宽度变成一跳。
+        # ⚠️ 下限给 120 而不是直接钉成 config_w：窗口窄到比整份布局的下限还小
+        #    （本机 1600 逻辑宽，1/4 分屏只有 400px）时，宁可**卡片自己收窄、
+        #    卡内表单被裁一条**，也绝不能整张卡戳到窗口外面去 —— 后者看着像界面炸了。
+        if not self._expanded and not self._rx_transition_busy():
+            self._config_card.setMinimumWidth(
+                (spec["config_w"] + (2 * SHADOW_PAD if self._card_pad == 0 else 0))
+                if level == 0 else 120)
+            self._config_card.setMaximumWidth(spec["config_w"])
+            self._config_content.setFixedWidth(
+                max(120, spec["config_w"] - 2 * (SHADOW_PAD + CARD_PAD)))
+
+    def _rx_transition_busy(self) -> bool:
+        """接收区展开/收起的转场是不是正在跑（正在跑就别去动它钉的几何）。"""
+        tween = getattr(self, "_rx_tween", None)
+        return bool(tween is not None and tween.running)
 
     def changeEvent(self, event) -> None:
         if event.type() == QEvent.Type.WindowStateChange:
+            state = self.windowState()
+            # od47i：同步后台快照线程的全屏标记（它只读这个普通 bool，不碰 Qt）。
+            self._bg_is_fs = bool(state & Qt.WindowState.WindowFullScreen)
+            # 从最小化还原：最小化时窗口已经淡到 0，这里必须淡回来 ——
+            # 不淡的话会"啪"一下整块出现（用户点名的那三种跳变之一）。
+            was_min = bool(self._last_window_state & Qt.WindowState.WindowMinimized)
+            is_min = bool(state & Qt.WindowState.WindowMinimized)
+            if is_min:
+                # 进入最小化：记下标志，showEvent 还原时据此重做全屏覆盖
+                self._was_minimized = True
+            if was_min and not is_min:
+                if self.windowOpacity() < 0.999:
+                    self._reveal_window(self.windowOpacity(), 140)
+                # ⚠️ 2026-11-02：「最大化→最小化→从任务栏打开还有缝隙」。
+                #    Qt 在 全屏→最小化→还原 这条链上会**丢掉全屏标志**，窗口可能以
+                #    "普通态"回来；而此刻用户仍想要全屏（_want_fullscreen 在点最大化
+                #    时就置真、退出全屏才清）。两件事一起补：
+                #    ① showEvent 里若仍非全屏，立刻 setWindowState(FullScreen)+
+                #       _enforce_native_fullscreen 像素级钉屏（修 200% DPI 几何缝隙），
+                #       这比下面 220ms 定时器更稳（200% DPI 上定时器可能漏拍）；
+                #    ② 再核一次原生全屏（最小化期间 shell 可能收回了覆盖）。
+                #    padding 由 _sync_fullscreen_padding 读 _want_fullscreen 直接收 0，
+                #    不会闪出四周缝。
+                app_log.info(
+                    f"[restore] 从最小化还原：isFullScreen={self.isFullScreen()} "
+                    f"isMaximized={self.isMaximized()} state={state} "
+                    f"want_fs={self._want_fullscreen} card_pad={self._card_pad}")
+                if (self._want_fullscreen and not self.isMaximized()
+                        and not self.isFullScreen()):
+                    # ⚠️ 还原这 220ms 里窗口是"普通态"，但用户要的是全屏：先把
+                    #    _pending_restore_fs 置真让 padding 收 0（避免卡片阴影 3px
+                    #    被当成四周缝），startup_fullscreen 真正落地后再清掉。
+                    self._pending_restore_fs = True
+                    QTimer.singleShot(220, self.startup_fullscreen)
+                # ⚠️ 兜底重钉（与 showEvent 双保险）：无论全屏标志是否残留 True
+                #    （200% DPI 还原常把标志残留成 True、窗口其实没铺满），只要用户
+                #    仍想要全屏就立刻重钉。延迟一拍等窗口上屏，避免被 DWM/Qt 吞。
+                if (self._want_fullscreen and not self._expect_normal
+                        and not self.isMinimized()):
+                    QTimer.singleShot(30, self._enforce_native_fullscreen)
+                QTimer.singleShot(80, self._sync_fullscreen_padding)
+                if self._want_fullscreen:
+                    self._schedule_verify(260)
+            # 系统直接**改小**全屏窗口（Win+方向键 / Snap 面板 / 拖标题栏到边缘）：
+            # 这不是我们的退全屏路径（那条走 _on_escape + _win_geo_morph，且
+            # _expect_normal 为真）。记下"从哪个满屏矩形出来"，_apply_snap_zoom
+            # 一旦判定接管分屏，就用它当覆盖层起点，把这一下硬跳补成连续缩小。
+            # ⛔ 必须在更新 _last_window_state **之前**读旧状态；
+            # ⛔ 排除"从最小化还原"（was_min）：那条链要**回到**全屏。
+            was_fs = bool(self._last_window_state & Qt.WindowState.WindowFullScreen)
+            is_fs = bool(state & Qt.WindowState.WindowFullScreen)
+            self._last_window_state = state
+            if (was_fs and not is_fs and not was_min and not self._expect_normal
+                    and not self._geo_animating):
+                self._fs_left_rect = (QRect(self._fs_rect) if self._fs_rect
+                                      else None)
+                self._fs_left_ts = time.monotonic()
+                # 用户主动离开全屏（Win+↓ / Snap）：意图要跟着降，否则
+                # _verify_fullscreen 会把窗口又钉回全屏。
+                self._want_fullscreen = False
             # 用户点了**最大化**按钮：Windows 的最大化永远给任务栏让位，
             # 物理上盖不住它 —— 这个软件是全屏应用，直接转成真全屏
             # （物理像素铺满 + 任务栏隐藏，这正是用户要的"最大化程度"）。
+            # ⚠️ 2026-11-01：**不要立刻转**！立刻 showFullScreen 会把 Windows 的
+            #    原生最大化动画掐断（用户："最大化依旧没有动画"）。等原生动画
+            #    落定（~220ms）再转全屏，观感是先连续长大、再补上任务栏那一截。
             # singleShot 派发：不在状态切换的回调里再切状态（会重入）。
-            if (self.windowState() & Qt.WindowState.WindowMaximized
+            if (state & Qt.WindowState.WindowMaximized
                     and not self.isFullScreen() and not self._expect_normal):
-                QTimer.singleShot(0, self.startup_fullscreen)
+                QTimer.singleShot(220, self.startup_fullscreen)
             # 全屏 ⇄ 普通的每一次切换都会走到这儿，标题栏那颗键的面孔在这里统一刷
             self._refresh_caption_ui()
+            # 状态落地后再算一次内容边距：showNormal/showFullScreen 是异步的，
+            # 切换当拍读到的还是旧状态（实测还原后边距停在 0）。
+            QTimer.singleShot(0, self._sync_fullscreen_padding)
         super().changeEvent(event)
+
+    # ------------------------------------------------------ Windows Snap Layouts
+    #
+    # Win11 里"鼠标悬停在最大化键上弹出分屏面板"（1/2、1/3、1/4 就在那个面板里）、
+    # 以及 Win+Z，前提都是系统知道**鼠标此刻压在最大化键上** —— 判据是窗口对
+    # ``WM_NCHITTEST`` 返回 ``HTMAXBUTTON``。我们的标题栏是自绘的（无边框窗口），
+    # 整个客户区默认返回 ``HTCLIENT``，所以面板永远不弹（用户报的"适不了分屏"）。
+    #
+    # 这里只补这一条：鼠标落在**最大化键矩形内**时返回 HTMAXBUTTON，其余一律交回
+    # Qt/系统 —— 边缘那 6px 的缩放命中带（startSystemResize）、拖拽、双击最大化
+    # 全都不受影响（它们走的还是 Qt 的事件路）。
+    #
+    # ⛔ 只在**普通态**给：全屏时那颗键是"退出全屏"，交给 Windows 去"还原"会和
+    #    _want_fullscreen / _verify_fullscreen 那套延迟核对打架。
+    # ⛔ 只用 ctypes 的 GetCursorPos / ScreenToClient 做坐标换算（不引依赖、不 Add-Type）。
+
+    WM_NCHITTEST = 0x0084
+    WM_NCMOUSELEAVE = 0x02A2
+    WM_NCLBUTTONDOWN = 0x00A1
+    WM_NCLBUTTONDBLCLK = 0x00A3
+    HTMAXBUTTON = 9
+
+    def nativeEvent(self, eventType, message):
+        if sys.platform == "win32":
+            try:
+                from ctypes import wintypes
+                msg = wintypes.MSG.from_address(int(message))
+            except Exception:
+                msg = None
+            if msg is not None and msg.message == 0x0083 and msg.wParam:
+                # WM_NCCALCSIZE：客户区 = 整个窗口矩形（吃掉系统标题栏/边框高度）。
+                # 画面上仍是我们自绘的标题栏，但**窗口样式**是普通窗口 —— 这样
+                # 最小化/还原由 DWM 原生播放动画（用户 2026-11-01 要"连续、符合逻辑"）。
+                if self._nccalc_preserve:
+                    # ⛔ 2026-11-04 无闪还原窗口期：返回 WVR_ALIGNTOP|LEFT，
+                    #    resize 时系统**保留**旧客户内容（钉左上）而不是整块
+                    #    失效清空 —— 否则 backing store 被 resize 丢弃、Qt 异步
+                    #    重绘前 DWM 已开始合成原生还原动画，动画首段是一块
+                    #    无内容的纯灰（黑底录屏 f0050 实测）= 用户报的"闪"。
+                    return True, 0x0030   # WVR_ALIGNTOP(0x10) | WVR_ALIGNLEFT(0x20)
+                return True, 0
+            if msg is not None and not self.isFullScreen():
+                if msg.message == self.WM_NCHITTEST:
+                    if self._cursor_on_max_button():
+                        self._set_max_button_hot(True)
+                        return True, self.HTMAXBUTTON
+                    self._set_max_button_hot(False)
+                elif msg.message in (self.WM_NCLBUTTONDOWN, self.WM_NCLBUTTONDBLCLK) \
+                        and msg.wParam == self.HTMAXBUTTON:
+                    # ⚠️ 2026-11-01 **回滚原生最大化**：无边框窗口（WM_NCCALCSIZE
+                    #    吃掉标题栏/边框）走 SW_MAXIMIZE 时，Windows 按"工作区 +
+                    #    不可见边框"给尺寸 → 客户区溢出屏幕一圈，顶部内容被裁
+                    #    （用户截图"卡片头部被挡住"）。改回全屏直达；最大化动画
+                    #    若要做，必须先补 WM_GETMINMAXINFO 把最大化尺寸钉成显示器
+                    #    工作区，风险高、另议。
+                    QTimer.singleShot(0, self._toggle_fullscreen)
+                    return True, 0
+                elif msg.message == self.WM_NCMOUSELEAVE:
+                    self._set_max_button_hot(False)
+        return super().nativeEvent(eventType, message)
+
+    def _max_button_rect(self) -> QRect:
+        """最大化键在**窗口坐标**里的矩形（自绘标题栏里那颗，位置随宽度变）。"""
+        button = self._caption_bar.btn_max
+        return QRect(button.mapTo(self, QPoint(0, 0)), button.size())
+
+    def _cursor_on_max_button(self) -> bool:
+        """鼠标是否落在最大化键上（物理坐标 → 逻辑坐标，按 devicePixelRatio 换算）。"""
+        if not self._caption_bar.isVisible():
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            point = wintypes.POINT()
+            if not user32.GetCursorPos(ctypes.byref(point)):
+                return False
+            # ScreenToClient 给的是**物理**客户区坐标，Qt 的几何是逻辑坐标
+            if not user32.ScreenToClient(int(self.winId()), ctypes.byref(point)):
+                return False
+        except Exception:
+            return False
+        dpr = max(1.0, self.devicePixelRatioF())
+        return self._max_button_rect().contains(int(point.x / dpr), int(point.y / dpr))
+
+    def _set_max_button_hot(self, hot: bool) -> None:
+        """系统把悬停事件从标题栏抢走了，这里替那颗键补上悬停反馈。
+
+        WM_NCHITTEST 返回 HTMAXBUTTON 之后，鼠标移动不再进 Qt 的事件路 ——
+        按钮的 enterEvent 永远不来，悬停色块也就不亮。每个 NCHITTEST 顺手补一次
+        （只在状态真变时发，避免每帧重启补间）。
+        """
+        if hot == self._max_btn_hot:
+            return
+        self._max_btn_hot = hot
+        button = self._caption_bar.btn_max
+        try:
+            if hot:
+                local = QPointF(button.width() / 2.0, button.height() / 2.0)
+                global_pos = QPointF(button.mapToGlobal(local.toPoint()))
+                QApplication.sendEvent(
+                    button, QEnterEvent(local, global_pos, global_pos))
+            else:
+                QApplication.sendEvent(button, QEvent(QEvent.Type.Leave))
+        except RuntimeError:
+            pass
 
     def event(self, event) -> bool:
         # 全屏期间每次几何变化都核对物理覆盖：Qt 偶尔会用**逻辑几何**把全屏
@@ -2167,7 +4244,15 @@ class MainWindow(QMainWindow):
         return super().event(event)
 
     def _set_corner_preference(self, hwnd: int, round_: bool) -> None:
-        """Win11 的窗口圆角在全屏时会在四角露出壁纸 —— 全屏时明确关掉。"""
+        """Win11 的窗口圆角在全屏时会在四角露出壁纸 —— 全屏时明确关掉。
+
+        2026-11-02 追加：Win11 还会给带 ``WS_THICKFRAME`` 的窗口在**窗口内侧**画
+        1 逻辑像素的描边。全屏时这圈描边就在屏幕最外沿 —— 截图逐像素实测四边都有
+        2 物理像素（dpr=2）的中性灰 ``(60,60,60)``，向内第 3 像素才是应用底色
+        ``(13,13,15)``。这就是用户反复报的"四周缝隙"真身（几何其实已精确等于显示器）。
+        全屏时把 ``DWMWA_BORDER_COLOR`` 设成 ``DWMWA_COLOR_NONE`` 去掉；回普通态
+        恢复 ``DWMWA_COLOR_DEFAULT``，普通窗口的描边/阴影照旧。
+        """
         try:
             import ctypes
             # DWMWA_WINDOW_CORNER_PREFERENCE=33，DWMWCP_DEFAULT=0/DONOTROUND=1
@@ -2175,8 +4260,14 @@ class MainWindow(QMainWindow):
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 ctypes.c_void_p(hwnd), 33, ctypes.byref(pref),
                 ctypes.sizeof(pref))
+            # DWMWA_BORDER_COLOR=34；DWMWA_COLOR_NONE=0xFFFFFFFE / DEFAULT=0xFFFFFFFF
+            # round_=False（全屏/最大化）→ 去掉描边；round_=True（普通窗）→ 系统默认。
+            border = ctypes.c_uint(0xFFFFFFFF if round_ else 0xFFFFFFFE)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                ctypes.c_void_p(hwnd), 34, ctypes.byref(border),
+                ctypes.sizeof(border))
         except Exception:
-            pass            # Win10 没有这个属性，静默忽略
+            pass            # Win10 没有这些属性，静默忽略
 
     def _enforce_native_fullscreen(self):
         """游戏式兜底：把窗口精确对到**所在显示器**的物理矩形，帮 shell 认全屏。
@@ -2248,15 +4339,28 @@ class MainWindow(QMainWindow):
         self._set_corner_preference(hwnd, round_=False)
         target = (left, top, left + width, top + height)
         if (rect.left, rect.top, rect.right, rect.bottom) == target:
+            # ⛔ showFullScreen()/setWindowState(FullScreen) 会把 WS_POPUP 重新加回给
+            #    无边框窗口（Qt 把全屏态当 popup）→ DWM 不播最小化/还原/打开动画、shell
+            #    也不把它当正常全屏窗口管理（缝隙 + 首帧无动画的共同根因）。钉屏后立刻
+            #    把 POPUP 再摘掉一次（_enable_native_snap 幂等、自保活 win32）。
+            self._enable_native_snap()
             return (rect.left, rect.top, rect.right, rect.bottom), target
+        before = (rect.left, rect.top, rect.right, rect.bottom)
         # SWP_NOZORDER=0x0004（z 序交给 Qt 的全屏态，绝不能碰 TOPMOST）
         user32.SetWindowPos(wintypes.HWND(hwnd), None,
                             left, top, width, height, 0x0004)
         # 落定后再量一次，记进日志的才是"真实结果"而不是"我下发的目标"
         user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect))
+        # ⚠️ 2026-11-02 诊断：DPI 缩放屏上"差几物理像素没铺满"是缝隙根源，
+        #    这条日志能看出还原后到底修了多大幅度的偏移（用户复现后回传日志定位）。
+        app_log.info(f"钉屏修正：{before} -> {(rect.left, rect.top, rect.right, rect.bottom)} "
+                     f"(目标显示器 {target})")
+        # ⛔ 同上：钉屏（SetWindowPos 改几何）之后必须把 showFullScreen 加回的
+        #    WS_POPUP 摘掉，否则窗口仍是 popup 态、DWM 不播动画、shell 不认全屏。
+        self._enable_native_snap()
         return (rect.left, rect.top, rect.right, rect.bottom), target
 
-    def _verify_fullscreen(self) -> None:
+    def _verify_fullscreen(self, token: int | None = None) -> None:
         """延迟核对：该全屏却没铺满本显示器 → 重新钉一遍，并把结果记进日志。
 
         为什么需要它：Windows 的"最大化 / 全屏"切换带系统动画，shell 也可能在
@@ -2266,13 +4370,27 @@ class MainWindow(QMainWindow):
         只在"用户想要全屏"（``_want_fullscreen``）且不在程序性退普通窗口的窗口期
         （``_expect_normal``）才动手：用户按 Esc 主动退出、或收起接收区展开回到普通
         窗口之后，这里绝不能再把人拽回全屏。
+
+        ⚠️ ``token`` 是"全屏意图代次"：``_schedule_verify`` 排的时候记下当前代次，
+        意图一变（Esc 退出 / 重新进全屏）代次就 +1，**旧定时器一律作废**。
+        没有它的话，进全屏时排的 +180/+600ms 核对会在用户刚退出、又刚把
+        `_want_fullscreen` 置回真的那一瞬间抢跑，把窗口拽回全屏
+        （自测「普通态没落下去」就是这么假挂的）。直接调用（token=None）不受限。
         """
-        if not self._want_fullscreen or self._expect_normal:
+        if token is not None and token != self._verify_token:
+            return
+        if (not self._want_fullscreen or self._expect_normal
+                or self.isMinimized()):
             return
         result = self._enforce_native_fullscreen()
         if result is not None:
             window_rect, monitor_rect = result
             app_log.info(f"全屏核对：窗口 {window_rect} / 显示器 {monitor_rect}")
+
+    def _schedule_verify(self, delay: int) -> None:
+        """排一次带代次的延迟核对（见 _verify_fullscreen 的 token 说明）。"""
+        token = self._verify_token
+        QTimer.singleShot(delay, lambda: self._verify_fullscreen(token))
 
     def startup_fullscreen(self) -> None:
         """软件启动即**整窗全屏**（showFullScreen 连任务栏一起盖掉）。
@@ -2282,16 +4400,209 @@ class MainWindow(QMainWindow):
         点放大按钮控制。物理像素对齐见 ``_enforce_native_fullscreen``。
         普通几何不用在这里存：进入前它一直被 _remember_normal_geometry 记着。
         """
+        # ⛔ 进入全屏前把普通几何钉住（showEvent 补记之外的第二道保险）：
+        #    此刻仍是普通态，_remember 的守卫会自己挡住非普通态。
+        if self._normal_geometry is None:
+            self._remember_normal_geometry()
         self._want_fullscreen = True
-        self.showFullScreen()
-        self.raise_()
-        self.activateWindow()
-        self._enforce_native_fullscreen()
+        self._pending_restore_fs = False
+        self._state_ts = time.monotonic()
+        # 连点：还原动画的无闪窗口期立即作废（进全屏方向要整窗重排，
+        # 保留旧内容反而钉住过期画面）。
+        self._clear_nccalc_preserve()
+        # 新的全屏意图：作废之前排的延迟核对（见 _verify_fullscreen 的 token）
+        self._verify_token += 1
+        # 捕获本次意图代次：进全屏的"延迟状态落地"要带它排队（见下方 _land），
+        # 期间意图一变（连点/退出）旧回调立即作废。
+        token = self._verify_token
+        # 进全屏前掐掉在途的"还原几何补间"（连点最大化/还原时不打架）。
+        # ⛔ Tween.stop() 默认不触发 on_finished —— _geo_animating 必须手动清。
+        if self._win_geo_tween is not None and self._win_geo_tween.running:
+            self._win_geo_tween.stop()
+        # ⛔ 同 _reverse_enter_to_normal：掐掉在途补间后先解冻（stop 不走回调）
+        self._morph_unfreeze()
+        self._geo_animating = False
+        self._fs_animating = False      # 连点最大化：上一段进全屏补间到此作废
+        self._fs_target = None
+        self._fs_left_rect = None
+        # 开屏期间（main.py 设 `_skip_startup_anim`）：跳过所有启动动画，
+        # 直接把窗口摆成全屏 —— 开屏盖着看不出来，也省掉 260ms 补间/淡入的
+        # 重排开销，把 GPU/CPU 让给开屏视频（用户 2026-11-03："感觉有点小卡"）。
+        if getattr(self, "_skip_startup_anim", False):
+            self.showFullScreen()
+            self._sync_fullscreen_padding()
+            self.raise_()
+            self.activateWindow()
+            self._enforce_native_fullscreen()
+            self._fs_rect = (self.screen().geometry() if self.screen()
+                             else QRect(self.geometry()))
+            self.setWindowOpacity(1.0)
+            for delay in (180, 600):
+                self._schedule_verify(delay)
+            self._fs_idle_pix = None
+            self._fs_idle_ts = 0.0
+            # ⛔ 开屏期间不排（会砸在开屏动画尾部），见 _schedule_fs_idle_snap
+            self._schedule_fs_idle_snap()
+            return
+        # 分屏 → 全屏：分屏接管时页头/配置卡/发送卡/opts 行是藏着的，进了全屏
+        # 若不管，窗口会停在"分屏版式"的全屏。先按进来时的可见性还原，再抓图。
+        if self._snap_zoom:
+            self._leave_snap_zoom()
+        # 2026-11-02 第七轮：**真窗口几何补间**（用户："要连续的流畅的，不要闪"）。
+        # 窗口不是全屏、有普通几何、不是开屏 → 直接对真窗口 setGeometry：内容
+        # **实时回流**，不是"拉伸的旧快照"。补间结束由 _on_win_geo_done 调
+        # showFullScreen()（几何已等于显示器矩形，状态切换本身无可见跳变）。
+        # 开屏（还没画第一帧）没有可用的旧几何，仍走淡入。
+        _screen_rect = self.screen().geometry() if self.screen() else None
+        if (_screen_rect is not None and not self.isFullScreen()
+                and QRect(self.geometry()) == QRect(_screen_rect)):
+            # 窗口已经就在显示器矩形上（进全屏补间刚画完终点帧 / 连点落在
+            # 收尾边界 / 用户手动拖满）：没有任何几何可动，直接落地全屏。
+            # ⛔ 别走下面的覆盖层路径 —— 那会白抓一整屏（实测 105ms 同步阻塞
+            #    在点击里 = 连点卡顿来源之二）。
+            self.showFullScreen()
+            self._sync_fullscreen_padding()
+            self.raise_()
+            self.activateWindow()
+            self._enforce_native_fullscreen()
+            self._fs_rect = QRect(_screen_rect)
+            self.setWindowOpacity(1.0)
+            for delay in (180, 600):
+                self._schedule_verify(delay)
+            self._fs_idle_pix = None
+            self._fs_idle_ts = 0.0
+            self._schedule_fs_idle_snap()
+            return
+        # ⛔⛔ 2026-11-04：进全屏的"真窗口几何补间"快速通道**撤掉**。进程内实测
+        #    真窗口 morph 每帧 setGeometry 触发整窗重排+重绘（~36ms/帧），共享
+        #    ticker 被挤到 **27fps** = 用户报的"最大化动画卡得不行"；补间期间
+        #    挂起重绘虽能跑到 163fps，但画面完全不动（内容钉死、收尾一帧跳
+        #    全屏）= 另一种闪。改回**覆盖层缩放**：专用 8ms 定时器 +
+        #    FastTransformation（单帧 1~3ms），内容随窗缩放、末段 30% 交叉淡出
+        #    —— 与分屏→全屏同一条已验证链路。抓图用**窗口矩形**（od19 起恒现抓
+        #    ~51ms，远低于整屏 82~114ms；原因见下）。
+        # ⚠️ 抓图必须在 showFullScreen **之前**：之后抓到的是满屏画面，
+        #    覆盖层就没有"从旧矩形长大"的内容了。
+        _cover_from = QRect(self.geometry())
+        # ⛔ 必须屏幕抓图：self.grab() 对自绘玻璃只拿到纯底色（=黑块长大）
+        _cover_pix = None
+        if (animations_enabled() and self.isVisible()
+                and not self.isFullScreen()
+                and not getattr(self, "_startup_phase", False)):
+            # ⛔ od47i：改用后台线程的**新鲜**快照（≤160ms 前），零主线程阻塞。
+            #    旧实现现场同步抓窗口矩形 ~51ms（主线程卡顿 = 用户说的「卡」），
+            #    而空闲缓存又是 1.5s 前的旧帧（= 「闪」）—— 二者互斥、都不对。
+            #    后台 SnapWorker 已把抓图搬到独立线程，这里只做 QImage→QPixmap。
+            _cover_pix = self._fresh_snapshot_pixmap()
+        # ⛔ od47g：抓到的「普通版式」快照顺手存为**还原方向**覆盖层的 B 层（目标=普通版式）。
+        #    此刻窗口仍是普通态、抓到的正是普通布局；还原时 A(全屏快照)→B(此帧) 交叉溶解到
+        #    真实普通窗口，无缝。⛔ 启动即全屏走 _skip_startup_anim 早退分支，根本到不了
+        #    这里 → _normal_idle_pix 保持 None（真机已确认）；该首轮还原由
+        #    _run_window_cover(inject_b=True) 在状态落地后 grab 目标版式补建，不再退化单快照。
+        self._normal_idle_pix = _cover_pix
+        # ⛔⛔ 2026-11-04 od19：**延迟落地状态**（与还原方向同一条已验证结论）。
+        #    覆盖层是新顶层窗，show() 到 DWM 首帧合成实测 **70~100ms**；旧方案
+        #    状态立刻落地、靠 _on_cover_tick 在 ~24ms 后藏主窗 —— 那一刻覆盖层
+        #    还没上屏、主窗已透明，中间几十毫秒什么都没有（露桌面）= 用户报的
+        #    「最大化的动画会闪」。
+        #    现在的顺序：① 覆盖层先铺好（此刻主窗仍是普通态，矩形与覆盖层重合，
+        #    内容一致 —— 用户看不出任何变化）；② 等 100ms 让 DWM 把覆盖层合成
+        #    上屏；③ 才 showFullScreen + 藏主窗 + 启动覆盖层缩放（末段 30%
+        #    交叉淡出露出真实全屏界面，机制不变）。
+        #    抓图仍用**窗口矩形**（~51ms，远低于整屏 82~114ms），且在状态切换前。
+        # ⛔ od47i：A 层（起手=当前普通版式）用后台新鲜快照（见上），消除「现场
+        #    同步抓 ~51ms = 卡」与「旧缓存 = 闪」。
+        # ⛔⛔ S2：B 层（目标=全屏版式）用缓存的 _fs_idle_pix。与 od47i 旧注释
+        #    不同 —— S2 让 B 从 t=0.90 起渐显约 100ms，陈旧内容（串口数据滚动）
+        #    在溶解段**用户可见**；源码 4 处历史真机注释记录「1.5s 旧缓存 +
+        #    串口滚动 = 内容跳变 = 闪」。故按 _fresh_snapshot_pixmap 同款 ≤450ms
+        #    年龄闸校验 _fs_idle_ts：B 年龄 >450ms 时把溶解窗口从 [0.90,1.0]
+        #    压到 [0.99,1.0]（_cover_blend_start=0.99）—— 陈旧内容只在最后
+        #    1~2 帧可见，且**末帧仍是 B**（全屏版式），收尾 hide 露真窗同版式
+        #    → 无缝，绝不退回 S0 的「全程 A + 收尾亮度塌陷」。
+        #    ⛔ 不用窗口级透明淡出实现退路（od62 教训）。
+        #    B 来源：_on_escape 2597 顺手存的新鲜全屏帧 + _build_fs_idle_pix
+        #    的 60ms 自重试链；两处都记 _fs_idle_ts。
+        #    ⛔ 首轮进全屏（普通启动→最大化）_fs_idle_pix 恒 None、首次还原的
+        #    _normal_idle_pix 也可能 None：这两处由 _run_window_cover(inject_b=True)
+        #    在状态落地后 grab 目标版式补建 B（见 _inject_target_cover_b）。
+        #    边界 4318/4347 early-return 只是「该次切换」不播覆盖层、无需 B；
+        #    ⚠️ 但它导致后续第一次还原的 _normal_idle_pix 缺失，已由上面兜底覆盖。
+        self._cover_blend_start = 0.90
+        if (self._fs_idle_pix is not None
+                and (time.monotonic() - self._fs_idle_ts) > 0.45):
+            self._cover_blend_start = 0.99
+        _cover = self._begin_window_cover(
+            _cover_pix, _cover_from, pixmap_b=self._fs_idle_pix,
+            want_crossfade=True)
+
+        def _land() -> None:
+            # 延迟期间意图变了（连点/退出）：本次作废。只清理**自己的**覆盖层
+            # —— 期间若又发起一次进全屏，_begin_window_cover 已接管新覆盖层，
+            # 这里绝不能把它一起干掉（否则新回调拿死控件 setGeometry = 崩）。
+            if token != self._verify_token:
+                if self._cover_label is _cover:
+                    self._finish_window_cover()
+                return
+            if not self.isVisible():
+                if self._cover_label is _cover:
+                    self._finish_window_cover()
+                return
+            # 覆盖层已在屏上：此刻藏主窗（全屏主窗被 _enforce_native_fullscreen
+            # 钉进 TOPMOST 带，不藏会压住同带的覆盖层）。t>0.7 时由
+            # _cover_opacity_pending 机制恢复主窗可见。
+            self.setWindowOpacity(0.0)
+            # ⛔⛔ 2026-11-07 修「进全屏拉伸」：压掉系统原生全屏动画（与还原方向
+            # 对称——还原在 _on_escape 里已压）。覆盖层在播自己的缩放，系统若再给
+            # 主窗播一遍全屏弹簧，两层叠加在覆盖层撤掉那一刻会露出"系统版"缩放 =
+            # 用户看到的"拉伸"。_finish_window_cover 收尾统一恢复。
+            self._set_dwm_transitions(int(self.winId()), True)
+            self.showFullScreen()
+            self._sync_fullscreen_padding()
+            self.raise_()
+            self.activateWindow()
+            self._enforce_native_fullscreen()
+            # 记下满屏矩形：全屏→分屏（Win+方向键 / Snap 面板）的反向动画要拿它
+            # 当覆盖层起点。此时 _enforce_native_fullscreen 已把窗口钉到显示器上。
+            self._fs_rect = (self.screen().geometry() if self.screen()
+                             else QRect(self.geometry()))
+            self._raise_window_cover()
+            self._cover_opacity_pending = True     # 70% 处恢复主窗可见（原有机制）
+            self._run_window_cover(_cover, _cover_from, self._fs_rect, 300,
+                                   inject_b=True)
+
+        if _cover is not None:
+            # ⛔ 延迟 100ms：32ms 不够（还原方向 v7 录屏 f0050 实测仍是空白）。
+            # ⛔ od55：100→48ms（与还原方向同档；DWM 首帧 p95 21ms）。
+            QTimer.singleShot(48, _land)
+        else:
+            # 无覆盖层（动画关/抓图失败/开屏）：保持原行为 —— 状态立刻落地 + 淡入。
+            self.showFullScreen()
+            self._sync_fullscreen_padding()
+            self.raise_()
+            self.activateWindow()
+            self._enforce_native_fullscreen()
+            self._fs_rect = (self.screen().geometry() if self.screen()
+                             else QRect(self.geometry()))
+            if getattr(self, "_startup_phase", False):
+                # 开屏：从全透明淡入。窗口刚出现，没有"上一帧"可做几何动画，
+                # 淡入才是正确的"软件出现"观感（抓屏会抓到桌面，不能用覆盖层）。
+                self._reveal_window(0.0, 240)
+            else:
+                self._reveal_window(0.75, 120)
         # 动画落定后再核两次：Windows 最大化/全屏切换有系统动画，shell 有可能在
         # 动画结束时用最大化的排版盖掉全屏（"点了最大化四周还有桌面"）。核不上
         # 就重新钉一遍，并把窗口/显示器矩形写进日志（logs/ 里能查）。
         for delay in (180, 600):
-            QTimer.singleShot(delay, self._verify_fullscreen)
+            self._schedule_verify(delay)
+        # 空闲后缓存一张全屏快照：还原方向的覆盖层"旧画面"（点击现场零抓屏）。
+        # 进全屏前先清旧缓存。⛔ 1500ms：旧值 600ms 落在"点最大化后用户正在看
+        # 动画/刚放手"的窗口里，而 _grab_window_rect() 在全屏尺寸下是整屏
+        # BitBlt（实测 82~114ms 主线程阻塞）= 一次明显卡顿。挪到 1.5s 后
+        # 覆盖层动画（100ms 延迟 + 300ms）早已收尾、版式重排也稳定了。
+        self._fs_idle_pix = None
+        self._fs_idle_ts = 0.0
+        self._schedule_fs_idle_snap()
 
     def apply_startup_state(self) -> None:
         """按「定制功能 → 启动时最大化」摆起手姿态（入口在 main.py，show() 之后调一次）。
@@ -2304,10 +4615,25 @@ class MainWindow(QMainWindow):
         吃掉了 —— 留成 True 的话，窗口一旦有什么几何变化就会被钉回全屏。
         """
         if customization.get("startup_maximized"):
-            self.startup_fullscreen()
+            # 2026-11-02 用户第七轮：开屏动画。窗口刚 show()、**还没画出第一帧**，
+            # 此时抓屏只会抓到后面的桌面 —— 覆盖层会把桌面放大，观感完全不对。
+            # 用 _startup_phase 告诉 startup_fullscreen：这次不抓图，走淡入。
+            self._startup_phase = True
+            try:
+                self.startup_fullscreen()
+            finally:
+                self._startup_phase = False
         else:
             self._want_fullscreen = False
             self._refresh_caption_ui()
+            # 打开软件：从全透明淡进来（120ms），不是"啪"一下整块出现
+            self._reveal_window(0.0, 150)
+        # od47i：开屏结束后再启后台抓图线程（1.5s 足够开屏淡出走完），
+        # 避免抓图 BitBlt 与开屏动画抢 CPU 压帧率。
+        # ⛔ 必须带 context（self）：无 context 的单发定时器不会随窗口销毁而取消，
+        #    自测/探针里窗口 1.5s 内就 close+deleteLater，定时器到点仍会回调 →
+        #    访问已析构的 QThread parent，进程静默死掉（selftest 退出码 127 的根因）。
+        QTimer.singleShot(1500, self, self._start_snap_worker)
 
     def _apply_startup_maximized(self) -> None:
         """设置面板里拨了「启动时最大化」→ 当场按新选择摆一次窗口。
@@ -2339,6 +4665,27 @@ class MainWindow(QMainWindow):
         就失效、铺不满屏幕"的根源）。窗口全屏是**持久状态**（startup_fullscreen
         进入、Esc 退出），这里只切换卡片显隐，几何一个字节都不动。
         """
+        # 2026-11-02 用户：「分屏状态下点击接收区最大化按钮时要做一个单独的动画优化…
+        # 最大化之后再点击就回到最初的软件最大化的界面，而不是分屏状态」。
+        # 分屏进来时卡片本来就已经藏起：只退出分屏接管（清标志 + 收竖栏那颗无文字
+        # 开关），**不把卡片显示回来**（否则会闪一下再被展开动画藏掉）；收起时回
+        # 整窗全屏（_pre_expand_fullscreen=True）。
+        was_snap = self._snap_zoom
+        self._expand_from_snap = was_snap
+        # 2026-11-03 用户澄清：**只有分屏来源的展开**才把飞进竖栏的开关藏成
+        # 无文字胶囊；普通态（非分屏）展开的动画/开关带文字行为**完全不变**。
+        # 这个标志每次展开重设、收起的 _rx_transition(False) 还要读它恢复
+        # 文字，所以不在 _collapse_receive 里清（下次展开覆盖）。
+        self._rx_switch_textless = was_snap
+        if was_snap:
+            self._snap_zoom = False
+            self._snap_zoom_saved = None
+            self._in_snap_apply = True
+            try:
+                self.chk_snap_power.setVisible(False)
+            finally:
+                self._in_snap_apply = False
+            self._sync_fullscreen_padding()
         self._expanded = True
         # ⛔ 先把在途的转场补间**冻结**在当前进度：下面 showFullScreen + 等窗口落地
         #    会阻塞（最多 160ms），不冻结的话反向点击时旧补间会在这段时间里继续跑
@@ -2357,7 +4704,7 @@ class MainWindow(QMainWindow):
         # 大小（用户点名）。之前就是全屏 → 回全屏；之前是普通窗口 → 回原位。
         # 同样用**客户区矩形**（与 _remember_normal_geometry 一致），
         # saveGeometry/restoreGeometry 会被 DWM 的不可见边框带上偏移。
-        self._pre_expand_fullscreen = self.isFullScreen()
+        self._pre_expand_fullscreen = self.isFullScreen() or was_snap
         self._pre_expand_geometry = (None if self._pre_expand_fullscreen
                                      else self.geometry())
         # ⚠️ showFullScreen **必须无条件调用**：收起后 isFullScreen() 会短暂
@@ -2444,11 +4791,14 @@ class MainWindow(QMainWindow):
     # 各有各的时长/曲线/起跑时刻：速度在合成处相加、短的那条先停 → 折点；
     # 各自 _on_finished 又落在不同帧 → 收尾一连串小跳（逐帧实测单帧 60~110px）。
     #
-    # 现在只有一条 Tween(260, STANDARD)：_on_rx_transition(t) 里一次性把所有
+    # 现在只有一条 Tween(320, STANDARD)：_on_rx_transition(t) 里一次性把所有
     # 几何算出来并应用（每帧只触发一次布局），收尾也只有一个 _on_rx_done。
     # t 连续 → 中途再次点击从当前 t 反向（Tween.start(self._rx_t, target)），
     # 不跳回起点、也不跑完再反向。展开/退出用同一条公式（t 反向即镜像曲线）。
-    _RX_TRANSITION_MS = 260
+    # 时长 260→320ms：同样的位移摊在更多帧上，峰值速度更低（不再"一上来就窜出去"），
+    # 在 165Hz 屏上肉眼更顺；卡片"提前到位"的标定（_RX_CARD_AHEAD）在 q 空间、
+    # 与绝对时长无关，只是到达满宽的时间点同步后移，语义不变。
+    _RX_TRANSITION_MS = 320
 
     # 配置卡"提前到位"的进度占比：q（普通态进度 0→1）走到 0.85 时卡片已是满宽。
     #
@@ -2465,6 +4815,18 @@ class MainWindow(QMainWindow):
 
     def _rx_transition(self, to_expanded: bool) -> None:
         """接收区最大化 / 退出：**一条时间线**驱动全部几何（见上方说明）。"""
+        # 展开态：串口开关飞进右侧 rail —— **只有分屏来源的展开**（_rx_switch_textless，
+        # 由 _expand_receive 按 was_snap 设定）才藏「串口开关」文字；普通态展开的
+        # 开关始终带文字（用户 2026-11-03：「正常状态下接收区最大化不改变」）。
+        # ⛔ 必须在 _rx_capture_full 之前切：这样 _open_row 的尺寸（_rx_row_w /
+        #    rail 落点）按「无文字的窄宽」算，整段动画尺寸一致不跳。
+        # Switch 的 accessibleName 在构造时一次性设好、不被 setText 抹掉，无障碍名保留。
+        if getattr(self, "_rx_switch_textless", False):
+            # snap 来源：开关始终以「无文字胶囊」形态出现在竖栏；恢复时也只是把它
+            # 淡出（见 _rx_switch_fade），文字在落定插回卡片那一刻才恢复。
+            self.btn_open.setText("")
+        else:
+            self.btn_open.setText("串口开关")
         target = 1.0 if to_expanded else 0.0
         self._expanded = to_expanded
         if to_expanded and self._rx_t <= 0.01:
@@ -2475,17 +4837,16 @@ class MainWindow(QMainWindow):
         self._rx_prepare(to_expanded)
         self._rx_target = target
         if self._rx_tween is None:
-            # ⚠️ min_interval_ms=16：接收区最大化每帧都要重排三张大卡 + 磨砂重绘，
-            #    单帧能到 13~22ms，扛不住 165Hz 的 6ms 节拍。不节流的话计时器会在
-            #    一次重绘卡顿后**连发两拍**（实测两次 tick 只隔 1.7~3.5ms），把攒下
-            #    的进度一口气推完 —— 逐帧看就是一帧滑出去 60~86px 的"跳"，且高分
-            #    辨率屏上这种连发更多、尾巴更长（时长 60Hz 275ms vs 165Hz 320ms）。
-            #    限到 ≈60fps 稳定节拍后：进度仍按 perf_counter 算（时长不变、终点帧
-            #    不吞），但不再有"追赶式连发"，每帧位移摊在真实 dt 上 → 速度连续。
-            #    这是 Tween 专门为"每帧改布局的重动画"留的档，不是调阈值糊。
+            # ⚠️ min_interval_ms=8：与全局补间节拍（ui_anim.frame_interval_ms()=8ms、
+            #    即 120Hz）对齐。补间进度按 perf_counter 实时算（ui_anim.Tween.advance），
+            #    某一帧被布局卡住后下一拍送出的也是「对应该真实时间的进度」—— 不会像
+            #    旧版按 tick 计数那样把卡住的进度一口气推完。所以把节流从 16ms（≈60fps）
+            #    降到 8ms 既不会重现当年「一帧滑 60~86px 的跳」，又让接收区转场在 165Hz
+            #    屏上不再被压成半速、肉眼可见的卡顿。单帧重排 3 张大卡 + 磨砂仍可能到
+            #    13~22ms（≈45~75fps 真实上限），但那是渲染成本，节流不再额外雪上加霜。
             self._rx_tween = Tween(self._RX_TRANSITION_MS, STANDARD,
                                    self._on_rx_transition, self._on_rx_done,
-                                   parent=self, min_interval_ms=16)
+                                   parent=self, min_interval_ms=8)
         self._rx_tween.start(self._rx_t, target)
 
     def _rx_card_slot_w(self) -> int:
@@ -2578,6 +4939,14 @@ class MainWindow(QMainWindow):
         ⚠️ 必须对**中途反向**安全：不去重置"已在该值上"的东西（否则反向那一下
         会跳）。分割器尺寸、发送卡上限都由 _on_rx_transition 每帧按 t 现算。
         """
+        # 分屏恢复：开关用覆盖层淡出（见 _SwitchFade），不再飞回卡片。
+        was_fading = bool(getattr(self, "_rx_switch_fade", False))
+        self._rx_switch_fade = bool(
+            (not to_expanded) and getattr(self, "_rx_switch_textless", False))
+        if was_fading and not self._rx_switch_fade:
+            # 上一段淡出被中途打断（例如又点了展开）：撤掉覆盖层、把隐藏的开关
+            # 复位成窗口内浮动态，交给下面的正常 detach/飞行收尾（中断安全）。
+            self._rx_cancel_switch_fade(reset_row=True)
         if self._split_tween is not None and self._split_tween.running:
             self._split_tween.stop()
         # 暂停时工具栏可能正在收/展（见 _animate_opts_row）：先把行高还给布局，
@@ -2609,7 +4978,11 @@ class MainWindow(QMainWindow):
         if not already_flying:
             self._rx_switch_rail = (self._rx_rail_rect() if not to_expanded
                                     else self._rx_rail_rect_expanded)
-        self._rx_detach_switch()
+        if self._rx_switch_fade:
+            # 分屏恢复：不飞回卡片，抓图后用覆盖层淡出（见 _rx_detach_switch_for_fade）。
+            self._rx_detach_switch_for_fade()
+        else:
+            self._rx_detach_switch()
         # 配置卡宽度：**两个方向都先钉住**（原来只在展开方向钉）。
         # 开关离开卡片的那一瞬间卡的 sizeHint 就变小了，布局会当场按内容换一次
         # 宽度；收起方向也一样 —— 卡刚从隐藏态长回来时，布局先按内容算一次的宽度
@@ -2686,6 +5059,54 @@ class MainWindow(QMainWindow):
         row.show()
         row.raise_()
         self._rx_switch_active = True
+
+    def _rx_detach_switch_for_fade(self) -> None:
+        """分屏恢复专用：把开关从竖栏摘到窗口层级（**不飞**），抓图后用顶层覆盖层淡出。
+
+        真控件在动画期间隐藏；落定时由 ``_rx_finish_normal`` 把它插回卡片（带文字），
+        于是用户看到的是「开关在竖栏处淡出消失」，而不是被缩放/瞬切（项目铁律禁用
+        ``QGraphicsOpacityEffect``，这里走位图覆盖层 + ``paintEvent`` 里 setOpacity 绘制）。
+        """
+        row = self._open_row
+        g = row.geometry()
+        screen_pos = row.mapToGlobal(QPoint(0, 0))
+        try:
+            pix = row.grab(QRect(0, 0, max(1, g.width()), max(1, g.height())))
+        except RuntimeError:
+            pix = QPixmap()
+        rail_lay = self._rx_rail.layout()
+        in_rail = rail_lay is not None and rail_lay.indexOf(row) >= 0
+        if in_rail and rail_lay is not None:
+            rail_lay.removeWidget(row)
+        elif self._open_row_home.indexOf(row) >= 0:
+            self._open_row_home.removeWidget(row)
+        row.setParent(self)
+        row.setGeometry(screen_pos.x(), screen_pos.y(), g.width(), g.height())
+        row.hide()
+        fade = _SwitchFade()
+        fade.set_pix(pix)
+        fade.setGeometry(screen_pos.x(), screen_pos.y(), g.width(), g.height())
+        fade.set_alpha(1.0)
+        fade.show()
+        fade.raise_()
+        self._switch_fade = fade
+
+    def _rx_cancel_switch_fade(self, reset_row: bool = False) -> None:
+        """撤掉开关淡出覆盖层（中断 / 落定时用）。"""
+        fade = getattr(self, "_switch_fade", None)
+        if fade is not None:
+            try:
+                fade.hide()
+                fade.deleteLater()
+            except RuntimeError:
+                pass
+            self._switch_fade = None
+        self._rx_switch_fade = False
+        if reset_row:
+            try:
+                self._open_row.show()
+            except RuntimeError:
+                pass
 
     def _rx_place_home_gap(self) -> None:
         """在开关的原始格位放一个**同尺寸占位**（原因见 _rx_detach_switch）。
@@ -2765,12 +5186,14 @@ class MainWindow(QMainWindow):
                 self._rx_opts_row.hide()
             elif collapsing:
                 self._rx_opts_row.setFixedHeight(max(0, oh))
-                self._rx_opts_row.show()
+                if not self._snap_zoom:
+                    self._rx_opts_row.show()
             elif oh <= 3:
                 self._rx_opts_row.hide()
             else:
                 self._rx_opts_row.setFixedHeight(oh)
-                self._rx_opts_row.show()
+                if not self._snap_zoom:
+                    self._rx_opts_row.show()
             # 功能列宽度：普通宽 → 最大化宽（容下开关）
             # ⚠️ 必须在 setSizes **之前**设：``setFixedWidth`` 只把 LayoutRequest 排进
             #    队列，setSizes 却是**同步**重排 —— 反过来的话分割器先按旧列宽摆一遍，
@@ -2820,8 +5243,12 @@ class MainWindow(QMainWindow):
             #    放到前面只会多一次"旧尺寸 + 新上限"的中间重排。
             self._tx_card.setMaximumHeight(max(0, tx))
             self._splitter.setSizes([rx, tx])
-            # 串口开关位置：rail(1) ↔ home(0)
-            self._rx_place_switch(p)
+            # 串口开关位置：rail(1) ↔ home(0)；分屏恢复走淡出，不飞。
+            if self._rx_switch_fade:
+                if self._switch_fade is not None:
+                    self._switch_fade.set_alpha(max(0.0, 1.0 - p))
+            else:
+                self._rx_place_switch(p)
         except RuntimeError:                     # 窗口收尾，控件已析构
             if self._rx_tween is not None:
                 self._rx_tween.stop()
@@ -2981,14 +5408,17 @@ class MainWindow(QMainWindow):
             #    否则收尾会跳一下（最容易漏的一处）。q=1 时 _rx_card_width 返回
             #    的正是满宽（min(1, 1/0.85)=1），所以这里用**同一个函数**取值，
             #    而不是另写一个常量。逐帧探针会核对：最后一帧宽 == 落定后宽。
-            self._config_card.setFixedWidth(self._rx_card_width(1.0))
+            self._config_card.setFixedWidth(
+                min(self._rx_card_width(1.0),
+                    COMPACT_SPECS.get(max(0, self._compact_level),
+                                      COMPACT_SPECS[0])["config_w"]))
             self._config_card.show()
         self._rx_opts_row.setMinimumHeight(0)
         self._rx_opts_row.setMaximumHeight(WIDGETSIZE_MAX)
         # 全屏转场把内容钉过高度（见 _rx_capture_full）；退出时若它被钉成
         # "一条缝"就解钉，否则回到普通态工具栏仍然是 1~2px 的细条。
         self._heal_opts_content()
-        if not self._paused:
+        if not self._paused and not self._snap_zoom:
             self._rx_opts_row.show()
         target_h = self._rx_tx_normal
         content = not self._pre_send_collapsed
@@ -3000,6 +5430,16 @@ class MainWindow(QMainWindow):
         self._rx_clear_home_gap()
         self._open_row_home.insertWidget(0, self._open_row)
         self._open_row.show()
+        # 分屏恢复：开关是"淡出"收尾的，覆盖层在此撤掉（真控件已插回卡片并带文字）。
+        if self._rx_switch_fade and self._switch_fade is not None:
+            try:
+                self._switch_fade.hide()
+                self._switch_fade.deleteLater()
+            except RuntimeError:
+                pass
+            self._switch_fade = None
+            self._rx_switch_fade = False
+            self.btn_open.setText("串口开关")
         # 落定后重记一次"那一格"（窗口尺寸/DPI 变过之后仍然准）
         self._rx_apply_layout_now()
         self._rx_remember_home_slot(True)
@@ -3072,6 +5512,13 @@ class MainWindow(QMainWindow):
         self._set_rail_compact(False)   # 功能列还原成整列居中（见 _set_rail_compact）
         self.btn_expand.set_glyph(GLYPH_EXPAND)
         self.btn_expand.setToolTip("接收区全屏显示（Esc 退出）")
+        # 分屏进来的展开：收起要回到"卡片都在"的整窗全屏（用户 2026-11-02：
+        # 「最大化之后再点击就回到最初的软件最大化的界面，而不是分屏状态」）。
+        # 把"展开前隐藏的块"清空 / 把 _rx_hidden 复位，反向时间线才会把卡片带回来。
+        if getattr(self, "_expand_from_snap", False):
+            self._expand_from_snap = False
+            self._pre_hidden_blocks = []
+            self._rx_hidden = set()
         # ⛔ 窗口状态**先落地、再起动画**：原先这步排在函数末尾，动画跑到 80ms
         #    时窗口才变，整屏当场跳 12px（逐帧探针抓到过）。见 _restore_window_state。
         self._restore_window_state()
@@ -3299,6 +5746,11 @@ class MainWindow(QMainWindow):
         self._tx_card.setMaximumHeight(WIDGETSIZE_MAX)
         self._repin_rx_bottom()
     def _play_intro(self) -> None:
+        # ⛔ 有开屏时主窗藏在开屏下面，入场淡入用户看不见，却会起 4 路
+        #    QGraphicsOpacityEffect 离屏合成，和开屏落点/淡出抢同一个 GUI
+        #    线程 → 落点掉帧。与 _reveal_window / _rebuild 的 skip 判定一致。
+        if getattr(self, "_skip_startup_anim", False):
+            return
         # 小米那套入场是短促的淡入，不做位移也不做扫光
         fade_in(self.brand_header, delay_ms=0, duration_ms=220)
         for index, card in enumerate(self._cards):
@@ -3874,6 +6326,12 @@ class MainWindow(QMainWindow):
         if new_text == text:
             return False
         self._clear_alert_highlight()
+        # 2026-11-02 用户：「选择车辆之后刷新数据也不要闪，也要有动画」——
+        # 整篇文字一帧内换掉，长文档上肉眼就是硬切。复用回放那条交叉淡入（_RxShot）：
+        # ①先把当前画面抓成快照盖上去；②换文本；③把第一帧重排当场画掉；④旧画面淡出。
+        # ⛔ 顺序不能反（见 _enter_replay 的注释：先改文本再抓图，新内容会直接亮出来）。
+        shot = self._grab_rx_shot()
+        self._show_rx_shot(shot)
         box.blockSignals(True)
         box.setPlainText(new_text)
         box.blockSignals(False)
@@ -3894,6 +6352,10 @@ class MainWindow(QMainWindow):
             state = section_of(line, state)
         self._align_section = state
         self._rx_highlighter.refresh()
+        # 快照盖着时把"塞完新排版后的第一帧重排+绘制"当场付掉，再淡出旧画面 ——
+        # 否则那次重绘会落在补间起跑之后、把动画堵成台阶（同 _enter_replay）。
+        self._settle_rx_layout()
+        self._fade_rx_shot()
         return True
 
     def _export_profile_now(self) -> tuple:
@@ -3913,7 +6375,12 @@ class MainWindow(QMainWindow):
         return ([n] * mods, [m] * mods if m > 0 else [])
 
     def _feed_export(self, text: str) -> None:
-        """把一块原始分帧文本喂给结构化导出缓存。
+        """把一块原始分帧文本喂给结构化导出缓存**和会话数据库**。
+
+        两个消费者同源同位置：都是 ``align_indexes`` **之前**的原始文本 ——
+        对齐会补零、重排网格、断线插 X，反解析必错（见 rx_export 模块注释）。
+        会话库在 ``record_block`` 里只做入队（后台线程解析 + 批量落盘），
+        **不阻塞**这条接收热路径。
 
         ⚠️ 这里出任何异常都不能影响接收：落盘是附赠功能，接收是主功能。
         """
@@ -3922,7 +6389,9 @@ class MainWindow(QMainWindow):
             if profile != self._rx_export_profile:
                 self._rx_export_profile = profile
                 rx_export.session().configure(*profile)
+                rx_store.configure(*profile)      # 会话库同一份逐模组口径
             rx_export.session().feed(text)
+            rx_store.record_block(text)           # 会话库：同一块原始文本（入队即返）
         except Exception:                     # noqa: BLE001 - 绝不影响接收
             import traceback
             app_log.error("导出采集异常: " + traceback.format_exc(limit=2))
@@ -4989,16 +7458,17 @@ class MainWindow(QMainWindow):
         """设置键 = **开关**：开着就关、关着就开（用户点名"已经打开的情况下
         再点击设置按钮让设置界面关闭"）。
 
-        动画是 iOS 开应用那种"**整块均匀放大**"：面板先 ``grab()`` 成一张位图，
-        再由 ``_SettingsShot`` 把这张位图从设置按钮矩形等比放大到面板最终矩形
-        （340ms / ``STANDARD`` 临界阻尼），落地时换回真面板；关闭走同一条路反向往回。
+        动画是 iOS 开应用那种"**从设置按钮飞出来、整块均匀放大**"：面板先
+        ``grab()`` 成一张位图，再由 ``_SettingsShot`` 把这张位图从设置按钮矩形
+        等比放大到面板最终矩形（260ms / ``STANDARD`` 临界阻尼），落地时换回真面板；
+        关闭走同一条路反向缩回按钮（见 ``_close_settings_dialog``）。
+
+        ⛔ 2026-11-06 曾按用户要求「回到之前直接弹出」改成无动画，**2026-11-07 用户
+           又要求改回来**（原话：「我设置按钮的飞入飞出动画怎么没了，给我改回去，
+           改回昨天的样子」）。别再删这套——用户要的是"从按钮飞出来"的手感。
 
         ⛔ 不用 ``exec()``：模态阻塞一来没有动画，二来动画期间会卡住事件循环。
-        ⛔ 不用 geometry 插值 + 每帧内容重排（那只是外框在滑），也不用
-        ``QGraphicsOpacityEffect`` / ``QGraphicsScale``（离屏合成 = 抽搐）。
-
-        状态机是"**目标态 + 当前矩形**"：点一下只改目标态，补间从当前矩形继续
-        插值 —— 所以动画中途再点不会跳，而是平滑折返（苹果的可打断原则）。
+        ⛔ 不用 ``QGraphicsOpacityEffect`` / ``QGraphicsScale``（离屏合成 = 抽搐）。
         """
         if self._settings_dialog is not None:
             # 已经开着（或正在开/关的动画里）：目标态取反
@@ -5036,8 +7506,7 @@ class MainWindow(QMainWindow):
         #    就是用户报的那个"闪一下"。挪到 -4000,-4000 再 show，用户什么都看不到。
         # ⚠️ **不要**用 WA_ShowWithoutActivating：那会让快照里的标题栏是"非激活态"，
         #    而动画结束真面板上屏时是激活态 —— 两态标题栏亮度不同，换帧那一下就是
-        #    用户说的"动画结束时闪一下"（快照其他部分逐像素一致也没用，就差这一块）。
-        #    让它抓图时就激活（在屏幕外，主窗口焦点丢一下看不见），上屏时两态一致。
+        #    "动画结束时闪一下"（快照其他部分逐像素一致也没用，就差这一块）。
         dialog.move(_SETTINGS_OFFSCREEN, _SETTINGS_OFFSCREEN)
         dialog.show()
         dialog.activateWindow()
@@ -5047,11 +7516,8 @@ class MainWindow(QMainWindow):
         self._settings_geom_from = self._settings_button_rect()
         self._settings_geom_to = QRect(target)
         self._settings_geom_opening = True
-        # 确保快照以**全不透明、非分层**状态开始：入场是「硬切」，落定那拍
-        # 真面板以不透明上屏、快照同拍撤走，动画期间没有任何亚满 alpha 操作，
-        # 所以这道窗口始终是普通非分层窗口（见 _SettingsShot 的 exstyle 说明），
-        # 不会触发「非分层↔分层」的 DWM 合成切换 —— 那次切换正是当初
-        # 「打开时最后一帧闪」的根因（现由硬切 + 不带 layered 一起根除）。
+        # 快照以**全不透明、非分层**状态开始：入场是「硬切」，落定那拍真面板以
+        # 不透明上屏、快照同拍撤走，动画期间没有任何亚满 alpha 操作。
         self._settings_shot.set_alpha(1.0)
         self._show_settings_shot(self._grab_settings_frame())
         dialog.hide()
@@ -5092,9 +7558,15 @@ class MainWindow(QMainWindow):
 
         早先这里写的是 ``mapTo(self, QPoint(0, 0))``（返主窗口坐标），是因为
         那时误以为快照是主窗口的子控件 —— 它其实是顶层窗口，所以必须换过来。
+
+        od56：返回值**外扩** ``_SETTINGS_START_INFLATE``（以按钮中心为锚）。
+        28×28 的起点里塞着整块面板，第一帧就是"一个小方块啪地出现"；外扩到
+        52×52 之后起步更软，收场也停在按钮周围一小圈，不会缩成一个点。
         """
-        return QRect(self.btn_settings.mapToGlobal(QPoint(0, 0)),
+        rect = QRect(self.btn_settings.mapToGlobal(QPoint(0, 0)),
                      self.btn_settings.size())
+        return rect.adjusted(-_SETTINGS_START_INFLATE, -_SETTINGS_START_INFLATE,
+                             _SETTINGS_START_INFLATE, _SETTINGS_START_INFLATE)
 
     def _animate_settings_geometry(self, start: QRect, end: QRect,
                                    opening: bool) -> None:
@@ -5118,11 +7590,11 @@ class MainWindow(QMainWindow):
         self._settings_geom_opening = bool(opening)
         self._settings_dialog.setMinimumSize(0, 0)
         if self._settings_geom_tween is None:
-            self._settings_geom_tween = Tween(260, STANDARD,
+            self._settings_geom_tween = Tween(_SETTINGS_ANIM_MS, STANDARD,
                                               self._on_settings_geometry,
                                               self._on_settings_geometry_done,
                                               parent=self)
-        self._settings_geom_tween.start(0.0, 1.0, 260)
+        self._settings_geom_tween.start(0.0, 1.0, _SETTINGS_ANIM_MS)
 
     def _grab_settings_frame(self) -> QPixmap:
         """把设置面板**整个窗口**（含原生标题栏）抓成位图。
@@ -5303,7 +7775,11 @@ class MainWindow(QMainWindow):
             # 2 帧盖住它，等 dialog 合成出深色再硬切——既无白闪，也无旧版 96ms
             # 半透明叠加鬼影（快照全程 alpha=1.0，不碰分层/亚满透明度）。
             self._settings_swap_target = dialog
-            QTimer.singleShot(50, lambda: self._finish_settings_swap(dialog))
+            # od56：**不再** ``singleShot(50)`` 硬撤快照。实测硬撤那一帧有 10.7%
+            # 的像素一次变完（快照是屏幕外抓的、真面板落地后布局有极小差异），
+            # 用户看到的就是「跳一下」。改成延迟 34ms（等 DWM 合成真面板深色首帧）
+            # → 90ms 交叉溶解，把这点差异摊成渐变。
+            self._start_settings_swap_fade(dialog)
             return
         accepted = bool(self._settings_result)
         self._settings_dialog = None
@@ -5363,6 +7839,88 @@ class MainWindow(QMainWindow):
         except Exception:               # noqa: BLE001, S110  ← 拿不到 dwmapi 就算了
             pass
 
+    def _start_settings_swap_fade(self, dialog) -> None:
+        """换帧收尾的**交叉溶解**：延迟 34ms → 90ms 把快照 alpha 收到 0。
+
+        为什么不再硬撤（2026-11-07 用户「设置动画会跳一下」）：
+        ``devtools/_probe_settings_open_framesync.py`` 逐帧实测 —— 换帧那一拍只差
+        3.7%，但 ``singleShot(50)`` 撤快照的那一帧**一次变了 10.7% 的像素**、整窗
+        均亮从 33.19 掉到 31.97。原因是快照是**屏幕外**用 PrintWindow 抓的，真面板
+        落地后（标题栏激活态 / 滚动条 / 一像素级布局差异）不可能逐像素相同，硬切
+        就把这点差异放大成"跳"。
+        溶解把它摊成 90ms 的渐变，肉眼只看到"轻微对焦"，不是跳。
+
+        ⚠️ 仍然保留 34ms 的延迟：真面板 show() 后 DWM 合成出深色首帧要比我们自己
+        repaint 慢一拍，立刻撤快照会漏出一帧白底（历史实测，见
+        ``_on_settings_geometry_done`` 里"为什么是硬切"那段）。
+        """
+        from ui_anim import Tween
+
+        self._settings_swap_target = dialog
+        old = self._settings_swap_tween
+        self._settings_swap_tween = None
+        if old is not None:
+            try:
+                old.stop()
+                old.deleteLater()
+            except RuntimeError:
+                pass
+        self._settings_swap_tween = Tween(
+            _SETTINGS_SWAP_FADE_MS, "linear",
+            self._on_settings_swap_fade, self._on_settings_swap_fade_done,
+            parent=self, min_interval_ms=8)
+        QTimer.singleShot(_SETTINGS_SWAP_DELAY_MS, self._begin_settings_swap_fade)
+        # ⛔⛔ 安全兜底：溶解补间若因任何原因没跑完（高 DPI/低帧率下曾见），快照会停在
+        #    **半透明**状态 → 整块面板淡重影（用户 200% 缩放反馈的「整片残影」正是它：
+        #    几何/日志全正常，只有合成层上多一层淡淡的旧面板）。到点无条件把快照收掉。
+        QTimer.singleShot(
+            _SETTINGS_SWAP_DELAY_MS + _SETTINGS_SWAP_FADE_MS + 250,
+            self._safety_hide_settings_shot)
+
+    def _safety_hide_settings_shot(self) -> None:
+        """兜底把飞入快照收掉（只做入场；收场动画自带一套，不能乱动）。"""
+        if not getattr(self, "_settings_geom_opening", False):
+            return
+        shot = getattr(self, "_settings_shot", None)
+        if shot is None:
+            return
+        try:
+            if shot.isVisible():
+                shot.hide()
+                shot.set_shot(None)
+                shot.set_alpha(1.0)
+            # 顺便同步重绘一次真面板：把合成层上可能残留的快照旧帧覆盖掉。
+            d = self._settings_dialog
+            if d is not None:
+                d.update()
+                d.repaint()
+        except RuntimeError:
+            pass
+
+    def _begin_settings_swap_fade(self) -> None:
+        tween = getattr(self, "_settings_swap_tween", None)
+        if tween is None or self._settings_swap_target is None:
+            return
+        # 不延迟、立刻开始溶解（理由见 _SETTINGS_SWAP_DELAY_MS 的注释：
+        # 延迟反而会让真面板的首帧在撤快照那一拍漏出来）。
+        tween.start(0.0, 1.0, _SETTINGS_SWAP_FADE_MS)
+
+    def _on_settings_swap_fade(self, t: float) -> None:
+        if self._settings_swap_target is None:
+            return
+        if not self._settings_geom_opening:
+            return                    # 已经转进关闭链路，快照归关闭那条管
+        try:
+            self._settings_shot.set_alpha(1.0 - float(t))
+        except RuntimeError:
+            pass
+
+    def _on_settings_swap_fade_done(self) -> None:
+        dialog = self._settings_swap_target
+        self._settings_swap_tween = None
+        if dialog is not None:
+            self._finish_settings_swap(dialog)
+
     def _finish_settings_swap(self, dialog) -> None:
         """撤快照收尾（入场落定硬切时触发）。
 
@@ -5393,25 +7951,46 @@ class MainWindow(QMainWindow):
         self._close_settings_dialog(accepted=False)
 
     def _close_settings_dialog(self, accepted: bool) -> None:
-        """关闭：先**原路缩回按钮**，动画结束才真正落地结果。"""
+        """关闭：先**原路缩回设置按钮**，动画结束才真正落地结果。
+
+        ⛔ 2026-11-06 曾按用户要求改成"直接关"，**2026-11-07 用户要求改回**
+           （「设置按钮的飞入飞出动画怎么没了，给我改回去」）—— 收场必须回到
+           按钮那一小块，不是啪一下消失。
+        """
         dialog = self._settings_dialog
         if dialog is None:
             return
-        # 防御性收尾：入场换帧现在是**硬切**（落定那拍同步 show+repaint+
-        # _dwm_flush+撤快照，没有挂着的渐隐补间），正常情况下用户能点关闭时
-        # ``_settings_swap_target`` 早已被清。这里只兜底清状态，并确保快照是
-        # 全不透明的——收场动画拿它当底图缩回按钮，半透明会整段漏底（"淡着消失"）。
-        if self._settings_swap_target is dialog:
-            self._settings_swap_target = None
+        # od56：收场前必须**先掐掉换帧的交叉溶解**（否则它会继续把 alpha 往下拉，
+        # 而收场动画要拿这张快照当底图缩回按钮，半透明会整段漏底）。
+        _fade = getattr(self, "_settings_swap_tween", None)
+        if _fade is not None:
+            self._settings_swap_tween = None
+            try:
+                _fade.stop()
+                _fade.deleteLater()
+            except RuntimeError:
+                pass
+        # 防御性收尾：正常情况下用户能点关闭时 ``_settings_swap_target`` 早已被清。
+        # 这里只兜底清状态，并确保快照是**全不透明**的 —— 收场动画拿它当底图缩回
+        # 按钮，半透明会整段漏底（"淡着消失"）。
+        self._settings_swap_target = None
         self._settings_shot.set_alpha(1.0)
-        self._settings_result = bool(accepted)
         # ⚠️ 面板会在关闭动画结束时析构，结果必须**现在**抓下来（含"定制功能"
-        # 里被改过的项），否则应用阶段会踩到已删除的控件。
+        #    里被改过的项），否则应用阶段会踩到已删除的控件。
+        self._settings_result = bool(accepted)
         self._settings_values = dialog.values()
         self._settings_custom = dialog.custom_values()
         self._settings_hidden = dialog.hidden_buttons()
-        # 抓一张"当前内容"的整窗快照（含标题栏）→ 藏起真面板 → 容器画同一张位图缩回按钮。
-        # 抓图与隐藏在同一次调用里同步完成，用户看不到中间的闪烁。
+        worker = getattr(dialog, "_worker", None)
+        if worker is not None and worker.isRunning():
+            # 后台任务还在跑：沿用 dialog 自己的"关窗标记 + 跑完自动关"守卫，
+            # 不在这里强制关 / 删（否则析构运行中的线程会崩）。``_settings_dialog``
+            # 保持指向，待 worker 跑完 ``accept()`` → ``done()`` 会重新进入本函数
+            # 正常收尾（那时 worker 已停，走下面分支）。
+            dialog.close()      # 被 closeEvent 守卫忽略，置 _pending_close
+            return
+        # 抓一张"当前内容"的整窗快照（含标题栏）→ 藏起真面板 → 容器画同一张位图
+        # 缩回按钮。抓图与隐藏在同一次调用里同步完成，用户看不到中间的闪烁。
         self._show_settings_shot(self._grab_settings_frame())
         dialog.hide()
         self._animate_settings_geometry(dialog.frameGeometry(),
@@ -5660,8 +8239,44 @@ class MainWindow(QMainWindow):
             # 现在存的是**客户区矩形**（见 _remember_normal_geometry 的说明）
             self.setGeometry(geometry)
         elif geometry is not None:
-            # 老配置里存的是 saveGeometry() 的字节串，还能用就继续用
+            # 老配置里存的是 saveGeometry() 的字节串，还能用就继续走
             self.restoreGeometry(geometry)
+        # ⛔⛔ 恢复完必须夹一次屏幕（用户 2026-11-07：「卡片位置怎么有点奇怪…
+        #    要适应所有机型屏幕啊」—— 他那台是 1920×1200@125%，保存的 1060×920
+        #    已经超过可用高度 816，窗口下沿连同发送区/底栏一起被切到屏幕外，
+        #    看起来就像"卡片位置不对"）。换机、改缩放、拔掉外接屏都会出现，
+        #    所以不能只在"没存过几何"时用默认值兜底。
+        self._clamp_geometry_to_screen()
+
+    def _fit_rect_to_screen(self, rect: QRect) -> QRect:
+        """把矩形夹进当前屏幕可用区（宽高各留 8px 余量，见 ``_clamp_geometry_to_screen``）。"""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return rect
+        avail = screen.availableGeometry()
+        if avail.width() <= 0 or avail.height() <= 0:
+            return rect
+        max_w = max(320, avail.width() - 8)
+        max_h = max(240, avail.height() - 8)
+        w = min(rect.width(), max_w)
+        h = min(rect.height(), max_h)
+        x = min(max(rect.x(), avail.left()), avail.right() - w + 1)
+        y = min(max(rect.y(), avail.top()), avail.bottom() - h + 1)
+        return QRect(x, y, w, h)
+
+    def _clamp_geometry_to_screen(self) -> None:
+        """把当前几何夹进**所在屏幕的可用区**（不含任务栏），位置也一并收回屏内。
+
+        ⚠️ 只夹普通窗口几何：全屏由 ``startup_fullscreen``/``_enforce_native_fullscreen``
+        自己按屏幕物理矩形核对，走到这里时还没全屏。
+        """
+        geo = self.geometry()
+        fit = self._fit_rect_to_screen(geo)
+        if fit != geo:
+            self.setGeometry(fit)
+            app_log.info(f"[geometry] 夹进屏幕可用区："
+                         f"{geo.width()}x{geo.height()}+{geo.x()}+{geo.y()}"
+                         f" → {fit.width()}x{fit.height()}+{fit.x()}+{fit.y()}")
 
     def _save_settings(self) -> None:
         settings = self._settings
@@ -5703,13 +8318,102 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        # od47i：后台快照线程要的窗口句柄 + 全屏标记（这里 winId 已有效）。
+        self._hwnd = int(self.winId() or 0)
+        self._bg_is_fs = self.isFullScreen()
+        # 兜底：不经 apply_startup_state 的路径（自测/探针）也在 show 后 1.5s 起线程。
+        # ⛔ 带 context：见 apply_startup_state 里的说明（无 context 会在窗口销毁后
+        #    仍回调，进程静默退出）。
+        QTimer.singleShot(1500, self, self._start_snap_worker)
+        # ⛔ 普通几何不能只靠 moveEvent/resizeEvent 记忆（2026-11-03 录屏实证）：
+        #    窗口 show 之后只要用户没拖过/缩放过，这两个事件**一次都不来**，
+        #    _normal_geometry 就一直是 None —— 点还原时找不到"普通矩形"可回，
+        #    只能原地满屏 + 淡入假还原（用户报的"还原闪烁/不连贯"根因）。
+        #    showEvent 时窗口几何已定，补记一次；普通态守卫在 _remember 里。
+        self._remember_normal_geometry()
         # 阴影/圆角属性要等窗口真正创建（winId 有效）之后再设 —— 幂等，多设几次无害
         self._enable_native_shadow()
+        # 分屏（Snap）要的 WS_THICKFRAME 也得等原生窗口在（见 _enable_native_snap）
+        self._enable_native_snap()
         # 标题栏主题同样要等窗口创建之后；主窗口现在是无边框（没有系统标题栏），
         # 这一步主要作用在 DWM 的边框色/阴影上，以及给设置对话框那类仍有边框的
         # 窗口用同一套处理。
         apply_titlebar_theme(self, self._titlebar_scheme or detect_system_scheme(),
                              rounded=not self.isFullScreen())
+        # ⚠️ 从最小化（任务栏）还原后，Qt 在 200% DPI 上常把全屏窗口还原成
+        #    "差 1~2 物理像素没铺满"或干脆**把全屏标志残留成 True**（窗口其实没铺满、
+        #    四周露壁纸）。表现就是用户报的"最大化→最小化→还原 100% 有缝隙"。
+        #    用 showEvent 这枚更稳的钩子兜底：一旦"刚最小化了又回来"且用户仍想要全屏，
+        #    立刻重做原生全屏覆盖（_enforce_native_fullscreen 的 SetWindowPos 钉到显示器矩形）。
+        # ⛔ 不再用 ``not isFullScreen()`` 门控：残留 True 时那条门控会直接跳过兜底、
+        #    缝隙永久留下。只要"想全屏 + 没在程序性退普通窗口 + 没在最小化"就强制重钉。
+        # ⛔ 延迟一拍再钉：showEvent 此刻窗口可能还没真正上屏，立刻 SetWindowPos 会被
+        #    DWM/Qt 吞掉；等 ~30ms 窗口可见了再钉，才真正落到物理矩形。
+        if getattr(self, "_was_minimized", False):
+            self._was_minimized = False
+            if (self._want_fullscreen and not self._expect_normal
+                    and not self.isMinimized()):
+                app_log.info(
+                    f"[restore] showEvent 兜底：_want_fullscreen={self._want_fullscreen} "
+                    f"isFullScreen={self.isFullScreen()} isMaximized={self.isMaximized()} "
+                    f"geo={self.geometry().width()}x{self.geometry().height()}"
+                    f"@{self.geometry().x()},{self.geometry().y()}")
+                QTimer.singleShot(30, self._enforce_native_fullscreen)
+                QTimer.singleShot(40, self._sync_fullscreen_padding)
+
+    def _enable_native_snap(self) -> None:
+        """把 WS_THICKFRAME 补回给无边框窗口 —— Windows 才肯给这个窗口做分屏。
+
+        ``FramelessWindowHint`` 会把 WS_CAPTION 和 **WS_THICKFRAME** 一起摘掉
+        （实测 GWL_STYLE=0x960B0000：只有 WS_POPUP / WS_VISIBLE / WS_CLIPCHILDREN…）。
+        少了 WS_THICKFRAME，shell 就认为这个窗口"不可缩放"，**拒绝**参与 Snap：
+
+            实测（Win11，1600×1000 逻辑屏，2 倍缩放）
+            没补之前   按 Win+←：窗口一动不动（仍 1000×900 @120,100）
+            补上之后   按 Win+←：窗口变成 (0,0,800,952) —— 正好左半屏 ✓
+
+        这一步和 ``_enable_native_shadow`` 是一对：那个借回 DWM 的阴影/圆角，
+        这个借回"可缩放"这个身份。副作用都逐条核对过：
+        - **客户区矩形不变**：没有标题栏，就没有非客户区高度可让，setGeometry
+          前后都是 (120,100,1000,900)；
+        - **全屏仍然精确覆盖显示器**：ShowWindow 之后 WinRect = (0,0,3200,2000)
+          物理像素，截图里任务栏照样被藏、四角不漏桌面；
+        - **看不见系统边框**：截图角落逐像素看过，没有白边/亮线；
+        - 窗口四周那 8px 变成**系统**的缩放命中带（原生行为，光标提示由系统给），
+          Qt 那条 ``startSystemResize`` 的路照旧留着，两者不冲突。
+
+        ⚠️ 幂等：Qt 在状态切换时可能重排样式位，所以放在 showEvent 里每次都核对。
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+            user32 = ctypes.windll.user32
+            # ⛔ 必须 & 0xFFFFFFFF：GetWindowLongW 返回**有符号负整数**，直接
+            #    与 `~0x80000000` 运算会得到 64 位负数，传给 SetWindowLongW 时
+            #    ctypes 溢出抛异常（被下面的 except 吞掉 → 样式永远设不上）。
+            style = user32.GetWindowLongW(hwnd, -16) & 0xFFFFFFFF   # GWL_STYLE
+            # 2026-11-01：不只是补 WS_THICKFRAME（分屏），还要去掉 Qt 给无边框窗口
+            # 设的 **WS_POPUP**、补回 CAPTION/SYSMENU/MINBOX/MAXBOX —— Windows 对
+            # POPUP 窗口**不播放**最小化/还原的系统动画。系统标题栏由 nativeEvent
+            # 的 WM_NCCALCSIZE=0 吃掉，画面不受影响。
+            wanted = (0x00C00000    # WS_CAPTION
+                      | 0x00080000  # WS_SYSMENU
+                      | 0x00040000  # WS_THICKFRAME
+                      | 0x00020000  # WS_MINIMIZEBOX
+                      | 0x00010000)  # WS_MAXIMIZEBOX
+            new_style = (style & ~0x80000000) | wanted     # 去掉 WS_POPUP
+            if new_style == style:
+                return
+            user32.SetWindowLongW(hwnd, -16, ctypes.c_uint(new_style).value)
+            # 样式改动要 SWP_FRAMECHANGED 才会生效（否则要等下一次尺寸变化）
+            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                                0x0001 | 0x0002 | 0x0004 | 0x0020 | 0x0010)
+        except Exception:
+            pass
 
     def _enable_native_shadow(self) -> None:
         """给无边框窗口借回系统的阴影与圆角。
@@ -5746,6 +8450,26 @@ class MainWindow(QMainWindow):
             pass        # Win7 / 远程桌面下拿不到 DWM：退回平面无影窗口，功能不受影响
 
     def closeEvent(self, event) -> None:
+        # 关闭也做一段淡出（用户 2026-10-31："关闭...还是没有动画"）。先忽略这次
+        # close、淡到 0 再真正关；_closing 闸住重入（第二次进来直接走清理）。
+        # 在途的"长大/缩小"覆盖层先撤：它是无父窗口，跟着进程退出会留下一个
+        # 盖在桌面上的残影。
+        self._finish_window_cover()
+        # ⛔⛔ 抓图线程必须在这里就停，不能等到下面第二次进来的清理段：
+        #     第一次 close 只是 event.ignore() + 160ms 淡出，真正的清理在
+        #     165ms 后的 _finish_close 里。而调用方（自测/探针/任何外部代码）
+        #     完全可能在 close() 之后**立刻** deleteLater() —— 父对象析构会
+        #     连子 QThread 一起 delete，此时线程仍在跑 = qFatal
+        #     "QThread: Destroyed while thread is still running"，
+        #     进程无任何输出地退出（selftest 退出码 127 的真根因）。
+        #     淡出期间覆盖层已撤、不需要新快照，提前停无副作用。
+        self._stop_snap_worker()
+        if not self._closing and animations_enabled() and self.isVisible():
+            event.ignore()
+            self._closing = True
+            self._fade_window(0.0, 160, out_cubic)
+            QTimer.singleShot(165, self._finish_close)
+            return
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
@@ -5755,10 +8479,22 @@ class MainWindow(QMainWindow):
         if self._ble_scanner is not None:
             self._finish_ble_scan(fill=False)
         self._save_settings()
+        # 会话库收尾：把批量窗口里还没提交的帧（≤50 帧 / 500ms）落盘再退出。
+        # 超时短一点：关窗是自己触发的，不能为了尾巴卡住退出。
+        try:
+            rx_store.flush(1.0)
+        except Exception:                 # noqa: BLE001 - 落库绝不影响关窗
+            pass
         if self._worker is not None:
             worker, self._worker = self._worker, None
             worker.stop()
+        # od47i：停掉后台快照线程（幂等；第一次 close 时已停过，这里兜底）。
+        self._stop_snap_worker()
         super().closeEvent(event)
+
+    def _finish_close(self) -> None:
+        """淡出结束后的真正关闭（第二次 closeEvent 走清理，不再淡出）。"""
+        self.close()
 
 
 

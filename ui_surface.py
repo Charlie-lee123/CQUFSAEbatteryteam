@@ -382,6 +382,7 @@ class Card(QFrame):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
 
         pad = SHADOW_PAD
+        self._shadow_pad = pad
         outer = QVBoxLayout(self)
         outer.setContentsMargins(pad + CARD_PAD, pad + TITLE_H + 10,
                                  pad + CARD_PAD, pad + CARD_PAD)
@@ -390,11 +391,28 @@ class Card(QFrame):
         self.body.setSpacing(10)
         outer.addLayout(self.body)
 
+    def set_shadow_pad(self, pad: int) -> None:
+        """改卡片四周为阴影预留的空隙（全屏时收成 0，内容贴到屏幕边）。
+
+        用户 2026-11-01：「四周还是会出现缝隙」—— 那圈 4px 是卡片**自己内部**的
+        阴影留白，不是窗口没铺满。全屏时把它收掉，边缘就被内容顶满。
+        """
+        pad = max(0, int(pad))
+        if pad == getattr(self, "_shadow_pad", SHADOW_PAD):
+            return
+        self._shadow_pad = pad
+        outer = self.layout()
+        if outer is not None:
+            outer.setContentsMargins(pad + CARD_PAD, pad + TITLE_H + 10,
+                                     pad + CARD_PAD, pad + CARD_PAD)
+        self.update()
+
     # -- 对外 ------------------------------------------------------------
 
     def box(self) -> QRectF:
         """卡片可见矩形（去掉为阴影预留的空隙）。"""
-        return QRectF(self.rect()).adjusted(SHADOW_PAD, SHADOW_PAD, -SHADOW_PAD, -SHADOW_PAD)
+        pad = getattr(self, "_shadow_pad", SHADOW_PAD)
+        return QRectF(self.rect()).adjusted(pad, pad, -pad, -pad)
 
     def add_header_button(self, button: QWidget) -> None:
         """把按钮排在标题行右侧 —— Windows 那种把折叠按钮放进标题栏的做法。"""
@@ -444,17 +462,33 @@ class Card(QFrame):
         self.update()
 
     def enterEvent(self, event) -> None:
+        # 浮起时把卡片提到**兄弟控件最前**：否则上移的绘制面会被后创建的兄弟
+        # 元素（卡片上方的分隔线/工具栏底边）压住，顶部圆角看着像被切了一刀
+        # （用户 2026-11-01：卡片浮起时被上面的横线挡住一部分）。
+        self.raise_()
         self._animate_lift(1.0, 170)
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
         # ⚠️ 光标从卡片移到它的**子控件**上时，Qt 也会给卡片发 Leave —— 卡面被
-        #    子控件铺满，不判断的话悬停会不停"抬起-落下"地抖。用鼠标实际位置
-        #    判断是否还在卡里：还在就忽略这次 Leave。
-        if self.rect().contains(self.mapFromGlobal(QCursor.pos())):
+        #    子控件铺满，不判断的话悬停会不停"抬起-落下"地抖。
+        # ⛔ 不能在这一拍立刻用 QCursor.pos() 判：离开那一瞬间坐标可能还没更新，
+        #    会被判成"还在卡里"直接吞掉，之后再没有 Leave 事件 → 卡片卡在抬起
+        #    状态降不下去（用户 2026-11-02：「有时候降不下去」）。
+        #    改成**延迟 30ms 复核**：underMouse() 由 Qt 维护、比瞬时坐标可靠。
+        super().leaveEvent(event)
+        QTimer.singleShot(30, self._drop_if_left)
+
+    def _drop_if_left(self) -> None:
+        """延迟复核：确认光标真的不在卡片（含子控件）上才落下。"""
+        try:
+            if self.underMouse():
+                return
+            if self.rect().contains(self.mapFromGlobal(QCursor.pos())):
+                return
+        except RuntimeError:      # 卡片已销毁（C++ 对象已不存在）
             return
         self._animate_lift(0.0, 200)
-        super().leaveEvent(event)
 
     def _animate_lift(self, target: float, duration: int) -> None:
         self._lift_anim.start(self._lift, target, duration)
@@ -468,7 +502,11 @@ class Card(QFrame):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         box = self.box()
         # 悬停时整块**绘制面**上移最多 2px（不动几何）—— 苹果 §1 的"即时反馈"。
-        lift = self._lift * 2.0
+        # ⛔ 抬升量**不许用尽**卡片自留的空隙：正好用尽时顶部圆弧的抗锯齿边缘
+        #    会被控件矩形裁掉半像素（用户 2026-11-02："浮起来后还是有一点点
+        #    挡住了"）。留 1px 余量；全屏 set_shadow_pad(0) 时也不会上移。
+        lift = min(self._lift * 2.0,
+                   max(0.0, float(getattr(self, "_shadow_pad", SHADOW_PAD)) - 1.0))
         if lift > 0.05:
             box = box.translated(0.0, -lift)
         radius = CARD_RADIUS
@@ -489,7 +527,10 @@ class Card(QFrame):
 
         # 2) 材质面：按当前材质（毛玻璃 / 液态玻璃）画主体、颗粒 / 镜面高光、描边。
         #    flash 仍由材质描边表达（"亮了一下"）。
-        paint_glass(painter, box, radius, flash=self._flash,
+        # 悬停反馈兜底：全屏/贴边时卡片没有抬升余量（shadow_pad=0，位移会被
+        # 控件矩形裁掉），这里用**描边提亮**表达"选中"——不位移，绝不会被挡。
+        paint_glass(painter, box, radius,
+                    flash=max(self._flash, self._lift * 0.35),
                     dpr=self.devicePixelRatioF())
 
         # 3) 标题行：标题 + 一条细线。小米的卡片头就是靠这条线分层的

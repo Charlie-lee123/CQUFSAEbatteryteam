@@ -27,6 +27,12 @@ _DROP_BINARIES = {
     'qt6qmlmeta.dll', 'qt6qmlworkerscript.dll', 'qt6virtualkeyboard.dll',
     'qt6pdf.dll', 'qt6opengl.dll',
     'qtiff.dll', 'qwebp.dll',
+    # ---- 2026-11-02 开屏动画：只留 Windows Media Foundation 后端 ----
+    # ffmpeg 后端带 avcodec(约 5.9MB)+avformat+avutil+sw* ≈ +10MB；用户的开屏 mp4
+    # 是 H.264，Windows 自带 MF 直接能解（实测 3800ms、正常推进）。main.py 里再
+    # 显式 QT_MEDIA_BACKEND=windows 双保险。
+    'ffmpegmediaplugin.dll', 'avcodec-63.dll', 'avformat-63.dll',
+    'avutil-61.dll', 'swresample-7.dll', 'swscale-10.dll',
     # ---- 2026-10-22（2.3 瘦身）----
     # 平台插件只留 qwindows：direct2d 是**可选**平台（Qt 默认走 windows），
     # minimal/offscreen 只有显式设置 QT_QPA_PLATFORM 才会用到，产品从不设。
@@ -48,15 +54,16 @@ _DROP_BINARIES = {
     #    ⚠️ Python 自己的 libcrypto-3.dll / libssl-3.dll（不带 -x64）**不能删**：
     #    那是 CPython 的 ssl 模块用的，两者名字不同、来源不同。
     'qopensslbackend.dll', 'libcrypto-3-x64.dll', 'libssl-3-x64.dll',
-    # ③ JPEG 解码插件：assets 里只有 ico / png / svg，程序不接受用户图片，
-    #    按文件名解码的路径根本不存在（png/ico 由 Qt 内置处理）。
-    'qjpeg.dll',
+    # ③ qjpeg.dll 保留：Qt 静态图/贴图解码要用（开屏 poster.png 走内置 PNG）。
+    #    ⛔ 2026-11-04 起逐帧 JPEG 序列（*_frames/）已整体移除，见下方 a.datas
+    #    过滤；这里保留 qjpeg 与帧序列无关，别再按旧注释理解。
     # ④ 网络状态查询插件（QNetworkInformation 专用）：全项目没调用过这个 API，
     #    Qt 也不会自动加载它（只在显式 backend 查询时才载入）。
     'qnetworklistmanager.dll',
 }
 
 # 数据文件层同样要减：Qt 的翻译目录整块不要（见上"从来没装过 QTranslator"）。
+# ⚠️ assets/splash/ **要打进去**：开屏动画的预设就是从这里扫的（splash_anim.py）。
 _DROP_DATA_DIRS = {'pyside6/translations'}
 
 a = Analysis(
@@ -66,14 +73,20 @@ a = Analysis(
     # mcp/ 目录要跟着走：设置面板「AI 接入」复制的那段接入包靠它自包含
     #（源码在包内，Agent 不需要联网 clone 仓库）。见 mcp_bridge.py。
     datas=[('assets', 'assets'), ('mcp/serial_assistant_mcp.py', 'mcp')],
-    hiddenimports=[],
+    # splash_motion 只在 splash_anim._start_motion() 里被**函数内** import，
+    # 是 PYZ 收集的唯一引用点；显式列进 hiddenimports 做双保险（零体积成本）。
+    # _snap_worker 是 main_window 顶部的普通 import，静态分析能收到；同样列进来
+    # 做双保险 —— 它一旦漏包，最大化/还原会退化成现场同步抓（用户报的"卡"回归）。
+    hiddenimports=['splash_motion', '_snap_worker'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
         # ---- 没用到的 Qt 模块（Python 侧；顺带阻止 hook 再拉它们的依赖）----
         'PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets',
-        'PySide6.QtWebEngineQuick', 'PySide6.Qt3DCore', 'PySide6.QtMultimedia',
+        # ⛔ 'PySide6.QtMultimedia' 已从排除表移除：开屏动画（splash_anim.py）
+        #    要播 assets/splash/ 下的 mp4。QtMultimediaWidgets 本来就没排。
+        'PySide6.QtWebEngineQuick', 'PySide6.Qt3DCore',
         'PySide6.QtCharts', 'PySide6.QtDataVisualization',
         'PySide6.QtQml', 'PySide6.QtQuick', 'PySide6.QtQuickWidgets',
         'PySide6.QtQuick3D', 'PySide6.QtPdf', 'PySide6.QtPdfWidgets',
@@ -82,7 +95,16 @@ a = Analysis(
         'PySide6.QtPrintSupport', 'PySide6.QtUiTools', 'PySide6.QtHelp',
         'PySide6.QtDesigner', 'PySide6.QtBluetooth', 'PySide6.QtPositioning',
         # ---- 标准库里明显用不到的大件 ----
-        'tkinter', 'unittest', 'pydoc', 'doctest', 'sqlite3', 'xmlrpc',
+        # ⛔ 'sqlite3' **不能排**：2026-11-01 起「会话数据库」功能要用它
+        #    （rx_store.py 顶层 import）。排掉的后果是打包版**启动即崩**
+        #    （ModuleNotFoundError: No module named 'sqlite3'，源码环境测不出来）。
+        # ---- 2026-11-04：砍掉 cv2（opencv）----
+        # 它在包里占 41.5MB（cv2.pyd 29.1 + opencv_videoio_ffmpeg 12.4），是
+        # onefile 冷启动要 3~5s 的主因。开屏的高斯模糊已由 splash_motion.py
+        # 的 numpy 可分离卷积替代；帧序列路径因 *_frames/ 被过滤在打包版不可达，
+        # splash_anim 里剩余 cv2 调用点均已加 `cv2 is None` 防御性降级。
+        'cv2',
+        'tkinter', 'unittest', 'pydoc', 'doctest', 'xmlrpc',
         'distutils', 'setuptools', 'pip',
         # ---- 2026-10-24（2.4 二次瘦身；每条都查过 import 链）----
         # tarfile 只被 `shutil.unpack_archive` 引用（本项目只用 shutil.copyfile
@@ -104,9 +126,18 @@ a = Analysis(
 a.binaries = [entry for entry in a.binaries
               if os.path.basename(entry[0]).lower() not in _DROP_BINARIES]
 # datas 里也要滤（translations 是目录形式进来的，按规范化路径前缀匹配）
+# ⛔ 2026-11-04：开屏动画改为**原生几何绘制**（splash_motion.py，设计稿只作参考），
+#    逐帧 JPEG 序列（972 张 ≈93MB，占 exe 解压量 41%）不再需要 —— 它是启动要
+#    多等 1.5~2s 的主因。mp4 设计稿与 poster 保留：planA 的回退路径还要用它们，
+#    而且用户换主题时设置面板要靠它们列出预设。
+#    ⚠️ 只滤 ``_frames/`` 目录，别误伤 assets 根下的界面素材。
 a.datas = [entry for entry in a.datas
            if not any(str(entry[0]).replace("\\", "/").lower().startswith(d)
-                      for d in _DROP_DATA_DIRS)]
+                      for d in _DROP_DATA_DIRS)
+           and "_frames/" not in str(entry[0]).replace("\\", "/").lower()]
+# ⛔ 2026-11-03 用户：「不要压画质和帧率」—— **仍在用**的开屏素材（mp4 设计稿、
+# poster）照原样打进包，不转码、不降分辨率。逐帧序列已由原生几何动画取代，
+# 见上面的 _frames/ 过滤：那不是压画质，是那份素材根本不播了。
 
 pyz = PYZ(a.pure)
 

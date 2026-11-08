@@ -61,7 +61,10 @@ def main() -> int:
         # ---- 原样复刻 selftest.main() 的清零动作 ----
         for key in ("module_count", "cells_per_module", "temps_per_module"):
             settings.setValue(f"custom/{key}", 0)
-        settings.setValue("custom/vehicle", "")
+        # ⛔ 2026-10-22 起 selftest 改走 select_vehicle("")：只写 custom/vehicle
+        #    镜像键无效（_load_store 优先认 vehicles JSON 里的 current）。
+        #    本探针以前硬编码写镜像键，于是永远误报"清零无效"。
+        customization.select_vehicle("")
         settings.sync()
 
         print("=== 复刻 selftest.main() 的清零之后 ===")

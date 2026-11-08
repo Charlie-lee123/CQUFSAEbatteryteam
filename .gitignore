@@ -20,3 +20,16 @@ devtools/_tmp_*
 
 # ---- 本机助手数据（不进仓库）----
 .workbuddy/
+
+# ---- 构建日志 / 临时产物（od 轮次留下的）----
+build_*/
+_build_*.log
+.build*.log
+_selftest_*.log
+_net_out.txt
+*.genie
+
+# ---- 开屏逐帧序列（每套 20MB+，构建时本地生成；只保留 mp4/poster/json 进仓库）----
+assets/splash/*_frames/
+build_*.log
+devtools/_*_tmp/

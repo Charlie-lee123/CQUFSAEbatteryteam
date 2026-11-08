@@ -38,6 +38,7 @@
 
 #define ExeName        "SerialAssistant.exe"
 #define SrcExe         AddBackslash(SourcePath) + "..\发布\" + ExeName
+#define SrcExeDir      AddBackslash(SourcePath) + "..\发布"
 #define SrcIcon        AddBackslash(SourcePath) + "..\发布\app.ico"
 #define ArtDir         AddBackslash(SourcePath) + "art"
 #define OutDir         AddBackslash(SourcePath) + "..\发布"
@@ -126,7 +127,12 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \
     GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
 
 [Files]
+; ⛔ 2026-11-03 起发布形态是 **onedir 文件夹**（exe 2MB + _internal 依赖目录，
+;     双击→画面从 2.9s 降到 0.5s）。整目录递归复制：exe 放在 {app} 根，
+;     _internal 与它同级（PyInstaller 6 的布局，缺了就跑不起来）。
+;     ⚠️ 不要再改回单文件复制：只拷 exe 会得到一个启动即崩的安装。
 Source: "{#SrcExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SrcExeDir}\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; 图标单独放一份：快捷方式指它而不是 50MB 的 exe（Windows 从大 exe 抽图标
 ; 会超时退化成白纸，见 devtools\_desktop_shortcut.py 的说明）
 Source: "{#SrcIcon}"; DestDir: "{app}"; Flags: ignoreversion

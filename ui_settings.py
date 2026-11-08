@@ -16,24 +16,29 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 from datetime import datetime
 from pathlib import Path
+import math
 
-from PySide6.QtCore import QDate, QTimer, Qt
+from PySide6.QtCore import QDate, QPoint, QRect, QRectF, QSize, QThread, QTimer, Qt, Signal
 from PySide6.QtNetwork import (
     QNetworkAccessManager,
 )
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QGridLayout,
-    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QScrollArea, QVBoxLayout,
-    QWidget,
+    QAbstractItemView, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
+    QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMessageBox, QPlainTextEdit, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 import app_log
 import customization
 from ui_theme import apply_titlebar_theme
-from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication, QIntValidator
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QFontMetrics, QGuiApplication, QIntValidator,
+    QPainter, QPixmap,
+)
 from PySide6.QtCore import QUrl
 from ui_controls import (
     ChevronComboBox, ChevronSpinBox, GlassSlider, IconButton, InkButton, Switch,
@@ -46,22 +51,183 @@ from ui_theme import (
 # (显示名, 存进配置的值)
 THEME_MODES = (("跟随系统", "system"), ("浅色", "light"), ("深色", "dark"))
 # 「定制功能」里那一列数字框的统一宽度。宽到装得下最长的一条（"10000 mV" +
-# 左右内边距 + 右侧 chevron），又不至于让 "7" 这种一位数拖出一大片空框。
-SPIN_COLUMN_W = 158
+# 左右内边距 + 右侧 chevron ≈ 95px），又不至于让 "7" 这种一位数拖出一大片空框。
+# 108 → 100：一位数的"暂停定位行数/行数（最大化）/温度下限"等框不再空一大截
+# （用户点名"这个框也大了"）。
+SPIN_COLUMN_W = 100
 # 按钮开关排几列。三列是为了"一屏放完"：
 # 两列时最后一行会被滚动区截掉半颗开关，看着像画坏了。
-BUTTON_COLUMNS = 3
+BUTTON_COLUMNS = 4
 # 「模组 i」里两个"数量"输入框的宽度。**手动输入**（用户 2026-10-22 明确），
 # 所以只要装得下 3 位数 + 内边距；左边写"电芯数量："、右边再没有量词了。
 MODULE_INPUT_W = 64
 # 独立下拉框（主题 / 界面材质 / 编码…）的宽度：**按内容定宽**，不再拉满整列。
 # 这些框里的值都很短（"深色""毛玻璃""utf-8"），铺满整行只会让人觉得空。
 FIELD_W = 210
+# 面板整体的**兜底下限**（真正的宽度按内容算，见 __init__ 末尾那行）。
+# ⚠️ 不能再往下调：body 的最小宽由"最宽标签 187 + 18 + 最宽字段 362"决定，
+# 把下限设到 body 之下没用（内容仍然要那么宽），只会让面板在窄屏上被裁。
+PANEL_MIN_W = 470
 # 「赛季」年份框的宽度：4 位数 + 内边距 + 右侧 chevron
 SEASON_SPIN_W = 78
-# 车辆那一排里的「模组数」框宽：两位数字 + 内边距 + 右侧 chevron
-# （前缀「模组数 」已经移到框外当标签了，框里只有数字）
-MODULE_COUNT_W = 86
+# 车辆那一排里的「模组数」框宽：两颗数字（上限 64）+ 内边距。
+# ⚠️ 上限 64 只有两位数的空间，chevron 已隐藏（set_arrows_visible(False)），
+#    框里只有居中的数字 —— 86 对"5"整整空一大截，压到 72 刚好不挤（用户点名"框太大"）。
+MODULE_COUNT_W = 72
+# InkButton 的宽度算法（见 ui_controls.InkButton._apply_size_hint）：文字宽 + 44。
+# 这里要"几颗按钮同宽"，就照同一条公式取最大那张 —— 各按自己文字长短长宽的话，
+# 一排放四颗就是四个不同宽度（用户点名的"等宽对齐"就没了）。
+_INK_PAD = 44
+
+
+def _equalize_buttons(buttons, extra_texts=()) -> int:
+    """把一排按钮锁成同一宽度（取最大者），返回该宽度。
+
+    ``extra_texts`` 是**运行时会临时印在按钮上**的文字（"✓ 123 行" / "✓ +2 台"
+    这类原地反馈）：必须一起算进来。否则反馈一长，``InkButton.setText`` 里的
+    ``setMinimumSize`` 会把那一颗顶宽 —— 一排里瞬间不等宽，对齐当场破掉。
+    """
+    live = [button for button in buttons if button is not None]
+    if not live:
+        return 0
+    metrics = QFontMetrics(live[0].font())
+    texts = [button.text() for button in live] + [str(text) for text in extra_texts]
+    width = max(metrics.horizontalAdvance(text) for text in texts) + _INK_PAD
+    for button in live:
+        button.setFixedWidth(width)
+    return width
+
+
+class _ElidedPathLabel(QLabel):
+    """单行路径标签（用户 2026-11-01：地址要显示成一排）。
+
+    宽度不够时**中间省略**（…），完整路径永远在 tooltip 里；文字可选中复制。
+    ⛔ 不用 wordWrap —— 折行就是"两排"，用户点名不要。三处路径标签
+    （日志 / 会话数据库 / 接收历史）统一用它，观感一致。
+    """
+
+    def __init__(self, text: str, font=None) -> None:
+        super().__init__(text)
+        self._full = text
+        if font is not None:
+            self.setFont(font)
+        self.setWordWrap(False)
+        self.setMinimumWidth(1)
+        # 宽度完全交给布局：Ignored 让 sizeHint 不参与拉伸分配
+        self.setSizePolicy(QSizePolicy.Policy.Ignored,
+                           QSizePolicy.Policy.Preferred)
+        self.setToolTip(text)
+        self.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+
+    # -- 尺寸：别把整条路径的宽度带进布局 --------------------------------
+    def sizeHint(self) -> QSize:                      # noqa: N802 (Qt 命名)
+        # 给一个"典型宽度"占位：整条路径（可达 80+ 字符）会把面板撑宽
+        return QSize(240, super().sizeHint().height())
+
+    def minimumSizeHint(self) -> QSize:               # noqa: N802 (Qt 命名)
+        # ⛔ 非折行 QLabel 的 minimumSizeHint = 整条文本宽；不覆写的话布局
+        #    压不窄它，超出部分被父容器**硬裁**（用户 2026-11-01 截图：
+        #    接收历史路径末尾 ".lo" 被切、且没有省略号）。给 1px 允许压缩，
+        #    压缩后由 resizeEvent 里的 elidedText 生成 "…"。
+        return QSize(1, super().minimumSizeHint().height())
+
+    # -- 文本：外部改文本（换车号 / 换目录）也要重新省略 ------------------
+    def setText(self, text: str) -> None:
+        self._full = text or ""
+        self.setToolTip(self._full)
+        self._refit()
+
+    def _refit(self) -> None:
+        fm = QFontMetrics(self.font())
+        QLabel.setText(self, fm.elidedText(
+            self._full, Qt.TextElideMode.ElideMiddle, max(16, self.width())))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refit()
+
+
+def _import_summary(result) -> tuple[int, str]:
+    """``vehicle_share`` 的导入结果 → （变更台数, 一句话说明）。
+
+    真实返回是 ``{"added", "updated", "skipped", "errors"}``（见
+    ``vehicle_share.import_payload``）；同名 = 更新、不同名 = 新增，所以
+    "动了多少台" = added + updated。**errors 里的那句人话**直接拿来当失败原因 ——
+    那个模块把"文件读不了/JSON 坏了/包是空的"都翻译好了，这里不再自己判。
+    """
+    if not isinstance(result, dict):
+        return 0, ""
+    added = int(result.get("added") or 0)
+    updated = int(result.get("updated") or 0)
+    errors = [str(item) for item in (result.get("errors") or []) if str(item)]
+    if added and updated:
+        note = f"新增 {added}、更新 {updated}"
+    elif updated:
+        note = f"更新 {updated} 台"
+    elif added:
+        note = f"新增 {added} 台"
+    else:
+        note = errors[0] if errors else ""
+    return added + updated, note
+
+
+def _pack_text(entry) -> tuple[str, str]:
+    """远程清单条目 → （一行文字「名称 · N 模组 · 备注」，tooltip）。
+
+    条目形状由 ``vehicle_share._index_items`` 归一过：
+    ``{"name", "file", "modules", "note"}``。这里仍然逐个键**软取**（缺字段就
+    少一段，而不是整行变成 "（未命名）"）：索引是仓库里的 json，队友手改过也
+    不该让清单变成一片空白。
+    """
+    if isinstance(entry, dict):
+        name = str(entry.get("name") or entry.get("file") or "（未命名）")
+        parts = [name]
+        try:
+            modules = int(entry.get("modules") or 0)
+        except (TypeError, ValueError):
+            modules = 0
+        if modules > 0:
+            parts.append(f"{modules} 模组")
+        note = str(entry.get("note") or "").strip()
+        if note:
+            parts.append(note)          # 来源/说明：索引里能给的都摊在一行里
+        tip_lines = []
+        if entry.get("file"):
+            tip_lines.append(f"文件：{entry.get('file')}")
+        if note:
+            tip_lines.append(f"说明：{note}")
+        return " · ".join(parts), "\n".join(tip_lines) or " · ".join(parts)
+    return str(entry), str(entry)
+
+
+def _vehicle_doc(names) -> dict:
+    """挑几台车 → 一个可上传的文档（结构由 ``vehicle_share.export_payload`` 定）。
+
+    优先用模块自己的打包函数（它才知道远端认什么格式：schema / app /
+    exported_at / vehicles）；没有就退回 ``{"vehicles": [...]}`` —— 与本机
+    ``customization.vehicles()`` 同形。
+    """
+    share = _vehicle_share_module()
+    builder = getattr(share, "export_payload", None) if share else None
+    if callable(builder):
+        return builder(list(names))
+    wanted = set(names)
+    items = [item for item in customization.vehicles() if item["name"] in wanted]
+    return {"vehicles": items}
+
+
+def _vehicle_share_module():
+    """惰性取 ``vehicle_share``；没落地（ImportError）就返回 None。
+
+    它是**新模块**，可能比本文件晚到 —— 面板不能因为"还没写完"就整块崩掉，
+    所以调用方一律先拿到 None 检查，再给按钮置灰 + tooltip 说明。
+    """
+    try:
+        import vehicle_share
+    except ImportError:
+        return None
+    return vehicle_share
 
 
 class _NameDialog(QDialog):
@@ -258,6 +424,740 @@ class McpManualDialog(QDialog):
         apply_titlebar_theme(self, self._scheme)
 
 
+class _TaskWorker(QThread):
+    """把**一次阻塞调用**（网络 / 文件 IO）挪到后台线程，结果用信号送回 UI。
+
+    为什么自己搓这一层：取清单、下载导入、上传都是"发一次请求拿一个结果"，
+    用 QNetworkAccessManager 得写一整套状态机；而界面这边只需要"别卡"。所以最
+    薄的一层封装:一个 callable 进、一个结果信号出、一个错误信号出。
+
+    ⛔ 异常必须在这里吞掉转成 ``failed``：槽里抛出去的异常会被 Qt 打印到 stderr，
+    而 exe 是 ``console=False`` —— 用户看到的就是"点了没反应"。
+    """
+
+    ok = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._fn = fn
+
+    def run(self) -> None:
+        try:
+            result = self._fn()
+        except Exception as exc:          # 网络/文件/解析一视同仁，交给 UI 显示红字
+            self.failed.emit(str(exc) or type(exc).__name__)
+            return
+        self.ok.emit(result)
+
+
+class VehicleLibraryDialog(QDialog):
+    """在线车辆库：从远端拉车辆包清单、导入到本机，或把自己的车传上去。
+
+    四段式布局（自上而下）：刷新条 / 远程清单 / 导入动作 / 上传区。
+    三个阻塞动作（取索引、下载导入、上传）全部走 ``_TaskWorker`` —— 一张"点了
+    就定住"的对话框，用户只会以为软件卡死。
+    """
+
+    # 导入成功后通知设置面板：车辆下拉 / 逐模组行要重建（参数是新增台数）
+    vehicles_changed = Signal(int)
+
+    def __init__(self, scheme: str = "dark", parent: QWidget | None = None,
+                 auto_refresh: bool = True) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("在线车辆库")
+        self.setModal(True)
+        self.setMinimumWidth(620)
+        self._scheme = scheme
+        self._entries: list = []
+        self._worker: _TaskWorker | None = None
+        self._pending_close = False
+        # "仓库里已有同名文件"的确认态：true 时「上传」按钮显示"确认覆盖？"，
+        # 再点一次才带 overwrite=True 真写（换车/刷新清单会撤回这个态）。
+        self._pending_overwrite = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(GAP + 6, GAP + 6, GAP + 6, GAP + 6)
+        root.setSpacing(GAP)
+
+        tip = QLabel("从在线库挑一台车导入，或把本机的车上传上去（只传车辆结构）。")
+        tip.setFont(ui_font(11))
+        tip.setObjectName("groupCaption")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
+
+        # ---- 刷新条 ----
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        self.btn_refresh = InkButton("刷新", variant="ghost")
+        self.btn_refresh.setToolTip("重新从在线库拉一次车辆包清单")
+        self.btn_refresh.clicked.connect(self._refresh_index)
+        top.addWidget(self.btn_refresh)
+        # 状态文字必须是**短**的（同 MCP 那行），长文案会被按钮裁掉；全句进 tooltip
+        self.lbl_status = QLabel("")
+        self.lbl_status.setFont(ui_font(10.5))
+        self.lbl_status.setObjectName("groupCaption")
+        self.lbl_status.setMinimumWidth(1)      # 0 等于没设（见日志行那条注释）
+        top.addWidget(self.lbl_status, 1)
+        root.addLayout(top)
+
+        # ---- 远程清单 ----
+        self.list_packs = QListWidget()
+        self.list_packs.setObjectName("packList")
+        self.list_packs.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_packs.setMinimumHeight(190)
+        self.list_packs.setStyleSheet(self._list_qss())
+        self.list_packs.setToolTip("单选或多选（Ctrl / Shift）后点下面的「导入选中」")
+        root.addWidget(self.list_packs, 1)
+        self._show_placeholder("点「刷新」从在线库拉取车辆包清单")
+
+        # ---- 导入动作 ----
+        import_row = QHBoxLayout()
+        import_row.setSpacing(GAP)
+        self.btn_import_selected = InkButton("导入选中", variant="primary")
+        self.btn_import_selected.clicked.connect(self._import_selected)
+        import_row.addWidget(self.btn_import_selected)
+        self.btn_import_all = InkButton("导入全部", variant="ghost")
+        self.btn_import_all.clicked.connect(self._import_all)
+        import_row.addWidget(self.btn_import_all)
+        import_row.addStretch(1)
+        root.addLayout(import_row)
+
+        # ---- 上传区 ----
+        # 一条 1px 分隔线（用 QFrame 的横线形状，不加 QSS）
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setLineWidth(1)
+        root.addWidget(line)
+
+        upload_title = QLabel("上传到在线库")
+        upload_title.setFont(ui_font(12.5))
+        root.addWidget(upload_title)
+
+        form = QFormLayout()
+        form.setSpacing(GAP)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft
+                               | Qt.AlignmentFlag.AlignVCenter)
+        # ⛔ 两参数 addRow(标签, 控件)：单参数那版控件横跨两列、标签列全空
+        self.cmb_upload = ChevronComboBox()
+        self.cmb_upload.setMaximumWidth(FIELD_W)
+        self._refresh_upload_combo()
+        # 换车就等于换目标文件：上一次"确认覆盖"的待定态立刻作废
+        self.cmb_upload.currentIndexChanged.connect(
+            lambda _index: self._reset_overwrite())
+        form.addRow(self._field_label("车辆："), self.cmb_upload)
+
+        self.edit_token = QLineEdit()
+        self.edit_token.setObjectName("fieldEdit")   # 与面板其它输入框同一族
+        self.edit_token.setFont(ui_font(11.5))
+        self.edit_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.edit_token.setPlaceholderText("GitHub Token（点右侧「创建令牌」生成后粘贴）")
+        # token 的存取**全交给 vehicle_share**：它用 Windows DPAPI 按当前用户加密
+        # 落盘（不是明文，也不进注册表的明文值）。面板自己再存一份只会多出
+        # 一个没人管的明文副本。
+        share = _vehicle_share_module()
+        load_token = getattr(share, "load_token", None) if share else None
+        if callable(load_token):
+            try:
+                self.edit_token.setText(str(load_token() or ""))
+            except Exception as exc:
+                app_log.warning(f"读取车辆上传令牌失败：{exc}")
+        self.edit_token.setToolTip(
+            "上传需要一个有 contents:write 权限的 GitHub Token。\n"
+            "令牌由 Windows DPAPI 按当前用户加密后存在本机（换账户/换机器都解不开），"
+            "不会上传到别处。\n"
+            "填一次之后，点「上传」就是**全自动**，不用再开浏览器拖文件。")
+        # 「创建令牌」直链：GitHub 的经典 PAT 页面支持 URL 预填 scope，一键带好
+        # repo 权限 —— 用户只要点一下、复制、粘贴回来，之后上传就全自动了。
+        self.btn_new_token = InkButton("创建令牌", variant="ghost")
+        self.btn_new_token.setToolTip(
+            "打开 GitHub 创建令牌页面（已预填 repo 权限）；\n"
+            "生成后复制粘贴到左边这一格，以后「上传」就全自动了")
+        self.btn_new_token.clicked.connect(self._open_new_token_page)
+        token_row = QHBoxLayout()
+        token_row.setContentsMargins(0, 0, 0, 0)
+        token_row.setSpacing(8)
+        token_row.addWidget(self.edit_token, 1)
+        token_row.addWidget(self.btn_new_token)
+        token_holder = QWidget()
+        token_holder.setLayout(token_row)
+        token_row.setContentsMargins(0, 0, 0, 0)     # setLayout 会塞回样式默认 9px
+        form.addRow(self._field_label("Token："), token_holder)
+        root.addLayout(form)
+        # 令牌状态小字：存不住 / 解不开 / 本次会话有效 —— 都写这一行（红字），
+        # 不去挤上面那条总状态行（它还要报清单和导入的结果）。
+        self.lbl_note = QLabel("")
+        self.lbl_note.setFont(ui_font(10.5))
+        self.lbl_note.setObjectName("groupCaption")
+        self.lbl_note.setMinimumWidth(1)            # 0 等于没设（同日志行）
+        self.lbl_note.setWordWrap(True)
+        self.lbl_note.setVisible(False)
+        root.addWidget(self.lbl_note)
+        self._report_token_state(loaded=bool(self.edit_token.text()))
+
+        upload_row = QHBoxLayout()
+        upload_row.setSpacing(GAP)
+        self.btn_upload = InkButton("上传", variant="ghost")
+        self.btn_upload.setToolTip(
+            "把选中的车辆结构推到在线库（Token 由系统加密存在本机）")
+        self.btn_upload.clicked.connect(lambda: self._upload())
+        upload_row.addWidget(self.btn_upload)
+        self.btn_upload_browser = InkButton("在浏览器里上传", variant="ghost")
+        self.btn_upload_browser.setToolTip(
+            "没有 Token 时的兜底：在浏览器里手动把打包好的文件拖上去\n"
+            "（想要全自动，填一次 Token 即可）")
+        self.btn_upload_browser.clicked.connect(self._open_browser_upload)
+        upload_row.addWidget(self.btn_upload_browser)
+        self.btn_clear_token = InkButton("清除令牌", variant="ghost")
+        self.btn_clear_token.setToolTip(
+            "把本机加密保存的 GitHub 令牌删掉（只影响这台机器，不动仓库）")
+        self.btn_clear_token.clicked.connect(self._clear_token)
+        upload_row.addWidget(self.btn_clear_token)
+        upload_row.addStretch(1)
+        close = InkButton("关闭", variant="primary")
+        close.clicked.connect(self.accept)
+        upload_row.addWidget(close)
+        root.addLayout(upload_row)
+
+        # 不认字也不该给个能点的上传按钮：模块没落地就整组置灰
+        self._sync_availability()
+        if auto_refresh:
+            # 事件循环起来之后再发请求：exec() 之前 show 都没出，先拉也没有意义
+            QTimer.singleShot(0, self._refresh_index)
+
+    # -- 外观 ------------------------------------------------------------
+
+    @staticmethod
+    def _list_qss() -> str:
+        """清单的圆角浅描边底（与 fieldEdit 同一族观感）。
+
+        ⛔ 不写进 ``ui_theme`` 的全局 QSS：那份一改就影响全程序的每个窗口，而且
+        写错一个 token 会让后面的规则整段静默失效。这里只作用于本对话框的
+        ``#packList``，颜色从主题 token **现取**，深浅色都跟得上。
+        """
+        surface_2 = qcolor("surface_2").name()
+        line = qcolor("line").name()
+        ink = qcolor("ink").name()
+        sel = qcolor("sel").name()
+        on_sel = qcolor("on_sel").name()
+        return (
+            f"QListWidget#packList {{ background: {surface_2};"
+            f" border: 1px solid {line}; border-radius: 12px;"
+            " padding: 4px; outline: none; }"
+            f"QListWidget#packList::item {{ padding: 7px 8px;"
+            f" border-radius: 8px; color: {ink}; }}"
+            f"QListWidget#packList::item:selected {{ background: {sel};"
+            f" color: {on_sel}; }}"
+        )
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        apply_titlebar_theme(self, self._scheme)
+
+    @staticmethod
+    def _field_label(text: str) -> QLabel:
+        """上传区的小标签（字号与设置面板里「赛季：」那一档一致）。
+
+        ⚠️ 最小宽度钉住文字宽度：QFormLayout 的标签列不够宽时会把这个 min 小的
+        标签压扁（"Token："被压成两个点，踩过）。
+        """
+        label = QLabel(text)
+        label.setFont(ui_font(10.5))
+        label.setObjectName("groupCaption")
+        label.setMinimumWidth(label.fontMetrics().horizontalAdvance(text) + 2)
+        return label
+
+    # -- 状态 ------------------------------------------------------------
+
+    def _set_status(self, text: str, error: bool = False) -> None:
+        """状态行：正常是次要文字色，出错是主题里的警示红（就地显示，不弹框）。"""
+        self.lbl_status.setText(text)
+        self.lbl_status.setToolTip(text)
+        color = qcolor("alert_red").name() if error else qcolor("ink_2").name()
+        self.lbl_status.setStyleSheet(f"color: {color};")
+
+    def _sync_availability(self) -> None:
+        """按 `vehicle_share` 落了哪些入口决定按钮可用度（缺什么灰什么 + tooltip）。"""
+        share = _vehicle_share_module()
+
+        def has(name: str) -> bool:
+            return share is not None and callable(getattr(share, name, None))
+
+        if not has("fetch_remote_index"):
+            self.btn_refresh.setEnabled(False)
+            self.btn_refresh.setToolTip("当前版本还取不到在线清单（车辆共享模块未就绪）")
+        # download_remote_pack 是"下载 + 导入"一步到位的入口（内部已调
+        # import_payload），面板只需要它这一个。
+        if not has("download_remote_pack"):
+            for button in (self.btn_import_selected, self.btn_import_all):
+                button.setEnabled(False)
+                button.setToolTip("当前版本还不支持导入在线车辆")
+        if not has("upload_pack"):
+            self.btn_upload.setEnabled(False)
+            self.btn_upload.setToolTip("当前版本还不支持上传")
+        if not has("upload_url_for_web"):
+            self.btn_upload_browser.setEnabled(False)
+            self.btn_upload_browser.setToolTip("当前版本没有配置浏览器上传地址")
+        if not has("clear_token"):
+            self.btn_clear_token.setEnabled(False)
+            self.btn_clear_token.setToolTip("当前版本没有令牌管理入口")
+
+    # -- 后台任务 --------------------------------------------------------
+
+    def _run_task(self, fn, on_ok, busy: str) -> None:
+        """起一个后台任务；同一时刻只允许一个（避免连点刷新堆线程）。"""
+        if self._worker is not None and self._worker.isRunning():
+            self._set_status("上一个任务还在跑…")
+            return
+        self._set_status(busy)
+        worker = _TaskWorker(fn, self)
+        worker.ok.connect(on_ok)
+        worker.failed.connect(self._on_task_failed)
+        worker.finished.connect(self._on_task_done)
+        self._worker = worker
+        worker.start()
+
+    def _on_task_failed(self, reason: str) -> None:
+        self._set_status(f"✗ {reason}", error=True)
+
+    def _on_task_done(self) -> None:
+        """线程结束：放掉引用（不然 QThread 析构在跑着的时候会 fail-fast）。"""
+        worker = self._worker
+        self._worker = None
+        if worker is not None:
+            worker.deleteLater()
+        if self._pending_close:
+            self._pending_close = False
+            self.accept()
+
+    def closeEvent(self, event) -> None:
+        """后台还在跑时**不许关窗**：析构一个运行中的 QThread 会让程序直接退出。
+
+        不 ``wait()``（下载可能很久，界面就冻了），改成"关窗标记 + 跑完自动关"。
+        """
+        worker = self._worker
+        if worker is not None and worker.isRunning():
+            self._pending_close = True
+            self._set_status("正在处理，完成后自动关闭…")
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    # -- 清单 ------------------------------------------------------------
+
+    def _refresh_index(self) -> None:
+        share = _vehicle_share_module()
+        fetch = getattr(share, "fetch_remote_index", None) if share else None
+        if not callable(fetch):
+            self._set_status("✗ 当前版本取不到在线清单", error=True)
+            return
+        self._reset_overwrite()          # 重新拉清单 = 重新开始，覆盖待定态作废
+        self._run_task(fetch, self._fill_index, "正在获取在线清单…")
+
+    def _fill_index(self, result) -> None:
+        """填表：``fetch_remote_index`` 返回 ``{"ok","items","error","source"}``。
+
+        ``ok=False`` 只说明"这次没拉到"（网络/镜像全挂、索引结构不对），
+        **不是异常** —— 所以错误文案直接印在状态行上，清单保持原样（上一次
+        拉到的还在，别清空）。
+        """
+        if not isinstance(result, dict):
+            self._set_status("✗ 清单格式不认识", error=True)
+            return
+        if not result.get("ok"):
+            self._set_status(f"✗ {result.get('error') or '清单拉取失败'}", error=True)
+            return
+        items = [entry for entry in (result.get("items") or [])
+                 if isinstance(entry, dict)]
+        self._entries = items
+        self.list_packs.clear()
+        source = str(result.get("source") or "")
+        if not items:
+            self._show_placeholder("在线库里还没有车辆包")
+            self._set_status("在线库还是空的")
+            return
+        for entry in items:
+            text, tip = _pack_text(entry)
+            item = QListWidgetItem(text)
+            item.setToolTip(tip)
+            item.setData(Qt.ItemDataRole.UserRole, entry)
+            self.list_packs.addItem(item)
+        self._set_status(f"✓ {len(items)} 个车辆包（可多选后导入）")
+        if source:
+            self.lbl_status.setToolTip(f"清单来源：{source}")
+
+    def _show_placeholder(self, text: str) -> None:
+        """空清单时的一行灰字说明：不可选、不参与导入（data 为空会被过滤掉）。"""
+        item = QListWidgetItem(text)
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        self.list_packs.addItem(item)
+
+    def _selected_entries(self) -> list:
+        entries = []
+        for item in self.list_packs.selectedItems():
+            entry = item.data(Qt.ItemDataRole.UserRole)
+            if entry is not None:
+                entries.append(entry)
+        return entries
+
+    def _import_selected(self) -> None:
+        entries = self._selected_entries()
+        if not entries:
+            self._set_status("✗ 先在清单里选一个车辆包", error=True)
+            return
+        self._import_entries(entries)
+
+    def _import_all(self) -> None:
+        if not self._entries:
+            self._set_status("✗ 清单是空的，先点「刷新」", error=True)
+            return
+        self._import_entries(self._entries)
+
+    def _import_entries(self, entries) -> None:
+        share = _vehicle_share_module()
+        download = getattr(share, "download_remote_pack", None) if share else None
+        if not callable(download):
+            self._set_status("✗ 当前版本不支持导入在线车辆", error=True)
+            return
+
+        def job() -> tuple[int, list[str]]:
+            # ``download_remote_pack`` **下载 + 导入一步到位**（内部已经调
+            # import_payload），返回值是 {"ok","added","updated","errors",...}。
+            # 所以这里只累加，别再自己 import 一次（会重复写盘）。
+            total = 0
+            problems: list[str] = []
+            for entry in entries:
+                result = download(entry)
+                changed, note = _import_summary(result)
+                total += changed
+                if not changed:
+                    problems.append(note or str(entry.get("name") or "?"))
+            return total, problems
+
+        self._run_task(job, self._on_imported, f"正在导入 {len(entries)} 个包…")
+
+    def _on_imported(self, payload) -> None:
+        total, problems = payload if isinstance(payload, tuple) else (0, [])
+        total = int(total or 0)
+        # 同一个错误在多个包上会重复（"下载失败：连接超时" × N）—— 去重再数，
+        # 否则状态行会变成一句被复读的长文案，面板宽度放不下。
+        unique = list(dict.fromkeys(str(item) for item in problems if str(item)))
+        if total:
+            tail = f"，{len(unique)} 个包没导入" if unique else ""
+            self._set_status(f"✓ 已导入 {total} 台{tail}")
+        else:
+            short = unique[0] if unique else "包里没有可导入的车辆"
+            extra = f"（共 {len(unique)} 个包失败）" if len(unique) > 1 else ""
+            self._set_status(f"✗ {short}{extra}", error=True)
+        if unique:
+            self.lbl_status.setToolTip("没导入的包：\n" + "\n".join(unique[:6]))
+        self._refresh_upload_combo()
+        self.vehicles_changed.emit(total)
+
+    # -- 上传 ------------------------------------------------------------
+
+    def _refresh_upload_combo(self) -> None:
+        """上传用的车辆下拉：跟着本机档案走（导入完要重建一次）。"""
+        current = self.cmb_upload.currentData()
+        self.cmb_upload.blockSignals(True)
+        self.cmb_upload.clear()
+        for name in customization.vehicle_names():
+            self.cmb_upload.addItem(name, name)
+        if self.cmb_upload.count() == 0:
+            self.cmb_upload.addItem("（本机还没有车辆）", "")
+            self.cmb_upload.setEnabled(False)
+        else:
+            self.cmb_upload.setEnabled(True)
+            index = self.cmb_upload.findData(current)
+            self.cmb_upload.setCurrentIndex(index if index >= 0 else 0)
+        self.cmb_upload.blockSignals(False)
+
+    def _show_note(self, text: str, error: bool = True) -> None:
+        """上传区的小字提示（令牌状态 / 索引登记结果）：有问题才出现。
+
+        跟顶上那条 ``lbl_status`` 分开：那条是"这次操作成功还是失败"，
+        这条是"有个附带情况要你知道"，两条同时存在时不该互相盖掉。
+        """
+        self.lbl_note.setText(text)
+        self.lbl_note.setToolTip(text)
+        color = qcolor("alert_red") if error else qcolor("ink_2")
+        self.lbl_note.setStyleSheet(f"color: {color.name()};")
+        self.lbl_note.setVisible(True)
+
+    def _report_token_state(self, loaded: bool) -> None:
+        """令牌状态的**小字**提示（红字，只在有话说的时候出现）。
+
+        两种要告诉用户的情况：
+        - ``load_token()`` 拿回空串但 ``LAST_TOKEN_ERROR`` 非空 → 存过、但这台机器
+          解不开（换账户 / 配置被拷走），得重新填；
+        - ``save_token()`` 返回 False → 加密不可用，令牌只在本次运行有效。
+        """
+        share = _vehicle_share_module()
+        hint = str(getattr(share, "LAST_TOKEN_ERROR", "") or "") if share else ""
+        if not hint:
+            self.lbl_note.setVisible(False)
+            return
+        text = (f"已存的令牌解不开，请重新填写（{hint}）" if not loaded
+                else f"令牌只在本次运行有效（{hint}）")
+        self._show_note(text)
+
+    def _clear_token(self) -> None:
+        """清掉本机保存的令牌（只动这台机器，不动仓库）。"""
+        share = _vehicle_share_module()
+        clear = getattr(share, "clear_token", None) if share else None
+        if not callable(clear):
+            self._set_status("✗ 当前版本不支持清除令牌", error=True)
+            return
+        try:
+            clear()
+        except Exception as exc:
+            self._set_status(f"✗ 清除令牌失败：{exc}", error=True)
+            return
+        self.edit_token.clear()
+        self.lbl_note.setVisible(False)
+        self._set_status("✓ 已清除本机保存的令牌")
+        self.btn_clear_token.setText("✓ 已清除")
+        QTimer.singleShot(1800, lambda: self.btn_clear_token.setText("清除令牌"))
+
+    def _reset_overwrite(self) -> None:
+        """撤回"确认覆盖"的待定态（切换车辆 / 刷新清单 / 上一次成功之后）。"""
+        if getattr(self, "_pending_overwrite", False):
+            self._pending_overwrite = False
+            self.btn_upload.setText("上传")
+            self.btn_upload.setToolTip(
+                "把选中的车辆结构推到在线库（Token 由系统加密存在本机）")
+
+    def _upload(self, overwrite: bool = False) -> None:
+        share = _vehicle_share_module()
+        upload = getattr(share, "upload_pack", None) if share else None
+        if not callable(upload):
+            self._set_status("✗ 当前版本不支持上传", error=True)
+            return
+        name = self.cmb_upload.currentData()
+        if not name:
+            self._set_status("✗ 先选一台要上传的车", error=True)
+            return
+        token = self.edit_token.text().strip()
+        if not token:
+            self._set_status("✗ 先填 GitHub Token（需要 contents:write 权限）", error=True)
+            self.edit_token.setFocus()
+            return
+        # 上一次点出来的"确认覆盖"：正常情形下用户再点一次「上传」就是确认。
+        if getattr(self, "_pending_overwrite", False) and not overwrite:
+            overwrite = True
+        self._reset_overwrite()
+        self.lbl_note.setVisible(False)       # 上一次的旧提示先撤掉
+        try:
+            doc = _vehicle_doc([name])
+        except Exception as exc:
+            self._set_status(f"✗ 打包失败：{exc}", error=True)
+            return
+        # token 交给 vehicle_share 存（DPAPI 加密）；存不住时它返回 False 并把
+        # 原因放在 LAST_TOKEN_ERROR 里 —— 那种情况下只说"本次运行有效"，
+        # **不降级成明文落盘**。
+        save_token = getattr(share, "save_token", None)
+        if callable(save_token):
+            try:
+                kept = bool(save_token(token))
+            except Exception as exc:
+                kept = False
+                app_log.warning(f"保存车辆上传令牌失败：{exc}")
+            if not kept:
+                self._report_token_state(loaded=True)
+        self._run_task(lambda: upload(doc, token, overwrite), self._on_uploaded,
+                       f"正在上传「{name}」…")
+
+    def _on_uploaded(self, result) -> None:
+        """上传结果：同名文件已存在时**在按钮上就地确认**，再点一次才覆盖。
+
+        为什么不用 QMessageBox：那是系统大问号框，跟这套黑白灰面板不是一路；
+        而且"再点一次就是确认"这种就地确认不打断手（同「检查更新」那一套手感）。
+        """
+        if not isinstance(result, dict):
+            self._set_status("✓ 已上传")
+            return
+        if result.get("need_confirm"):
+            file = str(result.get("file") or "同名文件")
+            self._pending_overwrite = True
+            self.btn_upload.setText("确认覆盖？")
+            self.btn_upload.setToolTip(
+                f"{file} 在仓库里已经存在。再点一次「确认覆盖？」"
+                f"就会替换服务器上的版本。\n{result.get('error') or ''}".strip())
+            self._set_status(f"仓库里已有 {file}，再点一次即覆盖")
+            return
+        if not result.get("ok"):
+            self._set_status(f"✗ {result.get('error') or '上传失败'}", error=True)
+            return
+        index = result.get("index")
+        if isinstance(index, dict) and index.get("ok") is False:
+            # 两条结论分开说：包确实传上去了，只是索引没登记（不影响下次导入？
+            # 影响 —— 索引里没有它别人就看不到，所以红字单独一行）。
+            self._set_status("✓ 包已上传")
+            self._show_note(f"索引登记失败：{index.get('error') or '未知原因'}")
+            return
+        file = str(result.get("file") or "")
+        self._set_status("✓ 已上传并登记到在线车辆库" + (f"（{file}）" if file else ""))
+
+    def _open_browser_upload(self) -> None:
+        share = _vehicle_share_module()
+        url = ""
+        builder = getattr(share, "upload_url_for_web", None) if share else None
+        if callable(builder):
+            try:
+                url = str(builder() or "")
+            except Exception as exc:
+                app_log.warning(f"取浏览器上传地址失败：{exc}")
+        if not url:
+            self._set_status("✗ 没有配置浏览器上传地址", error=True)
+            return
+        QDesktopServices.openUrl(QUrl(url))
+
+    def _open_new_token_page(self) -> None:
+        """打开 GitHub 创建令牌页（经典 PAT，URL 预填 repo 权限）。
+
+        为什么用经典 PAT 而不是 fine-grained：经典 PAT 的创建页支持 ``?scopes=``
+        预填 —— 点开就已经勾好 ``repo``，用户只要 Generate → 复制 → 粘回来。
+        fine-grained 没有官方 URL 预填，反而多好几步。
+        """
+        QDesktopServices.openUrl(QUrl(
+            "https://github.com/settings/tokens/new"
+            "?scopes=repo&description=CQUFSAE-SerialAssistant-vehicles"))
+
+
+# ---------------------------------------------------------------- 选车号动画
+# 时间轴（2026-11-07 用户定稿）：
+#   「选中之后直接其他元素慢慢下移，留出电池箱参数的位置，然后参数直接全部高斯
+#     模糊淡入」+「整体高斯模糊淡出加 0.2s，停留加 0.1s，用高质量高斯模糊」。
+# 四个数就是四段的边界，后续调参只改这里（改小 = 更快，段与段不会错位）。
+_VEH_SHIFT_MS = 480          # P0 让位：其他元素下移，占位行 0 → Δ（延长到 480ms
+                              # 让单帧位移降到 ~8px 以下，见 _veh_shift_ease 说明）
+
+_VEH_BLUR_OUT_MS = 200       # P1 旧参数块高斯模糊淡出（"模糊淡出 +0.2s"）
+_VEH_SWAP_MS = 320           # P2 空白结束 / P3 起点（新块开始淡入）
+# 真行显形（撤占位）安排在 P3 **末**（= _VEH_BLUR_IN_END_MS）：P3 期间新行一直
+# 藏着、高度由占位行扛，覆盖层底下没有"已显形的清晰内容"，α 0→1 才成立。
+_VEH_BLUR_IN_END_MS = 680    # P3 新参数块模糊淡入结束（σ=0，末帧纯原图）
+_VEH_TOTAL_MS = 780          # P4 完全清晰静止 100ms 后收尾
+# 逐模组行的行距（实测：34px 控件 + 12px QFormLayout 行距）。区域总高 = 46×行数。
+# ⚠️ 占位行即使高度 0 也自带**一条** 12px 行距 —— 目标高度要按 (Δ − 12) 算，
+#    否则末端换行会差 12px（见 devtools/_probe_vehicle_mech.py 的实测）。
+_VEH_PITCH = 46
+# 高斯：只做 5 档 + 原图，1/4 降采样。实测 946×528 全分辨率 6 档要 551ms，
+# 1/4 只要 26~31ms（模糊结果再放大，肉眼看不出差别）。
+# σ 单位是**物理像素**（图像按 1/4 算，所以内部用 σ/4）。实测 10 只算"轻微发虚"，
+# 24（≈12 逻辑px）才够"整块糊住再慢慢清"——用户要的是"全部高斯模糊淡入"。
+_VEH_SIGMA_MAX = 24.0
+_VEH_SIGMA_STEPS = (24.0, 16.0, 10.0, 6.0, 3.0)
+_VEH_BLUR_DIV = 4
+# 补间节拍。用户要求 60Hz（整视口重绘 4.5ms，165Hz 预算里会抖）；实测 16ms 的
+# 实际帧间隔 P95 会落到 24~25ms（共享 ticker 是 8ms，节流后取 2 拍），过不了
+# "P95 ≤ 20ms" 的验收线，故取 8ms（= ticker 本身，约 120Hz）——见报告里的对比表。
+_VEH_TICK_MS = 8
+
+# 「其他元素下移」专用的缓动：用户要的是「像鼠标滚动一样流畅」—— 速度连续、
+# 没有明显的"中间猛地一冲"。EASE(bezier 0.25,0.1,0.25,1) 中段斜率高达 1.9×，
+# 会让占位行在中间某一帧单步跳 ~16px（肉眼可见的顿挫）。这里用「线性 + 余弦缓动」
+# 的轻混合，最大斜率压到 ≈1.14×，再配 480ms 时长，单帧位移稳定 ≤ ~8px（DWM 帧
+# 间隔波动也扛得住）。模糊段（P1/P3）仍用自己的 cubic 曲线，不动。
+def _veh_shift_ease(p: float) -> float:
+    if p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return 1.0
+    lin = p
+    cos_ease = 0.5 - 0.5 * math.cos(math.pi * p)   # 最大斜率 ≈ π/2 ≈ 1.571
+    return 0.75 * lin + 0.25 * cos_ease           # 最大斜率 ≈ 0.75 + 0.25*1.571 ≈ 1.143
+
+
+
+class _FadeOverlay(QWidget):
+    """盖在一小块区域上的位图（可带高斯档），由外部时钟逐帧喂帧。
+
+    为什么需要：车辆节切车号 / 改模组数时 `_rebuild_module_rows` 会把整组行控件
+    删掉重建。2026-11-07 用户定稿的观感是「其他元素慢慢下移留出位置，参数整块
+    高斯模糊淡入」，所以这里不只做 alpha：外部会把**预生成好的高斯位图**按当前
+    sigma 混着喂进来，本控件只负责 fillRect + drawPixmap。
+
+    ⛔ 不用 QGraphicsOpacityEffect / QGraphicsBlurEffect（项目铁律：控件级离屏
+       合成会抽搐）。模糊全部在 numpy 里预生成，绘制阶段只有两次 drawPixmap。
+    """
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self._items: list[tuple[QPixmap, float]] = []
+        self._alpha = 0.0
+        self._bg: QColor | None = None
+        self._visible_h: int | None = None
+        # ⛔⛔ 2026-11-07 修「车号选择残影 / 淡化发灰」：覆盖层必须是**透明背景**，
+        #    否则 Qt 会先用 palette 的 Window 颜色把整块刷成不透明实底，再叠我们的
+        #    α 图 —— 淡化中途看到的是「实底 + 半透明图」而非「真行 + 半透明图」，
+        #    既发灰又会在真行与覆盖层错位时显得像残影。透明背景才能和底下内容做
+        #    真正的 α 合成。
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.hide()
+
+    def show_frame(self, items, rect: QRect, alpha: float,
+                   bg: QColor | None = None,
+                   visible_h: int | None = None) -> None:
+        """items = [(位图, 权重)]；bg 不为 None 时先整块铺底色。
+
+        visible_h 不为 None 时只画位图**顶部**这么多逻辑像素（源图按设备像素
+        等比裁剪、1:1 映射，不压扁），其余区域保持透明让底下真控件正常显示 ——
+        用于「让位动画」里让覆盖层只占 holder 当前让出的空间。None = 整块全画
+        （其它调用方与有旧块的 P1 走这条，保持原行为）。
+        """
+        try:
+            self._items = [(pix, float(w)) for pix, w in items if w > 0.004]
+            self._alpha = max(0.0, min(1.0, float(alpha)))
+            self._bg = bg
+            self._visible_h = (None if visible_h is None
+                               else max(0, int(visible_h)))
+            if self.geometry() != rect:
+                self.setGeometry(rect)
+            if not self.isVisible():
+                self.show()
+            self.raise_()
+            self.update()
+        except RuntimeError:              # 面板已关，C++ 对象已销毁：静默收尾
+            self.clear()
+
+    def clear(self) -> None:
+        self._items = []
+        self._bg = None
+        self._alpha = 0.0
+        self._visible_h = None
+        try:
+            self.hide()
+        except RuntimeError:
+            pass
+
+    def paintEvent(self, event) -> None:          # noqa: N802 (Qt 命名)
+        if not self._items and self._bg is None:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        if self._bg is not None:
+            painter.fillRect(self.rect(), self._bg)
+        full_h = self.height()
+        for pix, weight in self._items:
+            painter.setOpacity(self._alpha * weight)
+            if self._visible_h is None or full_h <= 0:
+                painter.drawPixmap(self.rect(), pix)
+                continue
+            h = min(int(self._visible_h), full_h)
+            if h <= 0:
+                continue
+            # pix 是 2× 设备像素位图、self 是逻辑像素：按高度比换算 dpr，
+            # 只取源图顶部对应的一段，用三参数重载做 1:1 映射（⛔ 绝不把整张
+            # 5 行位图压扁到当前高度 —— 那会变形）。
+            dpr = pix.height() / float(full_h)
+            target = QRectF(0, 0, self.width(), h)
+            source = QRectF(0, 0, pix.width(), h * dpr)
+            painter.drawPixmap(target, pix, source)
+
+
 class SettingsDialog(QDialog):
     """应用设置。确定后由调用方读 values() / hidden_buttons() 落盘并生效。
 
@@ -274,13 +1174,15 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setModal(True)
-        # 最小宽度（2026-10-22 收尾）：下拉框改成按内容定宽（FIELD_W）之后，
-        # 正文最少只要 490；560 视口 502 留 12px 余量，面板比原来窄一截。
-        self.setMinimumWidth(560)
+        # 先给个初值，真正的下限在本函数末尾按内容算出来（PANEL_MIN_W 兜底）
+        self.setMinimumWidth(PANEL_MIN_W)
         self._on_glass = on_glass
         self._on_buttons = on_buttons
         self._on_custom = on_custom
         self._button_switches: dict[str, Switch] = {}
+        # 构造期的首次 _sync_vehicle_rows **不许**跑过渡动画（面板还没上屏，
+        # 动画只会让打开面板那一瞬间的行数是"长到一半"的样子）。
+        self._veh_allow = False
         # 标题栏主题跟着本次打开的方案走（跟随系统则当场解析），showEvent 里应用
         self._scheme = (detect_system_scheme() if theme_mode == "system"
                         else theme_mode)
@@ -316,8 +1218,19 @@ class SettingsDialog(QDialog):
         form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         form.setHorizontalSpacing(18)
         form.setVerticalSpacing(12)
+        # ⛔ **不要**改成 WrapLongRows：它确实把 body 最小宽从 579 压到 392
+        #    （2026-10-31 实测），但 QFormLayout 只在**字段**放不下时才把标签挪到
+        #    上方，标签自己放不下时是**直接截断**—— 面板一窄，"材质强度""暂停定位
+        #    行数（最大化）"这些标签就被切掉左边（截图见汇报）。面板的最小宽度
+        #    由"最宽标签 187 + 间距 18 + 最宽字段（模组行）362"决定，想真正变窄
+        #    只能动这两项，见 _build_vehicle_section 里的说明。
         self.form = form
         body_layout.addLayout(form)
+
+        # 2026-11-03 用户：「不要喧宾夺主，把车辆信息放在设置界面的最上面」——
+        # 车辆（电池箱）是整个接收区排版的**前提**，放第一屏；主题/材质/开屏动画
+        # 都排到它后面。
+        self._build_vehicle_section(form)
 
         self.cmb_theme = ChevronComboBox()
         self.cmb_theme.setFixedWidth(FIELD_W)
@@ -381,13 +1294,14 @@ class SettingsDialog(QDialog):
             self._custom_widgets["material"] = self.cmb_material
             self._custom_rows["material"] = (material_label, self.cmb_material)
 
-        # 「车辆」：一套电池箱结构 = 一台车（模组个数 + 每个模组的电芯/温度采集数）。
-        # 放在「定制功能」**之前**：选车是"我用的是哪台电池箱"这个前提，下面那些
-        # 定制项是它的细节；而且选车一换，定制项里那三个旧的全局网格参数就整体
-        # 隐藏（见 _sync_vehicle_rows）——
+        # 「开屏动画」：预设（assets/splash/ 下扫出来的）/ 跟随主题 / 自定义文件。
+        # 只在这块做 UI；真正的播放/配置解析全在 splash_anim.py（接口层）。
+        self._build_splash_section(form)
+
+        # 「车辆」一节已经在**最上面**建好（见本方法开头，用户 2026-11-03：
+        # 「不要喧宾夺主，把车辆信息放在设置界面的最上面」）。
         #  ⚠️ 与 customize 的说明一致：车辆档案**不走 register_* 注册表**（它不是
         #     标量），所以这一节是手写的，其余定制项仍按 specs() 自动生成。
-        self._build_vehicle_section(form)
 
         # 「定制功能」：BMS 专用配置的统一管理入口。控件**按注册表动态生成**
         # （customization.specs()），以后加定制配置这里一行都不用改。
@@ -405,6 +1319,12 @@ class SettingsDialog(QDialog):
 
         # 日志一节放在**界面按钮的下方**（用户点名），整段一起随面板滚动
         self._build_log_section(form)
+
+        # 「会话数据库」：SQLite 每帧落库的入口（路径 / 近 N 天导出 / 统计）
+        self._build_session_db_section(form)
+
+        # 「协议」：解析规则可编辑（换一台 BMS 不用改 Python、不用重启）
+        self._build_protocol_section(form)
 
         # 「MCP Service」：把 MCP 服务交给 Agent 的入口（2.1 新增，2.2 起这么叫）
         self._build_mcp_section(form)
@@ -466,11 +1386,17 @@ class SettingsDialog(QDialog):
         # ⛔ 560 只是**下限**，不代表够用：模块行（Module N / 电芯数量 /
         #    温度采集数量）在 560 宽下右侧输入框会被裁掉 —— 实测内容最小宽度
         #    603，探针数出 38 个控件越界 31~43px（devtools/_probe_settings_clip.py）。
-        #    滚动区是 widgetResizable + 横向滚动条常关，于是越界部分直接被切，
+        #    滚动区是 widgetResizable + 横向滚动条常关，越界部分直接被切，
         #    用户看到的是"温度采集数量那个框只剩一半"。
         #    这里按 body 的最小宽度把面板撑到刚够，窄屏才由竖向滚动条接管。
-        chrome = 2 * (GAP + 6) + 4          # 外层边距 + 边框余量
-        self.setMinimumWidth(max(560, body.minimumSizeHint().width() + chrome))
+        #    ⚠️ body 的最小宽 = 最宽标签(187) + 18 + 最宽字段(模组行 362) + 12，
+        #    想再窄必须动这两项（见 _build_vehicle_section 末尾的说明）。
+        # 实测「面板宽 − body 宽 = 58」：外层边距 48 + 竖向滚动条 12 − 边框重叠 2。
+        # 少算这几十像素的后果就是右侧控件被裁（老坑，见上面那段说明）。
+        self._veh_allow = True          # 构造完成：之后的切换才有过渡
+        chrome = 58
+        self.setMinimumWidth(max(PANEL_MIN_W,
+                                 body.minimumSizeHint().width() + chrome))
 
     def _request_close(self) -> None:
         """按钮要求关闭：确定/取消按发起者区分，其余（Esc / 窗口 X）算取消。"""
@@ -488,6 +1414,9 @@ class SettingsDialog(QDialog):
         """
         hook = getattr(self, "_finish_hook", None)
         if hook is not None and self.isVisible():
+            # 收场：正在跑的"选车号过渡"必须先落到终态（换行 + 撤覆盖层），
+            # 否则收场动画那 260ms 里参数区还是空占位。
+            self._veh_stop(settle=True)
             hook(bool(result))
             return
         super().done(result)
@@ -497,6 +1426,88 @@ class SettingsDialog(QDialog):
     # 旧的全局网格三件套：选车后整行隐藏（一套参数说话，见 _sync_vehicle_rows）。
     # 名字与 customization 里那三条 register_int 一一对应。
     _LEGACY_GRID_KEYS = ("module_count", "cells_per_module", "temps_per_module")
+
+    # ------------------------------------------------------------ 开屏动画
+
+    def _build_splash_section(self, form: QFormLayout) -> None:
+        """开屏动画：预设 / 跟随主题 / 自定义文件 + 预览。
+
+        预设是 **扫** ``assets/splash/`` 得来的（用户把新动画丢进去、重开面板就能
+        看到）；真正的解析与播放全在 ``splash_anim.py``，这里只做选择与预览。
+        """
+        import splash_anim
+        self._splash_anim = splash_anim
+        # 2026-11-03 用户：「既然动画选择里面有无动画选项了那就不需要开屏动画
+        # 开关了」—— 去掉总开关，只留下拉（第一项就是「无」）。
+        self.cmb_splash = ChevronComboBox()
+        self.cmb_splash.addItem("无（直接进主界面）", "none")
+        # 只列**方案**（planA / planB）：同一方案的浅色/深色是变体，播放时按当前
+        # 主题自动挑（用户 2026-11-03：「只保留 planA、planB 这些选项，然后系统
+        # 自动选择当前主题相同的动画」）。
+        for plan in splash_anim.plans():
+            self.cmb_splash.addItem(plan["label"], plan["id"])
+        self.cmb_splash.addItem("自定义文件…", "custom")
+        # 宽度按**最宽条目**算：固定 FIELD_W 会把"跟随主题（自动选浅色/深色）"
+        # 截成"跟随主题（自动选浅色"（用户 2026-11-03 截图点名"框小了"）。
+        fm = self.cmb_splash.fontMetrics()
+        widest = max((fm.horizontalAdvance(self.cmb_splash.itemText(i))
+                      for i in range(self.cmb_splash.count())), default=0)
+        self.cmb_splash.setFixedWidth(max(FIELD_W, widest + 80))
+        index = self.cmb_splash.findData(splash_anim.choice())
+        self.cmb_splash.setCurrentIndex(index if index >= 0 else 1)
+        self.cmb_splash.currentIndexChanged.connect(self._on_splash_changed)
+        form.addRow(self._label("开屏动画"), self.cmb_splash)
+
+        path = splash_anim.custom_path()
+        self.lbl_splash_path = QLabel(Path(path).name if path else "未选择文件")
+        self.lbl_splash_path.setObjectName("groupCaption")
+        self.lbl_splash_path.setMinimumWidth(1)
+        self.lbl_splash_path.setToolTip(path or "选「自定义文件…」后在这里显示文件名")
+        btn_pick = InkButton("选择文件…", variant="ghost")
+        btn_pick.clicked.connect(self._on_splash_pick)
+        btn_preview = InkButton("预览", variant="ghost")
+        btn_preview.clicked.connect(self._on_splash_preview)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(self.lbl_splash_path, 1)
+        row.addWidget(btn_pick)
+        row.addWidget(btn_preview)
+        form.addRow(self._label("动画文件"), self._row(row))
+
+    def _on_splash_changed(self, index: int) -> None:
+        value = str(self.cmb_splash.itemData(index) or "theme")
+        self._splash_anim.save_choice(value)
+
+    def _on_splash_pick(self) -> None:
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "选择开屏动画", str(Path.home()),
+            "动画文件 (*.mp4 *.mov *.mkv *.webm *.avi *.gif *.webp "
+            "*.png *.jpg *.jpeg *.bmp)")
+        if not path:
+            return
+        self._splash_anim.save_custom_path(path)
+        self._splash_anim.save_choice("custom")
+        index = self.cmb_splash.findData("custom")
+        if index >= 0:
+            self.cmb_splash.blockSignals(True)
+            self.cmb_splash.setCurrentIndex(index)
+            self.cmb_splash.blockSignals(False)
+        self.lbl_splash_path.setText(Path(path).name)
+        self.lbl_splash_path.setToolTip(path)
+
+    def _on_splash_preview(self) -> None:
+        # 预览按下拉里当前选中的主题挑变体（与系统/固定浅深一致），让用户在设置里
+        # 切主题后能立刻看到对应的开屏，不用重启软件。
+        mode = str(self.cmb_theme.currentData() or "system")
+        scheme = detect_system_scheme() if mode == "system" else mode
+        preset = self._splash_anim.configured(scheme)
+        if preset is None:
+            QMessageBox.information(
+                self, "开屏动画",
+                "当前没有可预览的动画：请选择一个预设，或先「选择文件…」。")
+            return
+        # 预览自己就是一条独立置顶窗口，点一下/按任意键可跳过；不动主窗口。
+        self._splash_anim.play(preset)
 
     def _build_vehicle_section(self, form: QFormLayout) -> None:
         """「车辆」一节：选车 / 新建 / 删除 / 改名 + 逐模组的电芯与温度采集数。
@@ -542,12 +1553,19 @@ class SettingsDialog(QDialog):
         # 就地改写车号 = 改名（沿用"选车与改名合一"的老口径，回车/失焦生效）
         self.cmb_vehicle_number.setEditable(True)
         self.cmb_vehicle_number.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        # ⚠️ 最小宽度给小：这一行有「赛季 + 车号 + ＋」，车号有 stretch=1 会吃掉
-        #    剩余宽度，兜底给小一点反而不会顶破滚动区视口（老坑，见 git 历史）。
-        self.cmb_vehicle_number.setMinimumWidth(84)
-        # 上限让"赛季/车号/模组数"三个框看着是一套的：面板拉宽时余量留给右侧空白，
+        # ⚠️ 最小宽度必须给 **1**（2026-10-31）：可编辑 QComboBox 的
+        #    minimumSizeHint 会按**内容**算（实测 102，minWidth 84 也只是把它
+        #    压到 84），它自己撑住整行，面板就再也窄不下去。给 1 = 允许布局把
+        #    它压到很小，宽度由 stretch 吃剩余空间决定（面板宽时它照样展开）。
+        #    ⛔ 别写 0（Qt 把 0 当"没设过"，会退回 minimumSizeHint）。
+        self.cmb_vehicle_number.setMinimumWidth(1)
+        # 上限让"赛季/车号"两个框看着是一套的：面板拉宽时余量留给右侧空白，
         # 而不是把车号框拉成一条长条（用户 2026-10-22："优化一下这些框的大小"）。
-        self.cmb_vehicle_number.setMaximumWidth(240)
+        # 同时**不给 stretch**（下面是 pick_row.addWidget(..., 1) 那处被去掉了）：
+        # 车号是"E74"这种短内容，带 stretch 会把框撑到 180px、看着比内容大一圈
+        # （用户点名"这个框不需要这么大"）。去掉 stretch 后它按内容定宽，多余
+        # 空间统一交给行尾的 addStretch 推到右边。
+        self.cmb_vehicle_number.setMaximumWidth(160)
         # 车号居中（用户 2026-10-23）：显示与输入都居中，和旁边两个框一致
         self.cmb_vehicle_number.lineEdit().setAlignment(Qt.AlignmentFlag.AlignHCenter)
         # ⛔ 不设这条，sizeHint 会按最宽条目（「（未选择）」）算，把整行顶宽、
@@ -560,7 +1578,12 @@ class SettingsDialog(QDialog):
             "车号 = 车名的前半段（E74-2026 的 E74）。\n"
             "直接改写框里的车号 = 改名（回车或点别处生效）；\n"
             "展开后每条右端的 × 删除该车号（会二次确认）")
-        self.cmb_vehicle_number.currentIndexChanged.connect(self._on_vehicle_picked)
+        # ⛔⛔ 2026-11-08 根治「车号被反复取消选中（0↔5）」：用 `activated`（**只有用户
+        #    真正从下拉里选一项才发**），而不是 `currentIndexChanged`（`_refresh_number_combo`
+        #    重建下拉时 setCurrentIndex/clear 也会发，且 blockSignals 挡不住它自激）——
+        #    旧连接让"程序化重建 → 误当成用户取消选车 → 又重建"形成死循环，把模组行
+        #    反复塌陷成 0 行（用户截图：模组数 5 却没有 Module 行 + 陈旧帧残影）。
+        self.cmb_vehicle_number.activated.connect(self._on_vehicle_picked)
         self.cmb_vehicle_number.delete_requested.connect(self._on_vehicle_delete_requested)
         _number_line = self.cmb_vehicle_number.lineEdit()
         if _number_line is not None:
@@ -586,42 +1609,117 @@ class SettingsDialog(QDialog):
         self.lbl_vehicle_hint.setVisible(False)
 
         # 模组个数（用户 2026-10-22 第三轮：赛季 / 车号 / 模组个数**并到一排**；
-        # 第四轮：「模组数」移到**框外**当标签，加号紧跟车号）
+        # 2026-10-31 又**拆出去**：它顶宽 144px，是选车行里最贵的一格，而它本质
+        # 是"这台车有几个模组"，跟下面「逐模组」是同一件事 —— 挪到 Module 1
+        # 上方那一行，选车行立刻窄一截（用户点名"减少设置界面的宽度"）。
         self.spin_vehicle_modules = ChevronSpinBox()
         self.spin_vehicle_modules.setRange(0, 64)
         self.spin_vehicle_modules.setFixedWidth(MODULE_COUNT_W)
         self.spin_vehicle_modules.set_arrows_visible(False)
         self.spin_vehicle_modules.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         self.spin_vehicle_modules.setToolTip(
-            "模组个数 = 下面「模组 i」的行数；新增的模组沿用最后一个模组的配置，"
+            "模组个数 = 下面「Module i」的行数；新增的模组沿用最后一个模组的配置，"
             "缩短则从末尾截断")
         self.spin_vehicle_modules.valueChanged.connect(self._on_vehicle_modules_changed)
 
-        # 行内顺序（用户 2026-10-22 第四轮）：赛季：[..]  车号：[..]  ＋  模组数：[..]
+        # 行内顺序：赛季：[..]  车号：[..]  ＋
         # 另外**去掉左侧的「车辆」行标签** —— 这一排自己已经说清是什么，多一个
         # 行标签只会把整排往右推（它还占着表单的标签列宽）。
+        # 模组数（用户 2026-11-01：放回「车号」这一行，与赛季/车号/＋同排均匀分布）
         pick_row = QHBoxLayout()
         pick_row.setSpacing(8)
+        pick_row.addStretch(1)
         pick_row.addWidget(self._inline_caption("赛季："))
         pick_row.addWidget(self.spin_vehicle_season)
         pick_row.addSpacing(2)
         pick_row.addWidget(self._inline_caption("车号："))
-        pick_row.addWidget(self.cmb_vehicle_number, 1)
+        # ⛔ 不给 stretch：车号内容短（"E74"），带 stretch 会把它撑到 160px 上限、
+        # 看着比内容大一圈。去掉后按内容定宽。
+        pick_row.addWidget(self.cmb_vehicle_number)
         pick_row.addWidget(self.btn_vehicle_new)
-        pick_row.addSpacing(6)
+        pick_row.addWidget(self.lbl_vehicle_hint)
+        # 用户 2026-11-01 第二轮：「模组数要写上」—— 挪进这一行时把行标签
+        # 弄丢了，框里只剩数字；补回行内小标签（与"赛季：""车号："同款）。
         pick_row.addWidget(self._inline_caption("模组数："))
         pick_row.addWidget(self.spin_vehicle_modules)
-        pick_row.addWidget(self.lbl_vehicle_hint)
+        # 整行均匀分布（两端留白一致）：和下方「导出/导入/在线库」那一排
+        # 的分布感对齐（用户 2026-11-01："把这两行均匀分布"）。
+        pick_row.addStretch(1)
 
         # 无行标签：单参 addRow 让它**横跨两列**，左边缘与其它行的标签列对齐
         self._vehicle_field = self._row(pick_row)
         form.addRow(self._vehicle_field)
+
+        # ---- 车辆共享：导出 / 导入 / 在线库（2026-10-31 用户要求）----
+        # 摆在"选车行"下面、"模组 i"上面：上面是"我在编辑哪台车"，下面是那台车的
+        # 结构；共享是把**整车档案**搬来搬去，夹在中间最顺，也不会把逐模组那一片
+        # （长度随模组数变）挤到按钮后面去。
+        self.btn_vehicle_export = InkButton("导出车辆", variant="ghost")
+        self.btn_vehicle_export.setToolTip(
+            "把车辆档案（全部）另存成一个 .cqv.json 包，方便发给队友导入")
+        self.btn_vehicle_export.clicked.connect(self._export_vehicles)
+        self.btn_vehicle_import = InkButton("导入车辆", variant="ghost")
+        self.btn_vehicle_import.setToolTip(
+            "从别人给你的 .cqv.json 包导入车辆；同名的车按包里的结构更新")
+        self.btn_vehicle_import.clicked.connect(self._import_vehicles)
+        self.btn_vehicle_library = InkButton("在线车辆库", variant="ghost")
+        self.btn_vehicle_library.setToolTip(
+            "打开在线车辆库：浏览/导入别人的车，或把自己的车传上去")
+        self.btn_vehicle_library.clicked.connect(self._open_vehicle_library)
+        # 三颗**并排同一行**（用户 2026-10-31 明确要求：把这三个弄到同一行），
+        # 文案去掉省略号。反馈文案（"✓ N 台"/"导入失败"…）一起算进等宽 ——
+        # 否则一显示反馈，那一颗就被 setMinimumSize 顶宽、三等宽当场破掉。
+        cell_w = _equalize_buttons(
+            (self.btn_vehicle_export, self.btn_vehicle_import,
+             self.btn_vehicle_library),
+            extra_texts=("✓ 00 台", "✓ +00 台", "导出失败", "导入失败"))
+        # 用户 2026-11-01 第二轮：「这个分布要均匀啊」—— 之前三颗锁死等宽后
+        # 靠左挤成一团、右侧留一大截空白。改成**三颗等伸长平分整行**：宽度
+        # 天然一致、两处间距一致、整行铺满。
+        for button in (self.btn_vehicle_export, self.btn_vehicle_import,
+                       self.btn_vehicle_library):
+            # 2026-11-03 用户：「注意新增的按钮大小问题」—— 不再拉满整行，
+            # 按等宽基准给死（反馈文案也不会撑宽），左对齐紧凑排列。
+            button.setFixedWidth(cell_w)
+        share_row = QHBoxLayout()
+        share_row.setContentsMargins(0, 0, 0, 0)
+        share_row.setSpacing(10)
+        # 2026-11-03 用户：「这个要均匀排布，不要挤到一起」—— 四个 stretch 把三颗
+        # 按钮**等距铺开**（按钮本身仍是紧凑等宽，不拉满）。
+        share_row.addStretch(1)
+        share_row.addWidget(self.btn_vehicle_export)
+        share_row.addStretch(1)
+        share_row.addWidget(self.btn_vehicle_import)
+        share_row.addStretch(1)
+        share_row.addWidget(self.btn_vehicle_library)
+        share_row.addStretch(1)
+        # 单参 addRow：横跨两列（左边缘与本节其它行对齐）
+        form.addRow(self._row(share_row))
+
+        # 模块还没落地时按钮置灰 + 说清原因（别让用户点了没反应）
+        share = _vehicle_share_module()
+        for button, entry, label in (
+                (self.btn_vehicle_export, "export_to_file", "导出"),
+                (self.btn_vehicle_import, "import_from_file", "导入"),
+                (self.btn_vehicle_library, "fetch_remote_index", "在线库")):
+            if share is None or not callable(getattr(share, entry, None)):
+                button.setEnabled(False)
+                button.setToolTip(
+                    f"车辆{label}功能还没就绪（vehicle_share.{entry} 未提供），"
+                    "当前版本只能在本机使用车辆档案")
+
+        # 「模组数」已挪回上方「车号」那一行（用户 2026-11-01），这里不再单独成行。
 
         # 逐模组行插在这个位置（= 本节之后、「定制功能」之前）。
         # ⚠️ 用 insertRow/removeRow 按**行号**增删，不用容器套布局：套一层容器的话
         #    里面的标签会落到字段列那一列上，跟本节其它行标签错开一大截。
         self._module_row_base = form.rowCount()
         self._module_rows: list[tuple[QLabel, QWidget]] = []
+        # 当前**已经画在屏幕上**的逐模组结构（cells/temps 原样）。用来判断"选车后
+        # 结构没变就不用重建"—— 否则每次选同一台/同结构车都会把下面整片重排一遍，
+        # 模组数框下面的内容会"跳"一下（用户点名"我选择车辆之后模组数不要跳变"）。
+        self._shown_cells: list[int] = []
+        self._shown_temps: list[int] = []
 
     def _current_season(self) -> str:
         return str(self.spin_vehicle_season.value())
@@ -636,7 +1734,10 @@ class SettingsDialog(QDialog):
         names = customization.vehicle_names_in_season(season)
         current = customization.current_vehicle()
         combo = self.cmb_vehicle_number
-        combo.blockSignals(True)          # 重建期间别触发 currentIndexChanged
+        # ⛔ 保存并**恢复**原来的屏蔽状态（不是硬置 False）：外层 _on_vehicle_picked
+        #    在整段同步期间把下拉信号挡住了，这里若硬置 False 会把外层的屏蔽提前解除，
+        #    重建后这次 setCurrentIndex 立刻吐 currentIndexChanged → 自激 0↔5 反复。
+        _prev_block = combo.blockSignals(True)
         combo.clear()
         # ⚠️ 占位文字要**短**：560 宽的面板里车号框只有 ~96px，编辑框 48px，
         #    "（未选择）"会被截成"（未选"。三个字刚好放得下。
@@ -645,7 +1746,7 @@ class SettingsDialog(QDialog):
             combo.addItem(customization.split_vehicle(name)[1], name)
         index = combo.findData(current)
         combo.setCurrentIndex(index if index >= 0 else 0)
-        combo.blockSignals(False)
+        combo.blockSignals(_prev_block)
         # ⛔ 可编辑下拉 setCurrentIndex/setEditText 之后光标停在**末尾**，条目比框宽
         #    时显示的是尾巴（实测「（未选择）」只剩「择）」）—— 和老坑同一条。
         line = combo.lineEdit()
@@ -653,6 +1754,25 @@ class SettingsDialog(QDialog):
             line.setCursorPosition(0)
 
     def _sync_vehicle_rows(self) -> None:
+        """刷新车辆区（**带重入闸**）。
+
+        ⛔⛔ 2026-11-08 根治「打开设置/切车号时 _veh_start 被连开 5 次」：
+        多个信号（赛季 / 模组数 / 车号下拉 / 布局回调）在刷新过程中会互相触发，
+        导致本方法**重入**（实测日志：47ms 内 5 次 START，nrows 3→5→2→0→3，
+        h0 全为 0），每次都起一整段让位动画、互相打断，最后落在一个**错误的行数**
+        上 —— 用户看到「模组数 5 却没有 Module 行 / 行错位 + 残影」。
+        用一个重入闸把嵌套调用折叠成一次，彻底断掉这条链。
+        """
+        if getattr(self, "_veh_syncing", False):
+            self._veh_dbg("SYNC_REENTRY_SKIP")
+            return
+        self._veh_syncing = True
+        try:
+            self._sync_vehicle_rows_impl()
+        finally:
+            self._veh_syncing = False
+
+    def _sync_vehicle_rows_impl(self) -> None:
         """按"当前有没有选车"整体摆一次：整行显隐 + 填值 + 重建逐模组行。
 
         这是本节**唯一**的刷新入口（选赛季 / 选车号 / 新建 / 删除 / 改名 /
@@ -684,7 +1804,30 @@ class SettingsDialog(QDialog):
         spin.setValue(len(cells) if has_vehicle
                       else int(customization.get("module_count")))
         spin.blockSignals(False)
-        self._rebuild_module_rows(cells, temps)
+        # 结构没变就不重建逐模组行：选同一台车 / 同结构车时，重建会触发整表单重排，
+        # 模组数框下面的内容"跳"一下（用户点名"选车后模组数不要跳变"）。只有真
+        # 的 cell/temp 列表变了才动（改模组个数是另一条路径，不经这里）。
+        if (tuple(cells) != tuple(self._shown_cells)
+                or tuple(temps) != tuple(self._shown_temps)):
+            # 2026-11-02 用户：「选完车号后的动画有很大问题，逐帧分析」——
+            # 重建是**同步**的（同一帧删旧行、建新行），数值 25/8→20/6 直接硬切。
+            # 先把切换前的行区域抓成图，换完再淡出 = 交叉淡入。
+            # 用户第六轮补充：「为什么选择车号之后这三行会跟着移动，没有必要」——
+            # 根因就是 `_rebuild_module_rows` 同步删旧行建新行：最终几何虽然一样，
+            # 但重建会让整张表单重排一次（上面几行瞬时抖动）。行数没变时**原地改值**：
+            # 不重建控件、不碰布局，只换文本 + 交叉淡入。
+            same_count = (len(cells) == len(self._module_rows)
+                          and len(temps) == len(self._module_rows))
+            if same_count:
+                # 行数不变：**只原地改值**，不重建、也不盖覆盖层。用户 2026-11-02：
+                # 「第二个问题并没有解决」—— 覆盖层虽然是旧数值，但半透明叠在
+                # 新数值上仍会被看成"表格在动"；这里干脆什么都不动，只换数字。
+                self._update_module_row_values(cells, temps)
+            else:
+                # 2026-11-07 用户定稿：其他元素慢慢下移让出参数位置 → 参数整块
+                # 高斯模糊淡入。时间轴/机制见本文件顶部的 _VEH_* 常量与
+                # _veh_start()（占位行补间 + 预生成高斯位图，不用任何 QGraphics*Effect）。
+                self._veh_start(cells, temps)
 
     def _sync_grid_params_visibility(self) -> None:
         """网格参数二选一的**唯一判据**：接收区此刻真正吃哪一套，就只显示哪一套。
@@ -709,9 +1852,10 @@ class SettingsDialog(QDialog):
         —— 所以不用下拉预置值、也不用只能按箭头的数字框，就是一个能直接敲的输入框
         （0~999，非法输入自动回滚）。
 
-        用户 2026-10-22 晚定文案：一行读作「电芯数量：〔可填〕」——
-        前缀（"电芯数量：" / "温度采集数量："）**在框左边**，数字就是框里那个
-        自定义值。后来又说"全是个太难看了"，把框后面的量词"个"**删掉**了。
+        文案两轮收短：先是用户 2026-10-22 定的「电芯数量：〔可填〕」，后来把框后
+        的量词"个"删掉；2026-10-31 为了把面板压窄（用户："减少设置界面的宽度"）
+        再把前缀收成「电芯」/「温度」（−96px，模组行从 362 变 240）。完整含义在
+        这一排的 tooltip 里（"第 N 个模组的电芯数量 → 电压段这一排放几个点"）。
         """
         box = QLineEdit()
         # 挂 objectName 走 ui_theme 里的 QSS（QLineEdit#countEdit）：和下拉框/
@@ -743,6 +1887,8 @@ class SettingsDialog(QDialog):
         # 回滚目标跟着"最近一次成功值"走：改了 24→30 之后又敲了非法内容，
         # 应当退回 30，而不是退回建行时的 24（否则用户会以为自己的修改丢了）。
         last_ok = [int(value)]
+        # 原地改值（切车号但行数不变）时要把回滚目标一起更新，挂在框上最省事
+        box._last_ok = last_ok
 
         def apply(box_widget: QLineEdit = box) -> None:
             raw = box_widget.text().strip()
@@ -768,20 +1914,25 @@ class SettingsDialog(QDialog):
         lay.addStretch(1)
         return holder
 
-    def _rebuild_module_rows(self, cells: list[int], temps: list[int]) -> None:
-        """重建「模组 1..N」逐行控件（每行：电芯数量：N 个 + 温度采集数量：N 个）。"""
+    def _rebuild_module_rows(self, cells: list[int], temps: list[int],
+                             reserve: bool = False) -> None:
+        """重建「模组 1..N」逐行控件（每行：电芯数量：N 个 + 温度采集数量：N 个）。
+
+        ``reserve=True``：建完立刻用 `setRowVisible(False)` 压成 0 高 —— 给
+        ``_veh_start`` 的过渡用（新行先藏起来，由占位行扛高度，P3 起点再显形）。
+        """
         while self._module_rows:
             self._module_rows.pop()
             # 先 pop 再按"剩下的行数"算最后一行的行号：删一行后后面的行号整体上移
             self.form.removeRow(self._module_row_base + len(self._module_rows))
         for index in range(min(len(cells), len(temps))):
             field_cells = self._make_count_field(
-                int(cells[index]), "电芯数量：",
+                int(cells[index]), "电芯个数",
                 f"第 {index + 1} 个模组的电芯数量 → 电压段这一排放几个点"
                 "（0 = 这排不排）；直接输入数字，回车或点别处生效",
                 lambda number, i=index: self._on_module_value(i, False, number))
             field_temps = self._make_count_field(
-                int(temps[index]), "温度采集数量：",
+                int(temps[index]), "温度采集个数",
                 f"第 {index + 1} 个模组的温度采集数量 → 温度段这一排放几个点"
                 "（0 = 这排不排）；直接输入数字，回车或点别处生效",
                 lambda number, i=index: self._on_module_value(i, True, number))
@@ -799,6 +1950,714 @@ class SettingsDialog(QDialog):
             field = self._row(row)
             self.form.insertRow(self._module_row_base + index, label, field)
             self._module_rows.append((label, field))
+            if reserve:
+                self.form.setRowVisible(self._module_row_base + index, False)
+        # 记下这次真正画上去的结构，供 _sync_vehicle_rows 判断"下次是否要重建"
+        # （结构相同就跳过重建，避免选车时的布局跳变）。
+        self._shown_cells = list(cells)
+        self._shown_temps = list(temps)
+
+    def _module_rows_rect(self) -> QRect:
+        """当前逐模组行在**表单宿主控件**坐标系里的外接矩形（空 = 还没有行）。
+
+        ⚠️ 只算**可见**的行控件：过渡期间新行是 `setRowVisible(False)` 的，它们的
+        geometry 还没被布局算过（是前一版留下的脏值），混进来会把矩形撑错。
+        """
+        rect = QRect()
+        for label, holder in self._module_rows:
+            for widget in (label, holder):
+                if widget.isHidden():
+                    continue
+                r = widget.geometry()
+                rect = QRect(r) if rect.isNull() else rect.united(r)
+        return rect
+
+    def _update_module_row_values(self, cells: list[int], temps: list[int]) -> None:
+        """行数不变时**原地**改两列数字（不重建控件 → 布局不抖）。
+
+        每行的 holder 里两个 QLineEdit（电芯、温度，创建顺序固定）；
+        回滚目标 `_last_ok` 一起更新，否则用户改坏输入会退回建行时的旧值。
+        """
+        for index, (_label, field) in enumerate(self._module_rows):
+            boxes = field.findChildren(QLineEdit)
+            if len(boxes) < 2:
+                continue
+            for box, value in ((boxes[0], cells[index]), (boxes[1], temps[index])):
+                number = int(value)
+                box.blockSignals(True)
+                box.setText(str(number))
+                box.blockSignals(False)
+                last = getattr(box, "_last_ok", None)
+                if last is not None:
+                    last[0] = number
+        self._shown_cells = [int(v) for v in cells]
+        self._shown_temps = [int(v) for v in temps]
+
+    # ------------------------------------------------ 选车号过渡（P0~P4）
+    #
+    # 一条 780ms 的主时钟驱动全部四段，**不另起补间**（多开一条只会互相打架）：
+    #
+    #   P0 0→320ms    占位行 fixedHeight 0 → (Δ−12)，其他元素整体下移（EASE，60Hz）
+    #   P1 0→200ms    旧参数块 σ0→10px + α1→0（模糊淡出）
+    #   P2 200→320ms  空白（只有占位在长）
+    #   P3 320→680ms  新参数块 σ24→0 + α0→1（末帧纯原图）；到 680ms 才同帧
+    #                「撤占位 + 显真行」（总高相等 → 位移 0）
+    #   P4 680→780ms  完全清晰静止 100ms，然后收尾
+    #
+    # 为什么是"占位行"而不是套容器：套容器会把内部标签落到字段列，破坏整张表单
+    # 共享的标签列对齐（见 _build_vehicle_section 末尾那段说明）；QFormLayout 也
+    # 没有 rowHeight 可补间。占位行是唯一能"只改一处、其余自动重排"的落点。
+
+    def _veh_state(self) -> dict | None:
+        return getattr(self, "_veh", None)
+
+    def _veh_scrollbar(self):
+        area = self.findChild(QScrollArea)
+        return area.verticalScrollBar() if area is not None else None
+
+    def _veh_cost(self) -> int:
+        """当前逐模组区域占的垂直空间（逻辑 px）：46×可见行数，或占位行等效高度。"""
+        state = self._veh_state()
+        holder = state.get("holder") if state else None
+        if holder is not None:
+            try:
+                return int(holder.height()) + self.form.verticalSpacing()
+            except RuntimeError:
+                return 0
+        visible = sum(1 for _label, field in self._module_rows if not field.isHidden())
+        return _VEH_PITCH * visible
+
+    def _veh_dbg(self, tag: str, state: dict | None = None, extra: str = "") -> None:
+        """把车号动画的关键状态追加到 ``logs/vehicle_anim.log``（永不抛异常）。
+
+        只在 START/SWAP/FINISH/STOP/异常 这些关键节点写一行，不是每帧，开销可忽略。
+        用于在**用户真机**上抓「模组数为 N 却没行显示 / 残影」时的真实状态
+        （行是否已显、覆盖层可见性与几何、真实行矩形、行列数）。
+        """
+        try:
+            import os as _os
+            import time as _t
+            base = _os.environ.get("LOCALAPPDATA") or _os.path.expanduser("~")
+            folder = _os.path.join(base, "CQUFSAE-SerialAssistant", "logs")
+            _os.makedirs(folder, exist_ok=True)
+            parts = [f"{_t.strftime('%m-%d %H:%M:%S')}.{int(_t.time() * 1000) % 1000:03d}", tag]
+            if state is not None:
+                parts.append(f"shown={state.get('rows_shown')}")
+                parts.append(f"h0={state.get('h0')}/h1={state.get('h1')}")
+                try:
+                    parts.append(f"nrows={len(self._module_rows)}")
+                except Exception:            # noqa: BLE001
+                    pass
+                try:
+                    ov = getattr(self, "_veh_mask", None)
+                    if ov is not None:
+                        g = ov.geometry()
+                        parts.append(f"ov_vis={ov.isVisible()},ov=({g.x()},{g.y()},{g.width()},{g.height()})")
+                except Exception:            # noqa: BLE001
+                    pass
+                try:
+                    lr = self._module_rows_rect()
+                    parts.append(f"live=({lr.x()},{lr.y()},{lr.width()},{lr.height()})")
+                except Exception:            # noqa: BLE001
+                    pass
+            if tag == "START":
+                # 记下**调用栈**（文件名:行号），用于定位「47ms 内连开 5 次」到底是谁在调
+                import traceback as _tb
+                frames = _tb.extract_stack()[-7:-1]
+                parts.append("call=" + "<".join(
+                    f"{_os.path.basename(f.filename)}:{f.lineno}" for f in frames))
+            if extra:
+                parts.append(extra)
+            with open(_os.path.join(folder, "vehicle_anim.log"), "a", encoding="utf-8") as fh:
+                fh.write(" ".join(parts) + "\n")
+        except Exception:                    # noqa: BLE001
+            pass
+
+    def _veh_start(self, cells: list[int], temps: list[int]) -> None:
+        """开始（或打断重开）一次「让位 + 模糊交叉」。
+
+        打断的语义：拿**当前这一刻的画面**（含正在渐隐的覆盖层）当旧块、拿当前
+        占位高度当起点 → 新一段从当下接上，不会跳、也不会出现两条补间同时写高度。
+        """
+        body = self.form.parentWidget()
+        if body is None or not getattr(self, "_veh_allow", False):
+            self._veh_stop(settle=True)
+            self._rebuild_module_rows(cells, temps)
+            return
+        vsp = self.form.verticalSpacing()
+
+        # ① 抓下"现在屏幕上是什么"（body.grab 会把覆盖层一起抓进去）
+        rect_now = self._module_rows_rect()
+        if rect_now.isNull():
+            state = self._veh_state()
+            holder = state.get("holder") if state else None
+            if holder is not None:
+                g = holder.geometry()
+                if g.height() > 0:
+                    rect_now = QRect(0, g.y(), max(1, body.width()),
+                                     max(1, g.height()))
+        cost_now = self._veh_cost()
+        pix_now = None
+        # ⛔⛔ body.grab 会把**子控件覆盖层**一起抓进去。若上一次动画的覆盖层还没清，
+        #    旧残影会被"烤进" pix_old。抓图前先藏覆盖层，保证快照只有真实行。
+        overlay_pre = self._veh_overlay()
+        if overlay_pre is not None:
+            try:
+                overlay_pre.hide()
+                overlay_pre.update()
+            except RuntimeError:
+                pass
+        if not rect_now.isNull() and rect_now.height() > 0:
+            try:
+                pix_now = body.grab(rect_now)
+            except RuntimeError:
+                pix_now = None
+        bar = self._veh_scrollbar()
+        scroll_value = bar.value() if bar is not None else 0
+
+        # ② 收掉上一段：先停表、撤旧占位行，再把旧行换成新行（新行先藏着）
+        old = self._veh_state()
+        self._veh = None
+        if old is not None:
+            clock = old.get("clock")
+            if clock is not None:
+                try:
+                    clock.stop()
+                    clock.deleteLater()
+                except RuntimeError:
+                    pass
+            holder_old = old.get("holder")
+            if holder_old is not None:
+                try:
+                    self.form.removeRow(old["slot"])
+                except (RuntimeError, IndexError):
+                    pass
+        overlay = self._veh_overlay()
+        if overlay is not None:
+            overlay.clear()
+
+        self._rebuild_module_rows(cells, temps, reserve=True)
+
+        # ③ 占位行扛住当前高度（Δ 的起点），新行由 P3 起点那一刻显形
+        n_new = len(self._module_rows)
+        cost_to = _VEH_PITCH * n_new
+        holder = QWidget(body)
+        holder.setFixedHeight(max(0, cost_now - vsp))
+        slot = self._module_row_base + n_new
+        self.form.insertRow(slot, holder)
+
+        state = {
+            "holder": holder, "slot": slot, "rows_shown": False,
+            "h0": float(max(0, cost_now - vsp)),
+            "h1": float(max(0, cost_to - vsp)),
+            "rect_old": QRect(rect_now), "pix_old": pix_now,
+            "rect_new": QRect(), "pix_new": None,
+            "levels_old": [], "levels_new": [], "small_old": None, "small_new": None,
+            "bar": bar, "scroll": int(scroll_value), "clock": None,
+            "jobs": self._veh_jobs(skip_old=(pix_now is None or rect_now.isNull())),
+        }
+        self._veh = state
+        self._veh_dbg("START", state)
+
+        from ui_anim import Tween, animations_enabled
+        if not animations_enabled():
+            self._veh_finish(state)
+            return
+        clock = Tween(_VEH_TOTAL_MS, "linear",
+                      lambda k, s=state: self._veh_tick(s, k),
+                      lambda s=state: self._veh_finish(s),
+                      parent=self, min_interval_ms=_VEH_TICK_MS)
+        state["clock"] = clock
+        clock.start(0.0, 1.0, _VEH_TOTAL_MS)
+
+    def _veh_repaint_all(self) -> None:
+        """强制**整块同步重绘**（body + 滚动视口）。
+
+        模组区高度变化后，QScrollArea 的 viewport 不会自动把「上移后的新内容」全量
+        重画，旧的一帧就淡淡留在屏幕上 = 用户截图那种「每一行上方都有半截重影」
+        （滚动陈旧帧）。repaint() 同步，立刻用正确内容覆盖，不等事件循环。
+        """
+        try:
+            body = self.form.parentWidget()
+            if body is not None:
+                body.repaint()
+            sa = self.findChild(QScrollArea)
+            if sa is not None:
+                vp = sa.viewport()
+                if vp is not None:
+                    vp.repaint()
+        except RuntimeError:
+            pass
+
+    @staticmethod
+    def _veh_jobs(skip_old: bool = False) -> list:
+        """后台作业队列：每帧只做一个（模糊档一次 0.3~3ms，摊开算不掉帧）。
+
+        顺序按"谁先用谁先做"排：新块抓图 → 旧块档位（从小到大，淡出用）→
+        新块档位（从大到小，淡入用）。P3 在 320ms 才开始，全部来得及。
+
+        skip_old=True（无旧块：未选择→选中，pix_old is None）时跳过 5 个会
+        空转的 blur_old —— 否则它们白占 5 帧（≈75ms），首个 blur_new 高斯档
+        要到 ms≈95 才就绪，早期就只剩「清晰原图 α 混合」= 双份文字放大器。
+        """
+        steps = sorted(_VEH_SIGMA_STEPS)            # 3 / 6 / 10 / 16 / 24
+        jobs: list = [("grab_new", None)]
+        if not skip_old:
+            for sigma in steps:                      # 旧块：σ 从 0 往大走
+                jobs.append(("blur_old", sigma))
+        for sigma in reversed(steps):                # 新块：σ 从大往 0 走
+            jobs.append(("blur_new", sigma))
+        return jobs
+
+    def _veh_overlay(self) -> _FadeOverlay | None:
+        body = self.form.parentWidget()
+        if body is None:
+            return None
+        overlay = getattr(self, "_veh_mask", None)
+        if overlay is None or overlay.parentWidget() is not body:
+            try:
+                overlay = _FadeOverlay(body)
+            except RuntimeError:
+                return None
+            self._veh_mask = overlay
+        return overlay
+
+    # -- 每帧作业 -------------------------------------------------------
+    def _veh_pump(self, state: dict) -> None:
+        jobs = state.get("jobs") or []
+        if not jobs:
+            return
+        name, sigma = jobs.pop(0)
+        try:
+            if name == "grab_new":
+                self._veh_grab_new(state)
+            else:
+                self._veh_blur_level(state, "old" if name == "blur_old" else "new",
+                                     float(sigma))
+        except Exception:            # noqa: BLE001 - 一个档位算挂了不能带崩整段动画
+            pass
+
+    def _veh_grab_new(self, state: dict) -> None:
+        """把新参数块渲染成位图（临时显形 → grab → 立刻藏回去，全程不回到事件循环）。"""
+        body = self.form.parentWidget()
+        rows = self._module_rows
+        if body is None or not rows:
+            return
+        base = self._module_row_base
+        for i in range(len(rows)):
+            self.form.setRowVisible(base + i, True)
+        try:
+            # ⛔ 关键：行刚被 reserve 隐藏，控件几何还是上一版的脏值（=0 高 / 旧位置），
+            #    必须**先让表单布局把行高算出来**再抓，否则 _module_rows_rect 量到的
+            #    是无效矩形 → body.grab 出来是空图 → P3 模糊淡入没有素材（表现就是
+            #    "无数据→有数据"时参数只是硬冒出来、没有高斯模糊淡入）。
+            #    旧实现只 activate 了**对话框顶层布局**，表单内部行几何未必当拍落盘。
+            self.form.invalidate()
+            self.form.activate()
+            lay = self.layout()
+            if lay is not None:
+                lay.activate()
+            rect = self._module_rows_rect()
+            if (rect.isNull() or rect.height() <= 0) and rows:
+                # 兜底：个别平台 activate 不保证当拍把几何落到控件上，放一拍事件循环
+                #    让布局引擎把行几何真正算出来再抓（ guarded，避免时钟定时器在
+                #    processEvents 里重入本动画）。
+                from PySide6.QtCore import QCoreApplication
+                if not getattr(self, "_veh_grabbing", False):
+                    self._veh_grabbing = True
+                    try:
+                        QCoreApplication.processEvents()
+                    finally:
+                        self._veh_grabbing = False
+                rect = self._module_rows_rect()
+            if rect.isNull() or rect.height() <= 0:
+                return
+            # ⛔ 抓新块快照前也把覆盖层藏起来：否则 P1 的旧块模糊层会被烤进 pix_new，
+            #    P3 重放时与真实行形成「旧+新双份」。同一点在 _veh_start 的 pix_now 已处理。
+            ov_grab = self._veh_overlay()
+            if ov_grab is not None:
+                try:
+                    ov_grab.hide()
+                    ov_grab.update()
+                except RuntimeError:
+                    pass
+            state["pix_new"] = body.grab(rect)
+            state["rect_new"] = QRect(rect)
+        finally:
+            for i in range(len(rows)):
+                try:
+                    self.form.setRowVisible(base + i, False)
+                except (RuntimeError, IndexError):
+                    pass
+            self.form.invalidate()
+            self.form.activate()
+            lay = self.layout()
+            if lay is not None:
+                lay.activate()
+
+    def _veh_blur_level(self, state: dict, which: str, sigma: float) -> None:
+        """预生成一档高斯（1/4 降采样）。⛔ 不做在绘制里 —— 动画期间不再算高斯。"""
+        key = "pix_old" if which == "old" else "pix_new"
+        src = state.get(key)
+        if src is None or src.isNull():
+            return
+        small = state.get(f"small_{which}")
+        if small is None:
+            small = src.scaled(
+                max(1, src.width() // _VEH_BLUR_DIV),
+                max(1, src.height() // _VEH_BLUR_DIV),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            state[f"small_{which}"] = small
+        import splash_motion
+        blurred = splash_motion._gaussian(small, sigma / float(_VEH_BLUR_DIV))
+        if blurred is None or blurred.isNull():
+            return
+        state[f"levels_{which}"].append((sigma, blurred))
+
+    def _veh_frame_items(self, state: dict, which: str, sigma: float) -> list:
+        """按目标 sigma 在已生成档位里取两档加权（相邻两档差得近，混着看不出来）。"""
+        levels = sorted(state.get(f"levels_{which}") or [])
+        sharp = state.get("pix_old" if which == "old" else "pix_new")
+        items: list = []
+        if sigma <= 0.15:
+            return [(sharp, 1.0)] if sharp is not None else []
+        lo = (0.0, sharp) if sharp is not None else None
+        hi = None
+        for s, pix in levels:
+            if s <= sigma:
+                lo = (s, pix)
+            else:
+                hi = (s, pix)
+                break
+        if lo is None and hi is None:
+            return []
+        if hi is None:
+            # 无旧块动画里 grab_new 刚就绪、levels_new 还没生成的头 1~2 帧：
+            # 直接叠清晰原图会与底下仍可见的旧设置项形成「清晰+清晰」双份。
+            # 这一帧覆盖层留空，下一拍模糊档就绪再画。仅 new 方向；old 方向的
+            # P1 起点本就该显示清晰旧块，保持原行为，不回归「换车号」。
+            if which == "new" and not levels:
+                return []
+            return [(lo[1], 1.0)]
+        if lo is None:
+            return [(hi[1], 1.0)]
+        span = max(1e-6, hi[0] - lo[0])
+        t = max(0.0, min(1.0, (sigma - lo[0]) / span))
+        items.append((lo[1], 1.0 - t))
+        items.append((hi[1], t))
+        return items
+
+    # -- 主时钟 ---------------------------------------------------------
+    def _veh_tick(self, state: dict, k: float) -> None:
+        if self._veh_state() is not state:
+            return
+        try:
+            ms = k * _VEH_TOTAL_MS
+            if ms > 0.5:
+                self._veh_pump(state)
+            holder = state.get("holder")
+            if holder is not None and not state["rows_shown"]:
+                p = min(1.0, ms / max(1, _VEH_SHIFT_MS))
+                h = state["h0"] + (state["h1"] - state["h0"]) * float(_veh_shift_ease(p))
+                holder.setFixedHeight(int(round(h)))
+                # ⛔⛔ 2026-11-08 根治「车号动画残影」：占位行高度变了之后，QFormLayout
+                # 默认把下方行（主题/材质强度…）的重排**推迟到下一轮事件循环**，于是
+                # 「占位行长高」与「下方行下移」差 1~2 帧。覆盖层裁切用的是新的
+                # holder.height()，而 主题 还停在旧（更高）的位置 → 覆盖层画到 主题 上面
+                # = 双份残影。这里 invalidate + activate 让布局当拍重算并重排，主题 与
+                # 占位行同步，覆盖层（裁到 holder.height()）刚好落在 主题 上方，不再外溢。
+                # ⚠️ 必须先 invalidate 再 activate：setFixedHeight 改的是 sizeHint，
+                # 不 invalidate 的话 activate 会复用缓存的行高，主题 仍滞后（od67 实测
+                # 仅 activate 时 car→car 切换仍有一帧覆盖层压到 主题 上 ~10px）。
+                self.form.invalidate()
+                self.form.activate()
+                lay = self.layout()
+                if lay is not None:
+                    lay.invalidate()
+                    lay.activate()
+            # ⚠️ 换行放在 **P3 末**（不是 P3 起）：P3 期间新行一直藏着、高度由
+            #    占位行扛，覆盖层底下没有"已经显形的清晰内容"，α 0→1 才成立，
+            #    也不用去猜面板底色（body 的背景是透明的，猜错就是一条黑带）。
+            #    到 680ms 那一帧「撤占位 + 显真行」总高相等 → 位移 0（实测）。
+            if not state["rows_shown"] and ms >= _VEH_BLUR_IN_END_MS:
+                if holder is not None:
+                    holder.setFixedHeight(int(round(state["h1"])))
+                self._veh_swap(state)
+                # ⛔⛔ 2026-11-07 用户「车号选择有残影」：撤占位 + 显真行之后，真行
+                #    已经落在正确位置、清晰可见。覆盖层若再画一帧「同样内容的锐图」
+                #    （p 已被夹到 1.0 → σ0 且 α1），只要和真行位置差 1~2px 就是重影。
+                #    这里在显行当拍立刻清掉覆盖层，且随后不再喂帧（见下方守卫），
+                #    让真实的模组行直接顶上，杜绝任何重叠窗口造成的残影。
+                overlay = self._veh_overlay()
+                if overlay is not None:
+                    overlay.clear()
+            # 显行之后覆盖层已清，不再绘制；显行之前（P0~P3）照常喂模糊帧。
+            if not state["rows_shown"]:
+                self._veh_paint(state, ms)
+            self._veh_restore_scroll(state)
+        except Exception as _exc:    # noqa: BLE001
+            self._veh_dbg("TICK_EXC", state, repr(_exc))
+            # ⛔⛔ 2026-11-08 根治「模组数=N 却一行都不显示 + 整片残影」：
+            #    旧代码只捕 RuntimeError 且 `settle=False`。而 settle=False **不显行**
+            #    （见 _veh_stop），任何一次动画中断都会把逐模组行永远留在 reserve
+            #    隐藏状态 —— 用户截图在 200% 缩放下的现象正是「模组数 5、Module 行
+            #    一个都没有」，加上旧画面残留成残影。改为放宽到 Exception 且
+            #    settle=True：无论哪种异常都落到终态（显行 + 清覆盖层 + 还滚动），
+            #    面板永远回到有效状态，绝不留在半截动画里。
+            try:
+                self._veh_stop(settle=True)
+            except Exception:        # noqa: BLE001
+                self._veh_stop(settle=False)
+
+    def _veh_swap(self, state: dict) -> None:
+        """P3 起点：同一帧「撤占位 + 显真行」（实测总高相等 → 下面的行 0 位移）。"""
+        if state.get("rows_shown"):
+            return
+        state["rows_shown"] = True
+        base = self._module_row_base
+        for i in range(len(self._module_rows)):
+            try:
+                self.form.setRowVisible(base + i, True)
+            except (RuntimeError, IndexError):
+                break
+        holder = state.get("holder")
+        state["holder"] = None
+        if holder is not None:
+            try:
+                self.form.removeRow(state["slot"])
+            except (RuntimeError, IndexError):
+                pass
+        if state["rect_new"].isNull():
+            rect = self._module_rows_rect()
+            if not rect.isNull():
+                state["rect_new"] = QRect(rect)
+        self._veh_dbg("SWAP", state)
+
+    def _veh_paint(self, state: dict, ms: float) -> None:
+        overlay = self._veh_overlay()
+        if overlay is None:
+            return
+        # ⛔⛔ 2026-11-07（用户：「从未选择到选中车号的时候车辆数据选择动画还是
+        #    不对劲」）：**没有旧块**（未选择 → 选中，面板里本来没有参数行）时，
+        #    旧的 P1(0~200 旧块糊出) / P2(200~320 空白) 都是空转 —— 屏幕上只有
+        #    占位行把下面元素推下去、中间是一块**空档**，要等到 320ms 新块才开始
+        #    模糊淡入 → 读起来就是"先空一下、参数再冒出来"。
+        #    正确节奏：没有旧块时，新块**跟着让位一起**糊入（0 起跑，随空间打开
+        #    而渐渐清晰），P1/P2 直接跳过。有旧块（换车号）仍走原三段。
+        has_old = (state.get("pix_old") is not None
+                   and not state["rect_old"].isNull())
+        if has_old:
+            # ⛔⛔ 2026-11-08（用户：od64/od65「还是会有残影」）：有旧块（换车号/改模组数）
+            #   路径必须让旧块随占位行一起收敛。占位行当前高度用与 _veh_tick 里
+            #   setFixedHeight **同一条公式**算（无 >1 帧偏差）。
+            #   覆盖层几何**保持整块 rect_old**、只把可见高度裁剪到 cur_h：这样
+            #   paintEvent 的 dpr = pix.height()/rect_old.height() 才成立（顶对齐 1:1、
+            #   不压扁），旧块底部透明让设置项露出来，不再外溢压住设置项（也不会被
+            #   压扁成双份错位的残影）。
+            holder = state.get("holder")
+            if holder is not None:
+                cur_h = int(round(
+                    state["h0"]
+                    + (state["h1"] - state["h0"])
+                    * _veh_shift_ease(min(1.0, ms / max(1.0, _VEH_SHIFT_MS)))))
+            else:
+                cur_h = (state["rect_old"].height()
+                         if not state["rect_old"].isNull() else 0)
+            cur_h = max(1, cur_h)
+            if ms <= _VEH_BLUR_OUT_MS:
+                # P1：旧块模糊淡出（σ in_cubic、α out_cubic，先糊后淡）
+                p = ms / float(max(1, _VEH_BLUR_OUT_MS))
+                sigma = _VEH_SIGMA_MAX * (p ** 3)
+                alpha = 1.0 - (1.0 - p) ** 3
+                items = self._veh_frame_items(state, "old", sigma)
+                if items and not state["rect_old"].isNull():
+                    # ⛔⛔ 同 P3 的硬约束：旧块显示底部也绝不允许越过主题实时顶端。
+                    # 即便本段首帧 ms=0 时 alpha=0（不可见），仍夹紧几何，避免任何
+                    # 重排时序异常时旧块压到主题 形成残影。
+                    # ⚠️ 坐标必须统一到**对话框**坐标系：rect_old.y() 来自
+                    # _module_rows_rect()（对话框坐标），故主题顶端也要用
+                    # mapTo(self, QPoint(0,0)).y() 取到对话框坐标，不能用
+                    # self.cmb_theme.y()（那是 form 局部坐标，会算出负 max_h → 整段
+                    # 被夹成 0，车号动画变不可见）。
+                    vh = cur_h
+                    try:
+                        next_top = self.cmb_theme.mapTo(self, QPoint(0, 0)).y()
+                        max_h = next_top - self.form.verticalSpacing() \
+                            - state["rect_old"].y()
+                        if max_h < vh:
+                            vh = max(0, int(max_h))
+                    except RuntimeError:
+                        pass
+                    overlay.show_frame(items, state["rect_old"], alpha, None,
+                                       visible_h=vh)
+                else:
+                    # ⛔ 没有可画的旧块（图没抓到 / 矩形空）→ 主动清覆盖层，
+                    # 绝不能让上一段动画的残留帧停在屏幕上。
+                    overlay.clear()
+                return
+            if ms < _VEH_SWAP_MS:
+                overlay.clear()                  # P2：空白
+                return
+            # P3：新块模糊淡入。σ 10→0（out_cubic，先清得慢一点）、α 0→1（out_cubic）
+            span = max(1, _VEH_BLUR_IN_END_MS - _VEH_SWAP_MS)
+            p = max(0.0, min(1.0, (ms - _VEH_SWAP_MS) / float(span)))
+        else:
+            # 无旧块：新块从 0 开始糊入，到让位结束(_VEH_SHIFT_MS)时已基本清晰
+            span = max(1, _VEH_SHIFT_MS)
+            p = max(0.0, min(1.0, ms / float(span)))
+        from ui_anim import EASE
+        sigma = _VEH_SIGMA_MAX * (1.0 - float(EASE(p)))
+        alpha = 1.0 - (1.0 - p) ** 3
+        items = self._veh_frame_items(state, "new", sigma)
+        rect = state["rect_new"]
+        if not items and has_old:
+            # ⛔⛔ has_old（换车号/改模组数）P3：模糊档还没生成时（高 DPI / 低帧率下
+            #    一帧只做一个作业，到 320ms 可能还没轮完 new 档）**直接拿清晰新块顶上**，
+            #    并画在 rect_new 的正确位置。此刻真实行是 reserve 隐藏的、旧块也已 rebuild
+            #    掉，画清晰新块**不会**「清晰+清晰」双份；若像无旧块那样 return/clear，
+            #    会要么残留旧块（错位叠）、要么参数区空白一下再蹦出来（用户点名「不流畅」）。
+            sharp_new = state.get("pix_new")
+            if sharp_new is not None and not rect.isNull():
+                items = [(sharp_new, 1.0)]
+        if items and not rect.isNull():
+            # 有旧块 P3 也按当前占位高度裁剪：增模组数(3→5)时新块底部不外溢设置项；
+            # 与无旧块走同一「整块几何 + 可见高度裁剪」套路，保证 1:1 不压扁。
+            vh = cur_h if has_old else self._veh_visible_h(state, ms, rect.height())
+            # ⛔⛔ 硬约束（根治残影最后一道闸）：覆盖层显示底部**绝不允许**越过模块区
+            # 下方「第一行（主题）的实时顶端」。布局重排可能因事件循环时序滞后（主题/
+            # 材质强度 没及时下移），或 rect_new 捕获偏差，导致覆盖层压到下一行 = 残影。
+            # 这里用「实时几何」兜底：无论布局滞后到什么程度，覆盖层永远只画到主题顶端
+            # 上方一个 vsp 处，宁可少露一点（不闪不卡）也绝不外溢。整体时序正常时这道
+            # 闸不会触发（_veh_tick 里的 invalidate+activate 已让布局当拍重排）。
+            if overlay is not None:
+                try:
+                    # ⚠️ 坐标必须统一到**对话框**坐标系：rect.y() 来自 _module_rows_rect()
+                    # （对话框坐标），故主题顶端也要用 mapTo(self, QPoint(0,0)).y() 取对话框
+                    # 坐标，不能用 self.cmb_theme.y()（form 局部坐标，会算出负 max_h → 整段
+                    # 被夹成 0，车号动画变不可见）。用 rect.y()（覆盖层「即将落位」的位置）
+                    # 而非 overlay.y()（上一帧残留旧位置）：首帧 overlay 还没 setGeometry(rect)。
+                    next_top = self.cmb_theme.mapTo(self, QPoint(0, 0)).y()
+                    max_h = next_top - self.form.verticalSpacing() - rect.y()
+                    if max_h < vh:
+                        vh = max(0, int(max_h))
+                except RuntimeError:
+                    pass
+            overlay.show_frame(items, rect, alpha, None, visible_h=vh)
+        else:
+            # ⛔⛔ 根治「模糊块和清晰块错位叠」（2026-11-08 用户实测 200% 缩放仍残影）：
+            #    这一帧没有可画的内容——要么 `_veh_frame_items` 返回空（P3 刚开始、
+            #    模糊档还没生成，高 DPI 低帧率下常见），要么 `rect_new` 为空（取消选车）。
+            #    旧代码这里直接 return，**覆盖层保留上一帧**（P1 的旧块几何 rect_old /
+            #    旧块内容）→ 旧块以旧位置旧尺寸停在屏幕上，压住新块/新内容 = 用户说的
+            #    「模糊块和清晰块错位叠」。实测 200% 缩放时 rect_new=(y139,h126) 而覆盖层
+            #    停在 (y163,h218) 达 350ms。这里必须**主动 clear**，宁可短暂空白也绝不
+            #    留下错位的残影帧。
+            overlay.clear()
+
+    def _veh_visible_h(self, state: dict, ms: float, full_h: int) -> int:
+        """无旧块动画里覆盖层当前应显示的逻辑高度（顶部对齐，1:1 不压扁）。
+
+        实测几何：旧设置项 y ≈ rect_new.y() + holder.height() + 常数，即旧项
+        恒在 holder 下方。故可见高度取「当前 holder 高度」即可保证位图与旧项
+        物理不重叠。holder 终值 h1（实测 196）与 rect_new 高（实测 218）不等，
+        在 P0 让位结束(_VEH_SHIFT_MS)后、swap(_VEH_BLUR_IN_END_MS)之前把差额
+        线性补上，收敛到 full_h，避免底部一行被切 / 留空白条（此时 α 已=1，
+        即便与最下方旧项有十几 px 相交也被不透明位图盖住，实测干净）。
+        """
+        holder = state.get("holder")
+        if holder is None:
+            return full_h
+        try:
+            h = float(holder.height())
+        except RuntimeError:
+            return full_h
+        h1 = state.get("h1")
+        h1 = float(h1) if h1 is not None else h
+        extra = max(0.0, float(full_h) - h1)
+        if extra > 0.0 and ms > _VEH_SHIFT_MS:
+            q = min(1.0, (ms - _VEH_SHIFT_MS)
+                    / float(max(1, _VEH_BLUR_IN_END_MS - _VEH_SHIFT_MS)))
+            h += extra * q
+        return int(round(min(float(full_h), h)))
+
+    def _veh_restore_scroll(self, state: dict) -> None:
+        bar = state.get("bar")
+        if bar is None:
+            return
+        try:
+            bar.setValue(min(int(state.get("scroll", 0)), bar.maximum()))
+        except RuntimeError:
+            pass
+
+    def _veh_stop(self, settle: bool = True) -> None:
+        state = self._veh_state()
+        if state is None:
+            return
+        if settle:
+            self._veh_finish(state)
+            return
+        self._veh_dbg("STOP_NOSETTLE", state)
+        self._veh = None
+        clock = state.get("clock")
+        if clock is not None:
+            try:
+                clock.stop()
+                clock.deleteLater()
+            except RuntimeError:
+                pass
+        overlay = getattr(self, "_veh_mask", None)
+        if overlay is not None:
+            try:
+                overlay.clear()
+            except RuntimeError:
+                pass
+
+    def _veh_finish(self, state: dict) -> None:
+        """落到终态：高度到 h1、换行、撤覆盖层、还滚动位置 + 自愈 + 整块重绘。"""
+        if self._veh_state() is not state:
+            return
+        holder = state.get("holder")
+        if holder is not None:
+            try:
+                holder.setFixedHeight(int(round(state["h1"])))
+            except RuntimeError:
+                pass
+        try:
+            self._veh_swap(state)
+        except RuntimeError:
+            pass
+        self._veh_restore_scroll(state)
+        self._veh_dbg("FINISH", state)
+        self._veh = None
+        overlay = getattr(self, "_veh_mask", None)
+        if overlay is not None:
+            try:
+                overlay.clear()
+            except RuntimeError:
+                pass
+        # ⛔⛔ 自愈：确保逐模组行数 == 当前车模组个数，绝不停在「模组数 5 却 0 行」。
+        try:
+            want = 0
+            if customization.current_vehicle():
+                prof = customization.active_profile()
+                if prof:
+                    want = min(len(prof[0]), len(prof[1]))
+            if want and len(self._module_rows) != want:
+                self._veh_dbg("SELFHEAL", state,
+                              f"want={want} have={len(self._module_rows)}")
+                c, t = customization.active_profile()
+                self._rebuild_module_rows(list(c), list(t))
+        except Exception:                # noqa: BLE001
+            pass
+        self._veh_repaint_all()
+        clock = state.get("clock")
+        if clock is not None:
+            try:
+                clock.stop()
+                clock.deleteLater()
+            except RuntimeError:
+                pass
 
     def _on_module_value(self, index: int, is_temp: bool, value: int) -> None:
         """某个模组的电芯/温度数改了：**立刻写回这台车**，并请主窗口重排。"""
@@ -840,8 +2699,9 @@ class SettingsDialog(QDialog):
         # ⚠️ 这里不能用 _sync_vehicle_rows：那会把下拉框重建一遍，正在编辑的
         #    数字框会丢焦点（用户连点箭头就被打断）。只重建逐模组行 + 重摆
         #    "网格参数显隐"（模组个数从 0 变 1 或反过来时，旧三件套要跟着让位/露面）。
-        self._rebuild_module_rows(cells, temps)
+        # 重建走和选车号同一条过渡（让位 + 模糊交叉），见 _veh_start。
         self._sync_grid_params_visibility()
+        self._veh_start(cells, temps)
         self._notify_vehicle_changed()
 
     def _on_season_changed(self, value: int) -> None:
@@ -867,13 +2727,33 @@ class SettingsDialog(QDialog):
         打成 -1），那不是"换车"，改名交给 editingFinished 处理 —— 这里必须直接
         返回，否则输到一半就被当成"取消选车"，下拉内容会被清回（未选择）。
         """
-        if index < 0:
+        # `activated` 有 int/str 两个重载：若来的是文本，先反查下标
+        if isinstance(index, str):
+            found = self.cmb_vehicle_number.findData(index)
+            if found < 0:
+                found = self.cmb_vehicle_number.findText(index)
+            index = found
+        if index is None or index < 0:
             return
         name = str(self.cmb_vehicle_number.itemData(index) or "")
         if name == customization.current_vehicle():
             return
-        customization.select_vehicle(name)
-        self._sync_vehicle_rows()
+        # ⛔⛔ 2026-11-08 根治「打开设置时车号被 0↔5 反复切换」：整段同步期间屏蔽下拉信号。
+        #    `_sync_vehicle_rows → _refresh_number_combo` 会 combo.clear()+setCurrentIndex()
+        #    重建下拉，可编辑下拉在重建后可能回吐一次 currentIndexChanged(0/未选择)——若不在
+        #    本次同步期间挡住，就会被当成"用户取消选车"→ 又 select → 又 sync，形成
+        #    select→sync→(回吐0)→deselect→sync→(回吐5)→select 的自激环。
+        #    用户真机日志实测：打开面板 5 秒内 4 段 218↔0 的动画反复。
+        combo = self.cmb_vehicle_number
+        _prev_block = combo.blockSignals(True)
+        try:
+            customization.select_vehicle(name)
+            self._sync_vehicle_rows()
+        finally:
+            try:
+                combo.blockSignals(_prev_block)
+            except RuntimeError:
+                pass
         self._notify_vehicle_changed()
 
     def _on_vehicle_new(self) -> None:
@@ -1010,6 +2890,83 @@ class SettingsDialog(QDialog):
         if self._on_custom is not None:
             self._on_custom("vehicle", customization.current_vehicle())
 
+    # -------------------------------------------------------- 车辆共享
+
+    def _export_vehicles(self) -> None:
+        """把车辆档案导出成一个 .cqv.json 包（默认全部，用户挑路径）。
+
+        ⚠️ ``names=None`` = 全部：单人维护的场景里"挑几台导出"是少数，默认
+        整包出门才符合"发给队友"的意图。
+        """
+        share = _vehicle_share_module()
+        if share is None:
+            return
+        stamp = datetime.now().strftime("%Y%m%d")
+        default = Path.home() / f"vehicles-{stamp}.cqv.json"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出车辆", str(default),
+            "车辆档案 (*.cqv.json *.json);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            exported = share.export_to_file(path, names=None)
+        except Exception as exc:      # 文件/格式问题一律就地反馈，别抛到控制台
+            app_log.error(f"导出车辆失败：{exc}")
+            self._flash_btn(self.btn_vehicle_export, "导出失败", 4000)
+            self.btn_vehicle_export.setToolTip(f"导出失败：{exc}")
+            return
+        count = exported if isinstance(exported, int) else len(customization.vehicles())
+        self._flash_btn(self.btn_vehicle_export, f"✓ {count} 台", 3200)
+        self.btn_vehicle_export.setToolTip(f"已导出 {count} 台车辆到：\n{path}")
+        app_log.info(f"车辆档案已导出（{count} 台）：{path}")
+
+    def _import_vehicles(self) -> None:
+        """从 .cqv.json 包导入车辆，导入后面板里的车辆列表当场刷新。
+
+        反馈走按钮上的原地文字（``✓ +N 台``），**不弹模态框** —— 导入经常连着
+        做几次，每来一个"确定"就断一次手。
+
+        ``import_from_file`` 从不抛异常：读不了/JSON 坏了都会翻译成
+        ``{"added":0,…,"errors":["读不了文件（…）"]}``，所以"0 台 + 有 errors"
+        就是失败，那句人话直接进 tooltip。
+        """
+        share = _vehicle_share_module()
+        if share is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入车辆", str(Path.home()),
+            "车辆档案 (*.cqv.json *.json);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            result = share.import_from_file(path)
+        except Exception as exc:
+            app_log.error(f"导入车辆失败：{exc}")
+            self._flash_btn(self.btn_vehicle_import, "导入失败", 4000)
+            self.btn_vehicle_import.setToolTip(f"导入失败：{exc}")
+            return
+        changed, note = _import_summary(result)
+        self._sync_vehicle_rows()      # 车号下拉 / 逐模组行按新档案重建
+        if changed:
+            self._flash_btn(self.btn_vehicle_import, f"✓ +{changed} 台", 3600)
+            self.btn_vehicle_import.setToolTip(f"{note}：\n{path}")
+            app_log.info(f"车辆档案已导入（{note}）：{path}")
+            return
+        self._flash_btn(self.btn_vehicle_import, "导入失败", 4000)
+        self.btn_vehicle_import.setToolTip(f"导入失败：{note or '包里没有可导入的车辆'}\n{path}")
+        app_log.warning(f"导入车辆没有变更：{note}（{path}）")
+
+    def _open_vehicle_library(self) -> None:
+        """打开在线车辆库（模态；导入成功后回头刷新本面板的车辆列表）。"""
+        dialog = VehicleLibraryDialog(self._scheme, parent=self)
+        dialog.vehicles_changed.connect(self._on_library_imported)
+        dialog.exec()
+
+    def _on_library_imported(self, count: int) -> None:
+        self._sync_vehicle_rows()
+        if count:
+            self._flash_btn(self.btn_vehicle_library, f"✓ +{count} 台", 3600)
+
     # ------------------------------------------------------------ 定制功能
 
     def _build_custom_section(self, form: QFormLayout) -> None:
@@ -1024,7 +2981,6 @@ class SettingsDialog(QDialog):
         specs = customization.specs()
         if not specs:
             return
-        form.addRow(self._caption("定制功能"))
 
         # ⚠️ 这两张表在「主题」一节之前就建好了（见 _build_theme_section 上方）：
         #    「界面材质」会先登记进去，这里**不能重新赋值**，否则会被冲掉。
@@ -1033,6 +2989,21 @@ class SettingsDialog(QDialog):
         # 标签会在表单里留一个孤立文字，看着像坏了。
         # 滑杆型配置的预览标签（"拖动即时看效果"的那种），key -> QLabel
         self._custom_previews: dict[str, QLabel] = {}
+        # 数字框统一宽度 = max(基准, **本机字体实测**的最长文本)（用户
+        # 2026-11-01 两轮点名"mV 的 V 没显示完全"）：固定 100 没把 suffix +
+        # 右侧箭头(22) + 行内 textMargins(10+6) 算进去，"4500 mV" 必截。
+        # 按实测自动定宽，字体/缩放变了也不会再截。
+        _spin_w = SPIN_COLUMN_W
+        _spin_fm = QFontMetrics(self.font())
+        for spec in specs:
+            if (spec.get("suffix") and spec.get("kind") not in ("bool", "choice")
+                    and spec.get("widget") != "slider"):
+                need = (_spin_fm.horizontalAdvance(
+                            f"{spec['maximum']}{spec['suffix']}")
+                        + ChevronSpinBox.ARROW_W
+                        + ChevronSpinBox.TEXT_MARGIN[0]
+                        + ChevronSpinBox.TEXT_MARGIN[2] + 6)
+                _spin_w = max(_spin_w, int(need))
         for spec in specs:
             if spec["key"] == "material":
                 # 已经在「主题 / 材质强度」那一对里生成（见 _build_theme_section）
@@ -1079,7 +3050,10 @@ class SettingsDialog(QDialog):
                 # 显示一个够不着的值（真正生效值也会被 ui_anim 再夹一次）。
                 slider.setValue(max(int(spec["minimum"]),
                                     min(maximum, int(customization.get(spec["key"])))))
-                slider.setMinimumWidth(190)
+                # 160 而不是 190（2026-10-31）：滑杆行 = 滑杆 + 数值 + 复原图标
+                # = 290，当时是全表最宽的一行，比模组行还宽、替面板定宽。
+                # 160 仍然够拖（0~100 的滑杆，一像素约 0.6 格）。
+                slider.setMinimumWidth(160)
                 if spec["tip"]:
                     slider.setToolTip(spec["tip"])
                 value_label = QLabel()
@@ -1135,8 +3109,9 @@ class SettingsDialog(QDialog):
                 if spec["tip"]:
                     spin.setToolTip(spec["tip"])
                 # 一列数字框**共用一个宽度** —— 宽窄不一最显乱（"7" 与
-                # "10000 mV" 各占一块，右边缘参差不齐）。
-                spin.setFixedWidth(SPIN_COLUMN_W)
+                # "10000 mV" 各占一块，右边缘参差不齐）。宽度按上面实测的
+                # _spin_w 取，保证最长的 "10000 mV" 连 suffix 一起完整显示。
+                spin.setFixedWidth(_spin_w)
                 field = spin
                 widget = spin
                 row_label = self._label(spec["label"])
@@ -1288,35 +3263,48 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------------ 日志
 
     def _build_log_section(self, form: QFormLayout) -> None:
-        """「日志」一行：显示日志文件位置 + 打开文件夹 + **一键导出**。给维护和迭代用。"""
+        """「日志」路径 + 2×2 田字按钮；「接收历史」车号下拉 + 打开记录 + 选择目录。
+
+        2026-10-31 用户点名：原来「日志」一行挤四颗按钮（导出日志 / 打开文件夹 /
+        数据 CSV / 数据 JSON），把面板撑宽了一大截。改成**两排田字**：
+
+            导出日志     打开文件夹      ← 这一份文件
+            数据 CSV     数据 JSON       ← 这份数据
+
+        四颗同宽、两列左边缘对齐，整块只占原来两颗按钮的宽度 —— 面板最小宽度
+        因此跟着降下来。路径文字挪到按钮上方单独一行：挤在左边的话两排按钮的
+        左边缘就错开了（用户要的就是"左边缘对齐成两列"）。
+        """
         log_path = app_log.path()
         if not log_path:
             return
         form.addRow(self._caption("日志"))
 
-        row = QHBoxLayout()
-        row.setSpacing(10)
-        path_label = QLabel(self._elide_middle(log_path))
-        path_label.setFont(ui_font(10.5))
-        path_label.setObjectName("groupCaption")
+        # 34 个字符（≈270px）：面板压到 470 宽之后，52 字符的省略版还是放不下，
+        # 尾巴会被硬切（实测需 413px / 只有 282px）。完整路径在 tooltip 里。
+        # 用户 2026-11-01：「设置里面的地址要显示完全」—— 不再做中间省略，改成
+        # 完整路径 + 自动换行（面板窄就折成两行，tooltip 仍然是全路径）。
+        # 用户 2026-11-01 第二轮：「这个地址要显示成一排」—— 完整路径在窄面板
+        # 必然折成两行，改**单行中间省略**；完整路径在 tooltip，悬停可见。
+        self.lbl_log_path = _ElidedPathLabel(log_path, ui_font(10.5))
+        self.lbl_log_path.setObjectName("groupCaption")
         # ⚠️ 必须 setMinimumWidth(**1**)，不能是 0：Qt 布局算最小宽度时把 0 当成
-        # "没设过"，会退回 minimumSizeHint —— 那正是整条绝对路径的宽度。日志行
-        # 于是把面板撑得比视口还宽（实测 body 635 / 视口 530），而横向滚动条是
-        # 关着的，右半边连按钮一起被裁掉。设成 1 布局才敢把它压窄。
-        path_label.setMinimumWidth(1)
-        # 完整路径放 tooltip 里（显示的是中间省略版）
-        path_label.setToolTip(log_path)
-        path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        # 按钮**紧跟**在路径文字后面，不要被推到行尾：标签不给拉伸因子，
-        # 按钮接在它后面，剩下的空白交给末尾那根 stretch（用户点名："打开记录的
-        # 按钮应该紧挨着相邻文字，去掉它们之间多余的空白间距"——原来标签吃 stretch
-        # 撑满整行，文字结束到按钮之间就会空出一大段）。
-        row.addWidget(path_label)
+        # "没设过"，会退回 minimumSizeHint —— 那正是整条绝对路径的宽度，会把面板
+        # 撑得比视口还宽（横向滚动条是关着的 → 右半边连按钮一起被裁）。
+        self.lbl_log_path.setMinimumWidth(1)
+        self.lbl_log_path.setToolTip(log_path)      # 完整路径（显示的是省略版）
+        self.lbl_log_path.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+
         # 一键导出（用户点名）：把日志另存到用户挑的位置，方便发给别人排查。
         self.btn_export_log = InkButton("导出日志", variant="ghost")
         self.btn_export_log.setToolTip("把日志文件另存为一份，方便发给别人排查问题")
         self.btn_export_log.clicked.connect(self._export_log)
-        row.addWidget(self.btn_export_log)
+        self.btn_open_log_dir = InkButton("打开文件夹", variant="ghost")
+        self.btn_open_log_dir.setToolTip("在资源管理器里打开日志所在的文件夹")
+        self.btn_open_log_dir.clicked.connect(
+            lambda: QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(Path(log_path).parent))))
         # 结构化导出（2026-10-30 用户要求："本轮数据 → CSV/JSON，而不是只有日志文本"）：
         # 日志是给人看的，这两颗按钮是给 Excel / pandas 用的 —— 数据从
         # rx_export 的采集缓存来（主窗口在 _emit_block 里喂原始文本）。
@@ -1325,47 +3313,280 @@ class SettingsDialog(QDialog):
             "把已接收的数据导出成**宽表**：一行 = 某一轮的某个模组，"
             "电芯/温度各自展开成列，直接进 Excel 或 pandas")
         self.btn_export_csv.clicked.connect(lambda: self._export_data("csv"))
-        row.addWidget(self.btn_export_csv)
         self.btn_export_json = InkButton("数据 JSON", variant="ghost")
         self.btn_export_json.setToolTip(
             "把已接收的数据导出成**嵌套结构**：rounds → modules → cells/temps，"
             "带单位，适合脚本二次处理")
         self.btn_export_json.clicked.connect(lambda: self._export_data("json"))
-        row.addWidget(self.btn_export_json)
-        open_button = InkButton("打开文件夹", variant="ghost")
-        open_button.clicked.connect(
-            lambda: QDesktopServices.openUrl(
-                QUrl.fromLocalFile(str(Path(log_path).parent))))
-        row.addWidget(open_button)
-        row.addStretch(1)          # 同上：按钮串在文字后面，空白推到行尾
-        form.addRow(self._row(row))
 
-        # 接收历史行（自动保存的最近 5000 行接收数据，与日志同目录）：
-        # 路径没定位到（只读盘符等）就整行不显示，别给一个点不动的按钮。
+        # 用户 2026-11-01：「四颗边框一样大」+「地址显示完全」+「排版美观」：
+        # 路径**独占一行**（完整、自动换行），四颗按钮统一等宽、**同一行、靠右**。
+        # （之前为了压窄面板折成 2×2 田字，现在用户要求并成一行。）
+        _equalize_buttons(
+            (self.btn_export_log, self.btn_open_log_dir,
+             self.btn_export_csv, self.btn_export_json),
+            extra_texts=("✓ 已导出", "✓ 0000 行", "✓ 000 轮"))
+        log_row = QHBoxLayout()
+        log_row.setContentsMargins(0, 0, 0, 0)
+        log_row.setSpacing(8)
+        log_row.addStretch(1)                    # 整块**靠右**，与其它小节同一条右缘
+        log_row.addWidget(self.btn_export_log)
+        log_row.addWidget(self.btn_open_log_dir)
+        log_row.addWidget(self.btn_export_csv)
+        log_row.addWidget(self.btn_export_json)
+        holder = QWidget()
+        column = QVBoxLayout(holder)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(6)
+        column.addWidget(self.lbl_log_path)      # 完整路径独占一行
+        column.addLayout(log_row)                # 四颗等宽、同一行、靠右
+        form.addRow(self._row(column))
+
+        # ---- 接收历史 ----
+        # 用户 2026-10-31："接收历史的文件夹不只是需要跟着车号改变，还需要能够
+        # 手动选择，在打开记录前面加一个可以选择车号的功能。" 于是这一行变成
+        # 下拉（已存在的历史文件，新的在前）+ 打开记录 + 选择目录。
         import rx_history
-        history_path = rx_history.path()
+        history_path = rx_history.path() or ""
+        can_pick_dir = callable(getattr(rx_history, "set_directory", None))
+        if not history_path and not can_pick_dir:
+            return          # 定位不到、又不能手动选：整段不显示（别给点不动的按钮）
+        form.addRow(self._caption("接收历史"))
+
+        self.lbl_history_path = _ElidedPathLabel(
+            history_path if history_path else "（还没有历史文件）", ui_font(10.5))
+        self.lbl_history_path.setObjectName("groupCaption")
+        self.lbl_history_path.setMinimumWidth(1)    # 同日志行的坑（见上）
+        self.lbl_history_path.setToolTip(history_path)
+        self.lbl_history_path.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        # 车号下拉（同其它下拉的 ChevronComboBox）：条目 = 已存在的历史文件，
+        # 新的在前；第一项永远是"当前车号那一份"（保持原来"跟着车号走"的行为）。
+        self.cmb_history = ChevronComboBox()
+        # 宽度交给**最长条目**决定（车号可能更长：E74-2025 / E75-2026，固定宽会裁字）。
+        # 2026-11-02 用户第三次点名"不需要这么大的框 / 空太多"，前后实测（windows 平台、
+        # 真实 12.5pt MiSans，见 devtools/_probe_cmb_contentrect.py）：
+        #   · 之前 minContentsLength(10)+minWidth(96) → 顶到 max 150、右侧空一大片；
+        #   · ⚠️ 不能用 `AdjustToMinimumContentsLengthWithIcon` + minimumContentsLength(1)：
+        #     它是按"1 个字符"定宽（不是最长条目），实测框只剩 80px、真实字体下把
+        #     "E74-2026" 裁成 "E74-"（放大截图确认）。
+        #   · 改用 `AdjustToContents`（Qt 的"按内容/最长条目自适应"，正是这里要的）。
+        # chrome（chevron+左右 padding+边框）实测 48px，这是"不裁字"的物理下限 ——
+        # 空(w−文字) ≈ 48，正好是必需的外框占位，没有多余留白。
+        self.cmb_history.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.cmb_history.setMinimumWidth(1)
+        self.cmb_history.setMaximumWidth(150)
+        self.cmb_history.setToolTip(
+            "列出已存在的接收历史（每台车一个文件，新的在前）。\n"
+            "选中后「打开记录」打开的就是那一个。")
+
+        # 「打开记录」只在**真有文件**时才建：没文件可开就藏掉它（沿用老口径
+        # "别给一个点不动的按钮"，自测也钉着这条）；此时「选择目录」仍是这一节
+        # 唯一有意义的动作，所以整节照旧显示。
+        self.btn_open_history = None
         if history_path:
-            form.addRow(self._caption("接收历史"))
-            hrow = QHBoxLayout()
-            hrow.setSpacing(10)
-            hpath_label = QLabel(self._elide_middle(history_path))
-            hpath_label.setFont(ui_font(10.5))
-            hpath_label.setObjectName("groupCaption")
-            hpath_label.setMinimumWidth(1)      # 同日志行的坑（见上）
-            hpath_label.setToolTip(history_path)
-            hpath_label.setTextInteractionFlags(
-                Qt.TextInteractionFlag.TextSelectableByMouse)
-            hrow.addWidget(hpath_label)          # 不拉伸，见上面日志行的说明
-            hist_button = InkButton("打开记录", variant="ghost")
-            hist_button.setToolTip(
-                f"打开历史接收数据（自动保存最近 {rx_history.max_lines()} 行，"
+            self.btn_open_history = InkButton("打开记录", variant="ghost")
+            self.btn_open_history.setToolTip(
+                f"打开选中的历史接收数据（自动保存最近 {rx_history.max_lines()} 行，"
                 "含时间戳；行数与接收区「保留行数」一致，到量自动滚动覆盖最早的数据）")
-            hist_button.clicked.connect(
-                lambda: QDesktopServices.openUrl(
-                    QUrl.fromLocalFile(history_path)))
-            hrow.addWidget(hist_button)
-            hrow.addStretch(1)         # 同上：按钮紧挨文字，空白推到行尾
-            form.addRow(self._row(hrow))
+            self.btn_open_history.clicked.connect(self._open_history_record)
+
+        self.btn_history_dir = InkButton("选择目录", variant="ghost")
+        self.btn_history_dir.setToolTip(
+            "手动指定接收历史存到哪个文件夹（下次启动沿用）；\n"
+            "换目录后上面的列表会立刻按新目录重建")
+        self.btn_history_dir.clicked.connect(self._choose_history_dir)
+        if not can_pick_dir:
+            # rx_history 还没提供 set_directory：按钮别装成能点的样子
+            self.btn_history_dir.setEnabled(False)
+            self.btn_history_dir.setToolTip(
+                "当前版本还改不了历史目录（rx_history.set_directory 未提供）")
+
+        # 路径独占一行（地址显示完全、自动换行）；下方三颗控件**并成一排**
+        # （用户 2026-11-01 点名「这几个按钮弄成一行」）：选择目录 / 当前记录 /
+        # 打开记录。整排靠右，与「日志」节四颗按钮同一条右缘。
+        # ⚠️ 之前为压窄面板把三颗拆成两排；用户明确要并一排，故放开（面板最窄宽
+        #    已由「日志」四颗行定为 ~604px，三颗并排约 364px 不会比它更宽）。
+        path_row = QHBoxLayout()
+        path_row.setSpacing(10)
+        path_row.addWidget(self.lbl_history_path, 1)
+
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(10)
+        ctrl_row.addStretch(1)         # 整排靠右
+        ctrl_row.addWidget(self.btn_history_dir)
+        ctrl_row.addWidget(self.cmb_history)
+        if self.btn_open_history is not None:
+            ctrl_row.addWidget(self.btn_open_history)
+
+        hholder = QWidget()
+        hcolumn = QVBoxLayout(hholder)
+        hcolumn.setContentsMargins(0, 0, 0, 0)
+        hcolumn.setSpacing(6)
+        hcolumn.addLayout(path_row)
+        hcolumn.addLayout(ctrl_row)
+        form.addRow(self._row(hcolumn))
+
+        self._refresh_history_labels()
+
+    def _refresh_history_labels(self) -> None:
+        """重建「接收历史」下拉 + 路径文字（车号/目录变化后唯一的刷新入口）。
+
+        条目来自 ``rx_history.available_labels()`` —— ``[(显示标签, 绝对路径)]``，
+        **新的在前**。这个函数是另一个模块新加的，还没落地时退化成"只有当前
+        那一份"，并把下拉置灰：面板不能因为对方进度而整块崩掉。
+        """
+        combo = getattr(self, "cmb_history", None)
+        if combo is None:
+            return
+        import rx_history
+        current = rx_history.path() or ""
+        entries: list[tuple[str, str]] = []
+        getter = getattr(rx_history, "available_labels", None)
+        if callable(getter):
+            try:
+                entries = list(getter())
+            except Exception as exc:      # 目录读不了也不该炸面板
+                app_log.warning(f"列出接收历史文件失败：{exc}")
+                entries = []
+
+        # 用户 2026-10-31：「这个选择车辆要我能够选择我配置过的所有车辆的数据」——
+        # 下拉不能只列"已经有历史文件"的那几台，要把**所有已配置车辆**都放进去
+        # （还没收到数据的车也给条目，打开时提示"文件不存在"，而不是干脆选不到）。
+        try:
+            vehicles = [str(name) for name in customization.vehicle_names()]
+        except Exception as exc:          # 读不到车辆清单也不该炸面板
+            app_log.warning(f"读取车辆清单失败：{exc}")
+            vehicles = []
+        base_dir = ""
+        dir_getter = getattr(rx_history, "directory", None)
+        if callable(dir_getter):
+            try:
+                base_dir = str(dir_getter() or "")
+            except Exception:
+                base_dir = ""
+        file_for = getattr(rx_history, "file_for", None)
+        by_label = {str(lab): str(p) for lab, p in entries}
+        ordered: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for name in vehicles:
+            path = by_label.get(name)
+            if not path and base_dir and callable(file_for):
+                path = str(Path(base_dir) / file_for(name))
+            if path:
+                ordered.append((name, path))
+                seen.add(name)
+        for lab, path in entries:
+            lab = str(lab)
+            if lab not in seen:
+                ordered.append((lab, str(path)))
+                seen.add(lab)
+
+        combo.blockSignals(True)
+        combo.clear()
+        # ⛔ 不再加一条带「●」的"当前记录"：它和下面的同名车辆重复，而且一条有点、
+        #    其它没有，看着不一致（用户 2026-10-31 点名）。直接把所有车辆平铺，
+        #    再把当前那份**选中**即可 —— 选中态本身就是"当前"。
+        current_index = -1
+        if current:
+            try:
+                vehicle = customization.current_vehicle()
+            except Exception:
+                vehicle = ""
+            combo.addItem(str(vehicle) if vehicle else "当前记录", current)
+            current_index = 0
+        for label, path in ordered:
+            if path == current:
+                continue                  # 当前那份已经在第一项了
+            combo.addItem(str(label), str(path))
+        for index in range(combo.count()):
+            combo.setItemData(index, str(combo.itemData(index) or ""),
+                              Qt.ItemDataRole.ToolTipRole)
+        if combo.count() == 0:
+            combo.addItem("（还没有历史文件）", "")
+            combo.setEnabled(False)
+            combo.setToolTip("这个目录里还没有接收历史；先收一会儿数据再回来")
+        else:
+            combo.setEnabled(True)
+            combo.setCurrentIndex(current_index if current_index >= 0 else 0)
+        combo.blockSignals(False)
+        # 条目换完后**立刻**把宽度收到"最长条目 + 右侧 chevron"（sizeHint，受 max 150 约束）：
+        # 只改 sizeAdjustPolicy 时，控件在**首次布局激活之前**还停在旧宽度上（探针/未 show
+        # 时实测仍是 150），这里 adjustSize 让几何当场到位，面板一建出来就是窄的。
+        combo.updateGeometry()
+        combo.adjustSize()
+
+        if hasattr(self, "lbl_history_path"):
+            shown = current if current else "（还没有历史文件）"
+            self.lbl_history_path.setText(shown)
+            self.lbl_history_path.setToolTip(current)
+        open_button = getattr(self, "btn_open_history", None)
+        if open_button is not None:
+            open_button.setEnabled(bool(current or ordered))
+
+    def _open_history_record(self) -> None:
+        """打开下拉里选中的那一份历史；没选就打开当前车号的文件。"""
+        import rx_history
+        combo = getattr(self, "cmb_history", None)
+        target = combo.currentData() if combo is not None else None
+        if not target:
+            # 兜底：条目只给了标签时走 rx_history.path_for_label(label)
+            resolver = getattr(rx_history, "path_for_label", None)
+            label = combo.currentText() if combo is not None else ""
+            if callable(resolver) and label:
+                try:
+                    target = resolver(label)
+                except Exception as exc:
+                    app_log.warning(f"定位历史文件失败：{exc}")
+                    target = None
+        target = target or rx_history.path()
+        if not target:
+            self._flash_btn(self.btn_open_history, "没有文件", 2600)
+            return
+        if not Path(target).exists():
+            self._flash_btn(self.btn_open_history, "文件不存在", 2600)
+            self.btn_open_history.setToolTip(f"这个文件已经不在了：\n{target}")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
+    def _choose_history_dir(self) -> None:
+        """手动挑接收历史的存放目录（交 ``rx_history.set_directory`` 落地）。
+
+        ⚠️ 只负责"问路 + 转交 + 刷新"，**不自己记配置**：目录要不要持久化、
+        怎么迁移老文件，都是 ``rx_history`` 自己的事（它比面板更清楚那些细节）。
+        """
+        import rx_history
+        setter = getattr(rx_history, "set_directory", None)
+        if not callable(setter):
+            return
+        start = ""
+        getter = getattr(rx_history, "directory", None)
+        if callable(getter):
+            try:
+                start = str(getter() or "")
+            except Exception:
+                start = ""
+        if not start:
+            current = rx_history.path()
+            start = str(Path(current).parent) if current else str(Path.home())
+        chosen = QFileDialog.getExistingDirectory(self, "选择接收历史目录", start)
+        if not chosen:
+            return
+        try:
+            ok = bool(setter(chosen))
+        except Exception as exc:
+            ok = False
+            app_log.warning(f"设置接收历史目录失败：{exc}")
+        if not ok:
+            self._flash_btn(self.btn_history_dir, "✗ 不可用", 3000)
+            self.btn_history_dir.setToolTip(f"这个目录用不了：\n{chosen}")
+            return
+        self._flash_btn(self.btn_history_dir, "✓ 已切换", 2600)
+        self.btn_history_dir.setToolTip(f"接收历史目录：{chosen}")
+        self._refresh_history_labels()
+        app_log.info(f"接收历史目录已切换到：{chosen}")
 
     # -------------------------------------------------------- MCP Service
 
@@ -1382,7 +3603,7 @@ class SettingsDialog(QDialog):
         row.setSpacing(10)
         # ⚠️ 提示文字必须短：这行给按钮留位之后，剩余宽度有限，长文案会被
         #   裁在按钮底下（实测"直接读写串口"半个字压进按钮）。全句放 tooltip。
-        hint = QLabel("让 AI Agent 直接读写串口")
+        hint = QLabel("AI 可直接读写串口")
         hint.setFont(ui_font(10.5))
         hint.setObjectName("groupCaption")
         # 同日志行：必须给 1 而不是 0，否则 minimumSizeHint 会把面板撑宽
@@ -1392,7 +3613,7 @@ class SettingsDialog(QDialog):
             "三条自检。粘给任意 Agent（WorkBuddy / Claude / Cursor…），"
             "它就能自动装好并把串口接到自己手上")
         row.addWidget(hint)
-        self.btn_mcp_copy = InkButton("复制接入配置", variant="ghost")
+        self.btn_mcp_copy = InkButton("复制接入", variant="ghost")
         self.btn_mcp_copy.setToolTip(
             "复制一整段（含 MCP 服务源码与注册片段）—— 直接粘给任意 Agent，"
             "它会自动装依赖、写服务、注册 MCP 并自检")
@@ -1400,7 +3621,7 @@ class SettingsDialog(QDialog):
         row.addWidget(self.btn_mcp_copy)
         # 手动填写（2026-10-31 用户要求）：客户端那个「连接至自定义 MCP」是
         # 逐项填的（名称/类型/命令/参数/环境变量），光给"一整段给 Agent"不够用。
-        self.btn_mcp_manual = InkButton("手动填写参数", variant="ghost")
+        self.btn_mcp_manual = InkButton("手动填写", variant="ghost")
         self.btn_mcp_manual.setToolTip(
             "打开一张逐项参数表（名称/类型/命令/参数/环境变量），每项可单独复制，"
             "照着填进客户端的自定义 MCP 对话框")
@@ -1427,16 +3648,16 @@ class SettingsDialog(QDialog):
         clipboard.setText(text)
         if clipboard.text() == text:
             self._flash_button(self.btn_mcp_copy, "已复制，粘给 Agent 即可",
-                               "复制接入配置", 4000)
+                               "复制接入", 4000)
             app_log.info("MCP 接入包已复制到剪贴板")
             return
         try:
             path = mcp_bridge.write_payload()
         except OSError as exc:
             app_log.warning(f"MCP 接入包保存失败：{exc}")
-            self._flash_button(self.btn_mcp_copy, "复制失败", "复制接入配置", 4000)
+            self._flash_button(self.btn_mcp_copy, "复制失败", "复制接入", 4000)
             return
-        self._flash_button(self.btn_mcp_copy, Path(path).name, "复制接入配置", 6000)
+        self._flash_button(self.btn_mcp_copy, Path(path).name, "复制接入", 6000)
         app_log.info(f"MCP 接入包已保存：{path}")
 
     def _flash_button(self, button, text: str, restore: str, ms: int = 4000) -> None:
@@ -1450,6 +3671,298 @@ class SettingsDialog(QDialog):
                 pass
 
         QTimer.singleShot(ms, _restore)
+
+    # ---------------------------------------------------------- 会话数据库
+
+    def _build_session_db_section(self, form: QFormLayout) -> None:
+        """「会话数据库」：路径 + 打开文件夹；近 N 天导出 CSV；统计（点了才查）。
+
+        数据来自 ``rx_store``（SQLite，每帧一行 append-only）。设置面板**打开时
+        不碰库**：路径是纯字符串、统计要用户点「刷新」才查 —— 面板本来就要
+        秒开，不能因为库里有几十万行就卡在打开动作上。
+        """
+        import rx_store
+        db_path = rx_store.db_path()
+        if not db_path:
+            return          # 定位不到用户目录：整段不显示（同日志一节的处理）
+        form.addRow(self._caption("会话数据库"))
+
+        # 用户 2026-11-01：「地址也要显示完全」—— 不再用 _elide_middle 中间掐成
+        # "C:\Users\Lenovo\...\logs\sessions.db"，改成**完整路径 + 自动换行**
+        # （面板窄就折行，tooltip 仍是全路径），与「日志 / 接收历史」同款。
+        # 用户 2026-11-01 第二轮：「这个地址要显示成一排」—— 三处路径统一
+        # 单行中间省略（完整路径在 tooltip），与日志 / 接收历史同款。
+        self.lbl_db_path = _ElidedPathLabel(db_path, ui_font(10.5))
+        self.lbl_db_path.setObjectName("groupCaption")
+        # ⚠️ 最小宽度必须 setMinimumWidth(**1**)，不能是 0（同日志行的坑：
+        #    Qt 把 0 当"没设过"、退回整条路径的 minimumSizeHint，面板被撑爆）
+        self.lbl_db_path.setMinimumWidth(1)
+        self.lbl_db_path.setToolTip(db_path)        # 完整路径（显示的是完整版）
+        self.lbl_db_path.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        self.btn_open_db_dir = InkButton("打开文件夹", variant="ghost")
+        self.btn_open_db_dir.setToolTip("在资源管理器里打开会话数据库所在的文件夹")
+        self.btn_open_db_dir.clicked.connect(
+            lambda: QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(Path(db_path).parent))))
+        # 路径**独占一行**（完整、自动换行），与「日志 / 接收历史」同款；
+        # 不再和「打开文件夹」并排 —— 并排时路径被按钮挤窄、又无空格可折行，
+        # 末尾 "sessions.db" 会被裁掉（用户 2026-11-01 点名"地址要显示完全"）。
+        path_row = QHBoxLayout()
+        path_row.setContentsMargins(0, 0, 0, 0)
+        path_row.setSpacing(8)
+        path_row.addWidget(self.lbl_db_path, 1)
+
+        # 近 N 天导出（1~365，默认 7）：范围交给用户，默认值覆盖"这次车检"。
+        self.spin_db_days = ChevronSpinBox()
+        self.spin_db_days.setRange(1, 365)
+        self.spin_db_days.setValue(7)
+        self.spin_db_days.setSuffix(" 天")
+        self.spin_db_days.setToolTip("导出最近这么多天的会话数据（按帧，一天可能上万行）")
+        # 宽度按**当前文字**动态收紧（用户 2026-11-02 第三次点名"空太多"）：
+        # 固定成「365 天」的宽度时，值=7 右侧会空一大片（实测 w=124、空白 73~101px）。
+        # 由 _fit_db_days_width 在每次数值变化后按 text() 像素宽重设（下限 64、
+        # 上限 124 保证「365 天」放得下）。
+        self._fit_db_days_width()
+        self.spin_db_days.valueChanged.connect(
+            lambda _=0: self._fit_db_days_width())
+        self.btn_db_export = InkButton("导出 CSV", variant="ghost")
+        self.btn_db_export.setToolTip(
+            "把所选天数内的帧导出成 CSV：一行 = 一帧，电芯/温度空格分隔，"
+            "可直接进 Excel 或 pandas")
+        self.btn_db_export.clicked.connect(self._export_session_csv)
+        export_row = QHBoxLayout()
+        export_row.setContentsMargins(0, 0, 0, 0)
+        export_row.setSpacing(8)
+        # 右对齐（与下面「刷新」同一条右缘）：打开文件夹 + 数字框 + 导出，整组贴右。
+        # 别给按钮加 stretch，否则会拉成一条长条。
+        export_row.addStretch(1)
+        export_row.addWidget(self.btn_open_db_dir)
+        export_row.addWidget(self.spin_db_days)
+        export_row.addWidget(self.btn_db_export)
+
+        # 统计行：**懒加载** —— 打开面板不查库，点「刷新」才 SELECT。
+        self.lbl_db_stats = QLabel("共 — 帧（点「刷新」查询，打开面板不读库）")
+        self.lbl_db_stats.setFont(ui_font(10.5))
+        self.lbl_db_stats.setObjectName("groupCaption")
+        self.lbl_db_stats.setMinimumWidth(1)
+        self.lbl_db_stats.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.btn_db_stats = InkButton("刷新", variant="ghost")
+        self.btn_db_stats.setToolTip("查询总帧数、覆盖时间范围与车号数（只读）")
+        self.btn_db_stats.clicked.connect(self._refresh_db_stats)
+        stats_row = QHBoxLayout()
+        stats_row.setContentsMargins(0, 0, 0, 0)
+        stats_row.setSpacing(8)
+        stats_row.addWidget(self.lbl_db_stats, 1)
+        stats_row.addWidget(self.btn_db_stats)
+
+        column = QVBoxLayout()
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(6)
+        column.addLayout(path_row)
+        column.addLayout(export_row)
+        column.addLayout(stats_row)
+        form.addRow(self._row(column))
+
+    def _refresh_db_stats(self) -> None:
+        """查库统计（只有点「刷新」才碰库；失败只是显示"查不到"，不弹框）。"""
+        import rx_store
+        st = rx_store.stats()
+        if st["count"] <= 0:
+            self.lbl_db_stats.setText("共 0 帧（收到数据后自动入库）")
+            self.lbl_db_stats.setToolTip("")
+            return
+        first = (st["first"] or "")[:19].replace("T", " ")
+        last = (st["last"] or "")[:19].replace("T", " ")
+        self.lbl_db_stats.setText(
+            f"共 {st['count']} 帧 · {st['vehicles']} 台车 · {first} → {last}")
+        self.lbl_db_stats.setToolTip(f"最早：{st['first']}\n最晚：{st['last']}")
+
+    def _export_session_csv(self) -> None:
+        """把最近 N 天的会话数据导出成 CSV（一行 = 一帧）。"""
+        import rx_store
+        days = int(self.spin_db_days.value())
+        stamp = datetime.now().strftime("%Y%m%d-%H%M")
+        desktop = Path.home() / "Desktop"
+        folder = desktop if desktop.is_dir() else Path.home()
+        default = str(folder / f"serial-{stamp}-session-{days}d.csv")
+        path, _ = QFileDialog.getSaveFileName(
+            self, f"导出近 {days} 天会话数据（CSV）", default, "CSV 表格 (*.csv)")
+        if not path:
+            return
+        rows = rx_store.export_csv(path, days)
+        if rows <= 0:
+            QMessageBox.information(
+                self, "导出会话数据",
+                f"最近 {days} 天没有落库的数据。\n\n"
+                "收到数据后会自动入库（这一节的「刷新」能看到总帧数）。")
+            return
+        app_log.info(f"会话数据已导出: {path}（{rows} 行）")
+        self._flash_btn(self.btn_db_export, f"✓ {rows} 行")
+
+    def _fit_db_days_width(self) -> None:
+        """按当前文字（如「7 天」）收紧「近 N 天」数字框，避免大段空白。
+
+        用户 2026-11-02 三次点名"空太多"：固定成能放「365 天」的宽度时，值=7
+        右侧会空一大片。这里按 ``text()``（含 " 天" 后缀）的实测像素宽重设固定宽：
+        ``+22`` 是右侧上下箭头的自绘宽度，``+16`` 是左右文字内边距；下限 64 保证
+        单/双位数够看，上限 124 与「365 天」实测（85px + 22 + 16 ≈ 123）对齐，
+        既不裁「365 天」、又不给「7 天」留大段空白。数值一变就重算（见 valueChanged）。
+        """
+        spin = getattr(self, "spin_db_days", None)
+        if spin is None:
+            return
+        fm = spin.fontMetrics()
+        need = fm.horizontalAdvance(spin.text()) + 22 + 16   # 22=上下箭头, 16=左右内边距
+        spin.setFixedWidth(max(64, min(124, need)))           # 64=下限, 124=「365 天」实测上限
+
+    # ------------------------------------------------------------ 协议
+
+    def _build_protocol_section(self, form: QFormLayout) -> None:
+        """「协议」：解析规则 JSON 编辑 + 校验/保存 + 试跑。
+
+        为什么（用户："换一台 BMS 就得改 Python 重打包，太麻烦"）：标题写法
+        （``Voltage590:`` / ``Pack3:``）、值的位数（4 位 mV / 2 位℃）、错误字样
+        都可能变 —— 做成规则文件后，在面板里改、校验、试跑、保存即生效。
+        """
+        import rx_protocol
+        form.addRow(self._caption("协议"))
+        hint = QLabel("解析规则（JSON）。改完点「保存」立刻生效，不用重启；\n"
+                      "「试跑」只做验证、不保存。")
+        hint.setFont(ui_font(10.5))
+        hint.setObjectName("groupCaption")
+        hint.setWordWrap(True)
+        # 同日志行的坑：不钉 1 的话 minimumSizeHint 会把面板撑爆
+        hint.setMinimumWidth(1)
+        hint.setToolTip(
+            "可改的 7 项：module_header / temp_header（段标题）、"
+            "cell_value / cell_width（电芯值的正则与取几位）、"
+            "temp_value / temp_width（温度的）、error_pattern（错误字样）。\n"
+            "⛔ 默认值与原来写死在代码里的口径一字不差，改坏了点「恢复默认」即可。")
+        self.btn_proto_reset = InkButton("恢复默认", variant="ghost")
+        self.btn_proto_reset.setToolTip("删掉自定义规则，回到内置默认（与旧版本行为一致）")
+        self.btn_proto_reset.clicked.connect(self._restore_protocol)
+        head_row = QHBoxLayout()
+        head_row.setContentsMargins(0, 0, 0, 0)
+        head_row.setSpacing(8)
+        head_row.addWidget(hint, 1)
+        head_row.addWidget(self.btn_proto_reset)
+
+        self.txt_proto = QPlainTextEdit()
+        self.txt_proto.setFont(mono_font(10))
+        self.txt_proto.setFixedHeight(150)          # 10 行上下（可滚动）
+        self.txt_proto.setPlainText(
+            json.dumps(rx_protocol.active(), ensure_ascii=False, indent=2))
+        self.txt_proto.setToolTip("当前的协议规则（JSON）。校验不通过时不要保存。")
+        self.lbl_proto_state = QLabel("")
+        self.lbl_proto_state.setFont(ui_font(10.5))
+        self.lbl_proto_state.setObjectName("groupCaption")
+        self.lbl_proto_state.setMinimumWidth(1)
+        self.lbl_proto_state.setWordWrap(True)
+        self.btn_proto_check = InkButton("校验", variant="ghost")
+        self.btn_proto_check.setToolTip("只检查规则是否合法（报出是哪一项有问题），不保存")
+        self.btn_proto_check.clicked.connect(self._check_protocol)
+        self.btn_proto_save = InkButton("保存", variant="ghost")
+        self.btn_proto_save.setToolTip("校验通过后落盘并立刻生效（显示层马上按新规则解析）")
+        self.btn_proto_save.clicked.connect(self._save_protocol)
+        buttons_row = QHBoxLayout()
+        buttons_row.setContentsMargins(0, 0, 0, 0)
+        buttons_row.setSpacing(8)
+        buttons_row.addWidget(self.lbl_proto_state, 1)
+        buttons_row.addWidget(self.btn_proto_check)
+        buttons_row.addWidget(self.btn_proto_save)
+
+        # ---- 试跑 ----
+        self.txt_proto_sample = QPlainTextEdit()
+        self.txt_proto_sample.setFont(mono_font(10))
+        self.txt_proto_sample.setFixedHeight(84)    # 4~5 行
+        self.txt_proto_sample.setPlaceholderText(
+            "把一段真实接收数据粘到这里（含标题行），点「试跑」看解析结果")
+        self.btn_proto_try = InkButton("试跑", variant="ghost")
+        self.btn_proto_try.setToolTip("用左上的规则解析下面这段文本（不保存、不影响接收区）")
+        self.btn_proto_try.clicked.connect(self._try_protocol)
+        self.lbl_proto_try = QLabel("试跑结果：—")
+        self.lbl_proto_try.setFont(ui_font(10.5))
+        self.lbl_proto_try.setObjectName("groupCaption")
+        self.lbl_proto_try.setMinimumWidth(1)
+        self.lbl_proto_try.setWordWrap(True)
+        try_row = QHBoxLayout()
+        try_row.setContentsMargins(0, 0, 0, 0)
+        try_row.setSpacing(8)
+        try_row.addWidget(self.btn_proto_try)
+        try_row.addWidget(self.lbl_proto_try, 1)
+
+        column = QVBoxLayout()
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(6)
+        column.addLayout(head_row)
+        column.addWidget(self.txt_proto)
+        column.addLayout(buttons_row)
+        column.addWidget(self.txt_proto_sample)
+        column.addLayout(try_row)
+        form.addRow(self._row(column))
+
+    def _proto_say(self, text: str, ok: bool) -> None:
+        """原地显示校验/保存结果（不弹框：这里是高频编辑的输入区）。"""
+        self.lbl_proto_state.setText(("✓ " if ok else "✗ ") + text)
+        self.lbl_proto_state.setToolTip(text)
+
+    def _protocol_json(self) -> dict | None:
+        """编辑框里的 JSON → 规则字典；解析或校验失败时原地报错并返回 None。"""
+        import rx_protocol
+        text = self.txt_proto.toPlainText().strip()
+        if not text:
+            self._proto_say("规则是空的 —— 点「恢复默认」可载回默认规则", False)
+            return None
+        try:
+            profile = json.loads(text)
+        except ValueError as exc:
+            self._proto_say(f"JSON 解析失败：{exc}", False)
+            return None
+        ok, message = rx_protocol.validate(profile)
+        if not ok:
+            self._proto_say(message, False)
+            return None
+        return profile
+
+    def _check_protocol(self) -> None:
+        profile = self._protocol_json()
+        if profile is not None:
+            self._proto_say("规则有效（7 项全部通过）", True)
+
+    def _save_protocol(self) -> None:
+        import rx_protocol
+        import ui_highlight
+        profile = self._protocol_json()
+        if profile is None:
+            return
+        if not rx_protocol.save_profile(profile):
+            self._proto_say("保存失败（写入配置失败，规则未生效）", False)
+            return
+        ui_highlight.set_protocol(profile)      # 立刻生效（不用重启）
+        self._proto_say("已保存并生效（显示层已按新规则解析）", True)
+
+    def _restore_protocol(self) -> None:
+        import rx_protocol
+        import ui_highlight
+        rx_protocol.save_profile(None)
+        ui_highlight.set_protocol(None)
+        self.txt_proto.setPlainText(
+            json.dumps(rx_protocol.DEFAULT, ensure_ascii=False, indent=2))
+        self._proto_say("已恢复默认规则（与旧版本行为一致）", True)
+
+    def _try_protocol(self) -> None:
+        import rx_protocol
+        profile = self._protocol_json()
+        if profile is None:
+            return
+        result = rx_protocol.sample_parse(
+            self.txt_proto_sample.toPlainText(), profile)
+        self.lbl_proto_try.setText("试跑结果：" + result["note"])
+        self.lbl_proto_try.setToolTip(
+            f"电压模组：{result['cells']}\n温度模组：{result['temps']}")
 
     @staticmethod
     def _elide_middle(text: str, limit: int = 52) -> str:
@@ -1520,12 +4033,14 @@ class SettingsDialog(QDialog):
         try:
             if kind == "csv":
                 rows = session.write_csv(path)
-                msg = f"✓ 已导出 {rows} 行"
+                # 反馈文字要**短**：这两颗按钮现在是田字布局里的一格（宽度锁死，
+                # 见 _build_log_section），长文案会把按钮顶宽、两列当场对不齐。
+                msg = f"✓ {rows} 行"
             else:
                 from version import VERSION as _ver
                 meta = {"app": "CQUFSAE串口助手", "version": _ver}
                 n = session.write_json(path, meta=meta)
-                msg = f"✓ 已导出 {n} 轮"
+                msg = f"✓ {n} 轮"
         except OSError as exc:
             QMessageBox.warning(self, "导出失败", f"写文件失败：{exc}")
             return
@@ -1686,6 +4201,11 @@ class SettingsDialog(QDialog):
         # 深色面板配系统白标题栏是全界面最扎眼的撞色（用户截图点名）——
         # 对话框也要走一遍 DWM 深色标题栏 + 圆角，和主窗口同一套处理
         apply_titlebar_theme(self, self._scheme)
+        # 面板是"用的时候才打开"的：这一开期间可能收过数据、切过车、别的车也
+        # 存了历史 —— 「接收历史」的车号列表每次打开都重建一次（构造时已经建过
+        # 一次，两次走同一个入口，没有第二份逻辑）。
+        if hasattr(self, "cmb_history"):
+            self._refresh_history_labels()
 
     def _row(self, layout) -> QWidget:
         """把一个横向布局包成控件，当表单的"字段"用。

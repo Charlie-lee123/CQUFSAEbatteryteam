@@ -26,7 +26,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PySide6.QtCore import QSettings, QEvent, QTimer          # noqa: E402
+from PySide6.QtCore import QSettings, QEvent                    # noqa: E402
 from PySide6.QtTest import QTest                              # noqa: E402
 from PySide6.QtWidgets import QApplication                    # noqa: E402
 

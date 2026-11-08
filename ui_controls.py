@@ -42,8 +42,6 @@ from ui_theme import (
 
 _EDIT_INK_CACHE: dict[tuple, float | None] = {}
 _TEXT_INK_CACHE: dict[tuple, tuple | None] = {}
-
-
 def _edit_ink_offset(edit: QLineEdit) -> float | None:
     """行内编辑框里**文字墨迹**的竖直中心（相对编辑框顶部，逻辑像素）。
 
@@ -1125,14 +1123,40 @@ class ChevronComboBox(QComboBox):
         # 窗口直角边缘整个裁掉，看起来就是一块直角板（用户点名"缺少圆角"）。
         # 把容器窗口改成无边框 + 半透明，视图自己画的圆角才圆得起来；
         # 视图四周的空隙由 QSS 的 margin 留出（半透明处透出桌面/底色）。
+        # ⛔ 这组 flags/attribute 只在**首次**设置：``setWindowFlags`` 对已经
+        #    创建了原生句柄的窗口是「销毁重建」，高频点击（开→关→再开）时
+        #    每一轮 showPopup 都重建一次，DWM 可能拍到旧窗口销毁前的最后一帧
+        #    —— Qt 默认把弹层摆成"当前项对齐控件"（压在控件框上边），那一帧
+        #    就是用户报的「框的上边有残影闪烁」（2026-11-03 点名，数据位）。
+        #    设过一遍之后窗口类型不再变化，重复进入只走几何路径。
         container = self.view().window()
-        container.setWindowFlags(Qt.WindowType.Popup
-                                 | Qt.WindowType.FramelessWindowHint
-                                 | Qt.WindowType.NoDropShadowWindowHint)
-        container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        if not getattr(self, "_popup_flags_done", False):
+            container.setWindowFlags(Qt.WindowType.Popup
+                                     | Qt.WindowType.FramelessWindowHint
+                                     | Qt.WindowType.NoDropShadowWindowHint)
+            container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self._popup_flags_done = True
         self._round_popup_window(container)
         self._ensure_popup_delegate()
         self._fit_popup_width()
+        # ⛔ super() **之前**先把容器按目标位置摆成起始矮条（此刻窗口还隐藏，
+        #    改几何不可见）：随后 super().showPopup() 里 Qt 会把弹层摆到它自己的
+        #    默认位置（"当前项对齐控件"，整体压在控件框上/上边）——高频点击时
+        #    DWM 恰好拍到那一帧就是"框的上边有残影"。预先摆好之后，即使被 Qt
+        #    覆盖，最坏也只是 25% 高的矮条在目标位置，不再是满高错位帧。
+        #    hidePopup 结尾会把容器还原成满高 target，所以这里量到的
+        #    container.geometry() 高度就是完整高度，_popup_place() 结果有效。
+        pre_target, pre_below = self._popup_place()
+        self._popup_target = pre_target
+        self._popup_below = pre_below
+        pre_h = max(14, int(pre_target.height() * 0.25))
+        if pre_below:
+            container.setGeometry(pre_target.x(), pre_target.y(),
+                                  pre_target.width(), pre_h)
+        else:
+            container.setGeometry(pre_target.x(),
+                                  pre_target.y() + pre_target.height() - pre_h,
+                                  pre_target.width(), pre_h)
         super().showPopup()
         # ⚠️ 非编辑下拉的弹层容器布局里带「上下弹簧 + 底部箭头指示条」
         # （Qt 6.12 私有装饰，编辑下拉这几项是 0 高）—— 5+10+5 的黑条垫在
@@ -1152,18 +1176,19 @@ class ChevronComboBox(QComboBox):
                     it.spacerItem().changeSize(0, 0)
             lay.invalidate()
             lay.activate()
-        # ⚠️ **立刻**摆到我们算的位置：Qt 上面那一下已经把弹层显示在它自己的
-        #    位置上了（默认对齐当前项），不马上搬走的话，用户会看到"先出现在
-        #    下方、再跳到上方"（保留行数那个下拉就这么被点名过）。
+        # ⚠️ **立刻**重算并纠正摆位：super() 里面 Qt 已经把弹层放到它自己的
+        #    默认位置上了（默认对齐当前项），马上搬回我们的目标位置。
         #    动画仍延后一拍起跑（要等 Qt 定完位），但那时位置已经是对的。
+        #    （目标矩形在 super() **之前**已经预摆过一版，这里是 Qt 定位后
+        #    的最终纠正，两版用的是同一套 _popup_place 规则。）
         target, below = self._popup_place()
         self._popup_target = target
         self._popup_below = below
-        container.setGeometry(target)
-        # ⛔ 立刻进入"待展开"状态：先缩到起始高度、透明度归零，**再**返回事件循环。
-        #    以前这两步在 _start_popup_anim（延后一拍）里做，于是从 showPopup 返回到
-        #    那一拍之间，弹层是**满高且不透明**的 —— 用户看到"先整块闪一下、再缩回去
-        #    重新长出来"（逐帧实测：19ms 时 h=150/opacity=1.00，30ms 才变成 h=14/0.28）。
+        # ⛔ 立刻进入"待展开"状态：先缩到起始高度、**保持不透明**，**再**返回事件循环。
+        #    以前"别让人看见"靠透明度归零（setWindowOpacity(0.0)），但 opacity 逐帧
+        #    变化会让 DWM 对弹层窗口重新做 alpha 合成 → 弹层**抽搐抖动**（用户点名）。
+        #    现在 opacity 始终 1.0：不闪靠的是"几何先缩到 25% 高度这一帧"，窗口从
+        #    第一帧起就是不透明的小条再展开，没有满高闪一帧、也没有透明度合成。
         #    延后一拍仍然必须保留（要等 Qt 定完位），但"别让人看见"这一步不能等。
         start_h = max(14, int(target.height() * 0.25))
         if below:
@@ -1171,7 +1196,7 @@ class ChevronComboBox(QComboBox):
         else:
             container.setGeometry(target.x(), target.y() + target.height() - start_h,
                                   target.width(), start_h)
-        container.setWindowOpacity(0.0)
+        container.setWindowOpacity(1.0)
         self._animate_popup_open()
 
     @staticmethod
@@ -1260,15 +1285,21 @@ class ChevronComboBox(QComboBox):
         """
         QTimer.singleShot(0, self._start_popup_anim)
 
-    def _popup_place(self) -> tuple[QRect, bool]:
+    def _popup_place(self, size=None) -> tuple[QRect, bool]:
         """算出弹层**该在哪**（尺寸沿用 Qt 算好的，只改位置）。
+
+        ``size`` 给了就按这个尺寸算（不读容器当前几何）—— 供 ``_start_popup_anim``
+        用：那里容器已经缩到起始高度，读当前几何会量到"矮条"。
 
         规则只有一条：**贴控件下方展开**；下方实在放不下（底栏那几个）才翻到
         控件上方。Qt 默认则会把"当前项"对齐到控件上（弹层压在控件头顶），
         于是有的下拉压在控件上、有的落在下方 —— 用户拿两张图对比说"明显不一样"。
         """
         container = self.view().window()
-        geo = container.geometry()
+        if size is not None:
+            geo = QRect(0, 0, int(size.width()), int(size.height()))
+        else:
+            geo = container.geometry()
         anchor = self.mapToGlobal(QPoint(0, 0))
         gap = 4
         below_top = self.mapToGlobal(QPoint(0, self.height())).y() + gap
@@ -1298,24 +1329,26 @@ class ChevronComboBox(QComboBox):
                      # 翻到上方
 
     def _start_popup_anim(self) -> None:
-        """弹层展开动画：从锚点一侧"展开"到完整高度，同时淡入。
+        """弹层展开动画：从锚点一侧"展开"到完整高度（不再淡入）。
 
         朝下开就从顶端往下长、朝上开就从底端往上长。150ms STANDARD 曲线，
         和界面其它动效同一套节拍（ui_anim 的共享计时器，不另起 timer）。
         中途被关掉就立刻还原，不再推帧。
+        ⚠️ 只做几何插值：opacity 恒 1.0，不再逐帧变透明度 —— 否则 DWM 对弹层
+        窗口每帧重新 alpha 合成，弹层会抽搐抖动（用户点名"选择动画在抽搐"）。
         """
         # ⚠️ 这里**不做"弹层还在不在"的守卫**：延后一拍时窗口还没被标成可见，
         #    拿 isVisible() 当开关会把动画整个跳过（实测：七个下拉全都一帧到位）。
         #    弹层真被关了的话，往隐藏窗口推几何也无害，收尾统一交给 hidePopup。
         container = self.view().window()
-        # ⛔ showPopup 返回前已经把容器缩到起始高度了（为了不闪），这里**不能**
-        #    直接拿容器当前几何去量目标 —— 那量到的是"起始高度"，弹层会越开越矮
-        #    （实测 150 → 37）。先把目标矩形还回去，再按最新尺寸/位置重算一次。
+        # ⛔ **不要**先把容器还原成满高再缩回去 —— 那一帧就是用户报的
+        #    「展开后还是会有闪烁」（2026-11-02 第六轮）。目标矩形（含尺寸）在
+        #    showPopup 里已经算好了：这里只按它的**尺寸**重算一次位置，容器几何
+        #    始终停在"起始高度"，一帧满高都不会出现。
         if self._popup_target is not None:
-            container.setGeometry(self._popup_target)
-        # 位置再算一遍：延后这一拍里 Qt 可能又调过尺寸（比如按屏幕高度收了），
-        # 用最新尺寸重算，顺便把位置再按一次（showPopup 里已摆过一次）。
-        target, below = self._popup_place()
+            target, below = self._popup_place(self._popup_target.size())
+        else:
+            target, below = self._popup_place()
         self._popup_target = target
         self._popup_below = below
         start_h = max(14, int(target.height() * 0.25))
@@ -1324,7 +1357,7 @@ class ChevronComboBox(QComboBox):
         else:
             container.setGeometry(target.x(), target.y() + target.height() - start_h,
                                   target.width(), start_h)
-        container.setWindowOpacity(0.0)
+        container.setWindowOpacity(1.0)
         if self._popup_tween is None:
             self._popup_tween = Tween(150, STANDARD, self._on_popup_anim,
                                       parent=self)
@@ -1339,9 +1372,10 @@ class ChevronComboBox(QComboBox):
             return
         container = self.view().window()
         geo = self._popup_target
-        # 高度从**起始比例**长到满高（起始 25% 与 showPopup 里摆的那一帧对齐）：
-        # 以前按 h*global_t 算，t=0 那一帧会把 37px 直接缩到 14px —— 透明中看
-        # 不出来，但逐帧采样里就是一次"先缩一下再长"的反向位移。
+        # 高度从**起始比例**长到满高（起始 25% 与 showPopup 里摆的那一帧对齐，
+        # 现在 opacity 恒 1.0，所以这一帧是"25% 高的不透明小条"，一眼可见、方向
+        # 一致、不会闪）。不再按 h*global_t 算（t=0 会把 37px 又缩回 14px，是一次
+        # "先缩一下再长"的反向位移，逐帧采样里看得很清楚）。
         k = 0.25 + 0.75 * t
         h = max(14, int(round(geo.height() * k)))
         if self._popup_below:
@@ -1349,18 +1383,18 @@ class ChevronComboBox(QComboBox):
         else:
             container.setGeometry(geo.x(), geo.y() + geo.height() - h,
                                   geo.width(), h)
-        container.setWindowOpacity(min(1.0, 0.35 + 0.65 * t))
 
     def hidePopup(self) -> None:
         if self._popup_tween is not None and self._popup_tween.running:
             self._popup_tween.stop()
         container = self.view().window()
         container.setWindowOpacity(1.0)
-        # 半途关掉的话容器还停在裁剪高度 —— 不还原的话，下一次 showPopup 拿
-        # "当前几何"当目标尺寸，弹层会越开越矮（复利式缩水）。
+        super().hidePopup()
+        # ⛔ 还原满高必须放在**隐藏之后**：关之前还原会让弹层先闪一帧满高
+        #    （和展开方向同一个坑）。不还原的话下一次 showPopup 拿"当前几何"
+        #    当目标尺寸，弹层会越开越矮（复利式缩水）。
         if self._popup_target is not None:
             container.setGeometry(self._popup_target)
-        super().hidePopup()
 
     def wheelEvent(self, event) -> None:
         """滚轮**不改变选中项** —— 下拉框基本都躺在可滚动区域里（设置面板的
@@ -1489,17 +1523,14 @@ class ChevronSpinBox(QSpinBox):
             else:
                 want_y = (self.height() - self._edit.height()) // 2
             want_y = max(0, min(self.height() - self._edit.height(), want_y))
-            if not self._arrows:
-                # 无箭头：横向**接管** —— Qt 仍给隐藏的上下按钮保留 22px，
-                # 编辑框被压窄且靠左，AlignHCenter 只在编辑框里居中，
-                # 对整框就是左偏 11px（用户 2026-10-23 截图）。铺满整框，
-                # 配合对称 textMargins，AlignHCenter 才是真居中。
-                want = QRect(0, want_y, self.width(), self._edit.height())
-                if self._edit.geometry() != want:
-                    self._edit.setGeometry(want)
-                return
-            if self._edit.y() != want_y:
-                self._edit.move(self._edit.x(), want_y)
+            # 箭头占右侧 ARROW_W：有箭头时编辑框右端让开，否则 suffix（如 " mV"）
+            # 会被画在箭头下面截掉（用户 2026-11-01 报 "mV 没显示完全"）。
+            # 无箭头则铺满整框（Qt 给隐藏按钮留的 22px 由对称 textMargins 抵消，
+            # AlignHCenter 才是真居中）。
+            inset = self.ARROW_W if self._arrows else 0
+            want = QRect(0, want_y, self.width() - inset, self._edit.height())
+            if self._edit.geometry() != want:
+                self._edit.setGeometry(want)
         finally:
             self._placing_edit = False
 

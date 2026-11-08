@@ -22,7 +22,9 @@ import re
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QFont, QSyntaxHighlighter, QTextCharFormat
 
+import app_log
 import customization
+import rx_protocol
 from ui_theme import qcolor, rx_accent, stamp_accent
 
 # 时间戳：形如 [21:47:14] 或 [2026-10-10 21:47:14]（年/月/日三段各有独立
@@ -39,23 +41,80 @@ SAMPLE_RE = re.compile(r"(?<!\S)(\d+)(\.\d+)")
 
 # 段标题："Voltage1:" 开启电压段；"Temperature1:" 开启温度段；其它段标题都关掉。
 # 判段顺序不能反：OTHER 那条匹配任何 [A-Za-z]+\d*:，Temperature 也落进去。
-VOLT_HEADER_RE = re.compile(r"\s*Voltage\d*\s*:")
-TEMP_HEADER_RE = re.compile(r"\s*Temperature\d*\s*:")
+#
+# ⚠️ 上面两条（段标题）与下面的 BMS_ERROR 都是**协议可注入**的：名字不变，
+#    对象是"活代理"——每次 match/finditer 都问当前协议（见 rx_protocol）。
+#    ⛔ 不能直接换成 re.compile 的结果：main_window 在 import 时就把
+#    VOLT_HEADER_RE 这个名字绑走了（用它判"新一轮"），换对象的话那边永远是旧值。
 OTHER_HEADER_RE = re.compile(r"\s*[A-Za-z]+\d*\s*:")
 # BMS 那一行（"BMS ERROR" / "BMS OK" …）—— 它既是异常标记，也是**段的右边界**
 BMS_LINE_RE = re.compile(r"\s*BMS\b")
 
-# 段名：voltage / temperature / other（other 包含"还没见过任何段标题"的初始态）
-SECTION_VOLT = "voltage"
-SECTION_TEMP = "temperature"
-SECTION_OTHER = "other"
 
+class _LivePattern:
+    """跟随当前协议的"活"正则（用法与 ``re.Pattern`` 一致，只覆盖用到的几个口）。"""
+
+    __slots__ = ("_attr",)
+
+    def __init__(self, attr: str) -> None:
+        self._attr = attr
+
+    def _pattern(self):
+        return getattr(_PROTO, self._attr)
+
+    def match(self, text, *args, **kwargs):
+        return self._pattern().match(text, *args, **kwargs)
+
+    def search(self, text, *args, **kwargs):
+        return self._pattern().search(text, *args, **kwargs)
+
+    def fullmatch(self, text, *args, **kwargs):
+        return self._pattern().fullmatch(text, *args, **kwargs)
+
+    def finditer(self, text, *args, **kwargs):
+        return self._pattern().finditer(text, *args, **kwargs)
+
+    @property
+    def pattern(self) -> str:
+        return self._pattern().pattern
+
+
+# 当前协议（默认 = 与上面硬编码逐字节等价的 DEFAULT，见 rx_protocol）。
+_PROTO = rx_protocol.compile_profile(rx_protocol.DEFAULT)
+
+VOLT_HEADER_RE = _LivePattern("volt_header")
+TEMP_HEADER_RE = _LivePattern("temp_header")
 # ⛔ **必须忽略大小写**（2026-10-24 用户点名"出现 BMS Error 得标黄"）：真机发的是
 #    "BMS Error"（只有首字母大写），而这个常量原来写的是全大写 "BMS ERROR"，
 #    ``text.find()`` 区分大小写 → 一条都匹配不上，BMS 那行从来没被标过色。
 #    注意：只给这几个字上色，**不做**"错误明细整块标橙"（用户 2026-10-24 第二次
 #    点名"只标黄 BMS Error"）；BMS OK 不带 ERROR，自然一个字都不标。
-BMS_ERROR_RE = re.compile(r"BMS\s+ERROR", re.IGNORECASE)
+#    （大小写不敏感由 rx_protocol.Compiled 统一加 re.IGNORECASE 保证。）
+BMS_ERROR_RE = _LivePattern("error")
+
+
+def set_protocol(profile: dict | None = None) -> None:
+    """换一套协议规则（设置面板保存后调用）。``None`` / 无效 → 退回默认规则。
+
+    只换编译结果，不换上面的名字 —— 已经 import 走这些名字的模块（main_window
+    判"新一轮"用的 VOLT_HEADER_RE）会立刻跟着变，不用重启。
+    """
+    global _PROTO
+    try:
+        _PROTO = rx_protocol.compile_profile(
+            rx_protocol.DEFAULT if profile is None else profile)
+    except ValueError as exc:
+        app_log.error(f"协议规则无效，已退回默认：{exc}")
+        _PROTO = rx_protocol.compile_profile(rx_protocol.DEFAULT)
+
+
+# 启动注入一次：用户保存过自定义规则就用它，否则就是默认（= 原来的硬编码口径）。
+set_protocol(rx_protocol.active())
+
+# 段名：voltage / temperature / other（other 包含"还没见过任何段标题"的初始态）
+SECTION_VOLT = "voltage"
+SECTION_TEMP = "temperature"
+SECTION_OTHER = "other"
 
 
 def section_of(text: str, current: str = SECTION_OTHER) -> str:
@@ -163,14 +222,14 @@ def _is_data_line(line: str) -> bool:
 
 def _is_volt_line(line: str) -> bool:
     """电压段的**纯电压数据行**：整行都是采样点、且每个值都是 4 位小数
-    （mV 格式，见 VOLT_DECIMALS）。
+    （mV 格式，位数是协议项 ``cell_width``，默认 4）。
 
     温度值（"1.22"，2 位小数）万一落在电压段状态里（设备不发段标题等），
     不能当电压数据重排 —— 否则补零会把 "1.22" 造出 "01.0022" 这种假数据
     （凭空补位 = 篡改数值），着色也会把它按 mV 阈值误判成欠压绿
     （用户报的"标绿的区间到温度采集部分去了"）。"""
     return _is_data_line(line) and all(
-        re.fullmatch(r"\d+\.\d{%d}" % VOLT_DECIMALS, t)
+        re.fullmatch(r"\d+\.\d{%d}" % _PROTO.cell_width, t)
         for t in line.split())
 
 
@@ -612,20 +671,20 @@ def _entry_span(match: re.Match) -> tuple[int, int]:
 # 也不能按 mV 阈值去比，否则温度采集区会整片被标绿（用户报的
 # "标绿的区间不能到温度采集部分去"）。温度越界黄不受影响（温度段有自己的
 # 段边界，温度值本来就是 2 位小数）。
-VOLT_DECIMALS = 4
+# 位数现在是**协议项**（rx_protocol 的 cell_width，默认 4）。
 
 
 def _is_volt_value(match: re.Match) -> bool:
-    """这个采样点是不是电压格式（小数位数 == VOLT_DECIMALS）。"""
-    return len(match.group(2)) - 1 == VOLT_DECIMALS
+    """这个采样点是不是电压格式（小数位数 == 协议里的 cell_width）。"""
+    return len(match.group(2)) - 1 == _PROTO.cell_width
 
 
 def value_spans(text: str, low: int, high: int) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
     """电压采样值的分级区间 ``(超高, 超低)``，各自 ``[(起点, 长度), ...]``。
 
     区间是**整条**（序号+值，见 ``_entry_span``）；值取小数点后的整数部分
-    （"1.3820" 的 3820，单位 mV）。只认 4 位小数的电压值（见 VOLT_DECIMALS）
-    —— 温度值混进来也不会被按 mV 阈值误判。脱离控件可测。
+    （"1.3820" 的 3820，单位 mV）。只认 4 位小数的电压值（协议项 ``cell_width``，
+    默认 4）—— 温度值混进来也不会被按 mV 阈值误判。脱离控件可测。
     """
     high_spans: list[tuple[int, int]] = []
     low_spans: list[tuple[int, int]] = []

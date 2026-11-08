@@ -5,3 +5,4 @@ pyserial>=3.5
 # 进去，否则界面里的"蓝牙广播"模式会起不来
 # （产物验证命令：SerialAssistant.exe --ble-scan 6，结果落在产物 logs\蓝牙扫描结果.txt）。
 bleak>=0.22
+opencv-python-headless

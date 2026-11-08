@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import sys
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt
+from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import (
     QFontMetricsF, QGuiApplication, QIcon, QImage, QPainter, QPen, QPixmap,
 )
@@ -38,6 +38,13 @@ from ui_theme import (
 LOCKUP_SVG = {"dark": "lockup_on_dark.svg", "light": "lockup_on_light.svg"}
 LOCKUP_PNG = {"dark": "lockup_on_dark.png", "light": "lockup_on_light.png"}
 FALLBACK_ASPECT = 1576.0 / 370.0
+
+# 墨迹相对 lockup 整张内容盒的分数（来自 _check/splash/masters/ui_truth.json：
+# ink_local[31,46,1091,214] / logo_box_physical[1120,263]）。
+# ⛔ 单一真值源：BrandHeader.ink_rect() 与 splash_motion.MotionSpec 的 ink_*
+#    字段都引用本常量 —— od45 两边各存一份取整值（splash_motion 用
+#    0.0270/0.1745/0.948/0.638），落点会差 ≤0.16%。od46 统一到这里。
+INK_FRAC = (31.0 / 1120.0, 46.0 / 263.0, 1060.0 / 1120.0, 168.0 / 263.0)
 
 _cache: dict[tuple[str, int, int], tuple[QPixmap | None, float]] = {}
 _CACHE_LIMIT = 8
@@ -315,6 +322,61 @@ class BrandHeader(QWidget):
         self._vehicle_text = value
         self.update()
 
+    def lockup_rect(self) -> QRectF:
+        """队标组合在本控件**局部**坐标里的矩形（逻辑像素，含 SVG 整张 bounding）。
+
+        开屏播放器用它在运行时把视频里的 logo 精确拉到这个位置（见 splash_anim）。
+        """
+        if self._lockup is None or self._lockup_h <= 0.0:
+            return QRectF()
+        lockup_w = float(self._lockup.width()) / max(
+            1.0, self._lockup.devicePixelRatio())
+        left = float(CARD_PAD + SHADOW_PAD)
+        top = (float(self.height()) - self._lockup_h) / 2.0
+        return QRectF(left, top, lockup_w, self._lockup_h)
+
+    # 墨迹相对 lockup 整张内容盒的分数，单一真值源见模块级 INK_FRAC
+    # （splash_motion.MotionSpec 也引用它，保证开屏落点与 UI 墨迹盒同源）。
+    _INK_FRAC = INK_FRAC
+
+    def _drawn_lockup_rect(self) -> QRectF:
+        """队标**实际绘制**矩形（逻辑像素），含窄窗等比缩放。
+
+        ⛔ od46：``ink_rect()`` 必须基于这里，不能用 ``lockup_rect()``。
+        窗口窄到 ``avail < lockup_w`` 时（Windows 1/4 分屏 480px，队标规定
+        至少 560px），``paintEvent`` 会等比缩到 avail 再画；``lockup_rect()``
+        仍报完整 560 宽 → 开屏落点偏 119~244 物理 px（多机型验证矩阵实测）。
+        """
+        if self._lockup is None or self._lockup_h <= 0.0:
+            return QRectF()
+        lockup_w = float(self._lockup.width()) / max(
+            1.0, self._lockup.devicePixelRatio())
+        left = float(CARD_PAD + SHADOW_PAD)
+        height = float(self.height())
+        avail = max(1.0, float(self.width()) - 2.0 * left)
+        if lockup_w > avail:
+            draw_h = self._lockup_h * (avail / lockup_w)
+            return QRectF(left, (height - draw_h) / 2.0, avail, draw_h)
+        return QRectF(left, (height - self._lockup_h) / 2.0,
+                      lockup_w, self._lockup_h)
+
+    def ink_rect(self) -> QRectF:
+        """墨迹盒在本控件**局部**坐标（逻辑像素）。开屏播放器据此把视频墨迹拉到真实位置。"""
+        lr = self._drawn_lockup_rect()
+        if lr.isEmpty():
+            return QRectF()
+        fx, fy, fw, fh = self._INK_FRAC
+        return QRectF(lr.x() + fx * lr.width(), lr.y() + fy * lr.height(),
+                      fw * lr.width(), fh * lr.height())
+
+    def ink_global_rect(self) -> QRectF:
+        """墨迹盒在**全局（桌面逻辑）坐标**里的矩形。"""
+        local = self.ink_rect()
+        if local.isEmpty():
+            return local
+        gx, gy = self.mapToGlobal(QPoint(int(local.x()), int(local.y())))
+        return QRectF(float(gx), float(gy), local.width(), local.height())
+
     def paintEvent(self, event) -> None:
         # 换显示器会换 DPI，这里顺手校一次；就是一次浮点比较，可以每帧做
         if self._screen_ratio() != self._dpr:
@@ -333,11 +395,22 @@ class BrandHeader(QWidget):
         lockup_right = left
         lockup_h = self._lockup_h
         if self._lockup is not None and lockup_h > 0.0:
-            top = (height - lockup_h) / 2.0
             # 位图带 devicePixelRatio，按逻辑坐标直接画就是全物理像素分辨率
-            painter.drawPixmap(QPointF(left, top), self._lockup)
-            lockup_right = left + float(self._lockup.width()) / max(
+            lockup_w = float(self._lockup.width()) / max(
                 1.0, self._lockup.devicePixelRatio())
+            avail = max(1.0, right - left)
+            if lockup_w > avail:
+                # 窗口窄到放不下整组队标（Windows 1/4 分屏 = 480px，而 VIS 规定
+                # 横排组合至少 560px）：**等比缩到可用宽度**，而不是把右边切掉。
+                # 队标是品牌资产，宁可整体小一号，也不能少半截。
+                draw_h = lockup_h * (avail / lockup_w)
+                target = QRectF(left, (height - draw_h) / 2.0, avail, draw_h)
+                painter.drawPixmap(target, self._lockup, QRectF(self._lockup.rect()))
+                lockup_right = left + avail
+            else:
+                top = (height - lockup_h) / 2.0
+                painter.drawPixmap(QPointF(left, top), self._lockup)
+                lockup_right = left + lockup_w
 
         # 产品名右对齐到最右端。窗口太窄时宁可不画，也不让它压到队标上 ——
         # 队标是品牌资产，任何情况下不能被盖住。

@@ -40,7 +40,7 @@ def x_of(widget, dialog) -> int:
 
 
 def dump_rows(dialog, tag: str) -> None:
-    print(f"\n[{tag}] 下拉={dialog.cmb_vehicle.currentText()!r} "
+    print(f"\n[{tag}] 下拉={dialog.cmb_vehicle_number.currentText()!r} "
           f"模组个数框={dialog.spin_vehicle_modules.value()} "
           f"逐模组行={len(dialog._module_rows)}")
     print("       旧三件套可见 =",
@@ -127,11 +127,11 @@ def main() -> int:
         pump(app, 300)
         dump_rows(dialog, "删掉当前车之后")
         print("       active_profile() =", customization.active_profile())
-        print("       下拉条目 =", [dialog.cmb_vehicle.itemText(i)
-                                for i in range(dialog.cmb_vehicle.count())])
-        if dialog.cmb_vehicle.currentText() != "（未选择）":
+        print("       下拉条目 =", [dialog.cmb_vehicle_number.itemText(i)
+                                for i in range(dialog.cmb_vehicle_number.count())])
+        if dialog.cmb_vehicle_number.currentText() != "（未选择）":
             FAILS.append(f"删当前车后下拉应显示（未选择），实际 "
-                         f"{dialog.cmb_vehicle.currentText()!r}")
+                         f"{dialog.cmb_vehicle_number.currentText()!r}")
         if customization.active_profile() is not None:
             FAILS.append("删当前车后 active_profile 应为 None")
         if dialog._module_rows:
