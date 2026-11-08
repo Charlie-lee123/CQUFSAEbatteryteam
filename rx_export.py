@@ -226,10 +226,6 @@ class Session:
         self._kind = None
         self._last_index = 0
 
-    @property
-    def round_count(self) -> int:
-        return len(self._rounds) + (1 if self._cur else 0)
-
     def rounds(self) -> list[dict]:
         out = list(self._rounds)
         if self._cur and (self._cur["volt"] or self._cur["temp"] or self._frame):

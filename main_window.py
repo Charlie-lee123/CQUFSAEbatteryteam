@@ -1256,8 +1256,6 @@ class MainWindow(QMainWindow):
         # 容器（下面那个 content）。白边值不变，仍是为了卡片自带的那圈阴影空隙。
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(GAP - SHADOW_PAD * 2)
-        # 布局句柄留给 _apply_compact：分屏收窄时这些边距/间距要整档改
-        self._root_lay = root
 
         # 自绘标题栏：三颗窗口键 + 可拖拽区。**不进任何会被隐藏的分组**——
         # 接收区展开时页头/配置卡/发送卡都会藏，标题栏必须留着（用户要求
@@ -2894,12 +2892,6 @@ class MainWindow(QMainWindow):
         self._morph_from = QRect(start)
         self._morph_to = QRect(end)
         self._morph_tween.start(0.0, 1.0, duration)
-
-    def _play_window_morph(self, pixmap, start: QRect, end: QRect,
-                           duration: int = 240) -> None:
-        """兼容入口：先建再跑（两步合一）。"""
-        label = self._begin_window_morph(pixmap, start)
-        self._run_window_morph(label, start, end, duration)
 
     def _on_morph_frame(self, t: float) -> None:
         label, a, b = self._morph_label, self._morph_from, self._morph_to
