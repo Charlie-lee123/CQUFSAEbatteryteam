@@ -6,13 +6,13 @@
 是通用串口终端，它**认识这些数据**——按段正确着色、把采样点排成等宽网格、出问题时
 一键跳到异常点。车检和调试时打开就能读数，不用再肉眼在终端里找数字。
 
-当前版本：**v2.6**（2026-11-08）· Windows 10 / 11（64 位）· 约 27.5 MB
+当前版本：**v2.6**（2026-11-08）· Windows 10 / 11（64 位）· 单文件 exe 约 48 MB / 安装包约 49 MB
 
 ## 一键下载
 
 **推荐：安装版**（可选安装位置、自动建桌面快捷方式、带卸载程序、新版自动替换旧版）
 
-[![下载安装包](https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E4%B8%8B%E8%BD%BD-%E5%AE%89%E8%A3%85%E7%89%88%20Setup-2ea44f?logo=github&logoColor=white)](https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant-setup-2.4.exe)
+[![下载安装包](https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E4%B8%8B%E8%BD%BD-%E5%AE%89%E8%A3%85%E7%89%88%20Setup-2ea44f?logo=github&logoColor=white)](https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases/latest/download/SerialAssistant-setup-2.6.exe)
 
 **免安装版**（单文件，下载后双击即用）
 
@@ -47,6 +47,15 @@
 5. **一台车一套结构**——车辆档案里存着模组个数与**每个模组**的电芯/温度采集数，
    换车换档案，不用每次手改三遍参数；接收区按模组排版。
 6. **能给 AI 用**——内置 MCP 服务，你的 Agent 可以直接开关串口、收发数据、等回包。
+
+## 近期版本重点
+
+- **v2.6（2026-11-08）**：车辆（电池箱）切换动画彻底修干净。根因是车号下拉接了 `currentIndexChanged`——程序化重建也会触发，形成「选中 → 刷新 → 误判取消选车 → 再选中」的自激环，把逐模组行反复重建成 0 行（现象：**模组数 5 却一行 Module 都没有**，下方内容上移后旧帧残留成淡重影）。改用 `activated`（只有用户真正从下拉选中才发）断掉自激，并加**落定自愈**（行数 ≠ 当前车模组数时按档案重建）+ **滚动视口强制同步重绘**；保留高斯模糊过渡。构建改为单文件 ONEFILE，包体约 48MB。
+- **v2.5（2026-10-30）**：改名「CQUFSAE 串口助手」；新增结构化导出（数据 CSV / 数据 JSON，电芯按 mV 整数、温度一位小数）。
+- **v2.4（2026-10-24）**：断线标记（洋红 `X`）、BMS Error 只标原字、历史回放与实时逐行一致；包体 34.4 → 27.5MB。
+- **v2.2（2026-10-18）**：动画逐帧审计与修复、升级保留用户数据、多车型档案（车辆可增删改名、逐模组配置）。
+
+完整清单见下方「版本历史」。
 
 ## v2.3 新特性
 
@@ -246,7 +255,7 @@ SerialAssistant.exe --mcp-payload D:\mcp.txt      # 指定路径
 
 ### 安装
 
-双击 `SerialAssistant-setup-2.4.exe`，选好目录一路下一步即可（免管理员权限）。装完
+双击 `SerialAssistant-setup-2.6.exe`，选好目录一路下一步即可（免管理员权限）。装完
 自动建桌面快捷方式；以后有新版本，重新跑一遍新安装包会**自动移除旧版本**，你的配置、
 日志和接收历史都原封不动。
 
@@ -284,21 +293,73 @@ BMS ERROR               ← BMS 状态（橙），到此为止：其后的数值
 
 ---
 
-## 给开发者的
+## 开发者指南（给后来者）
 
-- **自测**：`selftest.py` 27 项用例（收发 / 着色 / 全屏 / 标题栏 / 建链 / 蓝牙广播 /
-  MCP 接入包 / 安装卸载流程）
-  `QT_QPA_PLATFORM=windows .venv/Scripts/python.exe selftest.py`
-- **打包**：`build.bat`（PyInstaller）→ 产物在 `dist/`，复制到 `发布/`
-- **安装包**：`python devtools/_build_installer.py`（Inno Setup，版本号从 `version.py`
-  现读；向导图先跑 `python devtools/_make_installer_art.py` 生成）
-- **安装/卸载体检**：`python devtools/_installer_check.py`（隔离目录全流程，不动真实安装）
-- **README 配图**：`python devtools/_make_readme_shots.py`（用当前代码现渲染，深/浅主题
-  各一张，数据是造的、裁剪按控件几何现算——改版之后重跑一次就行）
-- **静态检查**：`ruff check --select F,E7,E9 *.py devtools/*.py` + `vulture *.py`（基线零告警）
-- **MCP 服务**：`mcp/serial_assistant_mcp.py`（stdio，独立于 GUI 进程）；接入包文案在
-  `mcp_bridge.py`，源码由 `SerialAssistant.spec` 打进 exe（`datas` 里的 `mcp/`），
-  改完服务记得重打包——否则设置面板复制出来的还是旧源码
+### 项目结构
+
+| 路径 | 作用 |
+| --- | --- |
+| `main.py` | 程序入口：构造 `MainWindow`、驱动开屏与主事件循环 |
+| `main_window.py` | 主窗口框架（无边框、最大化/还原覆盖层动画、启动冻结期） |
+| `ui_*.py` | UI 模块：`ui_settings`（设置面板 + 车辆/模组行）、`ui_theme`（主题/材质）、`ui_anim`（补间时间线）、`ui_brand`（页头）、`ui_controls`/`ui_surface`/`ui_backdrop`/`ui_highlight` |
+| `rx_*.py` | 接收链路：`rx_protocol`（分段解析）、`rx_store`（着色/网格）、`rx_history`（历史留存）、`rx_export`（结构化导出 CSV/JSON） |
+| `serial_io.py` / `ble_io.py` | 串口与 BLE 广播（后者惰性 import） |
+| `customization.py` | 用户设置（QSettings）与车辆档案 |
+| `vehicle_share.py` | 车辆档案共享/在线车辆库，PAT 经 DPAPI 加密 |
+| `updater.py` | 自动更新（多源 + SHA256 校验） |
+| `splash_anim.py` / `splash_motion.py` | 开屏动画（真高斯模糊 + 纯 QPainter 几何） |
+| `mcp_bridge.py` / `mcp/` | MCP 接入包文案与 stdio 服务源码（随包发布） |
+| `selftest.py` | 自测套件 |
+| `SerialAssistant.spec` | PyInstaller **单文件（ONEFILE）**构建配方（必须进仓库） |
+| `devtools/` | 开发/验证脚本：探针、录屏、PYZ 指纹、发版 |
+| `assets/` | 图标 `app.ico`、开屏素材（mp4/poster/json；逐帧 `*_frames/` 不进仓库） |
+| `发布/` | 最终交付物（`SerialAssistant.exe` 单文件 + `SerialAssistant-setup-2.6.exe` 安装包），**不进 git** |
+| `installer/` | Inno Setup 脚本 |
+
+### 开发环境
+
+- Python 3.11 + 虚拟环境 `.venv`（已建好）；依赖：`pip install -r requirements.txt`
+- 从源码运行：`.venv/Scripts/python.exe main.py`
+- 静态检查（提交前必须零告警）：`ruff check --select F,E7,E9,W6 *.py devtools/*.py` + `vulture --min-confidence 60 *.py`
+
+### 构建流程（单文件 ONEFILE）
+
+```bash
+pyinstaller SerialAssistant.spec --distpath dist_odNN
+cp dist_odNN/SerialAssistant.exe 发布/
+# 校验打包产物
+.venv/Scripts/python.exe devtools/_verify_od63_pyz.py   # PYZ 符号指纹（断言关键补丁已进包）
+SerialAssistant.exe --check-splash                       # 开屏资源
+SerialAssistant.exe --check-net                          # HTTPS/网络（Schannel）
+# 安装包（Inno Setup，版本号从 version.py 现读）
+.venv/Scripts/python.exe devtools/_build_installer.py
+# 回写 SHA256 供自动更新（写进 version.py 的 LATEST_EXE_SHA256 / LATEST_SETUP_SHA256）
+.venv/Scripts/python.exe -c "import hashlib,pathlib;print(hashlib.sha256(pathlib.Path('发布/SerialAssistant.exe').read_bytes()).hexdigest())"
+```
+
+### 自测
+
+```bash
+QT_QPA_PLATFORM=windows .venv/Scripts/python.exe selftest.py
+```
+
+必须全绿（收发 / 着色 / 全屏 / 标题栏 / 建链 / 蓝牙广播 / MCP 接入包 / 安装卸载流程）；涉及新产物要先重打包 + 验 PYZ + 冒烟。
+
+### 开发工具（devtools/）
+
+- `_verify_od63_pyz.py`：抽 PYZ 递归查符号，断言关键补丁（如车号动画的 `[H]`/`[I]` 段）确实打进包。
+- `_probe_*` / `_record_*` / `_analyze_*`：复现与录屏各类动画/残留问题，输出 `geom.json` 或逐帧 PNG 供判断。
+- `_build_installer.py` / `_make_installer_art.py` / `_installer_check.py`：安装包生成与隔离体检。
+- `_github_release.py`：发版脚本（上传 exe + setup 到 GitHub Release，回写 SHA256 到 `version.py`）。
+- `_make_app_icon.py`：从 SVG 重绘 `assets/app.ico`（换标只换 `--svg`）。
+
+### 关键约定
+
+- ⛔ **未经允许不要 commit/push**；版本号由维护者定。
+- ⛔ 严禁在探针/脚本里**重置用户设置**：凡动 QSettings 必须 `finally` 还原快照。
+- ⚠️ 本项目可能**并行会话**同时改同一工作区，重打包前先确认 `main_window.py` 的 mtime 不再变化。
+- 新增 C 扩展必须同步改 `SerialAssistant.spec` 的 `excludes`，否则打包版启动即崩；`libcrypto/libssl-3.dll`（HTTPS 更新）**不能删**；`assets/splash` 必须进包。
+- 桌面快捷方式指向 `发布\SerialAssistant.exe`，图标指向独立的 `发布\app.ico`（不要直接抽 50MB 单文件 exe 的图标，会超时变白纸）。
 
 ## 版本
 
@@ -315,13 +376,13 @@ BMS ERROR               ← BMS 状态（橙），到此为止：其后的数值
 | v1.8 | 2026-10-13 | 安装程序与卸载程序（Inno Setup）；本地留存行数与接收区一致；软件内回放留存数据 |
 | v2.0 | 2026-10-15 | **蓝牙广播接收**（只扫描、不配对、不绑定）+「连接方式」切换 + `--ble-scan` 探针；**建链不卡界面**（可取消）；整项目瘦身（3.7GB→0.9GB）；安装器主题化 + 自动移除旧版本；修复自动更新「退出并重启」报错等 3 处问题 |
 | v2.1 | 2026-10-17 | **MCP 接入**（9 个工具的串口服务，源码随包走；设置面板一键复制部署包，粘给 Agent 即自动装好；`--mcp-payload` 命令行导出；该入口 v2.2 起名为「MCP Service」）；**包体 52.6MB → 35.2MB（−33%）**；**冷启动导入 −23%**（蓝牙模块惰性加载）；清理死代码与孤儿通道；修复普通窗口几何被写成无效值 |
-| v2.6 | 2026-11-08 | **车辆（电池箱）切换动画彻底修干净**：真根因是「车号下拉接的是 `currentIndexChanged`」——程序化重建下拉也会触发，形成「选中→刷新→误判取消选车→再选中」的自激环，把逐模组行反复重建成 **0 行**（现象：**模组数 5 却一行 Module 都没有**，下方内容上移后旧帧残留成淡重影）。改用 `activated`（只有用户真正从下拉里选中才发）断掉自激；并加**落定自愈**（行数≠当前车模组数时按档案重建）与 **body/滚动视口强制同步重绘**（消除陈旧帧）。保留高斯模糊过渡。清理死代码、构建日志与 89MB 逐帧开发素材不再进仓库。 |
-| v2.5 | 2026-10-30 | **改名**：CQUFSAE 串口调试助手 → **CQUFSAE 串口助手**（窗口标题 / 页头 / 安装向导 / 快捷方式 / 报错弹窗；内部标识、配置键、日志目录、AppId 全部不变，升级不丢配置与历史）。**新增结构化导出**：设置 → 日志 → 「数据 CSV / 数据 JSON」，把已接收的电压/温度导成宽表（一行 = 一轮里的一个模组，电芯按 mV 整数、温度一位小数、同轮共用时间戳）或嵌套 JSON，Excel / pandas 直接可用；采集在收包当下做（不受暂停/清空/回放影响），分包帧自动合并，配置对不上时保留残缺模组。 |
-| v2.4 | 2026-10-24 | **断线标记**：相邻电芯压差达「断线阈值」时，在异常电芯那一侧插一个洋红加粗的 `X`（偏低标右边、偏高标左边；一号电芯用本模组正常电芯平均值判定；不改变列对齐）。**BMS Error 只标那几个字**且不再区分大小写（真机发的是 `BMS Error`）。**接收区排版不再改动设备发来的行**（不再 4+4 合并成一行 8 个），空行固定出现在每个 `VoltageN:` / `TemperatureN:` / `BMS` 之上。**历史回放与实时逐行一致**，打开即停在最新一轮。设置面板不再裁掉右侧输入框。**包体 34.4MB → 27.5MB（−20%）**：去掉 Qt 多语翻译库、Qt 的 OpenSSL 后端（改用系统 Schannel，新增 `--check-net` 在产物上验 HTTPS）以及未用的标准库模块；全量缺陷排查修掉 10 处（含安装版自动更新必然失败、打开设置点确定会改配置等）。**检查/下载更新改为多源并行**（无代理约 1 秒出结果、下载多源抢跑）。 |
-| v2.3.2 | 2026-10-23 | 数字框**数据居中**（赛季/车号/模组数）、逐模组两组输入间距加大；赛季与模组数**去掉上下箭头**（只手动输入）；修掉浅色主题下拉展开后的一圈**方框**（Win11 给弹层画的是方角阴影，改由系统按圆角出阴影） |
-| v2.3.1 | 2026-10-23 | 校验位下拉改英文（None/Odd/Even/Mark/Space，老中文配置自动归一）；逐模组行标题改 Module N；无车时车号框占位文字缩短不再被截 |
-| v2.3 | 2026-10-22 | **界面细节收口**：下拉框按内容定宽、车辆行「赛季 / 车号 / ＋ / 模组数」一排、加号去描边；页头显示当前赛季与车号（对齐标题中轴）；数量框去量词、圆角与数字居中；数字框竖直居中改用字体度量（不再依赖抓图）；**包体 35.2MB → 34.4MB**（裁 12 个未用 Qt 插件）＋死代码清理 |
 | v2.2 | 2026-10-18 | **动画逐帧审计与修复**：设置面板打开/关闭「最后一帧闪/往左跳」真根因（DWM 扩展边框裁剪符号写反，快照位图右偏 7px）与换帧白帧竞态；退出最大化时发送区整块弹出；串口开关展开回抽；搜索条改 220ms；接收区转场改为单补间驱动。**升级保留用户数据**（日志与接收历史迁到 `%LOCALAPPDATA%`，安装器拆旧版前备份再搬回）。历史数据改「打开/关闭」toggle。**暂停/恢复动画改补间驱动**（工具栏收展、暂停定位滚动、恢复追底都不再硬跳）。「AI 接入」改名「MCP Service」。代码净化（定制配置 O(1) 索引、去死代码、静态检查零告警）。**多车型档案**（车辆可增删改名，选车即定模组个数，逐模组配置电芯/温度采集数，接收区按模组排版且在模组内均衡拆行）；**蓝牙设备下拉**修掉开合跳变与出屏 |
+| v2.3 | 2026-10-22 | **界面细节收口**：下拉框按内容定宽、车辆行「赛季 / 车号 / ＋ / 模组数」一排、加号去描边；页头显示当前赛季与车号（对齐标题中轴）；数量框去量词、圆角与数字居中；数字框竖直居中改用字体度量（不再依赖抓图）；**包体 35.2MB → 34.4MB**（裁 12 个未用 Qt 插件）＋死代码清理 |
+| v2.3.1 | 2026-10-23 | 校验位下拉改英文（None/Odd/Even/Mark/Space，老中文配置自动归一）；逐模组行标题改 Module N；无车时车号框占位文字缩短不再被截 |
+| v2.3.2 | 2026-10-23 | 数字框**数据居中**（赛季/车号/模组数）、逐模组两组输入间距加大；赛季与模组数**去掉上下箭头**（只手动输入）；修掉浅色主题下拉展开后的一圈**方框**（Win11 给弹层画的是方角阴影，改由系统按圆角出阴影） |
+| v2.4 | 2026-10-24 | **断线标记**：相邻电芯压差达「断线阈值」时，在异常电芯那一侧插一个洋红加粗的 `X`（偏低标右边、偏高标左边；一号电芯用本模组正常电芯平均值判定；不改变列对齐）。**BMS Error 只标那几个字**且不再区分大小写（真机发的是 `BMS Error`）。**接收区排版不再改动设备发来的行**（不再 4+4 合并成一行 8 个），空行固定出现在每个 `VoltageN:` / `TemperatureN:` / `BMS` 之上。**历史回放与实时逐行一致**，打开即停在最新一轮。设置面板不再裁掉右侧输入框。**包体 34.4MB → 27.5MB（−20%）**：去掉 Qt 多语翻译库、Qt 的 OpenSSL 后端（改用系统 Schannel，新增 `--check-net` 在产物上验 HTTPS）以及未用的标准库模块；全量缺陷排查修掉 10 处（含安装版自动更新必然失败、打开设置点确定会改配置等）。**检查/下载更新改为多源并行**（无代理约 1 秒出结果、下载多源抢跑）。 |
+| v2.5 | 2026-10-30 | **改名**：CQUFSAE 串口调试助手 → **CQUFSAE 串口助手**（窗口标题 / 页头 / 安装向导 / 快捷方式 / 报错弹窗；内部标识、配置键、日志目录、AppId 全部不变，升级不丢配置与历史）。**新增结构化导出**：设置 → 日志 → 「数据 CSV / 数据 JSON」，把已接收的电压/温度导成宽表（一行 = 一轮里的一个模组，电芯按 mV 整数、温度一位小数、同轮共用时间戳）或嵌套 JSON，Excel / pandas 直接可用；采集在收包当下做（不受暂停/清空/回放影响），分包帧自动合并，配置对不上时保留残缺模组。 |
+| v2.6 | 2026-11-08 | **车辆（电池箱）切换动画彻底修干净**：真根因是「车号下拉接的是 `currentIndexChanged`」——程序化重建下拉也会触发，形成「选中 → 刷新 → 误判取消选车 → 再选中」的自激环，把逐模组行反复重建成 **0 行**（现象：**模组数 5 却一行 Module 都没有**，下方内容上移后旧帧残留成淡重影）。改用 `activated`（只有用户真正从下拉里选中才发）断掉自激；并加**落定自愈**（行数 ≠ 当前车模组数时按档案重建）与 **body/滚动视口强制同步重绘**（消除陈旧帧）。保留高斯模糊过渡。构建改为单文件 ONEFILE，包体约 48MB；清理死代码、构建日志与逐帧开发素材不再进仓库。 |
 
 ## License
 

@@ -1,0 +1,26 @@
+==============================================================================
+最大化/还原覆盖层状态机连续性自检（od46 R1/R2 不变量）
+==============================================================================
+
+[1] R1 空闲快照自重试
+  [PASS] R1 空闲快照自重试就位 (<=1.5s)  — _fs_idle_pix=已建
+
+[2] R2 覆盖层底色同步缩放（进全屏首帧零跳变）
+  [PASS] R2 内容层起步矩形 == start  — label.geometry=PySide6.QtCore.QRect(120, 80, 400, 300)
+  [PASS] R2 底色层起步矩形 == start (非整屏)  — bg.geometry=PySide6.QtCore.QRect(120, 80, 400, 300)
+
+[3] 连续性 + 收尾状态还原
+  [PASS] 连续性 覆盖层矩形单调长大 (无回退/无抖)  — 采样 5 帧
+  [PASS] 连续性 bg 与 label 逐帧几何一致 (同步缩放)  — 5/5 帧有 bg
+  [PASS] 收尾 无残留覆盖层控件  — label=None bg=None
+  [PASS] 收尾 主窗 opacity 复位 1.0  — opacity=1.0
+  [PASS] 收尾 DWM 过渡旗复位 False  — _dwm_transition_off=False
+
+[4] DWM 过渡旗生命周期
+  [PASS] DWM 旗 _set_dwm_transitions(True) 置位  — _dwm_transition_off=True
+  [PASS] DWM 旗 _finish_window_cover() 对称复位  — _dwm_transition_off=False
+
+==============================================================================
+汇总：10/10 PASS，0 SKIP，0 FAIL
+（SKIP 多因 offscreen 无 screen()；真机 windows 平台下应全部 PASS）
+==============================================================================
