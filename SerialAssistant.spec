@@ -77,7 +77,13 @@ a = Analysis(
     # 是 PYZ 收集的唯一引用点；显式列进 hiddenimports 做双保险（零体积成本）。
     # _snap_worker 是 main_window 顶部的普通 import，静态分析能收到；同样列进来
     # 做双保险 —— 它一旦漏包，最大化/还原会退化成现场同步抓（用户报的"卡"回归）。
-    hiddenimports=['splash_motion', '_snap_worker'],
+    hiddenimports=['splash_motion', '_snap_worker',
+                   # ⛔⛔ 2026-11-08 修「在线车辆库」全挂：urllib/socket 走主机名要用
+                   #    idna 编解码器（encodings.idna），它内部 import unicodedata。
+                   #    之前把 unicodedata 排掉 → 冻结环境里 idna 加载失败 →
+                   #    "LookupError: unknown encoding: idna"，所有 urllib 请求（索引拉取、
+                   #    上传）全废。三者一起显式收进来，不再依赖动态探测。
+                   'encodings.idna', 'stringprep', 'unicodedata'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -110,10 +116,13 @@ a = Analysis(
         # tarfile 只被 `shutil.unpack_archive` 引用（本项目只用 shutil.copyfile
         # 干"覆盖 exe"那件事，从不解压），连带 _lzma/_bz2 一起省 0.36MB。
         'tarfile', 'lzma', '_lzma', 'bz2', '_bz2',
-        # unicodedata（1.1MB）：唯一引用链是 pathlib→urllib.parse→unicodedata，
-        # 而 urllib.parse 里那是**函数内**的 import（只在解析非 ASCII 主机名时才走）。
-        # 本程序所有 URL 都是 ASCII 常量、且从不解析用户输入的主机名 → 不会触发。
-        'unicodedata',
+        # ⛔⛔ 2026-11-08 反转此前「排除 unicodedata」的优化：
+        #    原判断"URL 都是 ASCII 常量、urllib.parse 只在解析非 ASCII 主机名时才
+        #    import unicodedata → 不会触发"在**冻结后的 exe**里不成立。Python 的
+        #    urllib/socket 处理主机名必经 encodings.idna，而它内部 import unicodedata；
+        #    缺了它 → "LookupError: unknown encoding: idna"，在线车辆库（urllib 通道）
+        #    的索引拉取与上传全部失败。1.1MB 换功能正常，必须保留。
+        # 'unicodedata',
         # 注：decimal/_decimal（0.28MB）**不能删** —— random→statistics→fractions→
         #     decimal 是一条真实链，random 是刚需。
     ],

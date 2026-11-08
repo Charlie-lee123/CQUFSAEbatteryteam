@@ -997,6 +997,7 @@ class ChevronComboBox(QComboBox):
         # _fit_key = 已经量过并稳定的"字体+文字+尺寸+dpr"组合，避免重复抓图。
         self._fit_shift = 0
         self._fit_key = None
+        self._fit_retried = False
         self.currentTextChanged.connect(lambda _text: self._place_edit())
         edit = self.lineEdit()
         if edit is not None:
@@ -1073,7 +1074,15 @@ class ChevronComboBox(QComboBox):
             return                    # 这个组合量过且已稳定，别再抓图
         offset = _combo_label_ink_offset(self)
         if offset is None:
+            # ⛔ 首秀/重排瞬间 combo.grab() 可能抓到还没绘制出来的空图（show 比首帧
+            #    paint 早），量不到墨迹就退回默认偏移 —— 文字长期偏（自测里偶发的
+            #    "上留白 12 / 下留白 7"）。首帧画完后再补量一次即可，且只补一次，
+            #    避免连续空白时无限重试。
+            if not self._fit_retried:
+                self._fit_retried = True
+                QTimer.singleShot(0, self._place_edit)
             return
+        self._fit_retried = False
         base_delta = (offset - self.height() / 2.0) - self._fit_shift
         shift = int(round(-base_delta))        # 目标位移（正 = 下移）
         shift = max(-4, min(4, shift))

@@ -212,11 +212,6 @@ def path() -> str | None:
     return str(_path) if _path else None
 
 
-def current_key() -> str | None:
-    """当前历史文件对应的车号（未选车 = None）。"""
-    return _current_key
-
-
 def _safe_key(key: str | None) -> str:
     """车辆名 → 文件名安全段（非法字符换成 _，限长 80）。"""
     text = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", str(key or "").strip())

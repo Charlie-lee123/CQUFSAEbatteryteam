@@ -3964,18 +3964,6 @@ class SettingsDialog(QDialog):
         self.lbl_proto_try.setToolTip(
             f"电压模组：{result['cells']}\n温度模组：{result['temps']}")
 
-    @staticmethod
-    def _elide_middle(text: str, limit: int = 52) -> str:
-        """超长的绝对路径在**中间**省略一段（头尾都留着，一眼能认出来是哪个盘/哪个文件）。
-
-        面板宽度有限，而横向滚动条是关着的 —— 整条路径铺开会把面板撑宽、
-        右半边被裁；这里按字符数先收一道。
-        """
-        if len(text) <= limit:
-            return text
-        keep = (limit - 1) // 2
-        return f"{text[:keep]}…{text[-(limit - 1 - keep):]}"
-
     def _export_log(self) -> None:
         """把日志文件复制一份到用户选定的位置。
 
@@ -4114,7 +4102,6 @@ class SettingsDialog(QDialog):
 
     # 本机 GitHub 直连通常不通（要靠 Clash）：第一遍走系统代理失败后，
     # 第二遍显式走本机 Clash 常用端口再试一次，还不行才报失败。
-    FALLBACK_PROXY = ("127.0.0.1", 7897)
 
     @staticmethod
     def _local_version() -> tuple:

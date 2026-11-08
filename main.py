@@ -31,7 +31,7 @@ _aud("start")  # 进程启动（main 模块被加载的最早时刻）
 # 其它模块（如设置面板）要从 version.py 取，不能反向 import 这里。
 from version import VERSION as __version__
 
-from PySide6.QtCore import QSettings, QTimer, QUrl
+from PySide6.QtCore import QSettings, QTimer, QUrl, Qt
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWidgets import QApplication
 
@@ -224,6 +224,43 @@ def _run_check_net(argv: list[str]) -> int:
     return 0 if ok_count else 1
 
 
+def _run_check_vehicles(argv: list[str]) -> int:
+    """`--check-vehicles`：不进界面，用车辆库**同一条 urllib 通道**拉一次在线索引。
+
+    与 ``--check-net``（走 Qt QNetworkAccessManager）是**不同**的网络栈。在线车辆库
+    的所有请求都走 Python ``urllib``（vehicle_share._open → _race），2026-11-08 曾因
+    spec 排除 unicodedata 导致 encodings.idna 加载失败、urllib 全挂
+    （"LookupError: unknown encoding: idna"）。本探针直接复现该路径，用来确认
+    重建后的产物里 urllib 真的可用。结果写 exe 同目录 ``vehicle_check.txt``。
+    """
+    import app_log
+    import json as _json
+    import vehicle_share
+
+    out = os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
+                       "vehicle_check.txt")
+    urls = vehicle_share.remote_index_urls()
+    payload, source, error = vehicle_share._race(urls, 8.0)
+    if payload is None:
+        text = f"FAIL urllib 通道不可用\nerror={error}\nsources={list(urls)}\n"
+        code = 1
+    else:
+        try:
+            doc = _json.loads(payload)
+            packs = doc.get("packs", [])
+            text = f"OK source={source} packs={len(packs)}\n"
+            code = 0
+        except Exception as exc:                     # noqa: BLE001
+            text = f"OK-fetch-but-parse-fail source={source} err={exc!r}\n"
+            code = 0
+    try:
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except OSError as exc:
+        app_log.error(f"--check-vehicles 写结果失败: {exc}")
+    return code
+
+
 def _run_ble_scan(argv: list[str]) -> int:
     """`--ble-scan [秒数] [manufacturer|service] [key]`：不进界面，扫 BLE 广播。
 
@@ -322,6 +359,11 @@ def main() -> int:
     if "--check-net" in sys.argv:
         return _run_check_net(sys.argv)
 
+    # 命令行探针：用车辆库**同一条 urllib 通道**拉一次在线索引（验证 2026-11-08
+    # 的 unicodedata 排除导致 encodings.idna 失效、urllib 全挂的修复是否真的生效）。
+    if "--check-vehicles" in sys.argv:
+        return _run_check_vehicles(sys.argv)
+
     # 命令行探针：只扫 BLE 广播、不进界面（验证产物 / 查自己的设备）
     if "--ble-scan" in sys.argv:
         return _run_ble_scan(sys.argv)
@@ -340,6 +382,15 @@ def main() -> int:
     import app_log
     app_log.init()
     app_log.info("=" * 8 + f" 软件启动 v{__version__} " + "=" * 8)
+
+    # 高 DPI / 多屏适配：固定缩放取整策略为 PassThrough，使 125%/150%/175% 等分数
+    # 缩放下也按物理像素精确缩放（不留整数取整导致的模糊）；整数缩放（如本机 dpr=2）
+    # 行为不变。必须在 QApplication 创建前设置。
+    try:
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    except Exception:  # noqa: BLE001 - 极老 Qt 无该 API 时静默跳过
+        pass
 
     app = QApplication(sys.argv)
     _aud("qapp")  # QApplication 创建完成

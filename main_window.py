@@ -3443,6 +3443,16 @@ class MainWindow(QMainWindow):
         """
         if label is None:
             return
+        # ⛔ 覆盖层是独立顶层窗，可能已被 Qt 析构（窗口关闭/连点切换时，_finish_window_cover
+        # 的 deleteLater 先落地，而本函数由 48ms 延迟定时器兜底调用）—— 此刻拿到的
+        # 是已删除的 C++ 对象，下面任何方法调用都会抛 "Internal C++ object already
+        # deleted"。先探活，死了就安静退出（状态切换早已发生，覆盖层只是装饰）。
+        try:
+            from shibokensupport import sip
+            if sip.isdeleted(label):
+                return
+        except Exception:  # noqa: BLE001 - sip 探测失败就按"活着"继续走原路径
+            pass
         if start == end or not animations_enabled():
             self._finish_window_cover()
             return
@@ -4633,12 +4643,18 @@ class MainWindow(QMainWindow):
         不这么做的话用户得重启才看得到反馈（这个开关字面上只管"下次打开"，
         但拨完能立刻看到变化更省事），关掉时复用 ``_on_escape`` 那条链 ——
         它顺手把"想要全屏"降下来，且展开态优先收展开。
+
+        ⛔「想要全屏」先严格跟随开关：无论当下是全屏还是普通态、收起还是展开，
+        标志位立刻等于配置。旧实现只在过渡分支里（startup_fullscreen /
+        _on_escape 内部）写它 —— 一旦因状态判断没进分支（例如窗口还卡在进全屏
+        动画途中 isFullScreen 已为真、或接收区正展开），标志位就停在旧值，
+        表现为「拨回开却没当场要全屏」、或关掉后仍被 _verify_fullscreen 钉回全屏。
         """
-        if customization.get("startup_maximized"):
+        self._want_fullscreen = bool(customization.get("startup_maximized"))
+        if self._want_fullscreen:
             if not self.isFullScreen() and not self._expanded:
                 self.startup_fullscreen()
         else:
-            self._want_fullscreen = False
             if self.isFullScreen() or self._expanded:
                 self._on_escape()
         self._refresh_caption_ui()
