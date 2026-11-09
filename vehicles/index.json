@@ -1,10 +1,16 @@
 {
  "schema": 1,
- "updated_at": "2026-11-09T21:15:43",
+ "updated_at": "2026-11-09T21:15:53",
  "packs": [
   {
    "name": "E74-2026",
    "file": "E74-2026.cqv.json",
+   "modules": 5,
+   "note": ""
+  },
+  {
+   "name": "A08-2026",
+   "file": "A08-2026.cqv.json",
    "modules": 5,
    "note": ""
   }
