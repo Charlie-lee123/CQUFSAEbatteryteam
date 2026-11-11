@@ -259,7 +259,9 @@ class Session:
                     cells = rnd["volt"][mod] if mod < len(rnd["volt"]) else []
                     temps = rnd["temp"][mod] if mod < len(rnd["temp"]) else []
                     row = [rnd["t"], no, mod + 1]
-                    row += [str(v) for v in cells] + \
+                    # 电压：4 位左零补齐（用户要求「电压数据都要是 4 位的，不足前面加零」）；
+                    # 温度保持原样不补。``v`` 已是 ``_value_of`` 解析出的 int（0..9999）。
+                    row += [f"{v:04d}" for v in cells] + \
                            ["" for _ in range(n_cells - len(cells))]
                     row += [str(t) for t in temps] + \
                            ["" for _ in range(n_temps - len(temps))]

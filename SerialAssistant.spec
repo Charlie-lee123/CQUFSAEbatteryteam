@@ -78,6 +78,13 @@ a = Analysis(
     # _snap_worker 是 main_window 顶部的普通 import，静态分析能收到；同样列进来
     # 做双保险 —— 它一旦漏包，最大化/还原会退化成现场同步抓（用户报的"卡"回归）。
     hiddenimports=['splash_motion', '_snap_worker',
+                   # 可选 DLC 运行时：main_window 顶部普通 import，静态分析能收到；
+                   # 显式列一份做双保险（插件本身是外部目录，不进 PYZ）。
+                   'dlc_host',
+                   # ⛔ 四状态 EKF 是 main_window._init_soc() 里的**函数内** import
+                   #   （只有开关打开时才走到），静态分析容易漏。漏包会让开关
+                   #   静默回退原算法、界面毫无提示 —— 显式收进来做双保险。
+                   'soc_ekf',
                    # ⛔⛔ 2026-11-08 修「在线车辆库」全挂：urllib/socket 走主机名要用
                    #    idna 编解码器（encodings.idna），它内部 import unicodedata。
                    #    之前把 unicodedata 排掉 → 冻结环境里 idna 加载失败 →

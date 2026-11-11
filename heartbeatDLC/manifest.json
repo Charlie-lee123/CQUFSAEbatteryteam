@@ -1,0 +1,13 @@
+{
+  "id": "heartbeatDLC",
+  "name": "心率广播 DLC",
+  "version": "1.0.0",
+  "api": 1,
+  "min_app": "2.6",
+  "entry": "heartbeatDLC",
+  "summary": "多设备并发接收蓝牙心率广播：同屏总览 + 每台独立详情，重点支持小米手环 10 Pro（含陶瓷特别版）；每台设备独立沉浸可视化（黑底 + 红色大字 BPM + 红色网格 ECG + 红白星点场心跳闪红，心宿 jcjt.uno 同款观感），可导出 CSV。",
+  "homepage": "https://github.com/Charlie-lee123/CQUFSAEbatteryteam/releases",
+  "license": "MIT",
+  "requires": ["PySide6>=6.6", "bleak>=0.22"],
+  "notes": "小米手环 8 代及以后的标准 Heart Rate Service (0x180D / 0x2A37)；10 Pro 另有设备名兜底与 0x2A37 存在性校验。4~7 代厂商广播不在范围内。多设备并发上限受电脑蓝牙适配器限制。每台设备详情页内置沉浸可视化：纯黑底 + 左上红色大字 BPM（带红光晕）+ 中部红色网格 ECG 带 + 满屏红/白星点场（每次心跳整体放大 30% 并闪红），是网页「心宿」(jcjt.uno) 同款视觉的 clean-room 功能性复刻，用 QPainter 重新实现，未复制其源代码、未引入 Three.js/WebGL。"
+}

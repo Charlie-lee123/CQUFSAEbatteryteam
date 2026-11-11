@@ -248,7 +248,7 @@ def export_csv(path: str, days: int = 7) -> int:
             writer.writerow(["时间", "车号", "模组", "电芯(mV)", "温度(℃)", "原始文本"])
             for ts, vehicle, module, cells, temps, raw in cur:
                 writer.writerow([ts, vehicle, "" if module is None else module,
-                                 _join_values(cells), _join_values(temps), raw])
+                                 _join_values(cells, 4), _join_values(temps), raw])
                 rows += 1
     except (sqlite3.Error, OSError) as exc:
         app_log.error(f"会话库导出失败: {exc}")
@@ -258,15 +258,19 @@ def export_csv(path: str, days: int = 7) -> int:
     return rows
 
 
-def _join_values(payload: str) -> str:
-    """``"[3851, 3849]"`` → ``"3851 3849"``（坏 JSON 原样返回，不炸导出）。"""
+def _join_values(payload: str, width: int = 0) -> str:
+    """``"[3851, 3849]"`` → ``"3851 3849"``（坏 JSON 原样返回，不炸导出）。
+
+    ``width > 0`` 时对每个数值按该宽度左零补齐（电压 4 位补齐用），温度等
+    传 ``0`` 保持原样。``v`` 已是 ``int``（0..9999），``:0{width}d`` 只补零不截断。
+    """
     try:
         values = json.loads(payload or "[]")
     except (TypeError, ValueError):
         return payload or ""
     if not isinstance(values, list):
         return payload or ""
-    return " ".join(str(v) for v in values)
+    return " ".join(f"{v:0{width}d}" if width else str(v) for v in values)
 
 
 # ---------------------------------------------------------------- 工作线程

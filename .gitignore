@@ -24,6 +24,9 @@ devtools/rec/
 # ---- 本机助手数据（不进仓库）----
 .workbuddy/
 
+# ---- Windows 保留设备名垃圾文件（nul 无法被任何 Win32 API 删除，仅 gitignore 排除）----
+/nul
+
 # ---- 构建日志 / 临时产物（od 轮次留下的）----
 build_*/
 _build_*.log

@@ -2503,12 +2503,28 @@ class SettingsDialog(QDialog):
             span = max(1, _VEH_BLUR_IN_END_MS - _VEH_SWAP_MS)
             p = max(0.0, min(1.0, (ms - _VEH_SWAP_MS) / float(span)))
         else:
-            # 无旧块：新块从 0 开始糊入，到让位结束(_VEH_SHIFT_MS)时已基本清晰
+            # 无旧块（未选择 → 选中）：新块「从虚到实」。
+            # ⛔⛔ 2026-11-11（用户：「从无车号到有车号过渡的时候数据要高斯模糊」）：
+            #    原先 σ 和 α 都只是 p 的函数、且方向相反 —— **σ 最大时 α≈0（看不见），
+            #    α 上来时 σ 已归零（不模糊）**，两者完全错开，感知上只剩"淡入"、没有"聚焦"。
+            #    实测（devtools/_trace_veh_blur.py）：
+            #      ms= 24 → σ=23.2 但 α=0.138（糊得看不见）
+            #      ms=300 → α=0.940 但 σ=2.5  （看得见时已经不糊了）
+            #    改法：α 用 out_cubic 在**前 45% 时间**就拉到 1（先把内容显出来），
+            #    σ 用 pow 0.45 延迟衰减（把大 σ 多留一会儿）—— 让「看得见」与
+            #    「明显模糊」重叠出 ~300ms 的真实聚焦窗口。反向（有旧块）的 P1 是
+            #    α 1→0 配 σ 0→24，本来就能看见模糊，不动。
             span = max(1, _VEH_SHIFT_MS)
             p = max(0.0, min(1.0, ms / float(span)))
         from ui_anim import EASE
-        sigma = _VEH_SIGMA_MAX * (1.0 - float(EASE(p)))
-        alpha = 1.0 - (1.0 - p) ** 3
+        if has_old:
+            # P3：σ 24→0、α 0→1（沿用原曲线，改它会改「换车号」的观感）
+            sigma = _VEH_SIGMA_MAX * (1.0 - float(EASE(p)))
+            alpha = 1.0 - (1.0 - p) ** 3
+        else:
+            ap = min(1.0, p / 0.45)
+            alpha = 1.0 - (1.0 - ap) ** 3                    # out_cubic，先显形
+            sigma = _VEH_SIGMA_MAX * ((1.0 - float(EASE(p))) ** 0.45)  # 延迟衰减
         items = self._veh_frame_items(state, "new", sigma)
         rect = state["rect_new"]
         if not items and has_old:

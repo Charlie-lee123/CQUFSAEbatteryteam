@@ -43,7 +43,7 @@ def make_index(code):
     return codes, by
 
 
-def run_checks(mw_codes, mw_by, us_codes, us_by) -> bool:
+def run_checks(mw_codes, mw_by, us_codes, us_by, extra=None) -> bool:
     ok = True
 
     def chk(label, cond):
@@ -251,6 +251,128 @@ def run_checks(mw_codes, mw_by, us_codes, us_by) -> bool:
         chk("_veh_repaint_all 含 viewport", "viewport" in rn)
         chk("_veh_repaint_all 含同步 repaint", "repaint" in rn)
 
+    # ---- O：od77 无车号→有车号 的「先显形再聚焦」曲线 ----
+    # 用户 2026-11-11：「从无车号到有车号过渡的时候数据要高斯模糊」。
+    # 原先 σ 与 α 都是 p 的函数且方向相反（σ 最大时 α≈0、α 上来时 σ 已归零），
+    # 感知上只有"淡入"没有"聚焦"。od77 改成 α 用 out_cubic 在前 45% 时间拉到 1、
+    # σ 用 pow 0.45 延迟衰减，可见模糊窗口从 153ms 扩到 343ms。
+    # ⛔ 不验这条就无法区分 od76（无此修复）与 od77 —— 两者 [I]/[N] 段完全相同。
+    print("\n[O] od77 无车号→有车号：α 提前 / σ 延迟衰减")
+    vp = us_by.get("_veh_paint")
+    chk("_veh_paint 存在", vp is not None)
+    if vp:
+        fl = floats(vp)
+        # ⚠️ CPython 会把同一 code object 里相同的常量**去重**，两个 0.45
+        #    （α 提前系数、σ 衰减指数）在 co_consts 里只留一份 → 只能判存在。
+        chk("有 0.45 常量（α 提前 / σ 延迟衰减）", 0.45 in fl)
+        chk("分支变量 ap 存在（α 的独立进度）", "ap" in vp.co_varnames)
+        chk("has_old 分支保留原曲线（仍用 EASE）", "EASE" in set(vp.co_names))
+
+    # ---- P：od78 性能模式（队标双击/三击 + 文本整流 + 高斯模糊浮层） ----
+    # 这是本轮唯一的新功能，必须能从产物里证明"整流逻辑和入口都真的进包了"，
+    # 而不是只看 main_window 里有个空壳方法。
+    print("\n[P] od78 性能模式（整流 + 手势 + 浮层）")
+    mods = extra or {}
+    pm = mods.get("perf_mode", (None, None))[1]
+    upm = mods.get("ui_perf_mode", (None, None))[1]
+    brand = mods.get("ui_brand", (None, None))[1]
+    chk("perf_mode 模块进包", pm is not None)
+    chk("ui_perf_mode 模块进包", upm is not None)
+    chk("ui_brand 模块进包", brand is not None)
+
+    sanitizer = pm.get("Sanitizer") if pm else None
+    chk("Sanitizer 类存在", sanitizer is not None)
+    if pm:
+        # 判据常量在**模块顶层**（不在 Sanitizer 类体里）：4600 mV 上限、
+        # 700 mV 偏离上限。改判据必须同步改断言，否则这条会替我们报警。
+        module = mods["perf_mode"][0][0]
+        _ints = {v for v in module.co_consts if isinstance(v, int)}
+        _flo = {v for v in module.co_consts if isinstance(v, float)}
+        chk("电压上限 4600mV 在包里", 4600 in _ints)
+        chk("离群判据 700mV 在包里", 700.0 in _flo)
+
+    overlay = upm.get("PerfModeOverlay") if upm else None
+    chk("PerfModeOverlay 类存在", overlay is not None)
+    blur = upm.get("_gaussian") if upm else None
+    chk("_gaussian 存在（真高斯）", blur is not None)
+    if blur is not None:
+        # ⛔ 可分离卷积的 einsum 下标：窗口轴在末尾 -> "hwck,k->hwc"。
+        #    写成 "hwkc" 会 ValueError 且被 except 吞掉、退回"没模糊"（od47 踩过）。
+        chk("高斯 einsum 维度正确（hwck）",
+            any(isinstance(c, str) and "hwck,k->hwc" in c
+                for c in blur.co_consts))
+
+    if brand is not None:
+        settle = brand.get("_settle_taps")
+        chk("队标手势：_settle_taps 发 perf_mode_requested",
+            settle is not None
+            and "perf_mode_requested" in set(settle.co_names))
+        chk("队标手势：_register_tap 做连击计数",
+            brand.get("_register_tap") is not None
+            and "_tap_count" in set(brand.get("_register_tap").co_names))
+
+    setter = mw_by.get("_set_perf_mode")
+    chk("主窗口 _set_perf_mode 存在", setter is not None)
+    emit = mw_by.get("_emit_block")
+    if emit is not None:
+        chk("_emit_block 接了整流（_perf_sanitizer）",
+            "_perf_sanitizer" in set(emit.co_names))
+
+    # ---- Q：od79 v2.7（底栏定位时序 + 电流判序 P1）----
+    # 本轮改的是"**什么时候**算"和"**先判哪一条**"，光看符号在不在区分不出来
+    # （新旧两版的 co_names 完全相同）。所以额外做一件更硬的事：把 PYZ 里这几个
+    # 函数的字节码与**当前源码编译出来的**逐字节比对 —— 这直接回答
+    # "打进去的是不是眼前这份代码"，od73 就是栽在构建窗口内源码被改。
+    print("\n[Q] od79 v2.7（版本号 + 底栏定位时序 + 电流判序）")
+    ver = mods.get("version", (None, None))[1]
+    se = mods.get("soc_est", (None, None))[1]
+    chk("version 模块进包", ver is not None)
+    chk("soc_est 模块进包", se is not None)
+    if ver is not None:
+        mod_code = mods["version"][0][0]
+        chk("包内版本号是 2.7",
+            "2.7" in {c for c in mod_code.co_consts if isinstance(c, str)})
+
+    chk("_schedule_place_soc 存在", mw_by.get("_schedule_place_soc") is not None)
+    chk("_place_soc_settled 存在", mw_by.get("_place_soc_settled") is not None)
+    # ⛔ 别用 mw_by.get("resizeEvent")：项目里同名方法有多个类，取到的第一个
+    #    未必是 MainWindow（见文件头的 ⛔ 说明）。用"任一 code object 命中"。
+    geo = [c for c in mw_codes if c.co_name in ("resizeEvent", "showEvent")]
+    chk("resizeEvent/showEvent 都改走 _schedule_place_soc",
+        bool(geo) and all("_schedule_place_soc" in set(c.co_names) for c in geo))
+    chk("resizeEvent/showEvent 不再直接调 _place_soc",
+        bool(geo) and not any("_place_soc" in set(c.co_names) for c in geo))
+    settled = mw_by.get("_place_soc_settled")
+    if settled is not None:
+        chk("_place_soc_settled 会清 pending 标志",
+            "_place_soc_pending" in set(settled.co_names))
+
+    def _sig(co):
+        """字节码指纹：指令流 + 名字表 + 非 code 常量。"""
+        return (co.co_code, co.co_names, co.co_varnames,
+                tuple(c for c in co.co_consts
+                      if not isinstance(c, types.CodeType)))
+
+    def _src_index(mod):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(root, mod + ".py")
+        with open(path, "rb") as f:
+            return make_index(compile(f.read(), path, "exec"))[1]
+
+    src_idx = {}
+    for mod in ("soc_est", "main_window"):
+        try:
+            src_idx[mod] = _src_index(mod)
+        except OSError:
+            src_idx[mod] = {}
+    for mod, index, fn in (("soc_est", se, "_effective_current"),
+                           ("main_window", mw_by, "_schedule_place_soc"),
+                           ("main_window", mw_by, "_place_soc_settled")):
+        got = index.get(fn) if index else None
+        want = src_idx.get(mod, {}).get(fn)
+        chk(f"{mod}.{fn} 与当前源码逐字节一致（不是旧构建）",
+            got is not None and want is not None and _sig(got) == _sig(want))
+
     return ok
 
 
@@ -275,14 +397,19 @@ def from_pyz(exe):
         zar = ZlibArchiveReader(tmp_path)
         ztoc = zar.toc
         toc = list(ztoc.keys()) if isinstance(ztoc, dict) else [t[0] for t in ztoc]
-        for mod in ("main_window", "ui_settings"):
+        wanted = ("main_window", "ui_settings", "perf_mode",
+                  "ui_perf_mode", "ui_brand", "soc_est", "version")
+        for mod in wanted:
             if mod not in toc:
                 print(f"FAIL PYZ.toc 缺模块 {mod}")
                 return None
-        print(f"PYZ.toc 含 main_window / ui_settings（共 {len(toc)} 条）")
-        mw = make_index(zar.extract("main_window"))
-        us = make_index(zar.extract("ui_settings"))
-        return mw[0], mw[1], us[0], us[1]
+        print(f"PYZ.toc 含 {' / '.join(wanted)}（共 {len(toc)} 条）")
+        built = {mod: make_index(zar.extract(mod)) for mod in wanted}
+        mw = built["main_window"]
+        us = built["ui_settings"]
+        extra = {mod: built[mod] for mod in ("perf_mode", "ui_perf_mode",
+                                             "ui_brand", "soc_est", "version")}
+        return mw[0], mw[1], us[0], us[1], extra
     finally:
         try:
             os.remove(tmp_path)
@@ -292,15 +419,20 @@ def from_pyz(exe):
 
 def from_source():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    out = []
-    for mod in ("main_window", "ui_settings"):
+    built = {}
+    for mod in ("main_window", "ui_settings", "perf_mode",
+                "ui_perf_mode", "ui_brand", "soc_est", "version"):
         path = os.path.join(root, mod + ".py")
         with open(path, "rb") as f:
             code = compile(f.read(), path, "exec")
         codes, by = make_index(code)
+        built[mod] = (codes, by)
         print(f"[source] {mod}.py -> {len(codes)} code objects")
-        out.extend((codes, by))
-    return out[0], out[1], out[2], out[3]
+    extra = {mod: built[mod] for mod in ("perf_mode", "ui_perf_mode",
+                                         "ui_brand", "soc_est", "version")}
+    mw = built["main_window"]
+    us = built["ui_settings"]
+    return mw[0], mw[1], us[0], us[1], extra
 
 
 def main() -> int:

@@ -368,6 +368,12 @@ def main() -> int:
     if "--ble-scan" in sys.argv:
         return _run_ble_scan(sys.argv)
 
+    # 命令行探针：验证 ONEFILE 产物能不能动态加载外部 DLC 目录（源码环境测不出
+    # 冻结导入器的行为）。结果写 exe 同目录 dlc_check.txt。
+    if "--check-dlc" in sys.argv:
+        import dlc_host
+        return dlc_host.check_runtime(sys.argv)
+
     # MCP 接入包导出：不进界面，把"交给 Agent 自动部署"的那段文本写成文件。
     # console=False 打不出字，所以走文件（也是验证"源码真的进了包"的落地证据）。
     if "--mcp-payload" in sys.argv:

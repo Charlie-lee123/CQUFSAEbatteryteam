@@ -8,8 +8,12 @@
 三条通道：
 - **本地文件**：``export_to_file`` / ``import_from_file``（离线、最稳）；
 - **在线下载**：仓库里的 ``vehicles/index.json`` + 各个 ``*.cqv.json`` 包。
-  索引与包都走 **镜像优先 → 直连** 的多源抢跑（复用 ``updater.MIRROR_PREFIXES``
-  那套思路：国内直连 raw.githubusercontent.com 基本不通，但镜像一路 200）；
+  读路径以 **GitHub contents API 为权威源**（与写链路同源、写完立即生效），和
+  **镜像优先 → 直连** 的降级链（复用 ``updater.MIRROR_PREFIXES`` 那套思路：国内
+  直连 raw.githubusercontent.com 基本不通，但镜像一路 200）**并行**拉取，再按
+  「权威 → 包数 → updated_at」择优，不再用「先到先赢」—— 镜像/raw 带
+  ``Cache-Control: max-age=300``，刚上传完最多 5 分钟仍是旧 ``packs=0``。
+  详见 ``fetch_remote_index`` / ``download_remote_pack``；
 - **在线上传**：GitHub contents API（PUT）。需要用户自己的 token —— 没有 token
   时退回 ``upload_url_for_web()``（浏览器里拖文件上传）。token 用 **Windows DPAPI**
   加密后存注册表（``custom/gh_token_enc``），**绝不明文**；DPAPI 不可用时只活在
@@ -37,6 +41,7 @@ import json
 import os
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -62,6 +67,19 @@ TOKEN_KEY = "custom/gh_token_enc"
 ORG, APP = "MimoWorks", "SerialAssistant"
 LAST_TOKEN_ERROR = ""                     # 最近一次 token 读写的问题（空串 = 没问题）
 _MEMORY_TOKEN = ""                        # DPAPI 不可用时的进程内兜底（不落盘）
+
+# 「刚写过在线索引」标记（**只活在进程内存**，⛔ 绝不写 QSettings / 注册表 / 文件）。
+# 上传走 GitHub contents API，写完立即生效；而在线索引的读走 raw / gh-proxy，
+# CDN 带 ``Cache-Control: max-age=300`` —— 刚写完的索引最多 5 分钟仍是旧的
+# ``packs=0``。详见 ``fetch_remote_index`` / ``note_index_written``。
+_WRITE_FRESH_S = 90.0                     # 「刚写过」窗口（要求 60~120s）
+_WRITE_LOCK = threading.Lock()
+_WRITTEN_DOC: dict | None = None          # 最近一次成功写入索引的 merged doc
+_WRITTEN_AT: float = 0.0                 # time.monotonic() 时间戳
+# 「刚写过」窗口是否激活（TTL 内为 True）。⛔ **不再是一次性回填资格**：窗口内
+# 的每一次刷新都能回填，只有 ``_WRITE_FRESH_S`` 到期 / 显式 reset 才失效。
+# 保留此符号供 QA 边界探针观测窗口状态，产品逻辑以 ``_WRITTEN_DOC`` + TTL 为准。
+_WRITTEN_PENDING = False
 
 
 # ------------------------------------------------------------------ 仓库 / 网络
@@ -376,24 +394,279 @@ def _index_items(doc) -> list[dict] | None:
     return out
 
 
-def fetch_remote_index(timeout_ms: int = 8000) -> dict:
-    """拉在线索引（**阻塞**，多源并行）。返回 ``{"ok", "items", "error", "source"}``。"""
-    urls = remote_index_urls()
-    total = max(1.0, timeout_ms / 1000.0)
-    payload, source, error = _race(urls, total, min(PER_SOURCE_S, total))
-    if payload is None:
-        return {"ok": False, "items": [], "error": f"索引拉取失败：{error}",
-                "source": ""}
+# ------------------------------------------------------------------ 写后读一致 / 权威源
+#
+# 用户报障：「上传车辆到在线库成功，但点刷新还是空的」。根因（QA 离线回放钉死）：
+#   * 写链路 ``update_index`` / ``upload_pack`` 走 GitHub **contents API**，写完立即生效；
+#   * 读链路只走 ``_mirrored(_raw_url(...))``，即镜像 + raw 直连，这些源带
+#     ``Cache-Control: max-age=300``，刚写完最多 300s 仍返回旧 ``packs=0``；
+#   * ``_race`` 是「任一源先到先赢」，最快的旧 CDN 稳定胜出 —— 空库。
+# 这是 300s TTL 窗口现象，不是永久空库；过了窗口所有源都变新，未修代码也会
+# 「看起来正常」，所以**绝不能拿真实网络刷新当验收**，判据一律以离线固定响应为准。
+#
+# 修法（保留既有容错架构，不推翻重构）：
+#   ① 把写链路同源的 contents API 作为**权威源**，与镜像/raw 链**并行**拉取；
+#      权威源慢一点也能赢（不再先到先赢），按「权威 → 包数 → updated_at」择优。
+#   ② 镜像/raw 与 contents API 都加 cache-busting nonce，逼 CDN / 中间代理回源。
+#   ③ 上传成功后在**进程内**记「刚写过」标记（含时间戳，60~120s），窗口内强制
+#      优先权威源；并在窗口内的**每一次**刷新都做窄兜底：仅当权威源本次没给出
+#      有效文档、网络候选又全部回报空库时，才回填刚写入的索引（防 contents API
+#      自身 max-age=60 的缓存）。⛔ 绝不写 QSettings；TTL 是唯一闸门，资格不消费。
+#   ④ 权威源全挂仍退回镜像/raw 链，不整体失败、不变慢：两条链路共享同一个
+#      ``total`` 预算并行跑，不叠加；``_race`` 语义与 ``PER_SOURCE_S`` 原样保留。
+#
+# ⛔ token：读公开索引根本不需要 token。下面所有请求都**不带** Authorization，
+#    也绝不把 token 拼进 URL / 日志 / 异常文本（``describe_error(URLError)`` 会
+#    回显 URL、``_http_detail`` 会回显正文、代理 access log 也留痕）。写链路的
+#    token 仍只由 ``_contents_headers`` 放进 ``Authorization`` 头，未改动。
+
+
+def note_index_written(merged: dict) -> None:
+    """``update_index`` PUT 成功后登记「刚写过」标记（进程内，含时间戳）。
+
+    存一份深拷贝，避免调用方后续改动把缓存带歪；⛔ 不写 QSettings、不落盘、
+    不进日志。TTL 过后自动失效，读路径重新完全依赖网络。
+    """
+    global _WRITTEN_DOC, _WRITTEN_AT, _WRITTEN_PENDING
+    if not isinstance(merged, dict):
+        return
+    try:
+        snapshot = json.loads(json.dumps(merged, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return
+    with _WRITE_LOCK:
+        _WRITTEN_DOC = snapshot
+        _WRITTEN_AT = time.monotonic()
+        _WRITTEN_PENDING = True
+
+
+def reset_written_marker() -> None:
+    """清掉「刚写过」标记（探针 / 测试用；产品代码不需要调用）。"""
+    global _WRITTEN_DOC, _WRITTEN_AT, _WRITTEN_PENDING
+    with _WRITE_LOCK:
+        _WRITTEN_DOC = None
+        _WRITTEN_AT = 0.0
+        _WRITTEN_PENDING = False
+
+
+def _write_state() -> tuple[dict | None, bool]:
+    """返回 ``(TTL 内的刚写索引副本, 该副本是否有效)``。
+
+    ⛔ **不再做一次性消费**：TTL 窗口内的**每一次**刷新都能拿到刚写索引。理由
+    （PRD「上传成功但刷新为空」的直接延伸）：用户刚上传成功，进程自己刚写进去
+    的包是**已知事实**；90s 内任何一次刷新，即使 contents API 不可达、镜像仍是
+    ``packs=0`` 旧缓存，也不该把在线库显示成空的。是否该盖掉远端真实变更由
+    ``_pick_index`` 的 ``not has_api`` 门负责，不需要靠「资格只授一次」防串扰；
+    测试隔离交 ``reset_written_marker()`` 在用例边界显式调用（QA harness 侧）。
+
+    第二个返回值等价于 ``doc is not None``，仅为保持既有 tuple 调用形状而保留。
+    """
+    global _WRITTEN_DOC, _WRITTEN_PENDING
+    with _WRITE_LOCK:
+        if _WRITTEN_DOC is None:
+            return None, False
+        if time.monotonic() - _WRITTEN_AT > _WRITE_FRESH_S:
+            _WRITTEN_DOC = None
+            _WRITTEN_PENDING = False      # 窗口到期，同步窗口标志
+            return None, False
+        try:
+            return json.loads(json.dumps(_WRITTEN_DOC, ensure_ascii=False)), True
+        except (TypeError, ValueError):
+            return None, False
+
+
+def _contents_api_url(path: str) -> str:
+    """仓库内某文件的 **contents API** 地址（读链路的权威源）。
+
+    写链路 ``update_index`` / ``upload_pack`` 自行拼出同源同形的地址；token 只经
+    ``_contents_headers`` 进 ``Authorization`` 头，⛔ 绝不进 URL / 日志 / 异常文本。
+    这里刻意不改动写链路，避免碰已验证过的鉴权与 PUT 语义。
+    """
+    return (f"https://api.github.com/repos/{repo_slug()}/contents/"
+            f"{path.lstrip('/')}")
+
+
+def _api_read_headers() -> dict:
+    """读索引/包时给 contents API 的请求头。
+
+    ``_open`` 已经统一带 User-Agent；这里额外要 GitHub API 版本 + 禁中间缓存。
+    ⛔ 绝不放 ``Authorization``（读公开仓库不需要 token，且零泄露面）。
+    """
+    return {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Cache-Control": "no-cache",
+    }
+
+
+def _cache_busted(urls: tuple[str, ...]) -> tuple[str, ...]:
+    """给 URL 追加一次性 nonce，绕开 CDN 的 ``max-age`` 旧缓存。
+
+    ⛔ 只在 ``fetch_remote_index`` / ``download_remote_pack`` 内部对源链做变换，
+      ``remote_index_urls()`` 本身返回值必须保持稳定 —— ``main.py`` 的
+      ``--check-vehicles`` 和 selftest 都直接依赖它。
+    """
+    nonce = str(time.time_ns())
+    out: list[str] = []
+    for url in urls:
+        sep = "&" if "?" in url else "?"
+        out.append(f"{url}{sep}_={nonce}")
+    return tuple(out)
+
+
+def _busted_api_url(path: str) -> str:
+    """contents API + ``ref=main`` + nonce（API 自身也有 max-age=60 缓存）。"""
+    return f"{_contents_api_url(path)}?ref=main&_={time.time_ns()}"
+
+
+def _decode_doc(payload: bytes, is_api: bool) -> dict | list | None:
+    """响应体 → doc；兼容 contents API 的 ``{content: base64, sha}`` 包装与裸 JSON。
+
+    ⛔ 别把 ``sha`` 当索引内容、别把包装体直接喂给 ``_index_items``（会得到
+      「缺 packs 列表」假失败）。解析失败一律返回 None，交给降级链路。
+    """
     try:
         doc = json.loads(payload.decode("utf-8-sig", errors="replace"))
-    except ValueError as exc:
+    except (ValueError, UnicodeError, AttributeError):
+        return None
+    if is_api and isinstance(doc, dict) and "content" in doc and "encoding" in doc:
+        try:
+            inner = base64.b64decode("".join(str(doc.get("content") or "").split()))
+            doc = json.loads(inner.decode("utf-8-sig", errors="replace"))
+        except Exception:                 # noqa: BLE001 - 包装体坏了就当失败
+            return None
+    return doc if isinstance(doc, (dict, list)) else None
+
+
+def _gather_sources(total: float, per: float, api_url: str,
+                    mirror_urls: tuple[str, ...]
+                    ) -> tuple[list[dict], list[str]]:
+    """并行拉「contents API 权威源」与「镜像/raw ``_race`` 链」，收集全部候选 doc。
+
+    返回 ``([{"doc","source","is_api"}], errors)``。两条链路**共享** ``total``
+    预算并行跑：权威源一到即可定案（不会被更快的旧 CDN 抢答），权威源全挂时
+    镜像链照常先到先赢，不强等权威源超时。⛔ ``_race`` 本身一字未改。
+
+    ⚠ 不做「任一源成功就返回」——那正是本次 bug 的根源；这里收齐一个窗口内
+      到达的候选，由调用方按新鲜度择优。
+    """
+    lock = threading.Lock()
+    wake = threading.Event()
+    box: dict = {"cands": [], "errors": [], "api_done": False,
+                 "mirror_done": False}
+
+    def push(is_api: bool, source: str, doc) -> None:
+        with lock:
+            box["cands"].append({"doc": doc, "source": source,
+                                 "is_api": is_api})
+            wake.set()
+
+    def mark_done(key: str, error: str) -> None:
+        with lock:
+            box[key] = True
+            if error:
+                box["errors"].append(error)
+            wake.set()
+
+    def api_worker() -> None:
+        doc = None
+        try:
+            # ⛔ 必须走 _open：统一 UA / HTTPS_PROXY / 单源超时，离线 harness
+            #    在 OpenerDirector.open 层拦截，绕过会打到真实外网。
+            with _open(api_url, per, headers=_api_read_headers()) as response:
+                doc = _decode_doc(response.read(), True)
+        except Exception:                 # noqa: BLE001 - 权威源失败不影响镜像链
+            doc = None
+        if doc is not None:
+            push(True, _host(api_url), doc)
+            mark_done("api_done", "")
+        else:
+            mark_done("api_done", "api.github.com：权威源不可达或返回无效内容")
+
+    def mirror_worker() -> None:
+        payload, source, error = _race(mirror_urls, total, per)
+        doc = _decode_doc(payload, False) if payload is not None else None
+        if doc is not None:
+            push(False, source or "镜像链", doc)
+            mark_done("mirror_done", "")
+        else:
+            mark_done("mirror_done", error or f"{source or '镜像链'}：响应无法解析")
+
+    threading.Thread(target=api_worker, daemon=True).start()
+    threading.Thread(target=mirror_worker, daemon=True).start()
+
+    deadline = time.monotonic() + total
+    while True:
+        with lock:
+            has_api = any(c["is_api"] for c in box["cands"])
+            all_done = box["api_done"] and box["mirror_done"]
+        if has_api or all_done:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        wake.wait(min(0.05, remaining))
+        wake.clear()
+    with lock:
+        return list(box["cands"]), list(box["errors"])
+
+
+def _pick_index(cands: list[dict], written: dict | None) -> dict | None:
+    """按新鲜度择优：权威源 > 包数多 > ``updated_at`` 新；返回扁平结果。
+
+    ``_index_items`` 是导入/上传共用的既有契约，这里只**调用**不改它：结构不对
+    的候选直接丢弃，绝不把 base64 包装体或嵌套结构漏进 ``items``。
+    """
+    scored: list[dict] = []
+    for cand in cands:
+        items = _index_items(cand["doc"])
+        if items is None:
+            continue
+        doc = cand["doc"]
+        updated = str(doc.get("updated_at") or "") if isinstance(doc, dict) else ""
+        scored.append({"items": items, "packs": len(items),
+                       "updated_at": updated, "source": str(cand["source"] or ""),
+                       "is_api": bool(cand["is_api"])})
+    if not scored:
+        return None
+    has_api = any(s["is_api"] for s in scored)
+    best = max(scored, key=lambda s: (1 if s["is_api"] else 0,
+                                      s["packs"], s["updated_at"]))
+    # 写后读一致的窄兜底：刚 PUT 成功写过非空索引，而**权威源本次没给出有效
+    # 文档**、镜像链又全是 packs=0 旧缓存时，回填本进程刚写的那份。
+    # ⛔ 三门，缺一不回填：① ``written is not None``（TTL 窗口内，刚写过索引）；
+    #    ② 有候选（全源失败时上面已 return None，仍返回干净 ok=False，AC-04，
+    #    绝不凭空造库）；③ ``not has_api`` 且 ``best["packs"]==0``（权威源本次
+    #    没成功、网络候选又全是旧空库；权威源真返回空就信它，不拿本地快照盖掉）。
+    # ⛔ 不再有「一次性资格」门：窗口内每次刷新都允许回填（K1 根因）。
+    if written is not None and not has_api and best["packs"] == 0:
+        local_items = _index_items(written)
+        if local_items:
+            return {"items": local_items, "packs": len(local_items),
+                    "updated_at": "", "source": "本地（刚上传）", "is_api": True}
+    return best
+
+
+def fetch_remote_index(timeout_ms: int = 8000) -> dict:
+    """拉在线索引（**阻塞**，权威源 + 镜像链并行 + 新鲜度择优）。
+
+    返回 ``{"ok", "items", "error", "source"}`` —— 形状与旧版完全一致，
+    ``ui_settings._on_index`` 直接吃这四个键。权威源不可达 / 无网络时仍退回
+    镜像链，不整体失败、不抛异常、不变慢、不返回脏结构。
+    """
+    total = max(1.0, timeout_ms / 1000.0)
+    per = min(PER_SOURCE_S, total)
+    written, _ = _write_state()
+    candidates, errors = _gather_sources(
+        total, per, _busted_api_url(INDEX_PATH),
+        _cache_busted(remote_index_urls()))
+    best = _pick_index(candidates, written)
+    if best is None:
+        detail = "；".join(e for e in errors if e) or "全部源都超时"
         return {"ok": False, "items": [],
-                "error": f"索引不是合法 JSON（{source}：{exc}）", "source": source}
-    items = _index_items(doc)
-    if items is None:
-        return {"ok": False, "items": [],
-                "error": f"索引结构不对（{source}：缺 packs 列表）", "source": source}
-    return {"ok": True, "items": items, "error": "", "source": source}
+                "error": f"索引拉取失败：{detail}", "source": ""}
+    return {"ok": True, "items": best["items"], "error": "",
+            "source": best["source"]}
 
 
 def _safe_file(name: str) -> str:
@@ -436,18 +709,33 @@ def download_remote_pack(entry: dict) -> dict:
         message = "索引条目里没有 file 字段"
         return {"ok": False, "added": 0, "updated": 0, "skipped": 0,
                 "errors": [message], "error": message, "source": ""}
-    urls = _mirrored(_raw_url(f"{UPLOAD_DIR}/{file}"))
-    payload, source, error = _race(urls, 8.0)
-    if payload is None:
+    # 与索引同一根因：包文件也在 CDN 的 max-age=300 缓存后面，只修索引会出现
+    # 「清单里看得见车、点下载却拿到 300 秒前的旧包」。这里同样走「contents API
+    # 权威源 + 镜像/raw cache-busting」并行择优，权威源全挂仍退回镜像链。
+    pack_path = f"{UPLOAD_DIR}/{file}"
+    candidates, errors = _gather_sources(
+        8.0, PER_SOURCE_S, _busted_api_url(pack_path),
+        _cache_busted(_mirrored(_raw_url(pack_path))))
+    picked: dict | None = None
+    # 优先权威源，且必须真是一份包（有 vehicles），避免误把索引 doc 当包导入。
+    for cand in candidates:
+        doc = cand.get("doc")
+        if cand["is_api"] and isinstance(doc, dict) and "vehicles" in doc:
+            picked = cand
+            break
+    if picked is None:
+        for cand in candidates:
+            doc = cand.get("doc")
+            if isinstance(doc, dict) and "vehicles" in doc:
+                picked = cand
+                break
+    if picked is None:
+        detail = "；".join(e for e in errors if e) or "全部源都超时"
+        message = f"下载失败：{detail}"
         return {"ok": False, "added": 0, "updated": 0, "skipped": 0,
-                "errors": [f"下载失败：{error}"], "error": f"下载失败：{error}",
-                "source": ""}
-    try:
-        doc = json.loads(payload.decode("utf-8-sig", errors="replace"))
-    except ValueError as exc:
-        message = f"下载到的包不是合法 JSON（{exc}）"
-        return {"ok": False, "added": 0, "updated": 0, "skipped": 0,
-                "errors": [message], "error": message, "source": source}
+                "errors": [message], "error": message, "source": ""}
+    source = str(picked["source"] or "")
+    doc = picked["doc"]
     result = import_payload(doc)
     imported = result["added"] + result["updated"]
     result["ok"] = imported > 0
@@ -734,6 +1022,10 @@ def update_index(pack: dict, token: str) -> dict:
     if error:
         return {"ok": False, "error": f"索引写入失败：{error}",
                 "count": 0, "file": ""}
+    # 写后读一致：PUT 成功后记进程内「刚写过」标记（含时间戳），随后
+    # ``_WRITE_FRESH_S`` 秒内 fetch_remote_index 强制优先权威源 / 窄兜底。
+    # ⛔ 只写模块内存，不碰 QSettings；返回值形状不变。
+    note_index_written(merged)
     url = ""
     content = info.get("content") if isinstance(info, dict) else None
     if isinstance(content, dict):

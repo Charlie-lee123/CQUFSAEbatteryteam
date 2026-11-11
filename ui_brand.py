@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt
+from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QFontMetricsF, QGuiApplication, QIcon, QImage, QPainter, QPen, QPixmap,
 )
@@ -257,7 +258,20 @@ class BrandHeader(QWidget):
 
     不套卡片 —— 页头直接坐在背景上，比再叠一层容器轻，
     也才不会在窗口顶部堆出两层框。
+
+    **隐藏手势**（用户 2026-11-11 点名）：在队标上双击 / 三击发
+    ``perf_mode_requested(bool)``，由主窗口去切"性能模式"。单击不做事，
+    但连击判定要等最后一击结束才能确定次数（双击 vs 三击），所以点击会先
+    攒 360ms 再发信号 —— 队标本来没有单击行为，这点延迟不影响任何操作。
     """
+
+    #: 双击 / 三击的连击判定（秒）与等待窗口（毫秒）
+    TAP_GAP_S = 0.28
+    TAP_WINDOW_MS = 320
+    #: 手势生效后的短暂锁：双击进入后手里还多按的那一下不能立刻算成"三击退出"
+    TAP_LOCK_S = 0.45
+
+    perf_mode_requested = Signal(bool)
 
     def __init__(self, product: str = "串口助手", parent=None) -> None:
         super().__init__(parent)
@@ -269,6 +283,13 @@ class BrandHeader(QWidget):
         self._vehicle_face = ui_font(10.5)
         self._lockup: QPixmap | None = None
         self._dpr = 1.0
+        self._tap_count = 0
+        self._tap_last = 0.0
+        self._tap_lock = 0.0
+        self._tap_timer = QTimer(self)
+        self._tap_timer.setSingleShot(True)
+        self._tap_timer.setInterval(self.TAP_WINDOW_MS)
+        self._tap_timer.timeout.connect(self._settle_taps)
         self._load()
         # ⚠️ **不要**给页头设 WA_TransparentForMouseEvents。
         # 按 Qt 的定义，这个属性是"禁掉本控件**及其子控件**的鼠标事件投递"
@@ -449,3 +470,37 @@ class BrandHeader(QWidget):
         # 页脚一条细线，把页头和内容分开 —— 不加框，只留线
         painter.setPen(QPen(qcolor("line"), 1.0))
         painter.drawLine(int(left), int(height) - 1, int(right), int(height) - 1)
+
+    # -- 隐藏手势：队标双击 / 三击 -----------------------------------------
+
+    def mousePressEvent(self, event) -> None:
+        """队标上的左键点击进入连击计数，其它位置交回基类。
+
+        ⚠️ 只认**队标矩形内**的点击：页头右侧还有产品名/车号，把整条页头都
+        算成热区的话，用户在窗口顶部随手点一下就可能误触。
+        """
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._drawn_lockup_rect().contains(event.position())):
+            self._register_tap()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def _register_tap(self) -> None:
+        now = time.monotonic()
+        if now < self._tap_lock:
+            return                      # 手势刚生效：手里多余的那一下不算数
+        if now - self._tap_last > self.TAP_GAP_S:
+            self._tap_count = 0         # 间隔太久 = 新的一组
+        self._tap_count += 1
+        self._tap_last = now
+        self._tap_timer.start()
+
+    def _settle_taps(self) -> None:
+        """连击结束：2 击进入、3 击退出，其它次数丢弃。"""
+        count = self._tap_count
+        self._tap_count = 0
+        if count not in (2, 3):
+            return
+        self._tap_lock = time.monotonic() + self.TAP_LOCK_S
+        self.perf_mode_requested.emit(count == 2)

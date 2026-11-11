@@ -101,8 +101,9 @@ def case_basic() -> None:
     ]
     for mod, tokens in enumerate(want):
         got = table[1 + mod][i_c1:i_c1 + 6]
-        exp = [str(mv(t)) for t in tokens]
-        check(f"B{mod + 1} 模组{mod + 1} 电芯列=mV 整数且落在电芯1..6",
+        # 电压 4 位左零补齐（新需求）：期望值同样按 4 位对比（零值 0 → "0000"）
+        exp = [f"{mv(t):04d}" for t in tokens]
+        check(f"B{mod + 1} 模组{mod + 1} 电芯列=mV 整数(4 位补零)且落在电芯1..6",
               got == exp, f"实得 {got} 期望 {exp}")
 
     check("A6 模组号列 = 1/2/3",

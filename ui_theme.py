@@ -954,6 +954,44 @@ QWidget#bottomBar QLabel {
     color: @ink_2@;
 }
 
+/* 底栏正中的实时 SOC min / max 与总电压 —— 三枚绝对定位的子控件，
+   由 MainWindow._place_soc() 摆成一组、整体居中（见 _place_soc 的注释）。
+   三枚都带 socpart="1"；用同一个属性选择器统一样式，避免写逗号分组。
+   ⚠️ 选择器**必须带上 QWidget#bottomBar**：上面那条 `QWidget#bottomBar QLabel`
+   权重比不带祖先的低不了一截，少写祖先就会被按回去且不报错。 */
+QWidget#bottomBar QLabel[socpart="1"] {
+    color: @ink@;
+    background: transparent;
+}
+
+/* 当前工况该看的那个：放电看 min、充电看 max（用户 2026-11-11 要求） */
+QWidget#bottomBar QLabel[socpart="1"][emphasis="focus"] {
+    font-weight: 600;
+}
+
+/* 另一个 SOC 弱化处理；静置时两个都 normal，不做强调 */
+QWidget#bottomBar QLabel[socpart="1"][emphasis="dim"] {
+    color: @ink_3@;
+}
+
+/* 总电压与工况标记常驻弱化，别抢两个 SOC 的注意力 */
+QWidget#bottomBar QLabel[socpart="1"][emphasis="volt"] {
+    color: @ink_3@;
+}
+QWidget#bottomBar QLabel[socpart="1"][emphasis="mode"] {
+    color: @ink_3@;
+}
+
+/* 还有断线没剔干净 / 整模组不均衡 / 健康电芯太少 / 滤波发散：整组转橙 */
+QWidget#bottomBar QLabel[socpart="1"][state="warn"] {
+    color: @bms_error@;
+}
+
+/* 没有数据或这台车没配 SOC 参数：整组显示 --，用弱化色 */
+QWidget#bottomBar QLabel[socpart="1"][state="off"] {
+    color: @ink_3@;
+}
+
 QDialog {
     background: @surface@;
 }
@@ -993,6 +1031,11 @@ def stylesheet() -> str:
         "@ink_disabled@": token("ink_disabled"),
         "@line@": token("line"), "@line_strong@": token("line_strong"),
         "@fill_primary@": token("fill_primary"),
+        # ⚠️ 这张表是**固定清单**：不在里面的 token 一个都不会被替换，留在 QSS 里
+        #    会让**其后所有样式静默失效**（自测 "QSS token 全量可替换" 就是查这个）。
+        #    bms_error 一直在调色板里（给 Python 侧的越界着色用），但没进过这张表，
+        #    底栏 SOC 读数要用它，这里补上。
+        "@bms_error@": token("bms_error"),
         "@CONTROL_RADIUS@": str(CONTROL_RADIUS),
         "@CARD_RADIUS@": str(CARD_RADIUS),
         "@sel_rgb@": rgb("sel"), "@ink3_rgb@": rgb("ink_3"),

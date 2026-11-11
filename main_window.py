@@ -39,9 +39,15 @@ from serial_io import (
     STOPBIT_CHOICES, SerialWorker, StreamDecoder, list_serial_ports, parse_hex, to_hex,
 )
 import app_log
+import dlc_host
 
+import perf_mode
 import rx_export
+import rx_protocol
 import rx_store
+import soc_est
+import soc_feed
+import soc_profiles
 import customization
 from ui_anim import (EASE, STANDARD, Reveal, Tween, animations_enabled,
                      in_out_cubic, in_out_quint, out_cubic)
@@ -59,6 +65,7 @@ from ui_controls import (
 )
 from ui_settings import SettingsDialog
 from ui_surface import Card, fade_in, paint_glass
+from ui_perf_mode import PerfModeOverlay
 from ui_theme import (
     CARD_PAD, CARD_RADIUS,
     DEFAULT_GLASS, GAP, GLYPH_CHEVRON_DOWN, GLYPH_CHEVRON_UP, GLYPH_CLEAR,
@@ -738,6 +745,13 @@ class MainWindow(QMainWindow):
         self._ble_scanner: object | None = None      # BleBroadcastWorker（惰性导入，见 _ble_worker_cls）
         self._ble_seen: dict[str, dict] = {}
         self._ble_target = ""
+        # 可选 DLC（见 dlc_host）：不装插件时只有一颗常驻「DLC」按钮，
+        # 插件入口按钮在启动后由 _init_dlc 动态插进 _dlc_launchers。
+        self._dlc_loaded: dict[str, object] = {}
+        self._dlc_spacers: list[QWidget] = []
+        self._dlc_buttons: list[InkButton] = []
+        self._dlc_shutdown_done = False
+        self._dlc_aboutquit_wired = False
         self._decoder = StreamDecoder()
         # 自动扫描：只记"上次看到的端口名单"，名单一变就说明插了或拔了东西（见
         # _poll_ports）。**扫到什么都不自动打开** —— 用户明确要求"我自己有手"。
@@ -917,6 +931,16 @@ class MainWindow(QMainWindow):
         self._align_section = SECTION_OTHER
         # 空行规则（模组标题/BMS 之上各一行）要跨帧知道"上一行是什么"
         self._rx_prev_line = ""
+        # 性能模式（用户 2026-11-11 的暗门）：队标双击进入、三击退出。
+        # ⛔ **不持久化**：每次启动都从"关"开始 —— 上次开着忘了关，第二天拿
+        #    假数据去查真故障，这是这个功能唯一可能造成实质伤害的路径。
+        self._perf_on = False
+        _proto = rx_protocol.active()
+        self._perf_sanitizer = perf_mode.Sanitizer(
+            cell_width=int(_proto.get("cell_width", 4)),
+            temp_width=int(_proto.get("temp_width", 2)))
+        # 提示浮层（懒建，见 _show_perf_overlay）
+        self._perf_overlay: PerfModeOverlay | None = None
 
         self._send_timer = QTimer(self)
         self._send_timer.setTimerType(Qt.PreciseTimer)
@@ -1121,6 +1145,9 @@ class MainWindow(QMainWindow):
             hints.colorSchemeChanged.connect(self._on_system_scheme_changed)
 
         QTimer.singleShot(50, self._play_intro)
+        # DLC 是可选扩展：等主窗上屏、事件循环空下来再发现/加载，绝不挤占
+        # 开屏与字体预热的关键路径；一个插件崩了也不影响主窗（见 dlc_host.load）。
+        QTimer.singleShot(0, self._init_dlc)
 
     # ---------------------------------------------------------------- 主题
 
@@ -1281,6 +1308,8 @@ class MainWindow(QMainWindow):
 
         self.brand_header = BrandHeader("串口助手")
         _pump_build()
+        # 队标双击 / 三击 → 性能模式（用户 2026-11-11 的暗门，见 _set_perf_mode）
+        self.brand_header.perf_mode_requested.connect(self._set_perf_mode)
         inner.addWidget(self.brand_header)
         self._refresh_vehicle_badge()
 
@@ -1432,6 +1461,47 @@ class MainWindow(QMainWindow):
         bar_row.addWidget(self.pulse)
         bar_row.addWidget(self.lbl_state)
         bar_row.addWidget(self.lbl_count)
+
+        # 正中央：SOC min / max 与总电压（用户 2026-11-11 要求「只显示 max 和 min」，
+        # 放电突出 min、充电突出 max；不放第三个中心 SOC）。
+        # ⛔ 不放进 bar_row：底栏左边是齿轮+提示、右边是三个状态控件，两边宽度
+        #    天然不等，塞进布局只能"居中于剩余空间"，不是窗口正中。三枚都是
+        #    底栏的**子控件**，由 _place_soc() 当成一组按 (栏宽-组宽)/2 绝对定位，
+        #    resizeEvent / showEvent 里跟着重排。
+        soc_font = num_font(12.0)
+        self.lbl_soc_mode = QLabel("")
+        self.lbl_soc_min = QLabel("SOC --")
+        self.lbl_soc_max = QLabel("")
+        self.lbl_soc_volt = QLabel("")
+        for _lbl, _name, _emph in (
+                (self.lbl_soc_mode, "socMode", "mode"),
+                (self.lbl_soc_min, "socMin", "normal"),
+                (self.lbl_soc_max, "socMax", "normal"),
+                (self.lbl_soc_volt, "socVolt", "volt")):
+            _lbl.setObjectName(_name)
+            _lbl.setParent(bar)
+            _lbl.setFont(soc_font)
+            _lbl.setAlignment(Qt.AlignCenter)
+            # QSS 用 [socpart="1"] 统一选中这三枚；state 管整组告警着色，
+            # emphasis 管「当前该看哪个」（focus/dim/normal/volt）
+            _lbl.setProperty("socpart", "1")
+            _lbl.setProperty("state", "off")
+            _lbl.setProperty("emphasis", _emph)
+            _lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.lbl_soc_mode.setToolTip(
+            "当前工况：放电 / 充电 / 静置 / 母线断开 / 工况未知。"
+            "母线断开时真实电流必为 0，读数只是传感器零漂")
+        self.lbl_soc_min.setToolTip(
+            "SOC min：由正常电压区间内最低单体电压估算（放电时看它）")
+        self.lbl_soc_max.setToolTip(
+            "SOC max：由正常电压区间内最高单体电压估算（充电时看它）")
+        self.lbl_soc_volt.setToolTip("总电压按清洗后电芯平均值 × 串数估算")
+        # 兼容别名：旧代码 / 自测用 lbl_soc 指主读数
+        self.lbl_soc = self.lbl_soc_min
+        self._soc_labels = (self.lbl_soc_mode, self.lbl_soc_min,
+                            self.lbl_soc_max, self.lbl_soc_volt)
+        self._bottom_bar = bar
+
         inner.addWidget(bar)
 
         self._update_counters()
@@ -1465,6 +1535,9 @@ class MainWindow(QMainWindow):
         # 历史按**当前车辆**分文件（用户 2026-10-23：不同电池箱的历史数据
         # 分开放）；没选车时落通用文件（与旧版本同一份）。
         rx_history.load(customization.current_vehicle() or None)
+
+        # SOC：按当前车辆取参数（没配参数的车显示 --，功能对它完全惰性）
+        self._init_soc()
 
     def _auto_check_update(self) -> None:
         """启动时的自动检查更新（静默失败，绝不打扰）。"""
@@ -1810,6 +1883,31 @@ class MainWindow(QMainWindow):
         hist_row.addWidget(spacer)
         hist_row.addWidget(self.btn_open_history, 1)
         col.addLayout(hist_row)
+
+        # ---- 可选 DLC 扩展（新增，见 dlc_host）--------------------------------
+        # 常驻一颗「DLC」：没装插件时也能找到安装入口。⚠️ 不进
+        # BUTTON_SPECS —— 那是「界面按钮」隐藏清单，允许隐藏等于让用户把自己
+        # 锁在扩展管理外面（和左下角设置按钮同一个理由）。
+        self.btn_dlc = InkButton("DLC", variant="ghost")
+        self.btn_dlc.setToolTip("管理可选 DLC：安装 / 启用 / 卸载")
+        self.btn_dlc.clicked.connect(self._open_dlc_manager)
+        dlc_row = QHBoxLayout()
+        dlc_row.setSpacing(10)
+        dlc_spacer = QWidget()
+        dlc_spacer.setFixedWidth(64)
+        self._dlc_spacer = dlc_spacer
+        dlc_row.addWidget(dlc_spacer)
+        dlc_row.addWidget(self.btn_dlc, 1)
+        col.addLayout(dlc_row)
+
+        # 插件自己的入口按钮由 dlc_host 在启动时插进来。空容器不占位：
+        # 没装任何 DLC 时界面与旧版只差上面这一颗按钮。
+        self._dlc_launchers = QWidget()
+        self._dlc_launchers_lay = QVBoxLayout(self._dlc_launchers)
+        self._dlc_launchers_lay.setContentsMargins(0, 0, 0, 0)
+        self._dlc_launchers_lay.setSpacing(10)
+        col.addWidget(self._dlc_launchers)
+        self._dlc_launchers.setVisible(False)
 
         col.addStretch(1)
 
@@ -3680,6 +3778,14 @@ class MainWindow(QMainWindow):
         self._sync_fullscreen_padding()
         # 分屏自动"最大化接收区"（1/3、1/4 窄档）
         self._sync_snap_zoom()
+        # 底栏正中的 SOC 读数是绝对定位的，窗口一变宽就得重新钉回正中。
+        # ⛔ 必须走 _schedule_place_soc（立即 + 落定后复核），别直接调 _place_soc：
+        #    resizeEvent 早于底栏子布局重排，此刻量到的 lbl_state 还是旧位置。
+        self._schedule_place_soc()
+        # 性能模式的提示浮层铺满整个客户区，窗口一变就跟上
+        _overlay = getattr(self, "_perf_overlay", None)
+        if _overlay is not None and _overlay.isVisible():
+            _overlay.setGeometry(self.rect())
         super().resizeEvent(event)
 
     # ------------------------------------------------- 分屏（Snap）紧凑版式
@@ -4012,6 +4118,14 @@ class MainWindow(QMainWindow):
         # （1/4 屏截图里量到过：文字比底色块还宽）。
         self.btn_open_history.setMinimumWidth(146 if field_w <= 0 else 104)
         self._hist_spacer.setFixedWidth(spec["label_w"])
+        # DLC 入口 / 插件入口跟「打开历史数据」同一套窄档收口：标签列收起时
+        # 占位一起收，按钮下限也压到 104，免得文字戳出圆角底板。
+        self._dlc_spacer.setFixedWidth(spec["label_w"])
+        self.btn_dlc.setMinimumWidth(146 if field_w <= 0 else 104)
+        for spacer in self._dlc_spacers:
+            spacer.setFixedWidth(spec["label_w"])
+        for button in self._dlc_buttons:
+            button.setMinimumWidth(146 if field_w <= 0 else 104)
 
         # 工具栏横/竖排。切换会改变内容自然高度，把"量过的高度"和"钉住的高度"一起
         # 作废 —— 否则下一次全屏转场会按旧行高插值（展开那一帧工具栏会被裁）。
@@ -6411,6 +6525,14 @@ class MainWindow(QMainWindow):
         text = text.strip("\r\n")
         if not text:
             return                      # 空帧（设备只发了个换行）不值得占一行
+        # 性能模式：把异常读数替换成同段正常值的平均值、BMS 统一显示 OK
+        # （纯文本层，见 perf_mode 模块注释）。⛔ 必须放在 _feed_export /
+        # _feed_soc / align_indexes **之前** —— 下游四条链路（显示、落盘、
+        # 导出、SOC）必须看到同一份数据，否则会"屏上是好的、导出里还是坏点"。
+        if self._perf_on:
+            text = self._perf_sanitizer.feed(text)
+            if not text.strip():
+                return                  # 整块都是报错明细，删完就空了
         # ⛔ 帧**内部**的空行一律丢掉（2026-10-24 用户点名"不应该空行的地方
         #    空行了"）：设备分包时偶尔多送一个 \r\n，以前那在接收区里就是一行
         #    真空白，看着毫无道理。轮与轮之间那一行空行是**我们自己**用
@@ -6430,6 +6552,9 @@ class MainWindow(QMainWindow):
         # 对齐会补零、把电压重排成「一排一个模组」的网格、在断线处插 X，
         # 那些都会让「第几个电芯」算错（见 rx_export 模块注释）。
         self._feed_export(text)
+        # SOC：同样拿原始文本（理由见 _feed_soc），对齐/补零之后再取数会把
+        # "第几个电芯"算错。它自己是完全隔离的 —— 出任何问题都只落到日志里。
+        self._feed_soc(text)
         text = align_indexes(text, section=self._align_section,
                              max_row_chars=self._rx_max_row_chars(),
                              **self._rx_grid_hints())
@@ -6446,7 +6571,18 @@ class MainWindow(QMainWindow):
             if self._align_section != SECTION_VOLT and VOLT_HEADER_RE.match(line):
                 new_round = True
             self._align_section = section_of(line, self._align_section)
-        if self.chk_timestamp.isChecked() and self._stamp_needed(text, new_round):
+        # ⚠️ 2026-11-11 用户点名：「无论接收的时候有没有选择显示时间戳，
+        #    在回看历史数据的时候都要显示时间戳」。
+        #    所以把这一帧拆成两份文本：
+        #      · ``stamped`` —— 恒含真时间戳，只用于**落盘**（本地留存）
+        #      · ``display`` —— 按"显示时间戳"开关决定带不带戳，只用于屏上
+        #    ⛔ 不能用文件 mtime 或回放时刻去"补一个时间"（那是伪造），也不能
+        #       让历史沿用屏上那份（开关一关，时间信息就永久丢了）。
+        #    ⚠️ 顺带修正：原来 ``isChecked() and self._stamp_needed(...)`` 会因
+        #       短路在开关关闭时**完全不推进轮首状态**，重开开关后时间戳会打错
+        #       位置。现在无条件调用 _stamp_needed，状态与显示开关彻底解耦。
+        need_stamp = self._stamp_needed(text, new_round)
+        if need_stamp:
             # 时间戳独占一行、本轮首行（Voltage1:）紧贴在它**下面**；它与
             # 上方（上一轮）的内容之间空一行 —— 轮与轮的视觉分隔（用户点名）。
             # 文档还是空的时候不加前导空行（第一帧顶上不留白）。
@@ -6454,25 +6590,32 @@ class MainWindow(QMainWindow):
             first = document.firstBlock()
             empty = document.blockCount() == 1 and first.length() <= 1
             head = self._stamp() if empty else f"\n{self._stamp()}"
-            display = f"{head}\n{text}"
+            stamped = f"{head}\n{text}"
         else:
-            display = text
+            stamped = text
+        shown = stamped if self.chk_timestamp.isChecked() else text
+
         # 空行规则（用户 2026-10-24 点名，与回放共用同一条）：
         # **每个 VoltageN: / TemperatureN: / BMS 状态之上各空一行**，其它位置
         # 一个空行都没有。`head` 里那个时间戳前导换行也一并由 gap_lines 生成。
         # ⛔ 逐帧追加时要跨帧判断"上一行是不是空的"，所以把最后一行记在
         #    self._rx_prev_line 上（_clear_receive 会重置）。
-        lines = gap_lines(display.split("\n"), prev=self._rx_prev_line)
+        prev_line = self._rx_prev_line
+        lines = gap_lines(shown.split("\n"), prev=prev_line)
         display = "\n".join(lines)
         if lines:
             self._rx_prev_line = lines[-1]
+        # 落盘那份用**同一个 prev 起点**再跑一遍空行规则，保证除了时间戳行
+        # 之外，格式与屏上逐行一致。
+        history_display = "\n".join(
+            gap_lines(stamped.split("\n"), prev=prev_line))
         # ⛔ 历史接收数据在**收到数据这一刻**就记，不等"显示"。
         #    以前 feed 挂在 _flush_rx_display 上：暂停期间数据只进 _paused_frames
         #    不喂历史，用户"看了半天数据，历史文件却一直停在暂停那一刻"
         #    （2026-10-18 用户点名："每次读取到串口数据就要更新"）。
         #    合并期（动画期间 60ms 批）同理：数据到了就该进历史。
         import rx_history
-        rx_history.feed(display)
+        rx_history.feed(history_display)
         if self._paused:
             # 暂停 = **冻结显示**：新数据连同到达时刻的时间戳一起进后台队列，
             # 画面一个像素都不动 —— 这就是"停留在当前数据页面"的严格实现。
@@ -6836,12 +6979,46 @@ class MainWindow(QMainWindow):
         self._align_section = SECTION_OTHER      # 画面清空 = 段状态归零
         # 空行规则要跨帧判断"上一行空不空"（见 _emit_block 的 gap_lines）
         self._rx_prev_line = ""
+        # 整流器的段状态跟着归零（否则清屏后第一帧会被当成上一段的续传）。
+        # getattr：_clear_receive 可能在 __init__ 早期就被调用，那时字段还没建。
+        _sanitizer = getattr(self, "_perf_sanitizer", None)
+        if _sanitizer is not None:
+            _sanitizer.reset()
         # 画面清空 = 重新开始数，时间戳的"轮首标记见过没有"也跟着归零；
         # 暂停队列里攒着的帧也作废（清空本身就是"不要之前的东西了"）
         self._paused_frames.clear()
         self._stamp_anchor_seen = False
         self._stamp_last_monotonic = 0.0
         self._update_counters()
+
+    # --------------------------------------------------- 性能模式（暗门）
+
+    def _set_perf_mode(self, entering: bool) -> None:
+        """切"性能模式"：队标双击进入 / 三击退出的槽（见 ``ui_brand.BrandHeader``）。
+
+        ⛔ 切换时**清屏**。两种模式的数据绝不能混在一屏里 —— 否则上半屏是整流
+        前的真值、下半屏是整流后的值，用户自己都分不清哪行是哪种。清屏只动
+        屏幕，本地留存（rx_history）不受影响。
+        """
+        entering = bool(entering)
+        if entering:
+            # 协议规则可能在设置面板里改过（位数变了）：进门前按当前口径同步一次，
+            # 否则会拿旧宽度去截 "1.318"，把 318 mV 当成 3180。
+            _profile = rx_protocol.active()
+            self._perf_sanitizer.set_widths(int(_profile.get("cell_width", 4)),
+                                            int(_profile.get("temp_width", 2)))
+        if entering != self._perf_on:
+            self._perf_on = entering
+            self._perf_sanitizer.reset()
+            self._clear_receive()
+            app_log.info(f"性能模式已{'开启' if entering else '关闭'}")
+        self._show_perf_overlay(entering)
+
+    def _show_perf_overlay(self, entering: bool) -> None:
+        """高斯模糊淡入 + 自动消失的提示（不需要用户确认）。"""
+        if self._perf_overlay is None:
+            self._perf_overlay = PerfModeOverlay(self)
+        self._perf_overlay.play(entering)
 
     # ---------------------------------------------------------- 最近一次异常
 
@@ -6992,6 +7169,35 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- 历史数据回放
 
+    @staticmethod
+    def _rows_with_stamps(rows):
+        """回看历史时保证**每轮都有一行时间**，返回 ``(行列表, 补了几个占位)``。
+
+        新落盘的数据恒带真时间戳（见 ``_emit_block`` 里 stamped / display 的
+        拆分），原样返回即可。
+
+        老文件是「显示时间戳」开关关闭时写的，那一行**从来就没生成过**，
+        事后无法还原真实时刻。⛔ 绝不拿文件 mtime 或当前时间伪造一个时间，
+        只给显式占位 ``[--:--:--]``，并由调用方 toast 明确告知用户。
+        """
+        import re
+
+        seq = list(rows)
+        # 真戳形如 [00:10:27] / [2026-11-11 00:10:27]，必含数字；
+        # 占位 [--:--:--] 不含数字，不会被当成本文件已有时间戳
+        stamp_re = re.compile(r"^\[[^\]]*\d[^\]]*\]$")
+        volt1_re = re.compile(r"^Voltage\s*1\s*:")
+        if any(stamp_re.match(str(line).strip()) for line in seq):
+            return seq, 0                 # 已有真时间戳，别动
+        out = []
+        filled = 0
+        for line in seq:
+            if volt1_re.match(str(line).strip()):
+                out.append("[--:--:--]")
+                filled += 1
+            out.append(line)
+        return out, filled
+
     def _open_history(self) -> None:
         """「打开 / 关闭历史数据」—— 这颗键是**开关**，不是单向入口。
 
@@ -7013,9 +7219,16 @@ class MainWindow(QMainWindow):
         if not rows:
             self._toast("还没有本地留存的接收数据", 3000)
             return
+        rows, filled = self._rows_with_stamps(rows)
         self._enter_replay(rows)
-        self._toast(f"已载入本地留存数据 {len(rows)} 行（可搜索/定位异常/复制；"
-                    "点右上角返回实时）", 5000)
+        if filled:
+            self._toast(
+                f"已载入本地留存数据 {len(rows)} 行；这段历史接收时未开「显示时间戳」，"
+                "真实时刻无法还原，已用 [--:--:--] 占位。"
+                "此后落盘会始终记录真实时间", 7000)
+        else:
+            self._toast(f"已载入本地留存数据 {len(rows)} 行（可搜索/定位异常/复制；"
+                        "点右上角返回实时）", 5000)
 
     def _enter_replay(self, rows) -> None:
         """把给定行灌进接收区并进入回放模式。
@@ -7045,6 +7258,11 @@ class MainWindow(QMainWindow):
         self._stamp_anchor_seen = False
         self._stamp_last_monotonic = 0.0
         text = "\n".join(rows)
+        # 性能模式下回放也要整流：历史文件可能是**开启之前**写的（里面还留着
+        # 坏点/BMS Error），不处理的话一打开历史就露馅。对已整流过的文件是
+        # 幂等的（见 perf_mode 的两条约束）。
+        if self._perf_on:
+            text = self._perf_sanitizer.feed(text)
         # ⛔ 空行与实时**同一条规则**（`ui_highlight.gap_lines`）：每个
         #    VoltageN: / TemperatureN: / BMS 状态、以及每个时间戳之上各空一行，
         #    其它位置一个空行都没有。历史文件可能是老版本写的（那时 feed 把空行
@@ -7458,9 +7676,248 @@ class MainWindow(QMainWindow):
             self.lbl_count.flash(0.8, duration=360)
 
     def _toast(self, message: str, ms: int = 3000) -> None:
-        """底部信息条里的临时提示。到点自动清空。"""
-        self.lbl_toast.setText(message)
+        """底部信息条里的临时提示。到点自动清空。
+
+        ⚠️ 底栏正中已经被 SOC 读数占住（见 ``_place_soc``），长一点的提示
+        （"已保存到 <长路径>"）会从左边顶到中间去。所以按**可用宽度**做一次
+        中段省略，完整内容塞进 tooltip —— 既不压住读数，也不丢信息。
+        """
+        text = message
+        limit = self._toast_width_limit()
+        if limit > 40:
+            metrics = QFontMetricsF(self.lbl_toast.font())
+            if metrics.horizontalAdvance(message) > limit:
+                text = metrics.elidedText(message, Qt.ElideMiddle, limit)
+        self.lbl_toast.setToolTip(message if text != message else "")
+        self.lbl_toast.setText(text)
         self._toast_timer.start(ms)
+
+    # ------------------------------------------------------------ SOC 读数
+
+    def _init_soc(self) -> None:
+        """按**当前车辆**准备 SOC 估算。
+
+        没配参数的车（``soc_profiles.cfg_for`` 返回 None）就是"这台车不做 SOC"，
+        读数固定显示 ``--`` —— 这是用户点名要的"预留别的车辆入口"：加一台车
+        只需要在 soc_profiles 里补一条参数，这里一行都不用改。
+        """
+        self._soc_cfg = None
+        self._soc_est = None
+        self._soc_feed = None
+        try:
+            self._soc_cfg = soc_profiles.cfg_for(customization.current_vehicle() or "")
+            if self._soc_cfg is None:
+                # 这台车没有 SOC 参数 = 不知道串数：性能模式**不推算总压**
+                # （猜串数会把 V= 换成一个更离谱的数）
+                self._perf_sanitizer.set_n_cells(0)
+                self._set_soc_parts(("", "SOC --", "", ""), "off")
+                return
+            # 性能模式换算总压要串数，与 SOC 用同一份车辆参数（单一真值源）
+            self._perf_sanitizer.set_n_cells(self._soc_cfg.n_cells)
+            # 算法开关：开 = 四状态 EKF，关 = 原「安时积分 + κ 回拉 + 静置锚定」。
+            # ⛔ EKF 模块导入/构造失败时**静默回退原算法**并记日志，绝不让一个
+            #    可选算法把接收链路搞挂（开关默认关，原路径零依赖）。
+            ekf = None
+            if bool(customization.get("soc_ekf4")):
+                try:
+                    import soc_ekf
+                    ekf = soc_ekf.SocEKF4(self._soc_cfg)
+                except Exception:                  # noqa: BLE001
+                    import traceback
+                    app_log.error("四状态 EKF 初始化失败，回退原算法: "
+                                  + traceback.format_exc(limit=2))
+                    ekf = None
+            self._soc_est = soc_est.SocEstimator(self._soc_cfg, ekf=ekf)
+            per = max(1, self._soc_cfg.cells_per_module)
+            self._soc_feed = soc_feed.RoundCollector(
+                n_modules=max(1, self._soc_cfg.n_cells // per),
+                cells_per_module=per)
+            self._set_soc_parts(("", "SOC --", "", ""), "off")
+        except Exception:                     # noqa: BLE001 - 绝不拖垮主界面
+            import traceback
+            app_log.error("SOC 初始化失败: " + traceback.format_exc(limit=2))
+            self._soc_cfg = None
+            self._soc_est = None
+            self._soc_feed = None
+
+    def _feed_soc(self, text: str) -> None:
+        """把一块原始报文喂给 SOC 链路。
+
+        ⛔ 必须拿**对齐之前**的原始文本（与结构化导出同一个位置）：对齐会把
+        电压重排成网格、在断线处插 X，按那个取数会把"第几个电芯"算错。
+        """
+        if self._soc_est is None or self._soc_feed is None:
+            return
+        try:
+            now = time.monotonic()
+            for data in self._soc_feed.feed(text):
+                res = self._soc_est.update(
+                    data.cells, data.temps, data.i_meas, ts=now,
+                    bad_mask=data.bad,
+                    contactor_open=data.contactor_open,
+                    bms_ok=data.bms_ok)
+                self._apply_soc(res)
+        except Exception:                     # noqa: BLE001 - 绝不影响接收
+            import traceback
+            app_log.error("SOC 采集异常: " + traceback.format_exc(limit=2))
+
+    def _apply_soc(self, res) -> None:
+        """把一轮结果刷到底栏正中的 min / max / 总压三枚标签。"""
+        state = "ok"
+        if res is None or res.clean is None or not res.clean.ok:
+            state = "off"
+        elif (res.clean.residual or res.clean.module_offset
+              or res.flag in ("WEAK", "EKF_RECOVER")):
+            # 残留坏点 / 整模组不均衡 / 健康电芯太少 / 滤波发散回退
+            # —— 读数可能不准，转橙色提醒
+            state = "warn"
+        if self._perf_on and state == "warn":
+            # 性能模式：橙色提醒同样属于"不该出现的异常信息"（用户点名
+            # "不显示其他报错信息"）。数值本身仍用估算结果，只把状态灯压平。
+            state = "ok"
+        parts = soc_est.format_soc_parts(res, self._soc_cfg)
+        self._set_soc_parts(parts, state,
+                            emphasis=(res.emphasis if res is not None else ""))
+
+    def _set_soc_parts(self, parts, state: str, emphasis: str = "") -> None:
+        """三枚标签统一刷文本 + 动态属性。
+
+        ⛔ 动态属性变了必须 ``unpolish``/``polish``，否则 QSS 不重新求值、
+        颜色不跟着变（旧版单标签时踩过）。
+        """
+        labels = getattr(self, "_soc_labels", None)
+        if not labels:
+            return
+        for lbl, text in zip(labels, parts):
+            if lbl.text() != text:
+                lbl.setText(text)
+        em_min = em_max = "normal"
+        if emphasis == "min":
+            em_min, em_max = "focus", "dim"       # 放电看最弱节
+        elif emphasis == "max":
+            em_min, em_max = "dim", "focus"       # 充电看最高节
+        for lbl, em in zip(labels, ("mode", em_min, em_max, "volt")):
+            changed = False
+            if lbl.property("state") != state:
+                lbl.setProperty("state", state)
+                changed = True
+            if lbl.property("emphasis") != em:
+                lbl.setProperty("emphasis", em)
+                changed = True
+            if changed:
+                style = lbl.style()
+                style.unpolish(lbl)
+                style.polish(lbl)
+                lbl.update()
+        self._place_soc()
+
+    def _set_soc_text(self, text: str, state: str) -> None:
+        """兼容旧调用：只设主标签。新代码走 :meth:`_set_soc_parts`。"""
+        self._set_soc_parts(("", text, "", ""), state)
+
+    def _place_soc(self) -> None:
+        """把「工况 / min / max / 总电压」当成**一组**钉在底栏正中央。
+
+        只对非空标签计宽度，所以没数据时只有 ``SOC --`` 一枚、也是精确居中；
+        有数据时三枚之间的间隙固定，不会因为文本变长而左右跳。
+
+        ⚠️ 必须夹紧（od75 补）：窗口拖窄到 ~820 时整组四枚会超出底栏中部，
+        硬居中会把右端压到「未打开」上（实测重叠 30px）。所以先取可用区间
+        ``[左内边距, 右侧状态文字左缘 − 8]``：够宽就居中，不够就先压间隙、
+        再整体靠左贴齐，宁可偏一边也不叠字。
+        """
+        bar = getattr(self, "_bottom_bar", None)
+        labels = getattr(self, "_soc_labels", None)
+        if bar is None or not labels:
+            return
+        gap = 14
+        sized = []
+        for lbl in labels:
+            lbl.adjustSize()
+            if lbl.text():
+                sized.append((lbl, lbl.width(), lbl.height()))
+            else:
+                lbl.setGeometry(0, 0, 0, 0)
+        if not sized:
+            return
+
+        def total_with(g: int) -> int:
+            return sum(w for _, w, _ in sized) + g * (len(sized) - 1)
+
+        # 可用横向区间：右边让开 lbl_state / 计数（它们靠右对齐，宽度随文本变）
+        pad = 8
+        left_limit = pad
+        right_limit = bar.width() - pad
+        state = getattr(self, "lbl_state", None)
+        if state is not None and state.isVisible():
+            sx = state.mapTo(bar, QPoint(0, 0)).x()
+            if sx > pad:
+                right_limit = min(right_limit, sx - pad)
+        usable = max(0, right_limit - left_limit)
+        total = total_with(gap)
+        if total > usable:
+            gap = 6                      # 先压间隙（14 → 6 省 24px）
+            total = total_with(gap)
+        # ⚠️ 先按**整栏**居中（这是正常观感，别拿可用区间中点算 —— 右边界紧贴
+        #    状态文字，区间中点比栏中点偏左一百多像素，会让读数整体歪向齿轮）。
+        #    只有居中后越界时才夹紧。
+        x = (bar.width() - total) // 2
+        if x < left_limit:
+            x = left_limit
+        if x + total > right_limit:
+            x = max(left_limit, right_limit - total)
+        for lbl, w, h in sized:
+            lbl.setGeometry(x, (bar.height() - h) // 2, w, h)
+            lbl.raise_()
+            x += w + gap
+
+    def _schedule_place_soc(self) -> None:
+        """摆一次 SOC 读数，并**再**补摆一次让真实几何复核。
+
+        为什么需要第二次：``_place_soc`` 的右边界取自
+        ``lbl_state.mapTo(bar, ...)`` —— 那是**兄弟控件已经排完版**之后的位置。
+        而窗口缩放时 ``resizeEvent`` 早于主布局把新宽度发给底栏、更早于底栏
+        自己的子布局重排，这一刻 ``bar.width()`` / ``lbl_state`` 可能还是旧值
+        （实测 900 宽窗口：入参 882、落定后 884，兄弟控件位置同步滞后）。
+        拿旧边界去判"够不够宽"会得出相反结论，两种方向都难看：
+          · 变窄时以为还有空间 → 不夹紧 → 四枚读数压到「未打开」上；
+          · 变宽时以为没空间 → 多夹一次 → 整组偏左。
+        本轮实测偏差只有 1~2px，但布局链一长（比如同时换了紧凑档/边距）滞后
+        会更大，所以不赌"差得小"。
+        所以先立即摆一次保住当前帧（正常路径下这一次就是对的，不会闪），
+        再挂一个 0ms 单发，等 LayoutRequest 走完用真实几何复核。两次都幂等
+        —— 重复调用只是把同一批控件 setGeometry 到相同矩形，不触发重绘。
+        """
+        self._place_soc()
+        if getattr(self, "_place_soc_pending", False):
+            return
+        self._place_soc_pending = True
+        # 带 context：窗口销毁后不再回调（同 _start_snap_worker 的写法）
+        QTimer.singleShot(0, self, self._place_soc_settled)
+
+    def _place_soc_settled(self) -> None:
+        """布局落定后的复核摆位，见 :meth:`_schedule_place_soc`。"""
+        self._place_soc_pending = False
+        self._place_soc()
+
+    def _toast_width_limit(self) -> int:
+        """提示文字能用到哪里为止：到 SOC 那一组的最左边缘（留 12px 间隙）。
+
+        ⚠️ 不能再用 ``lbl_soc.x()``（它是 min 标签）—— 加了工况标记之后
+        最左边是 ``lbl_soc_mode``，拿 min 算会让长提示压住工况文字。
+        """
+        labels = getattr(self, "_soc_labels", None)
+        toast = getattr(self, "lbl_toast", None)
+        if not labels or toast is None or not self._soc_active():
+            return 0
+        shown = [lbl for lbl in labels if lbl.text()]
+        if not shown:
+            return 0
+        return min(lbl.x() for lbl in shown) - 12 - toast.x()
+
+    def _soc_active(self) -> bool:
+        """这台车到底有没有 SOC 读数（没有就不必为它腾地方）。"""
+        return getattr(self, "_soc_cfg", None) is not None
 
     def _open_settings(self) -> None:
         """设置键 = **开关**：开着就关、关着就开（用户点名"已经打开的情况下
@@ -8070,6 +8527,14 @@ class MainWindow(QMainWindow):
         if "startup_maximized" in custom_changes:
             # 起手姿态当场摆一次（不然用户得重启才看得到自己改了什么）
             self._apply_startup_maximized()
+        if "soc_ekf4" in custom_changes:
+            # 换 SOC 算法 = 积分/滤波状态全部作废重来（⛔ 不能把上一套算法的
+            # 中间状态带过去，否则 SOC 会带着旧积分跳一下）
+            self._init_soc()
+            self._schedule_place_soc()
+            app_log.info("SOC 算法已切换为 " +
+                         ("四状态 EKF" if bool(customization.get("soc_ekf4"))
+                          else "固定增益融合"))
         if any(k in custom_changes for k in ("module_count", "cells_per_module",
                                              "temps_per_module", "broken_wire_mv")):
             # 决策-3：排版配置改完，**已显示的旧文本**也要按新网格重排（滚动位置、
@@ -8117,6 +8582,10 @@ class MainWindow(QMainWindow):
             import rx_history
             rx_history.switch_target(customization.current_vehicle() or None)
             self._schedule_vehicle_relayout()
+            # 换车 = 换了一套电池：积分状态、零漂、整轮拼装全部作废重来。
+            # ⛔ 不重置的话上一台车的 SOC 会"带"到新车上，比不显示更糟。
+            self._init_soc()
+            self._schedule_place_soc()
 
     def _preview_buttons(self, hidden: list[str]) -> None:
         """设置面板拖动开关时的实时预览（不落盘）。"""
@@ -8326,6 +8795,9 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        # 底栏正中的 SOC 读数按 (栏宽-自身宽)/2 绝对定位，show 之后栏宽才是真值。
+        # 同样要复核一次：show 之前那次布局很可能还没把底栏排完。
+        self._schedule_place_soc()
         # od47i：后台快照线程要的窗口句柄 + 全屏标记（这里 winId 已有效）。
         self._hwnd = int(self.winId() or 0)
         self._bg_is_fs = self.isFullScreen()
@@ -8457,6 +8929,70 @@ class MainWindow(QMainWindow):
         except Exception:
             pass        # Win7 / 远程桌面下拿不到 DWM：退回平面无影窗口，功能不受影响
 
+    # ------------------------------------------------------------- 可选 DLC
+
+    def _open_dlc_manager(self) -> None:
+        """「DLC」：安装 / 启用 / 卸载可选扩展（对话框在 dlc_host 里）。"""
+        try:
+            dialog = dlc_host.DlcManagerDialog.create(
+                dlc_host.HostContext(self), parent=self)
+            dialog.exec()
+        except Exception as exc:                    # noqa: BLE001 - 扩展管理不能拖垮主窗
+            app_log.error(f"DLC 管理对话框打不开：{type(exc).__name__}: {exc}")
+            QMessageBox.warning(self, "DLC", f"打不开扩展管理：{exc}")
+
+    def _init_dlc(self) -> None:
+        """发现并加载启用的 DLC。可重复调用（安装/启用后立即生效），按 id 去重。
+
+        ⚠️ 全程异常隔离：第三方扩展的 import 失败、缺依赖、create() 抛错，
+        都只写日志，主窗该开串口照开（见 dlc_host.load）。
+        """
+        ctx = dlc_host.HostContext(self)
+        for info in dlc_host.discover():
+            if info.error:
+                app_log.warning(f"DLC {info.id} 不可用：{info.error}")
+                continue
+            if not info.enabled or info.id in self._dlc_loaded:
+                continue
+            plugin = dlc_host.load(info, ctx)
+            if plugin is not None:
+                self._dlc_loaded[info.id] = plugin
+        app = QApplication.instance()
+        if app is not None and not self._dlc_aboutquit_wired:
+            self._dlc_aboutquit_wired = True
+            app.aboutToQuit.connect(self._shutdown_dlc)
+
+    def _dlc_add_launcher(self, text: str, callback, tooltip: str = "") -> None:
+        """插件上下文用的入口按钮注册（和「DLC」同一套排版）。"""
+        button = InkButton(str(text), variant="ghost")
+        button.setToolTip(tooltip or str(text))
+        # clicked 会带 checked=False，用 lambda 吞掉，别把它顶进 callback。
+        button.clicked.connect(lambda: callback())
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        spacer = QWidget()
+        spacer.setFixedWidth(64)
+        row.addWidget(spacer)
+        row.addWidget(button, 1)
+        self._dlc_launchers_lay.addLayout(row)
+        self._dlc_spacers.append(spacer)
+        self._dlc_buttons.append(button)
+        self._dlc_launchers.setVisible(True)
+
+    def _shutdown_dlc(self) -> None:
+        """退出前让插件停掉自己的 QThread（幂等，closeEvent 与 aboutToQuit 双保险）。"""
+        if self._dlc_shutdown_done:
+            return
+        self._dlc_shutdown_done = True
+        for plugin_id, plugin in list(self._dlc_loaded.items()):
+            shutdown = getattr(plugin, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception as exc:            # noqa: BLE001
+                    app_log.error(f"DLC {plugin_id} 收尾失败：{exc}")
+        self._dlc_loaded.clear()
+
     def closeEvent(self, event) -> None:
         # 关闭也做一段淡出（用户 2026-10-31："关闭...还是没有动画"）。先忽略这次
         # close、淡到 0 再真正关；_closing 闸住重入（第二次进来直接走清理）。
@@ -8486,6 +9022,8 @@ class MainWindow(QMainWindow):
         # 蓝牙列表扫描器也停掉（它和"连接"无关，主开关管不到它）
         if self._ble_scanner is not None:
             self._finish_ble_scan(fill=False)
+        # 插件可能开着 BLE 线程，必须在真正关窗这一拍停掉（幂等）。
+        self._shutdown_dlc()
         self._save_settings()
         # 会话库收尾：把批量窗口里还没提交的帧（≤50 帧 / 500ms）落盘再退出。
         # 超时短一点：关窗是自己触发的，不能为了尾巴卡住退出。
