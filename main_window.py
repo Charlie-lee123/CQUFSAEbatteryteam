@@ -745,11 +745,11 @@ class MainWindow(QMainWindow):
         self._ble_scanner: object | None = None      # BleBroadcastWorker（惰性导入，见 _ble_worker_cls）
         self._ble_seen: dict[str, dict] = {}
         self._ble_target = ""
-        # 可选 DLC（见 dlc_host）：不装插件时只有一颗常驻「DLC」按钮，
-        # 插件入口按钮在启动后由 _init_dlc 动态插进 _dlc_launchers。
+        # 可选 DLC（见 dlc_host）：单一开关模式。当前只有「心率广播 DLC」一个，
+        # 所以左侧 DLC 区只放一颗「心率 DLC」开关 + 一颗低调的「卸载」入口，
+        # 不再有「DLC 管理」按钮，也不再动态插入插件入口按钮。
         self._dlc_loaded: dict[str, object] = {}
-        self._dlc_spacers: list[QWidget] = []
-        self._dlc_buttons: list[InkButton] = []
+        self._dlc_launcher_cbs: dict[str, object] = {}   # 插件入口回调（按 launcher 文案存），开关 ON 时调用
         self._dlc_shutdown_done = False
         self._dlc_aboutquit_wired = False
         self._decoder = StreamDecoder()
@@ -1884,30 +1884,30 @@ class MainWindow(QMainWindow):
         hist_row.addWidget(self.btn_open_history, 1)
         col.addLayout(hist_row)
 
-        # ---- 可选 DLC 扩展（新增，见 dlc_host）--------------------------------
-        # 常驻一颗「DLC」：没装插件时也能找到安装入口。⚠️ 不进
-        # BUTTON_SPECS —— 那是「界面按钮」隐藏清单，允许隐藏等于让用户把自己
-        # 锁在扩展管理外面（和左下角设置按钮同一个理由）。
-        self.btn_dlc = InkButton("DLC", variant="ghost")
-        self.btn_dlc.setToolTip("管理可选 DLC：安装 / 启用 / 卸载")
-        self.btn_dlc.clicked.connect(self._open_dlc_manager)
+        # ---- 可选 DLC：单一开关（当前只有「心率广播 DLC」一个）-----------------
+        # 只放一颗「心率 DLC」开关 + 一颗低调的「卸载」入口，代替原来的
+        # 「DLC 管理」按钮 + 动态插件入口按钮（见 dlc_host）。
+        self._dlc_switch = Switch("心率 DLC")
+        self._dlc_switch.setToolTip("开启 / 关闭心率广播 DLC（小米手环 BLE 心率）")
+        self._dlc_switch.toggled.connect(self._on_dlc_switch)
+
+        self._dlc_uninstall = InkButton("卸载", variant="ghost")
+        self._dlc_uninstall.setToolTip("卸载心率广播 DLC")
+        self._dlc_uninstall.clicked.connect(self._uninstall_dlc)
+
         dlc_row = QHBoxLayout()
         dlc_row.setSpacing(10)
         dlc_spacer = QWidget()
         dlc_spacer.setFixedWidth(64)
         self._dlc_spacer = dlc_spacer
+        dlc_inner = QHBoxLayout()
+        dlc_inner.setSpacing(10)
+        dlc_inner.addWidget(self._dlc_switch)
+        dlc_inner.addWidget(self._dlc_uninstall)
+        dlc_inner.addStretch(1)
         dlc_row.addWidget(dlc_spacer)
-        dlc_row.addWidget(self.btn_dlc, 1)
+        dlc_row.addLayout(dlc_inner, 1)
         col.addLayout(dlc_row)
-
-        # 插件自己的入口按钮由 dlc_host 在启动时插进来。空容器不占位：
-        # 没装任何 DLC 时界面与旧版只差上面这一颗按钮。
-        self._dlc_launchers = QWidget()
-        self._dlc_launchers_lay = QVBoxLayout(self._dlc_launchers)
-        self._dlc_launchers_lay.setContentsMargins(0, 0, 0, 0)
-        self._dlc_launchers_lay.setSpacing(10)
-        col.addWidget(self._dlc_launchers)
-        self._dlc_launchers.setVisible(False)
 
         col.addStretch(1)
 
@@ -4118,14 +4118,11 @@ class MainWindow(QMainWindow):
         # （1/4 屏截图里量到过：文字比底色块还宽）。
         self.btn_open_history.setMinimumWidth(146 if field_w <= 0 else 104)
         self._hist_spacer.setFixedWidth(spec["label_w"])
-        # DLC 入口 / 插件入口跟「打开历史数据」同一套窄档收口：标签列收起时
-        # 占位一起收，按钮下限也压到 104，免得文字戳出圆角底板。
+        # DLC 入口（单一开关 + 卸载）跟「打开历史数据」同一套窄档收口：
+        # 标签列收起时占位一起收，控件下限也压到 104，免得文字戳出圆角底板。
         self._dlc_spacer.setFixedWidth(spec["label_w"])
-        self.btn_dlc.setMinimumWidth(146 if field_w <= 0 else 104)
-        for spacer in self._dlc_spacers:
-            spacer.setFixedWidth(spec["label_w"])
-        for button in self._dlc_buttons:
-            button.setMinimumWidth(146 if field_w <= 0 else 104)
+        self._dlc_switch.setMinimumWidth(146 if field_w <= 0 else 104)
+        self._dlc_uninstall.setMinimumWidth(146 if field_w <= 0 else 104)
 
         # 工具栏横/竖排。切换会改变内容自然高度，把"量过的高度"和"钉住的高度"一起
         # 作废 —— 否则下一次全屏转场会按旧行高插值（展开那一帧工具栏会被裁）。
@@ -8931,15 +8928,12 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- 可选 DLC
 
-    def _open_dlc_manager(self) -> None:
-        """「DLC」：安装 / 启用 / 卸载可选扩展（对话框在 dlc_host 里）。"""
-        try:
-            dialog = dlc_host.DlcManagerDialog.create(
-                dlc_host.HostContext(self), parent=self)
-            dialog.exec()
-        except Exception as exc:                    # noqa: BLE001 - 扩展管理不能拖垮主窗
-            app_log.error(f"DLC 管理对话框打不开：{type(exc).__name__}: {exc}")
-            QMessageBox.warning(self, "DLC", f"打不开扩展管理：{exc}")
+    def _heartbeat_dlc_info(self) -> object | None:
+        """找到本机已安装的心率广播 DLC（当前唯一一个）；没有返回 None。"""
+        for info in dlc_host.discover():
+            if info.id == "heartbeatDLC":
+                return info
+        return None
 
     def _init_dlc(self) -> None:
         """发现并加载启用的 DLC。可重复调用（安装/启用后立即生效），按 id 去重。
@@ -8957,27 +8951,120 @@ class MainWindow(QMainWindow):
             plugin = dlc_host.load(info, ctx)
             if plugin is not None:
                 self._dlc_loaded[info.id] = plugin
+        # 单一开关模式：启动时若已启用，直接打开面板，让「开关 ON」与
+        # 「面板已开」一致（旧版是启用后再点入口按钮才开）。
+        cb = self._dlc_launcher_cbs.get("心率 DLC")
+        if cb is not None:
+            try:
+                cb()
+            except Exception as exc:            # noqa: BLE001
+                app_log.error(f"心率 DLC 启动失败：{exc}")
         app = QApplication.instance()
         if app is not None and not self._dlc_aboutquit_wired:
             self._dlc_aboutquit_wired = True
             app.aboutToQuit.connect(self._shutdown_dlc)
+        self._sync_dlc_switch()
 
     def _dlc_add_launcher(self, text: str, callback, tooltip: str = "") -> None:
-        """插件上下文用的入口按钮注册（和「DLC」同一套排版）。"""
-        button = InkButton(str(text), variant="ghost")
-        button.setToolTip(tooltip or str(text))
-        # clicked 会带 checked=False，用 lambda 吞掉，别把它顶进 callback。
-        button.clicked.connect(lambda: callback())
-        row = QHBoxLayout()
-        row.setSpacing(10)
-        spacer = QWidget()
-        spacer.setFixedWidth(64)
-        row.addWidget(spacer)
-        row.addWidget(button, 1)
-        self._dlc_launchers_lay.addLayout(row)
-        self._dlc_spacers.append(spacer)
-        self._dlc_buttons.append(button)
-        self._dlc_launchers.setVisible(True)
+        """插件上下文注册入口回调（单一开关模式下不再单独生成按钮）。
+
+        旧版会把每个插件的入口做成一颗独立按钮插进左侧栏；现在只有一颗
+        「心率 DLC」开关，开关 ON 时直接调这里存下的回调（即插件的 show_panel）。
+        """
+        self._dlc_launcher_cbs[text] = callback
+
+    def _on_dlc_switch(self, checked: bool) -> None:
+        """单一「心率 DLC」开关：ON = 启用 + 加载 + 启动；OFF = 停止 + 禁用。"""
+        info = self._heartbeat_dlc_info()
+        if info is None or info.error:
+            if checked:
+                self._dlc_switch.setChecked(False)
+            QMessageBox.information(self, "心率 DLC",
+                                    "未检测到心率广播 DLC，无法切换。")
+            return
+        if checked:
+            dlc_host.set_enabled(info.id, True)
+            info = self._heartbeat_dlc_info()   # 重新读，让 enabled 同步
+            if info is None or info.error:
+                self._dlc_switch.setChecked(False)
+                return
+            if info.id not in self._dlc_loaded:
+                plugin = dlc_host.load(info, dlc_host.HostContext(self))
+                if plugin is not None:
+                    self._dlc_loaded[info.id] = plugin
+            cb = self._dlc_launcher_cbs.get("心率 DLC")
+            if cb is not None:
+                try:
+                    cb()
+                except Exception as exc:            # noqa: BLE001
+                    app_log.error(f"心率 DLC 启动失败：{exc}")
+        else:
+            plugin = self._dlc_loaded.pop(info.id, None)
+            if plugin is not None:
+                shutdown = getattr(plugin, "shutdown", None)
+                if callable(shutdown):
+                    try:
+                        shutdown()
+                    except Exception as exc:        # noqa: BLE001
+                        app_log.error(f"心率 DLC 关闭失败：{exc}")
+            dlc_host.set_enabled(info.id, False)
+        self._sync_dlc_switch()
+
+    def _uninstall_dlc(self) -> None:
+        """卸载心率广播 DLC：先停运行中的插件实例，再删文件（已自动备份）。"""
+        info = self._heartbeat_dlc_info()
+        if info is None:
+            QMessageBox.information(self, "心率 DLC", "未检测到心率广播 DLC。")
+            return
+        plugin = self._dlc_loaded.pop(info.id, None)
+        ans = QMessageBox.question(
+            self, "卸载心率 DLC",
+            f"确定卸载「{info.name}」？\n卸载会删除插件文件（已自动备份到本地）。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if ans != QMessageBox.StandardButton.Yes:
+            if plugin is not None:
+                self._dlc_loaded[info.id] = plugin   # 反悔：恢复运行实例
+            self._sync_dlc_switch()
+            return
+        if plugin is not None:                       # 确认卸载：先停实例，再删文件
+            shutdown = getattr(plugin, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception as exc:            # noqa: BLE001
+                    app_log.error(f"心率 DLC 关闭失败：{exc}")
+        try:
+            backup = dlc_host.uninstall(info)
+            QMessageBox.information(self, "卸载完成",
+                                    f"心率广播 DLC 已卸载。\n备份：{backup}")
+        except Exception as exc:                    # noqa: BLE001
+            app_log.error(f"心率 DLC 卸载失败：{exc}")
+            QMessageBox.warning(self, "卸载失败", f"卸载失败：{exc}")
+            if plugin is not None:
+                self._dlc_loaded[info.id] = plugin
+        self._sync_dlc_switch()
+
+    def _sync_dlc_switch(self) -> None:
+        """让开关 / 卸载按钮反映当前 DLC 的安装与启用状态。"""
+        if not hasattr(self, "_dlc_switch"):
+            return
+        self._dlc_switch.blockSignals(True)
+        try:
+            info = self._heartbeat_dlc_info()
+            installed = info is not None and not info.error
+            on = bool(installed and info.enabled and info.id in self._dlc_loaded)
+            self._dlc_switch.setChecked(on)
+            self._dlc_switch.setEnabled(installed)
+            self._dlc_uninstall.setEnabled(installed)
+        finally:
+            self._dlc_switch.blockSignals(False)
+        if not installed:
+            self._dlc_switch.setToolTip("未安装心率广播 DLC")
+            self._dlc_uninstall.setToolTip("未安装心率广播 DLC")
+        else:
+            self._dlc_switch.setToolTip(
+                "开启 / 关闭心率广播 DLC（小米手环 BLE 心率）")
+            self._dlc_uninstall.setToolTip("卸载心率广播 DLC")
 
     def _shutdown_dlc(self) -> None:
         """退出前让插件停掉自己的 QThread（幂等，closeEvent 与 aboutToQuit 双保险）。"""
