@@ -318,10 +318,18 @@ register_int("temps_per_module", "每模组温度采集数", 0, 0, 64,
 # 电压 / 温度区**独立**的显示行数（用户 2026-11-13 点名：与「模组个数」解耦，
 # 各自单独控制显示成几行）。0 = 自动（保持现状：没选车时按「每模组电芯数」推行数，
 # 选了车按车辆档案逐模组）。范围 0~64。
+#
+# ⚠️ 这两个键是**双份**语义（用户同日后半句："这个要跟着车号走"）：
+#   · 选了车 → 生效和落盘的真正是**车辆档案里那台车自己的** volt_rows/temp_rows
+#     （见 _normalize_items / set_vehicle_rows / active_row_hints），面板里改一格
+#     就写那台车；下面这两个全局键此时只当"没选车时的默认值"，不被改写。
+#   · 没选车 → 就是下面这两个全局键，按「确定」落盘（老行为一字不差）。
 register_int("volt_rows", "电压数据行数", 0, 0, 64,
-             tip="电压区显示成几行；0 = 自动（跟随每模组电芯数 / 车辆档案）")
+             tip="电压区显示成几行；0 = 自动（一排一个模组 / 跟随设备列数）。"
+                 "选了车号时这个值**跟着车号存**，每台车各自一份")
 register_int("temp_rows", "温度采集数据行数", 0, 0, 64,
-             tip="温度区显示成几行；0 = 自动（跟随每模组温度采集数 / 车辆档案）")
+             tip="温度区显示成几行；0 = 自动（一排一个模组 / 跟随设备列数）。"
+                 "选了车号时这个值**跟着车号存**，每台车各自一份")
 
 # 显示补零开关（用户 2026-11-13 点名）：开 = 当前行为（位数不够时前方补零）；
 # 关 = 把补的那些零换成**同宽空格**（等宽字体下宽度一致，列起点不动）。
@@ -387,6 +395,9 @@ DEFAULT_TEMPS = 8
 # 单模组取值范围：与 register_int 里那两个上限一致（超过设备协议就不合理）
 _CELL_RANGE = (0, 32)
 _TEMP_RANGE = (0, 64)
+# 「电压数据行数 / 温度采集数据行数」按车号存（用户 2026-11-13 点名"跟着车号走"）：
+# 范围与 customization.register_int("volt_rows"/"temp_rows") 的 0~64 一致。
+_ROWS_RANGE = (0, 64)
 _MAX_MODULES = 64
 
 
@@ -416,6 +427,17 @@ def _clamp_list(raw, limits: tuple[int, int]) -> list[int] | None:
     return out
 
 
+def _clamp_int(raw, limits: tuple[int, int], fallback: int = 0) -> int:
+    """把 JSON 里的单个数字归一成 int 并夹进量程；坏值/缺值 → ``fallback``。
+
+    和 ``_clamp_list`` 同一条思路：一个字段坏了不该让整台车从列表里消失。
+    """
+    try:
+        return max(limits[0], min(limits[1], int(raw)))
+    except (TypeError, ValueError):
+        return int(fallback)
+
+
 def _equalize(cells: list[int], temps: list[int]) -> tuple[list[int], list[int]]:
     """让 cells / temps 长度相等（不变式：两者长度都等于模组个数）。
 
@@ -435,10 +457,15 @@ def _equalize(cells: list[int], temps: list[int]) -> tuple[list[int], list[int]]
 
 
 def _normalize_items(raw) -> list[dict]:
-    """把 JSON 里的 items 归一成 ``[{"name", "cells", "temps"}, ...]``（只读，不改磁盘）。
+    """把 JSON 里的 items 归一成
+    ``[{"name", "cells", "temps", "volt_rows", "temp_rows"}, ...]``（只读，不改磁盘）。
 
     丢弃的只有"彻底没法用"的条目：不是字典、名字为空、名字重复（同名就认第一条
     —— 后面那条没有身份，留着会让"选中哪一台"变得不可预测）。
+
+    ``volt_rows`` / ``temp_rows`` 是 2026-11-13 新加的**逐车**显示行数（用户点名
+    "这个要跟着车号走"）。老档案没有这两个键 → 归一成 0（= 自动），行为与加它
+    之前一字不差。
     """
     items: list[dict] = []
     # ⚠️ 本模块里 ``set`` 是被 register_int/set 那个**写配置函数**占用的名字，
@@ -454,7 +481,9 @@ def _normalize_items(raw) -> list[dict]:
         temps = _clamp_list(entry.get("temps"), _TEMP_RANGE) or []
         cells, temps = _equalize(cells[: _MAX_MODULES], temps[: _MAX_MODULES])
         seen.append(name)
-        items.append({"name": name, "cells": cells, "temps": temps})
+        items.append({"name": name, "cells": cells, "temps": temps,
+                      "volt_rows": _clamp_int(entry.get("volt_rows"), _ROWS_RANGE),
+                      "temp_rows": _clamp_int(entry.get("temp_rows"), _ROWS_RANGE)})
     return items
 
 
@@ -495,14 +524,17 @@ def _save_store(items: list[dict], current: str) -> None:
 
 
 def vehicles() -> list[dict]:
-    """全部车辆档案（每条都带 name / cells / temps，结构已归一）。
+    """全部车辆档案（每条都带 name / cells / temps / volt_rows / temp_rows，结构已归一）。
 
     返回的是**副本**：调用方改了也不会悄悄改到磁盘上的档案（只在
-    ``save_vehicle`` 里才落盘）。坏了的数据在这里就被丢掉了，上层不用再做防御。
+    ``save_vehicle`` / ``set_vehicle_rows`` 里才落盘）。坏了的数据在这里就被
+    丢掉了，上层不用再做防御。
     """
     return [{"name": item["name"],
              "cells": list(item["cells"]),
-             "temps": list(item["temps"])}
+             "temps": list(item["temps"]),
+             "volt_rows": int(item["volt_rows"]),
+             "temp_rows": int(item["temp_rows"])}
             for item in _load_store()["items"]]
 
 
@@ -569,13 +601,18 @@ def select_vehicle(name: str) -> None:
     _save_store(store["items"], target)
 
 
-def save_vehicle(name: str, cells, temps) -> None:
+def save_vehicle(name: str, cells, temps,
+                 volt_rows: int | None = None, temp_rows: int | None = None) -> None:
     """存一台车的模组结构（**同名覆盖**，否则追加到末尾）。
 
     ``cells[i]`` / ``temps[i]`` 是第 i 个模组的电芯数 / 温度采集数，两者长度都
     等于模组个数（不等的话按 ``_equalize`` 补齐）。名字为空直接忽略 —— 没有名字
     的档案没法被选中，存了也只是条垃圾。同一条档案的**位置不变**（覆盖而不是
     删了再追加）：下拉框的排列顺序是用户认位置的一部分，改名/改结构不该让它跳。
+
+    ``volt_rows`` / ``temp_rows``：这台车自己的「电压数据行数 / 温度采集数据行数」
+    （0 = 自动）。**None = 不动这一项**（老调用点只改结构，不该把用户配的行数
+    抹成 0）；新建档案时 None 就存 0。要单独改行数用 ``set_vehicle_rows``。
     """
     target = str(name or "").strip()
     if not target:
@@ -586,13 +623,57 @@ def save_vehicle(name: str, cells, temps) -> None:
                                        temps_list[: _MAX_MODULES])
     store = _load_store()
     items = store["items"]
+    rows = {}
+    if volt_rows is not None:
+        rows["volt_rows"] = _clamp_int(volt_rows, _ROWS_RANGE)
+    if temp_rows is not None:
+        rows["temp_rows"] = _clamp_int(temp_rows, _ROWS_RANGE)
     for item in items:
         if item["name"] == target:
             item["cells"], item["temps"] = cells_list, temps_list
+            item.update(rows)
             break
     else:
-        items.append({"name": target, "cells": cells_list, "temps": temps_list})
+        entry = {"name": target, "cells": cells_list, "temps": temps_list,
+                 "volt_rows": 0, "temp_rows": 0}
+        entry.update(rows)
+        items.append(entry)
     _save_store(items, store["current"])
+
+
+def set_vehicle_rows(name: str, volt_rows: int, temp_rows: int) -> None:
+    """只改这台车的「电压 / 温度显示行数」，**不动模组结构**（0 = 自动）。
+
+    为什么单独开一个写入口：设置面板里那两个数字框是**改一下立刻落盘**的
+    （与逐模组行同一个口径），若复用 ``save_vehicle``，面板就得先把 cells/temps
+    读出来再写回去 —— 多一次读、还多一个"读到的不是最新"的窗口。
+    """
+    target = str(name or "").strip()
+    if not target:
+        return
+    store = _load_store()
+    for item in store["items"]:
+        if item["name"] == target:
+            item["volt_rows"] = _clamp_int(volt_rows, _ROWS_RANGE)
+            item["temp_rows"] = _clamp_int(temp_rows, _ROWS_RANGE)
+            _save_store(store["items"], store["current"])
+            return
+
+
+def active_row_hints() -> tuple[int, int]:
+    """当前车辆的 ``(volt_rows, temp_rows)``；没选车 → ``(0, 0)``（= 自动）。
+
+    与 ``active_profile`` 分开取：主窗口排版时两个都要，但语义不同 —— 前者是
+    **显示行数**（0 = 跟随逐模组尺寸），后者是**逐模组列数**。
+    """
+    store = _load_store()
+    current = store["current"]
+    if not current:
+        return 0, 0
+    for item in store["items"]:
+        if item["name"] == current:
+            return int(item["volt_rows"]), int(item["temp_rows"])
+    return 0, 0
 
 
 def delete_vehicle(name: str) -> None:

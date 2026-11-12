@@ -461,7 +461,8 @@ def _grid_rows(tokens: list[tuple[str, str]], section: str,
     ``cols``：设备自己发来的每行点数（这组里最宽一行的列数 —— 设备的排版意图）。
     ``rows_hint`` / ``cols_hint``：设置里的「模组个数」「每模组电芯数/温度采集数」
     （0 = 自动，跟随设备）。短行（分包劈出来的孤行）被并回网格，不单独占一行。
-    ``row_sizes``：车辆档案的逐模组尺寸（一排 = 一个模组）。
+    ``row_sizes``：车辆档案的逐模组尺寸（一排 = 一个模组）。⚠️ 但
+    ``rows_hint`` > 0 时**以行数为准**（见下面三条优先级），逐模组尺寸让位。
 
     ``max_row_chars``：视口一行能放下的字符数（主窗口量出来传入）。行宽超过
     视口的话软换行会在行尾甩出一个孤零零的单元格（用户截图里"13.6553"单独
@@ -487,7 +488,15 @@ def _grid_rows(tokens: list[tuple[str, str]], section: str,
     if max_row_chars > 0:
         fit = max(1, (max_row_chars + len(CELL_GAP)) // (cell_w + len(CELL_GAP)))
     # 没给"模组网格"就用设备自己的列数当目标列数（rows_hint=0 → 行数由列数推）
-    if row_sizes:
+    #
+    # 三条优先级（2026-11-13 用户点名「电压数据行数 / 温度采集数据行数要跟着车号
+    # 走」后补的第 ① 条）：
+    #   ① ``rows_hint`` > 0 → **显式行数**压过一切：按这个行数均分（不再按模组切）。
+    #      选了车也照样生效 —— 逐车行数本来就该是"这台车显示成几行"的最终口径。
+    #   ② 否则给了 ``row_sizes``（选了车）→ 一排 = 一个模组（``grid_row_sizes``
+    #      的显式尺寸分支），再按视口在模组内部均衡拆（``_cap_rows``）；
+    #   ③ 否则（没选车、也没设行数）→ 老行为：设备列数 + 「模组个数」均分。
+    if row_sizes and rows_hint <= 0:
         sizes = grid_row_sizes(len(cells), row_sizes=row_sizes)
         if fit:
             sizes = _cap_rows(sizes, fit)
@@ -496,8 +505,12 @@ def _grid_rows(tokens: list[tuple[str, str]], section: str,
             cols = min(cols, fit)
             if cols_hint > 0:
                 cols_hint = min(cols_hint, fit)
-        sizes = grid_row_sizes(len(cells), rows_hint,
-                               cols_hint if cols_hint > 0 else cols)
+        # ⛔ 显式行数（rows_hint > 0）时**列数必须传 0**，让 grid_row_sizes 按
+        #    ceil(count / rows) 自己推：否则它会拿"设备每行点数"当目标列数，
+        #    rows×cols 装不下 count 时又按列数把行数顶回去 —— 实测 125 点设成
+        #    3 行会被顶成 5 行（每行 25），"显示成几行"直接失效。
+        cols_target = 0 if rows_hint > 0 else (cols_hint if cols_hint > 0 else cols)
+        sizes = grid_row_sizes(len(cells), rows_hint, cols_target)
     rows: list[str] = []
     start = 0
     base = wire_base
@@ -561,6 +574,12 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
     模组的电芯数 / 温度采集数，见 customization.active_profile）。给了列表就
     按"一排 = 一个模组"排 —— 优先级**高于**上面三个 hint（同一时刻只该有一套
     参数说话；车辆档案是用户明确选中的那套，旧的全局三件套在选车后就该让位）。
+
+    ⚠️ **唯一的例外是显式行数** ``volt_rows_hint`` / ``temp_rows_hint`` > 0
+    （用户 2026-11-13："电压数据行数 / 温度采集数据行数要跟着车号走"）：这两个
+    是用户**直接指定显示成几行**，比"一排一个模组"更明确，所以它压过
+    ``*_row_sizes``（按行数均分，不再按模组切）；0 = 自动，仍走逐模组尺寸。
+
     列表为 None → 与加这个参数之前一字不差。
 
     ⚠️ 数字本身一个都不动：只在前导位置补数字 0（用户："在前方补零"）、重排

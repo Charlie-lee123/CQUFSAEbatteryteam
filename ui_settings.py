@@ -1392,8 +1392,12 @@ class SettingsDialog(QDialog):
 
     # 旧的全局网格三件套：选车后整行隐藏（一套参数说话，见 _sync_vehicle_rows）。
     # 名字与 customization 里那三条 register_int 一一对应。
-    _LEGACY_GRID_KEYS = ("module_count", "cells_per_module", "temps_per_module",
-                         "volt_rows", "temp_rows")
+    # ⚠️ 「电压数据行数 / 温度采集数据行数」（volt_rows / temp_rows）**不在**这里：
+    #    用户 2026-11-13 点名"这个要跟着车号走" —— 它们选车后照样露面，只是值改
+    #    成读/写这台车自己的（见 _VEHICLE_ROW_KEYS 与 _sync_row_hint_widgets）。
+    _LEGACY_GRID_KEYS = ("module_count", "cells_per_module", "temps_per_module")
+    # 跟着车号走的两个「显示行数」：选了车就落在车辆档案里，没选车才写全局键。
+    _VEHICLE_ROW_KEYS = ("volt_rows", "temp_rows")
 
     # ------------------------------------------------------------ 开屏动画
 
@@ -1764,6 +1768,8 @@ class SettingsDialog(QDialog):
         # 这一排没有行标签，永远在；显隐只由 _sync_grid_params_visibility 管
         self._vehicle_field.setVisible(True)
         self._sync_grid_params_visibility()
+        # 「电压/温度数据行数」是逐车的（用户 2026-11-13）：换车就换成这台车的值
+        self._sync_row_hint_widgets()
 
         spin = self.spin_vehicle_modules
         spin.blockSignals(True)
@@ -1777,25 +1783,12 @@ class SettingsDialog(QDialog):
         # 的 cell/temp 列表变了才动（改模组个数是另一条路径，不经这里）。
         if (tuple(cells) != tuple(self._shown_cells)
                 or tuple(temps) != tuple(self._shown_temps)):
-            # 2026-11-02 用户：「选完车号后的动画有很大问题，逐帧分析」——
-            # 重建是**同步**的（同一帧删旧行、建新行），数值 25/8→20/6 直接硬切。
-            # 先把切换前的行区域抓成图，换完再淡出 = 交叉淡入。
-            # 用户第六轮补充：「为什么选择车号之后这三行会跟着移动，没有必要」——
-            # 根因就是 `_rebuild_module_rows` 同步删旧行建新行：最终几何虽然一样，
-            # 但重建会让整张表单重排一次（上面几行瞬时抖动）。行数没变时**原地改值**：
-            # 不重建控件、不碰布局，只换文本 + 交叉淡入。
-            same_count = (len(cells) == len(self._module_rows)
-                          and len(temps) == len(self._module_rows))
-            if same_count:
-                # 行数不变：**只原地改值**，不重建、也不盖覆盖层。用户 2026-11-02：
-                # 「第二个问题并没有解决」—— 覆盖层虽然是旧数值，但半透明叠在
-                # 新数值上仍会被看成"表格在动"；这里干脆什么都不动，只换数字。
-                self._update_module_row_values(cells, temps)
-            else:
-                # 2026-11-13 用户定稿「推倒重来」：车号以下的设置区整片高斯模糊 →
-                # 淡出露出切换后的新数据。机制见本文件顶部的 _VEH_* 常量与
-                # _veh_start()（一次抓图 + 真高斯 + 覆盖层淡出，不用任何 QGraphics*Effect）。
-                self._veh_start(cells, temps)
+            # 2026-11-13 用户定稿：**每一次换车号都走同一条过渡**（整片高斯模糊 →
+            # 淡出露新数据），不再分"行数变没变"两种观感 —— 用户上一轮反馈
+            # "选择好了车号直接整片瞬间高斯模糊就可以了"，两种观感只会让人以为
+            # 动画时好时坏。行数没变时 `_veh_apply_rows` 会原地改值（不重建控件），
+            # 所以这一条既有动画、又不会丢焦点/抖布局。机制见 _veh_start()。
+            self._veh_start(cells, temps)
 
     def _sync_grid_params_visibility(self) -> None:
         """网格参数二选一的**唯一判据**：接收区此刻真正吃哪一套，就只显示哪一套。
@@ -1812,6 +1805,54 @@ class SettingsDialog(QDialog):
             if pair is not None:
                 for widget in pair:
                     widget.setVisible(legacy_on)
+
+    def _sync_row_hint_widgets(self) -> None:
+        """把「电压/温度数据行数」两个数字框摆成**当前这套参数**的值。
+
+        用户 2026-11-13：「不是让你在设置里面弄一个电压显示行数和温度显示行数吗，
+        这个要跟着车号走」—— 所以：
+
+        - 选了车 → 显示**这台车**存的两个行数（``customization.active_row_hints``）；
+        - 没选车 → 显示全局键（= 加这个功能时的老行为，一字不差）；
+        - 0 永远表示「自动」（选了车 = 一排一个模组，没选车 = 跟随设备列数）。
+
+        ⛔ 这里必须 ``blockSignals``：``setValue`` 会触发 ``valueChanged`` →
+        ``_on_rows_hint_changed`` 把刚读出来的值又写回去，换车时就会把 A 车的
+        行数写进 B 车（"跟着车号走"直接失效）。
+        """
+        has_vehicle = customization.active_profile() is not None
+        if has_vehicle:
+            volt, temp = customization.active_row_hints()
+        else:
+            volt = int(customization.get("volt_rows") or 0)
+            temp = int(customization.get("temp_rows") or 0)
+        for key, value in (("volt_rows", volt), ("temp_rows", temp)):
+            widget = self._custom_widgets.get(key)
+            if widget is None:
+                continue
+            blocked = widget.blockSignals(True)
+            try:
+                widget.setValue(int(value))
+            finally:
+                widget.blockSignals(blocked)
+
+    def _on_rows_hint_changed(self, key: str, value: int) -> None:
+        """「电压/温度数据行数」被改了：选了车就**立刻写进这台车**。
+
+        与逐模组行同一个口径（改一格就落盘，不等「确定」）；没选车时什么都不做，
+        仍由 ``custom_values`` 在按「确定」时统一写全局键（老行为）。
+        写完请主窗口重排接收区（它自己合并 200ms，见 _schedule_vehicle_relayout）。
+        """
+        name = customization.current_vehicle()
+        if not name or customization.active_profile() is None:
+            return
+        volt_rows, temp_rows = customization.active_row_hints()
+        if key == "volt_rows":
+            volt_rows = int(value)
+        else:
+            temp_rows = int(value)
+        customization.set_vehicle_rows(name, volt_rows, temp_rows)
+        self._notify_vehicle_changed()
 
     def _make_count_field(self, value: int, prefix: str, tip: str, on_apply) -> QWidget:
         """一个"数量"输入框：**手动输入**（文本框 + 整数校验，回车/失焦生效）。
@@ -2008,6 +2049,11 @@ class SettingsDialog(QDialog):
     # 整片抓图 → 高斯模糊 → α=1 盖住旧画面 → 立刻换上新数据 → 停留 HOLD → 淡出 FADE。
     # 没有占位行、没有逐模组交叉淡入、没有逐帧重排（那些都是上一代被推翻的方案）。
     # 覆盖层复用 _FadeOverlay（透明背景，绘制阶段只有一次 drawPixmap，无 QGraphics*Effect）。
+    #
+    # ⛔⛔ 覆盖层挂在**面板（self）**上，不是 body：body 在滚动区里，重建逐模组行时
+    # 它会重排 / 滚动条被夹位，挂在它上面的位图会跟着内容一起位移 —— 用户
+    # 2026-11-13 说的"从上往下"就是这个。挂面板上则钉死在屏幕坐标，底下的内容
+    # 怎么动都看不见；并且**先 repaint() 把糊层刷上屏，再去重建**。
 
     def _veh_state(self) -> dict | None:
         return getattr(self, "_veh", None)
@@ -2035,22 +2081,41 @@ class SettingsDialog(QDialog):
         except Exception:  # noqa: BLE001
             pass
 
+    def _veh_apply_rows(self, cells: list[int], temps: list[int]) -> None:
+        """把逐模组行换成新数据：**行数没变就原地改值**，变了才重建控件。
+
+        为什么要分两条路：重建会删掉正在编辑的输入框（丢焦点、整张表单重排
+        一次），行数没变时纯属白干。两条路都只在糊层底下跑，屏幕上看不见过程
+        （见 _veh_start）。
+        """
+        same = (len(cells) == len(self._module_rows)
+                and len(temps) == len(self._module_rows))
+        if same:
+            self._update_module_row_values(cells, temps)
+        else:
+            self._rebuild_module_rows(cells, temps)
+
     def _veh_start(self, cells: list[int], temps: list[int]) -> None:
         """切换车号 / 改模组数：整片「车号以下可见区」高斯模糊 → 淡出露新数据。
 
-        先抓**当前**屏幕可见的旧画面（车号以下的设置区）→ 真高斯模糊 → 以 α=1 盖在
-        上方（糊住旧画面），再把设置区换成切换后的新数据（清晰、已就位，盖在模糊层
-        底下），最后让模糊层淡出，露出清晰的新数据。任何一步被打断都落到终态
-        （清覆盖层 + 显示新行），绝不残影。
+        顺序是硬约定（用户 2026-11-13："直接整片瞬间高斯模糊就可以了，不用从上
+        往下，然后准备好车辆数据之后淡出"）：
+
+        ① 抓**当前**屏幕可见的旧画面（车号以下的设置区）→ 真高斯模糊；
+        ② 以 α=1 整片盖上并 ``repaint()`` **刷上屏** —— 此刻屏幕上是整片模糊；
+        ③ 才把设置区换成新数据（整段都在糊层底下，看不见过程），并当场算完布局；
+        ④ 停留 HOLD → 整片淡出，露出已经就位的新数据。
+
+        任何一步被打断都落到终态（清覆盖层 + 显示新行），绝不残影。
         """
         body = self.form.parentWidget()
         if body is None or not getattr(self, "_veh_allow", False):
-            # 面板还没上屏 / 动画被禁用：直接重建，不做过渡。
-            self._rebuild_module_rows(cells, temps)
+            # 面板还没上屏 / 动画被禁用：直接换行，不做过渡。
+            self._veh_apply_rows(cells, temps)
             return
         from ui_anim import animations_enabled
         if not animations_enabled():
-            self._rebuild_module_rows(cells, temps)
+            self._veh_apply_rows(cells, temps)
             return
 
         # 打断上一段（若还在跑）：先停表 + 清覆盖层，避免两条主时钟同时写覆盖层。
@@ -2075,26 +2140,48 @@ class SettingsDialog(QDialog):
             if grabbed is not None and not grabbed.isNull():
                 pix = self._veh_blur_pixmap(grabbed)
 
-        # ② 把设置区换成切换后的新数据（清晰、已就位，盖在模糊层底下）。
-        self._rebuild_module_rows(cells, temps)
-
-        # 没有可模糊的快照（极端：区域为空）→ 直接收尾。
+        # 没有可模糊的快照（极端：区域为空 / 面板还没排好版）→ 直接换数据收工。
         if pix is None or rect.isNull():
+            self._veh_apply_rows(cells, temps)
             self._veh_stop()
             return
 
-        # ③ 盖模糊层 α=1，主时钟驱动淡出。
+        # ② **先整片盖上去、当场刷上屏**，然后才动底下的内容。
+        #   这次的两处关键（用户 2026-11-13："直接整片瞬间高斯模糊就可以了，不用
+        #   从上往下，然后准备好车辆数据之后淡出"）：
+        #   · 覆盖层挂在**面板**上（以前挂 body）：body 在滚动区里，切车号重建逐
+        #     模组行时它会重排、滚动条还可能被夹位 —— 挂在它上面的位图会跟着内容
+        #     一起位移，观感就是"模糊层从上往下扫"。挂面板上就钉死在屏幕坐标，
+        #     底下怎么动都看不见。
+        #   · show_frame 之后立刻 repaint()：先把这一帧真的画上屏，再去重建行。
+        #     否则"重建"和"贴模糊层"谁先进合成器不确定，中间那一帧会露出新内容。
         try:
             overlay = getattr(self, "_veh_mask_full", None)
-            if overlay is None or overlay.parentWidget() is not body:
-                overlay = _FadeOverlay(body)
+            if overlay is None or overlay.parentWidget() is not self:
+                overlay = _FadeOverlay(self)
                 self._veh_mask_full = overlay
         except RuntimeError:
             return
-        state = {"rect": QRect(rect), "pix": pix, "overlay": overlay, "clock": None}
+        veil = self._veh_veil_rect(rect)
+        overlay.show_frame([(pix, 1.0)], veil, 1.0)
+        try:
+            overlay.repaint()                 # 同步刷屏：模糊此刻已在屏幕上
+        except RuntimeError:
+            pass
+
+        # ③ 数据就位（整段都在糊层底下，屏幕上看不见任何过程）。
+        #    form.activate() 让布局**当场**算完、不等事件循环 —— 淡出开始时底下
+        #    已经是最终几何，正是"准备好车辆数据之后再淡出"。
+        self._veh_apply_rows(cells, temps)
+        try:
+            self.form.activate()
+        except RuntimeError:
+            pass
+
+        # ④ 停留 + 淡出（一条主时钟）。
+        state = {"rect": veil, "pix": pix, "overlay": overlay, "clock": None}
         self._veh = state
         self._veh_dbg("START")
-        overlay.show_frame([(pix, 1.0)], rect, 1.0)
         from ui_anim import Tween
         clock = Tween(_VEH_BLUR_TOTAL_MS, "linear",
                      lambda k, s=state: self._veh_tick(s, k),
@@ -2102,6 +2189,21 @@ class SettingsDialog(QDialog):
                      parent=self, min_interval_ms=_VEH_TICK_MS)
         state["clock"] = clock
         clock.start(0.0, 1.0, _VEH_BLUR_TOTAL_MS)
+
+    def _veh_veil_rect(self, rect_body: QRect) -> QRect:
+        """body 局部坐标的那块区域 → **面板坐标**（覆盖层挂在面板上，见 _veh_start）。
+
+        覆盖层必须钉在屏幕坐标里：切车号时 body（滚动区内容）会重排、滚动条
+        可能被夹位，挂在 body 上的位图会跟着内容位移 = 用户看到的"从上往下"。
+        """
+        body = self.form.parentWidget()
+        if body is None:
+            return QRect(rect_body)
+        try:
+            top_left = body.mapTo(self, rect_body.topLeft())
+        except RuntimeError:
+            return QRect(rect_body)
+        return QRect(top_left, rect_body.size())
 
     def _veh_tick(self, state: dict, k: float) -> None:
         if self._veh_state() is not state:
@@ -2636,6 +2738,13 @@ class SettingsDialog(QDialog):
                 # "10000 mV" 各占一块，右边缘参差不齐）。宽度按上面实测的
                 # _spin_w 取，保证最长的 "10000 mV" 连 suffix 一起完整显示。
                 spin.setFixedWidth(_spin_w)
+                if spec["key"] in self._VEHICLE_ROW_KEYS:
+                    # 这两个行数是**逐车**的（用户 2026-11-13）：改了立刻写进当前
+                    # 那台车，不等「确定」（与逐模组行同一个口径，见
+                    # _on_rows_hint_changed）。connect 在 setValue 之后 —— 建面板
+                    # 时那一次赋值不该被当成"用户改了"。
+                    spin.valueChanged.connect(
+                        lambda val, k=spec["key"]: self._on_rows_hint_changed(k, int(val)))
                 field = spin
                 widget = spin
                 row_label = self._label(spec["label"])
@@ -2768,7 +2877,13 @@ class SettingsDialog(QDialog):
     def custom_values(self) -> dict:
         """「定制功能」区里被**改动过**的项 {key: value}，由主窗口统一落盘。"""
         changes: dict = {}
+        # 选了车 → 「电压/温度数据行数」属于那台车：改的时候已经落盘了（见
+        # _on_rows_hint_changed），⛔ 这里不能再当全局键报一遍，否则"没选车时的
+        # 默认行数"会被这台车的值悄悄覆盖掉（用户 2026-11-13："跟着车号走"）。
+        vehicle_on = customization.active_profile() is not None
         for spec in customization.specs():
+            if vehicle_on and spec["key"] in self._VEHICLE_ROW_KEYS:
+                continue
             widget = self._custom_widgets.get(spec["key"])
             if widget is None:
                 continue

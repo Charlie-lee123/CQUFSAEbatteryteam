@@ -6515,8 +6515,10 @@ class MainWindow(QMainWindow):
         - 选了车（``customization.active_profile()`` 不是 None）→ 用车辆档案里的
           **逐模组尺寸**（``volt_row_sizes`` / ``temp_row_sizes``）：一排 = 一个
           模组，各模组长短不必一致（用户原话："把每个模组个数和每个模组温度采集
-          个数改成一个一个模组自行设置"）。此时旧的三个 hint 不传 —— 同一时刻只
-          该有一套参数说话，两套一起给会互相打架（见 ui_highlight.grid_row_sizes）。
+          个数改成一个一个模组自行设置"）。**列数**那三个 hint 此时不传 —— 同一
+          时刻只该有一套参数说话；唯独这台车自己的「电压/温度数据行数」
+          （``active_row_hints``，0 = 自动）要传：用户 2026-11-13 点名"这个要
+          跟着车号走"，>0 时它在 ``_grid_rows`` 里压过逐模组尺寸。
         - 没选车 → 完全维持老行为：三个值**默认都是 0**，那时"每排个数"跟随设备
           发来的每行点数，但"末排多一、其余各排一致"的分配规则**始终生效**。
 
@@ -6528,7 +6530,12 @@ class MainWindow(QMainWindow):
         wire_mv = int(customization.get("broken_wire_mv") or 0)
         if profile is not None:
             cells, temps = profile
+            # 「电压数据行数 / 温度采集数据行数」是**逐车**存的（用户 2026-11-13
+            # 点名"这个要跟着车号走"）：0 = 自动（一排一个模组），>0 = 用户直接
+            # 指定显示成几行 —— 后者在 ui_highlight._grid_rows 里压过逐模组尺寸。
+            volt_rows, temp_rows = customization.active_row_hints()
             return {"volt_row_sizes": cells, "temp_row_sizes": temps,
+                    "volt_rows_hint": volt_rows, "temp_rows_hint": temp_rows,
                     "wire_mv": wire_mv}
         return {
             # ⛔ 这里**不再传 rows_hint**（模组个数）：2026-10-24 起排版改成

@@ -97,8 +97,14 @@ def pin_rx_grid_defaults(settings) -> None:
     ``customization.set()``，只为省掉 import 顺序上的坑 —— ``set()`` 也只写值、
     不碰 ``*_chosen``，两种写法对"自动/手动"语义的影响完全一样。
     """
-    for key in ("module_count", "cells_per_module", "temps_per_module"):
+    for key in ("module_count", "cells_per_module", "temps_per_module",
+                "volt_rows", "temp_rows"):
         settings.setValue(f"custom/{key}", 0)
+    # ⚠️ 2026-11-13 补：「显示补零」关掉时值前面补的是**同宽空格**（"01.3820" →
+    #    " 1.3820"），逐字比对"样例值在同一行"的用例会假挂。钉成开（默认值，
+    #    与加这个开关之前一字不差）。「电压/温度显示行数」同理：非 0 会把样板值
+    #    拆成多行，前提就不成立了。
+    settings.setValue("custom/pad_zero", True)
     # ⛔ 光把那三个键写成 0 **不够**：只要有一台车被选中，``active_profile()`` 就会
     #    压过它们（车辆档案的优先级高于旧三件套）。而"取消选车"也不能只写
     #    ``custom/vehicle=""`` —— ``customization._load_store`` 先看 ``custom/vehicles``
@@ -6400,8 +6406,21 @@ def main() -> int:
     #    没被踩到（各 check 自己会调 pin_rx_grid_defaults 兜着）。
     #    顺带：选了车的机器（custom/vehicle 非空）也不该影响自测，所以这里连
     #    当前车辆一起清空 —— 否则 active_profile() 会压过这三个 0。
-    for _grid_key in ("module_count", "cells_per_module", "temps_per_module"):
+    for _grid_key in ("module_count", "cells_per_module", "temps_per_module",
+                      "volt_rows", "temp_rows"):
         global_settings.setValue(f"custom/{_grid_key}", 0)
+    # ⚠️ 2026-11-13 补的两个前提（用户真机实测假挂，两条用例连挂）：
+    #   · custom/pad_zero：用户把「显示补零」关了之后，值前面补的是同宽空格，
+    #     "01.3820" 变成 " 1.3820"，于是「收包合并与暂停继续」里那条
+    #     `padded_row.startswith("01.3820   02.3820   03.3820")` 直接挂 —— 产品
+    #     行为完全正确（开关就是干这个的），是**用例前提**没钉。
+    #   · 顶层 rx_blocks（保留行数，不走 customization 注册表，main_window 直接
+    #     读）：用户填过 500000 时，「校验位/保留行数/时钟/发送区一排」里那句
+    #     `currentText() == str(DEFAULT_RX_BLOCKS)` 就挂。
+    # 两个都在 global_snapshot **之后**钉，收尾无条件还原，绝不污染用户配置。
+    from main_window import DEFAULT_RX_BLOCKS as _DEFAULT_RX_BLOCKS
+    global_settings.setValue("custom/pad_zero", True)
+    global_settings.setValue("rx_blocks", _DEFAULT_RX_BLOCKS)
     # ⛔ 取消选车必须走 select_vehicle("")：只写 custom/vehicle 镜像键没用
     #    （_load_store 优先认 vehicles JSON 里的 current，见 pin_rx_grid_defaults 的说明）。
     import customization as _cu_main
