@@ -1425,7 +1425,8 @@ class SettingsDialog(QDialog):
 
     # 旧的全局网格三件套：选车后整行隐藏（一套参数说话，见 _sync_vehicle_rows）。
     # 名字与 customization 里那三条 register_int 一一对应。
-    _LEGACY_GRID_KEYS = ("module_count", "cells_per_module", "temps_per_module")
+    _LEGACY_GRID_KEYS = ("module_count", "cells_per_module", "temps_per_module",
+                         "volt_rows", "temp_rows")
 
     # ------------------------------------------------------------ 开屏动画
 

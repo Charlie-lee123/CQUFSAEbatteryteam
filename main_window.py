@@ -2030,6 +2030,23 @@ class MainWindow(QMainWindow):
         hist_row.addWidget(self.btn_open_history, 1)
         col.addLayout(hist_row)
 
+        # 「历史报错数据」（用户 2026-11-13 点名）：扫一遍本地留存的接收数据，
+        # 把出现过的超温 / 超压 / 欠压 / BMS 报错逐条带时间戳列出来。和「打开历史
+        # 数据」同一套排法（标签列占位 + 按钮吃满字段列），挨在它下面。
+        self.btn_error_history = InkButton("历史报错数据", variant="ghost")
+        self.btn_error_history.setToolTip(
+            "查看历史接收数据里出现过的超温 / 超压 / 欠压 / BMS 报错，每条都带时间戳")
+        self.btn_error_history.clicked.connect(self._open_error_history)
+        err_row = QHBoxLayout()
+        err_row.setSpacing(10)
+        err_spacer = QWidget()
+        err_spacer.setFixedWidth(64)
+        # 窄档标签列收起时它跟着收（理由同 _hist_spacer）
+        self._err_spacer = err_spacer
+        err_row.addWidget(err_spacer)
+        err_row.addWidget(self.btn_error_history, 1)
+        col.addLayout(err_row)
+
         # 「DLC」常驻串口配置栏（用户 2026-11-12："DLC 按钮放串口设置那里"）：
         # 和「打开历史数据」同一套排法（标签列占位 + 按钮吃满字段列），挨在它下面。
         # 语义仍是单 DLC 直通：没装 → 提示安装，装了 → 直接进心率面板；
@@ -4205,6 +4222,9 @@ class MainWindow(QMainWindow):
         self.btn_open_history.setMinimumWidth(146 if field_w <= 0 else 104)
         self._hist_spacer.setFixedWidth(spec["label_w"])
         self._dlc_spacer.setFixedWidth(spec["label_w"])
+        # 「历史报错数据」的占位同理由 _hist_spacer 收起（窄档标签列收起时跟着收，
+        # 否则按钮会被挤成「历史报…」；之前漏了这行，属性从没被读过也触发了死代码告警）。
+        self._err_spacer.setFixedWidth(spec["label_w"])
 
         # 工具栏横/竖排。切换会改变内容自然高度，把"量过的高度"和"钉住的高度"一起
         # 作废 —— 否则下一次全屏转场会按旧行高插值（展开那一帧工具栏会被裁）。
@@ -6517,6 +6537,8 @@ class MainWindow(QMainWindow):
             #    该设置仍然决定车辆档案里的逐模组尺寸（见 active_profile）。
             "volt_cols_hint": int(customization.get("cells_per_module")),
             "temp_cols_hint": int(customization.get("temps_per_module")),
+            "volt_rows_hint": int(customization.get("volt_rows") or 0),
+            "temp_rows_hint": int(customization.get("temp_rows") or 0),
             "wire_mv": wire_mv,
         }
 
@@ -7237,6 +7259,118 @@ class MainWindow(QMainWindow):
         self._apply_extra_selections()
 
         self._toast(f"已定位到第 {number + 1} 行（{len(spans)} 处越界）", 2600)
+
+    def _open_error_history(self) -> None:
+        """「历史报错数据」：扫一遍本地留存的接收数据，把越界 / BMS 报错逐条带
+        时间戳列出来弹窗。
+
+        判据与着色器同款（``value_spans`` / ``temp_spans`` / ``bms_error_spans``），
+        否则"标成红/绿/黄的那行"和"列表里出现的那行"会对不上。段状态机从头正向
+        推（见 ``section_of``），电压用电压阈值、温度用温度阈值。
+        """
+        import rx_history
+        from PySide6.QtWidgets import (
+            QApplication, QDialog, QHeaderView, QLabel, QHBoxLayout,
+            QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
+        )
+        from PySide6.QtGui import QFont
+
+        lines = rx_history.all_lines()
+        if not lines:
+            self._toast("还没有本地留存的接收数据", 3000)
+            return
+
+        volt_low, volt_high = self._rx_highlighter.volt_limits()
+        temp_low, temp_high = self._rx_highlighter.temp_limits()
+
+        current_ts = ""
+        section = section_of("")
+        records: list[tuple[str, str, str]] = []
+        for raw in lines:
+            line = raw.rstrip("\n")
+            if stamp_span(line):
+                current_ts = line.strip()
+            section = section_of(line, section)
+            kinds: list[str] = []
+            if section == SECTION_VOLT:
+                hi, lo = value_spans(line, volt_low, volt_high)
+                if hi:
+                    kinds.append("超压")
+                if lo:
+                    kinds.append("欠压")
+            elif section == SECTION_TEMP:
+                if temp_spans(line, temp_low, temp_high):
+                    kinds.append("超温/低温")
+            if bms_error_spans(line):
+                kinds.append("BMS 报错")
+            for kind in kinds:
+                records.append((current_ts or "（无时间戳）", kind, line.strip()))
+
+        # ---- 弹窗 ----
+        dlg = QDialog(self)
+        dlg.setWindowTitle("历史报错数据")
+        dlg.setMinimumWidth(720)
+        root = QVBoxLayout(dlg)
+        root.setSpacing(12)
+        root.setContentsMargins(16, 16, 16, 16)
+
+        n = len(records)
+        if n == 0:
+            stat = QLabel("未发现超温 / 超压等报错记录")
+        else:
+            stat = QLabel(f"共 {n} 条报错记录（电压/温度越界 + BMS 报错）")
+        stat.setObjectName("hint")
+        root.addWidget(stat)
+
+        table = QTableWidget(n, 3)
+        table.setHorizontalHeaderLabels(["时间戳", "类型", "内容"])
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setAlternatingRowColors(True)
+        mono = QFont("Consolas", 10)
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        kind_color = {
+            "超压": qcolor("volt_high"),
+            "欠压": qcolor("volt_low"),
+            "超温/低温": qcolor("temp_warn"),
+            "BMS 报错": qcolor("bms_error"),
+        }
+        for row, (ts, kind, content) in enumerate(records):
+            ts_item = QTableWidgetItem(ts)
+            kind_item = QTableWidgetItem(kind)
+            kind_item.setForeground(kind_color.get(kind, kind_item.foreground()))
+            content_item = QTableWidgetItem(content)
+            content_item.setFont(mono)
+            table.setItem(row, 0, ts_item)
+            table.setItem(row, 1, kind_item)
+            table.setItem(row, 2, content_item)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        root.addWidget(table, 1)
+
+        def copy_all() -> None:
+            text = "\n".join(f"{ts}\t{kind}\t{content}"
+                            for ts, kind, content in records)
+            QApplication.clipboard().setText(text)
+            self._toast("已复制全部报错记录", 2500)
+
+        table.cellDoubleClicked.connect(
+            lambda r, _c: (QApplication.clipboard().setText(records[r][2]),
+                          self._toast("已复制该行", 2000)))
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_copy = QPushButton("复制全部")
+        btn_copy.clicked.connect(copy_all)
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_copy)
+        btn_row.addWidget(btn_close)
+        root.addLayout(btn_row)
+
+        dlg.exec()
 
     def _single_line_height(self) -> float:
         """单行块的**实测**高度（喂给 ``_visual_line_index`` 当尺子）。

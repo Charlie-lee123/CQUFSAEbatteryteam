@@ -221,33 +221,66 @@ def _is_data_line(line: str) -> bool:
 
 
 def _is_volt_line(line: str) -> bool:
-    """电压段的**纯电压数据行**：整行都是采样点、且每个值都是 4 位小数
-    （mV 格式，位数是协议项 ``cell_width``，默认 4）。
+    """电压段的**纯电压数据行**：整行都是采样点，且**至少有一个**是 mV 格式
+    （小数位数 == 协议项 ``cell_width``，默认 4），其余的位数不得比它长。
 
-    温度值（"1.22"，2 位小数）万一落在电压段状态里（设备不发段标题等），
-    不能当电压数据重排 —— 否则补零会把 "1.22" 造出 "01.0022" 这种假数据
-    （凭空补位 = 篡改数值），着色也会把它按 mV 阈值误判成欠压绿
-    （用户报的"标绿的区间到温度采集部分去了"）。"""
-    return _is_data_line(line) and all(
-        re.fullmatch(r"\d+\.\d{%d}" % _PROTO.cell_width, t)
-        for t in line.split())
+    ⛔ 2026-11-12 改：判据从"每个值都必须 4 位"放宽成"至少一个 4 位"。
+    真机固件（``BMS_kari/Core/Src/main.c``）的打印语句是
+        printf(" %d.%d    ", j + 1, Cells.voltage[i][j]);   // %d，一个零都不补
+    而 ``Cells.voltage`` 是 **mV 整数**（``uint16_t``，阈值 3100/4500，总压
+    ``packVoltageSum_mV / 1000``）。所以某颗电芯读到 402 mV 时设备发出来的就是
+    ``23.402``（6 个字符，比别的格少一格）—— 整行后半段于是左移一格、整列错开。
+    这类行以前被整行判成"非数据行"→ 既不重排也不补零 → 错位原样留在屏幕上
+    （用户 2026-11-12 截图点名的"电压数据没有对齐，电压数据是四位数，不够的添零"）。
+
+    值本身**一个数字都不改**：只在补零时按既有约定往**左**补到 cell_width
+    （``402`` → ``0402``，与温度段 ``1.5`` → ``1.05`` 同一条路，见 _grid_rows）。
+    左补不是猜 —— 设备自己的错误报告可以反推：同一帧日志里 23 号电芯报的是
+    ``4.23 Under Voltage``（固件判据 ``< CELL_LOW_VOLTAGE 3100``），只有
+    402 mV 成立；按"右边补零"读成 4020 会把它当成健康电芯（见 rx_export._value_of）。
+
+    为什么还要"至少一个 4 位"这个下限：温度行（``1.17 2.17 …``，2 位小数）万一
+    因为设备没发段标题而落在电压段状态里，补零会把它造出 ``01.0017`` 这种假数据
+    （凭空补位 = 篡改数值），着色也会按 mV 阈值把温度区整片标绿（用户
+    2026-10-23 报过）。真温度行里一个 4 位小数都没有，被这条下限挡在外面
+    （判据本身在 ``_volt_block``，与着色 / 定位共用同一份）；而"位数比
+    cell_width 还长"的 token 不是 mV 值（16 位 ADC 最大 6553 mV），整行判为
+    非电压行，宁可不重排也不瞎猜。"""
+    if not _is_data_line(line) or not _volt_block(line):
+        return False
+    width = _PROTO.cell_width
+    return all(len(token) - token.index(".") - 1 <= width
+               for token in line.split())
 
 
 def _pad_line(line: str, section: str, widths: dict[str, int],
-              index_width: int) -> str:
+              index_width: int, pad_char: str = "0") -> str:
     """非数据行的原地补零（老规则）：**电压段**的序号补到 index_width
     （0 号点除外），其它段（温度 / BMS 之后的错误明细等）序号保持设备原样
     （用户 2026-10-11 点名"温度区域序号不用加0"、"BMSERROR后面的序号
     只有一位数就不需要加0"）。电压/温度段的值补到段内最宽。混着其它字符的
-    行不重排 —— 万一是判定不了结构的行，保持原布局最稳。"""
+    行不重排 —— 万一是判定不了结构的行，保持原布局最稳。
+
+    ⚠️ 2026-11-12 补：这一支也是"位数不足的电压值"会掉进来的地方 ——
+    "标题与数据同一行"（``Voltage1:  01.3858  02.425``，老固件写法，见
+    rx_export 的模块注释）不是纯数据行，走不到 ``_grid_rows``。所以这里也要补零，
+    判据用 ``_volt_block``（本行出现过正好 cell_width 位的值）→ 真正的温度行
+    照样一个字符都不动。补零宽度以 cell_width 为下限，否则这一帧里一个 4 位值
+    都没有时 ``widths`` 会算成 3，补了等于没补。"""
+    volt_line = section == SECTION_VOLT and _volt_block(line)
+    width = max(widths.get(section, 0),
+                _PROTO.cell_width if volt_line else 0)
+
     def pad(match: re.Match, section: str = section) -> str:
         # 电压段只重排 mV 格式（4 位小数）的采样点 —— 温度值等其它小数位数
-        # 的值一个字符都不动（见 _is_volt_line 的说明）。
-        if section == SECTION_VOLT and not _is_volt_value(match):
+        # 的值一个字符都不动（见 _is_volt_line 的说明），除非本行确是电压行
+        # 且这个值只是位数不足（坏电芯）。
+        if section == SECTION_VOLT and not _is_volt_value(match) \
+                and not (volt_line and _is_short_volt_value(match)):
             return match.group(0)
         index = match.group(1)
         value = match.group(2)[1:]
-        value = "0" * max(0, widths.get(section, 0) - len(value)) + value
+        value = pad_char * max(0, width - len(value)) + value
         # 序号为 0 不补占位：0 号点是设备数据里的特殊行，补成 "00" 反而
         # 在序号前面多出一个占位字符（用户点名"序号为 0 时，序号前面不应
         # 再保留一个空格，去掉该多余空格"）—— 保持 "0.xxx" 原样。
@@ -255,7 +288,7 @@ def _pad_line(line: str, section: str, widths: dict[str, int],
             pad_w = max(0, index_width - len(index))
         else:
             pad_w = 0
-        return "0" * pad_w + index + "." + value
+        return pad_char * pad_w + index + "." + value
 
     return SAMPLE_RE.sub(pad, line)
 
@@ -418,7 +451,7 @@ def _grid_rows(tokens: list[tuple[str, str]], section: str,
                max_row_chars: int = 0, rows_hint: int = 0,
                cols_hint: int = 0, row_sizes: list[int] | None = None,
                wire_breaks: set[int] | None = None, wire_base: int = 0,
-               wire_lead: bool = False) -> list[str]:
+               wire_lead: bool = False, pad_char: str = "0") -> list[str]:
     """把一组采样点排成等宽网格：值补零到段内最宽；电压段序号补零到
     index_width（0 号点、温度段都不补）；单元格补空格到等宽后以 CELL_GAP 拼接。
 
@@ -443,9 +476,9 @@ def _grid_rows(tokens: list[tuple[str, str]], section: str,
     """
     cells: list[str] = []
     for index, value in tokens:
-        value = "0" * max(0, widths.get(section, 0) - len(value)) + value
+        value = pad_char * max(0, widths.get(section, 0) - len(value)) + value
         if section == SECTION_VOLT and index != "0":
-            index = "0" * max(0, index_width - len(index)) + index
+            index = pad_char * max(0, index_width - len(index)) + index
         cells.append(index + "." + value)
     cell_w = max(len(cell) for cell in cells)
     # 一行 n 个单元格只有 n-1 个间隔 → 精确上界是 (max_row_chars + len(CELL_GAP))
@@ -494,6 +527,7 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
                   section: str = SECTION_OTHER,
                   max_row_chars: int = 0, rows_hint: int = 0,
                   volt_cols_hint: int = 0, temp_cols_hint: int = 0,
+                  volt_rows_hint: int = 0, temp_rows_hint: int = 0,
                   volt_row_sizes: list[int] | None = None,
                   temp_row_sizes: list[int] | None = None,
                   wire_mv: int = 0) -> str:
@@ -537,6 +571,9 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
     #    重排会退化成只补零，改了阈值也去不掉旧的 X。还原后长度一格不变。
     if WIRE_BREAK in text:
         text = WIRE_BREAK_RE.sub(" ", text)
+    # 显示补零开关（customization.pad_zero，默认 True = 与加开关前一致）：
+    # 开 → 前导补 "0"；关 → 补同宽空格（等宽字体下宽度一致、列起点不动）。
+    pad = "0" if customization.get("pad_zero") else " "
     # ⛔ 序号补位宽度 = 这一帧里**最大序号的位数**（下限 INDEX_PAD_WIDTH）。
     #    固定 2 位的话，序号上到 100 以上就多占一格：实测一帧 1..120，小数点
     #    间距是 11,11,11,12,11 —— "100." 那格凸出去，用户的"个位数字上下对齐"
@@ -590,7 +627,7 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
         sec, is_data = marks[i]
         current = sec
         if not is_data:
-            out.append(_pad_line(lines[i], current, widths, index_width))
+            out.append(_pad_line(lines[i], current, widths, index_width, pad))
             i += 1
             continue
         j = i
@@ -611,11 +648,14 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
         lead = 0 in breaks            # 0 号边界 = 模组第一个电芯的左边 → 行首插 X
         hint = volt_cols_hint if sec == SECTION_VOLT else temp_cols_hint
         sizes = volt_row_sizes if sec == SECTION_VOLT else temp_row_sizes
+        # 电压/温度区**独立**显示行数（功能 1）：没设就退回通用的 rows_hint。
+        r_hint = (volt_rows_hint if sec == SECTION_VOLT else temp_rows_hint) or rows_hint
         base = 0
         for toks in group_tokens:
             out.extend(_grid_rows(toks, sec, widths, index_width, len(toks),
-                                  max_row_chars, 0, hint, sizes,
-                                  breaks, base, lead and base == 0))
+                                  max_row_chars, r_hint, hint, sizes,
+                                  breaks, base, lead and base == 0,
+                                  pad_char=pad))
             base += len(toks)
         i = j
     return "\n".join(out)
@@ -679,17 +719,39 @@ def _is_volt_value(match: re.Match) -> bool:
     return len(match.group(2)) - 1 == _PROTO.cell_width
 
 
+def _is_short_volt_value(match: re.Match) -> bool:
+    """**位数不足**的电压值（``.425``）：设备 ``%d.%d`` 直出，值本来就不到 4 位。
+
+    ⛔ 只用"位数不够"这一个特征判断够不够：它和温度值（也是 2 位小数）长得
+    一模一样，所以调用方必须再用 ``_volt_block`` 确认"这一段确实是电压数据"，
+    否则 17（＝温度 17℃）会被当成 17 mV 判成欠压绿。"""
+    return 0 < len(match.group(2)) - 1 < _PROTO.cell_width
+
+
+def _volt_block(text: str) -> bool:
+    """这一段里的采样点该按 mV 判吗（含位数不足的坏电芯）。
+
+    判据：**出现过正好 cell_width 位小数的值**。真温度行（2 位小数）一个 4 位值
+    都没有，于是仍然按温度处理 —— 这条下限是"温度区被整片标绿 / 标黄"那两次
+    事故留下来的护栏（2026-10-23 / 2026-10-24），⛔ 别为了多认几个坏电芯去掉。
+    """
+    return any(_is_volt_value(m) for m in SAMPLE_RE.finditer(text))
+
+
 def value_spans(text: str, low: int, high: int) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
     """电压采样值的分级区间 ``(超高, 超低)``，各自 ``[(起点, 长度), ...]``。
 
     区间是**整条**（序号+值，见 ``_entry_span``）；值取小数点后的整数部分
-    （"1.3820" 的 3820，单位 mV）。只认 4 位小数的电压值（协议项 ``cell_width``，
-    默认 4）—— 温度值混进来也不会被按 mV 阈值误判。脱离控件可测。
+    （"1.3820" 的 3820，单位 mV）。4 位小数的值一律按 mV 判；位数**不足**的
+    只在"这一段确实是电压数据"时才算（见 ``_volt_block``）—— 温度值混进来
+    不会被按 mV 阈值误判，而一颗 425 mV 的坏电芯能正常判成欠压（2026-11-12：
+    以前它连红/绿都不上，"定位最近异常"也跳不到它）。脱离控件可测。
     """
     high_spans: list[tuple[int, int]] = []
     low_spans: list[tuple[int, int]] = []
+    volt_block = _volt_block(text)
     for m in SAMPLE_RE.finditer(text):
-        if not _is_volt_value(m):
+        if not (_is_volt_value(m) or (volt_block and _is_short_volt_value(m))):
             continue
         value = int(m.group(2)[1:])
         if value > high:
@@ -707,12 +769,15 @@ def temp_spans(text: str, low: int, high: int) -> list[tuple[int, int]]:
     区间同样是**整条**（序号+值，见 ``_entry_span``）。
     """
     spans: list[tuple[int, int]] = []
+    volt_block = _volt_block(text)
     for m in SAMPLE_RE.finditer(text):
         # ⛔ 只判**温度格式**的值：4 位小数的是电压（mV），按 20~60℃ 去比 3858
         #    会把整排电压数据判成越界、整行标黄（用户 2026-10-23 报的现象）。
+        #    ⚠️ 2026-11-12 补：位数不足的电压值（"02.425"）在电压行里也算电压，
+        #    同样要跳过 —— 否则它会被按 20~60℃ 比成"低温"、整条标黄。
         #    与着色器里那条分支同一口径，避免"染色的行"和"点按钮跳过去的行"
         #    各按一套规则算。
-        if _is_volt_value(m):
+        if _is_volt_value(m) or (volt_block and _is_short_volt_value(m)):
             continue
         value = int(m.group(2)[1:])
         if value > high or value < low:
@@ -836,6 +901,9 @@ class RxHighlighter(QSyntaxHighlighter):
 
         volt_low, volt_high = self._limits
         temp_low, temp_high = self._temp_limits
+        # 这一块是不是"电压数据行"（出现过正好 cell_width 位的值）。位数不足的
+        # 值（坏电芯 425 mV 发成 "02.425"）只有在这种情况下才按 mV 判。
+        volt_row = _volt_block(text)
         for match in SAMPLE_RE.finditer(text):
             # 序号一律染蓝（"错误明细整行橙"那套已按用户要求删掉，见上）
             self.setFormat(match.start(1), match.end(1) - match.start(1),
@@ -847,14 +915,18 @@ class RxHighlighter(QSyntaxHighlighter):
             # 这一条 m.group(1)+m.group(2)，同行的其它采样点一个都不碰。
             start = match.start(1)
             length = match.end(2) - match.start(1)
-            if self._section == SECTION_VOLT and volt_high > 0 \
-                    and _is_volt_value(match):
+            # 这一条算不算"电压值"：4 位小数的永远是；位数不足的只在**这一块
+            # 确实是电压数据**时才算（见 _volt_block）—— 否则温度值会被按 mV
+            # 阈值判成欠压绿、电压值会被按 20~60℃ 判成越界黄。
+            is_mv = _is_volt_value(match) or (
+                volt_row and _is_short_volt_value(match))
+            if self._section == SECTION_VOLT and volt_high > 0 and is_mv:
                 value = int(match.group(2)[1:])
                 if value > volt_high:
                     self.setFormat(start, length, self._high_fmt)
                 elif value < volt_low:
                     self.setFormat(start, length, self._low_fmt)
-            elif self._section == SECTION_TEMP and not _is_volt_value(match):
+            elif self._section == SECTION_TEMP and not is_mv:
                 # ⛔ 温度阈值**只判温度格式的值**（小数位 != 4）。电压值万一因为
                 #    段状态错位落进温度段（设备不发 VoltageN: 标题那种轮次），
                 #    按 20~60℃ 去比 3858 会让**整排电压数据全被标黄** —— 用户
