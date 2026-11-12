@@ -7283,6 +7283,15 @@ class MainWindow(QMainWindow):
         volt_low, volt_high = self._rx_highlighter.volt_limits()
         temp_low, temp_high = self._rx_highlighter.temp_limits()
 
+        # 报错类型 → (编号, 着色)。用户 2026-11-13：类型要带编号；且**只列越界的那
+        # 一个数据点**——用着色器同款 span 从整行里抠出越界条目，不再是整行原文。
+        ERR_TYPES = {
+            "超压": ("01", qcolor("volt_high")),
+            "欠压": ("02", qcolor("volt_low")),
+            "超温/低温": ("03", qcolor("temp_warn")),
+            "BMS 报错": ("04", qcolor("bms_error")),
+        }
+
         current_ts = ""
         section = section_of("")
         records: list[tuple[str, str, str]] = []
@@ -7291,20 +7300,27 @@ class MainWindow(QMainWindow):
             if stamp_span(line):
                 current_ts = line.strip()
             section = section_of(line, section)
-            kinds: list[str] = []
+            # 每种判据给出越界条目在行内的 (起点, 长度) span；逐条抠出**具体数据点**。
+            hits: list[tuple[str, list[tuple[int, int]]]] = []
             if section == SECTION_VOLT:
                 hi, lo = value_spans(line, volt_low, volt_high)
                 if hi:
-                    kinds.append("超压")
+                    hits.append(("超压", hi))
                 if lo:
-                    kinds.append("欠压")
+                    hits.append(("欠压", lo))
             elif section == SECTION_TEMP:
-                if temp_spans(line, temp_low, temp_high):
-                    kinds.append("超温/低温")
-            if bms_error_spans(line):
-                kinds.append("BMS 报错")
-            for kind in kinds:
-                records.append((current_ts or "（无时间戳）", kind, line.strip()))
+                ts = temp_spans(line, temp_low, temp_high)
+                if ts:
+                    hits.append(("超温/低温", ts))
+            bs = bms_error_spans(line)
+            if bs:
+                hits.append(("BMS 报错", bs))
+            for kind, spans in hits:
+                for (s, length) in spans:
+                    token = line[s:s + length].strip()
+                    if token:
+                        records.append(
+                            (current_ts or "（无时间戳）", kind, token))
 
         # ---- 弹窗 ----
         dlg = QDialog(self)
@@ -7329,16 +7345,14 @@ class MainWindow(QMainWindow):
         table.setAlternatingRowColors(True)
         mono = QFont("Consolas", 10)
         mono.setStyleHint(QFont.StyleHint.Monospace)
-        kind_color = {
-            "超压": qcolor("volt_high"),
-            "欠压": qcolor("volt_low"),
-            "超温/低温": qcolor("temp_warn"),
-            "BMS 报错": qcolor("bms_error"),
-        }
         for row, (ts, kind, content) in enumerate(records):
+            entry = ERR_TYPES.get(kind)
+            code = entry[0] if entry else "??"
+            color = entry[1] if entry else None
             ts_item = QTableWidgetItem(ts)
-            kind_item = QTableWidgetItem(kind)
-            kind_item.setForeground(kind_color.get(kind, kind_item.foreground()))
+            kind_item = QTableWidgetItem(f"{code} {kind}")
+            if color is not None:
+                kind_item.setForeground(color)
             content_item = QTableWidgetItem(content)
             content_item.setFont(mono)
             table.setItem(row, 0, ts_item)

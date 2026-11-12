@@ -1039,6 +1039,10 @@ _VEH_SWAP_MS = 320           # P2 空白结束 / P3 起点（新块开始淡入�
 # 藏着、高度由占位行扛，覆盖层底下没有"已显形的清晰内容"，α 0→1 才成立。
 _VEH_BLUR_IN_END_MS = 680    # P3 新参数块模糊淡入结束（σ=0，末帧纯原图）
 _VEH_TOTAL_MS = 780          # P4 完全清晰静止 100ms 后收尾
+_VEH_FULL_HOLD_MS = 450       # 整片「车号以下」模糊覆盖层：先整块糊住到 450ms，
+                              # 再在 450→780ms 淡出，露出切换后的清晰数据（用户
+                              # 2026-11-13：「切换车号时车号以下的设置区都高斯模糊
+                              # 再显示切换好的数据」）
 # 逐模组行的行距（实测：34px 控件 + 12px QFormLayout 行距）。区域总高 = 46×行数。
 # ⚠️ 占位行即使高度 0 也自带**一条** 12px 行距 —— 目标高度要按 (Δ − 12) 算，
 #    否则末端换行会差 12px（见 devtools/_probe_vehicle_mech.py 的实测）。
@@ -1973,6 +1977,62 @@ class SettingsDialog(QDialog):
                 rect = QRect(r) if rect.isNull() else rect.united(r)
         return rect
 
+    def _below_vehicle_rect(self) -> QRect:
+        """对话框坐标系下，车辆区以下、body 底部以上的整块**可见**区域。
+
+        用于「切换车号时整片高斯模糊」覆盖层：只取当前屏幕可见的部分
+        （裁剪到滚动视口），与用户「屏幕正在显示的部分都高斯模糊」一致。
+        返回 body 局部坐标（与 body.grab / _FadeOverlay 一致）。
+        """
+        body = self.form.parentWidget()
+        if body is None:
+            return QRect()
+        try:
+            veh_bottom = self._vehicle_field.mapTo(
+                body, QPoint(0, self._vehicle_field.height())).y()
+        except RuntimeError:
+            return QRect()
+        region_bottom = body.height()
+        sa = self.findChild(QScrollArea)
+        if sa is not None:
+            vp = sa.viewport()
+            if vp is not None:
+                try:
+                    top_local = vp.mapTo(body, QPoint(0, 0)).y()
+                    bot_local = vp.mapTo(body, QPoint(0, vp.height())).y()
+                except RuntimeError:
+                    top_local = 0
+                    bot_local = region_bottom
+                veh_bottom = max(veh_bottom, top_local)
+                region_bottom = min(region_bottom, bot_local)
+        top = max(0, int(veh_bottom))
+        height = max(0, int(region_bottom - veh_bottom))
+        if height <= 0:
+            return QRect()
+        return QRect(0, top, body.width(), height)
+
+    def _veh_blur_pixmap(self, pix: "QPixmap | None") -> "QPixmap | None":
+        """1/4 降采样 + 真高斯（与 _veh_blur_level 同口径），返回可直接拉伸绘制的小位图。
+
+        失败返回 None（覆盖层那一段就直接跳过，不崩动画）。
+        """
+        if pix is None or pix.isNull():
+            return None
+        try:
+            small = pix.scaled(
+                max(1, pix.width() // _VEH_BLUR_DIV),
+                max(1, pix.height() // _VEH_BLUR_DIV),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            import splash_motion
+            blurred = splash_motion._gaussian(
+                small, _VEH_SIGMA_MAX / float(_VEH_BLUR_DIV))
+            if blurred is None or blurred.isNull():
+                return None
+            return blurred
+        except Exception:            # noqa: BLE001
+            return None
+
     def _update_module_row_values(self, cells: list[int], temps: list[int]) -> None:
         """行数不变时**原地**改两列数字（不重建控件 → 布局不抖）。
 
@@ -2113,6 +2173,20 @@ class SettingsDialog(QDialog):
                 pix_now = body.grab(rect_now)
             except RuntimeError:
                 pix_now = None
+        # 整片「车号以下」区域：抓**旧**画面（重建前）→ 高斯模糊，作为切换过渡覆盖层
+        rect_full = QRect()
+        pix_full = None
+        if getattr(self, "_veh_allow", False):
+            from ui_anim import animations_enabled
+            if animations_enabled():
+                rect_full = self._below_vehicle_rect()
+                if not rect_full.isNull() and rect_full.height() > 0:
+                    try:
+                        pix_full = body.grab(rect_full)
+                    except RuntimeError:
+                        pix_full = None
+                    if pix_full is not None and not pix_full.isNull():
+                        pix_full = self._veh_blur_pixmap(pix_full)
         bar = self._veh_scrollbar()
         scroll_value = bar.value() if bar is not None else 0
 
@@ -2136,6 +2210,7 @@ class SettingsDialog(QDialog):
         overlay = self._veh_overlay()
         if overlay is not None:
             overlay.clear()
+        self._veh_clear_full(old)
 
         self._rebuild_module_rows(cells, temps, reserve=True)
 
@@ -2156,6 +2231,10 @@ class SettingsDialog(QDialog):
             "levels_old": [], "levels_new": [], "small_old": None, "small_new": None,
             "bar": bar, "scroll": int(scroll_value), "clock": None,
             "jobs": self._veh_jobs(skip_old=(pix_now is None or rect_now.isNull())),
+            # 整片「车号以下」模糊覆盖层（用户 2026-11-13 新要求）
+            "rect_full": QRect(rect_full),
+            "pix_full": pix_full if (pix_full is not None and not pix_full.isNull()) else None,
+            "full_overlay": None,
         }
         self._veh = state
         self._veh_dbg("START", state)
@@ -2164,6 +2243,18 @@ class SettingsDialog(QDialog):
         if not animations_enabled():
             self._veh_finish(state)
             return
+        # 创建整片覆盖层（pix_full/rect_full 已就绪）：盖在模块动画之上，
+        # 由 _veh_tick_full 在 450ms 起淡出，露出切换后的清晰数据。
+        if (state.get("pix_full") is not None
+                and not state["rect_full"].isNull()):
+            try:
+                fo = getattr(self, "_veh_mask_full", None)
+                if fo is None or fo.parentWidget() is not body:
+                    fo = _FadeOverlay(body)
+                    self._veh_mask_full = fo
+                state["full_overlay"] = fo
+            except RuntimeError:
+                pass
         clock = Tween(_VEH_TOTAL_MS, "linear",
                       lambda k, s=state: self._veh_tick(s, k),
                       lambda s=state: self._veh_finish(s),
@@ -2396,6 +2487,7 @@ class SettingsDialog(QDialog):
             # 显行之后覆盖层已清，不再绘制；显行之前（P0~P3）照常喂模糊帧。
             if not state["rows_shown"]:
                 self._veh_paint(state, ms)
+            self._veh_tick_full(state, ms)
             self._veh_restore_scroll(state)
         except Exception as _exc:    # noqa: BLE001
             self._veh_dbg("TICK_EXC", state, repr(_exc))
@@ -2607,6 +2699,49 @@ class SettingsDialog(QDialog):
         except RuntimeError:
             pass
 
+    def _veh_tick_full(self, state: dict, ms: float) -> None:
+        """整片「车号以下」模糊覆盖层：持模糊到 _VEH_FULL_HOLD_MS，再淡出露清。
+
+        覆盖层盖在模块动画之上，先整块糊住（用户要的「都高斯模糊」），再在
+        450→780ms 淡出，露出切换好之后的清晰数据。和模块动画共用同一条主时钟，
+        不另起补间（避免互相打架）。
+        """
+        overlay = state.get("full_overlay")
+        pix = state.get("pix_full")
+        rect = state.get("rect_full")
+        if overlay is None or pix is None or rect is None or rect.isNull():
+            return
+        if ms <= _VEH_FULL_HOLD_MS:
+            alpha = 1.0
+        else:
+            p = min(1.0, (ms - _VEH_FULL_HOLD_MS)
+                    / max(1, _VEH_TOTAL_MS - _VEH_FULL_HOLD_MS))
+            alpha = 1.0 - (p * p)            # 末段加速清晰
+        if alpha <= 0.002:
+            try:
+                overlay.clear()
+            except RuntimeError:
+                pass
+            return
+        try:
+            overlay.show_frame([(pix, 1.0)], rect, alpha)
+        except RuntimeError:
+            try:
+                overlay.clear()
+            except RuntimeError:
+                pass
+
+    def _veh_clear_full(self, state: dict | None = None) -> None:
+        """撤掉整片模糊覆盖层（打断 / 收尾都要清，绝不留残影）。"""
+        fo = getattr(self, "_veh_mask_full", None)
+        if fo is not None:
+            try:
+                fo.clear()
+            except RuntimeError:
+                pass
+        if state is not None:
+            state["full_overlay"] = None
+
     def _veh_stop(self, settle: bool = True) -> None:
         state = self._veh_state()
         if state is None:
@@ -2629,6 +2764,7 @@ class SettingsDialog(QDialog):
                 overlay.clear()
             except RuntimeError:
                 pass
+        self._veh_clear_full(state)
 
     def _veh_finish(self, state: dict) -> None:
         """落到终态：高度到 h1、换行、撤覆盖层、还滚动位置 + 自愈 + 整块重绘。"""
@@ -2653,6 +2789,7 @@ class SettingsDialog(QDialog):
                 overlay.clear()
             except RuntimeError:
                 pass
+        self._veh_clear_full(state)
         # ⛔⛔ 自愈：确保逐模组行数 == 当前车模组个数，绝不停在「模组数 5 却 0 行」。
         try:
             want = 0
