@@ -35,8 +35,9 @@ class HeartbeatDLC:
 
     def shutdown(self) -> None:
         if self._panel is not None:
-            self._panel.shutdown()
-            self._panel = None
+            panel, self._panel = self._panel, None
+            panel.shutdown()          # 停扫描/连接线程
+            panel.close()             # 卸载或退出时把窗口收掉（幂等）
 
 
 def create(ctx):

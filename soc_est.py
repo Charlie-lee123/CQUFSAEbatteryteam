@@ -68,32 +68,68 @@ CELL_MAX_MV = 4600
 
 #: OCV-SOC 表 ``(SOC%, OCV V)``，严格单调递增。由工步 5 平移 +82 mV 而来。
 OCV_TABLE: tuple[tuple[float, float], ...] = (
-    (0, 3.0818),
-    (2, 3.4516),
-    (4, 3.5595),
-    (6, 3.6099),
-    (8, 3.6385),
-    (10, 3.6581),
-    (15, 3.6908),
-    (20, 3.7128),
-    (25, 3.7337),
-    (30, 3.7582),
-    (35, 3.7872),
-    (40, 3.8208),
-    (45, 3.8595),
-    (50, 3.9038),
-    (55, 3.9546),
-    (60, 4.0118),
-    (65, 4.0744),
-    (70, 4.1400),
-    (75, 4.2066),
-    (80, 4.2695),
-    (85, 4.3236),
-    (90, 4.3672),
-    (95, 4.4016),
-    (97, 4.4155),
-    (99, 4.4558),
-    (100, 4.4981),
+    (0, 3.081800),
+    (0.3654, 3.210200),
+    (2.026, 3.455400),
+    (3.6867, 3.550400),
+    (5.3473, 3.598800),
+    (7.0078, 3.627000),
+    (8.6684, 3.646200),
+    (10.329, 3.661100),
+    (11.9895, 3.673300),
+    (13.6501, 3.683600),
+    (15.3107, 3.692500),
+    (16.9713, 3.700300),
+    (18.6319, 3.707200),
+    (20.2925, 3.714000),
+    (21.953, 3.720700),
+    (23.6136, 3.727700),
+    (25.2742, 3.734900),
+    (26.9347, 3.742500),
+    (28.5953, 3.750900),
+    (30.2559, 3.759500),
+    (31.9165, 3.768700),
+    (33.5771, 3.778300),
+    (35.2376, 3.788700),
+    (36.8982, 3.799300),
+    (38.5588, 3.810600),
+    (40.2194, 3.822400),
+    (41.88, 3.834600),
+    (43.5405, 3.847500),
+    (45.2011, 3.861100),
+    (46.8617, 3.875300),
+    (48.5223, 3.890100),
+    (50.1829, 3.905500),
+    (51.8435, 3.921600),
+    (53.504, 3.938700),
+    (55.1646, 3.956300),
+    (56.8252, 3.974700),
+    (58.4858, 3.993700),
+    (60.1464, 4.013500),
+    (61.807, 4.033900),
+    (63.4676, 4.054700),
+    (65.1282, 4.076000),
+    (66.7888, 4.097600),
+    (68.4494, 4.119500),
+    (70.11, 4.141500),
+    (71.7706, 4.163700),
+    (73.4312, 4.185800),
+    (75.0918, 4.207800),
+    (76.7524, 4.229400),
+    (78.413, 4.250400),
+    (80.0735, 4.270400),
+    (81.7341, 4.289600),
+    (83.3947, 4.307500),
+    (85.0552, 4.324200),
+    (86.7158, 4.339700),
+    (88.3763, 4.354200),
+    (90.0369, 4.367500),
+    (91.6974, 4.379700),
+    (93.3579, 4.391000),
+    (95.0185, 4.401700),
+    (96.679, 4.412600),
+    (98.3395, 4.427800),
+    (100, 4.498100),
 )
 
 # ---------------------------------------------------------------- 清洗常量
@@ -138,6 +174,31 @@ EXTREME_DROP_MAX = 2
 
 #: 健康电芯占比低于这个值就认为整包数据不可用（不更新 SOC，只报错）。
 MIN_HEALTHY_RATIO = 0.6
+
+# ---------------------------------------------------------------- 弱芯 vs 断线（卡方）
+# 用户 2026-11-12：「弱芯可以通过卡方计算区分」。
+#
+# 判据：同一轮里，某节相对**中位数**的偏差 Δ 构造 χ² = (Δ/σ0)²，1 自由度、
+# 显著性 α = 0.001 的临界值 χ²_crit = 10.828 → Δ_crit = 3.29·σ0。
+# 超过 Δ_crit 才认定"物理上不可能是一节电芯"（= 断线/坏点，回填）；
+# 在 Δ_crit 以内的一律按**真实弱芯**保留读值。
+#
+# ⛔ 为什么 σ0 **不能用整包实测离散**（这条是本设计的关键）：
+#    E74 真机 101 轮实测，正常节的逐轮残差标准差只有 0~0.3 mV，整包 σ 约 1~3 mV。
+#    若拿 σ 当 σ0，一个 10 mV 的偏差就 χ²≈11 已经"显著"—— 卡方这时回答的只是
+#    「偏离是否可测」，不是「是不是一节电芯」。真弱芯 #112 恒 −32 mV 会 χ²≈114
+#    照样被判死。把 σ0 换成**物理允许的单体不均衡**，卡方问的才变成
+#    「这个偏差大到不可能是电芯了吗」—— 这才是要回答的问题。
+#
+# 标定（E74 101 轮真实日志，残差相对当轮中位数）：
+#   · 弱芯：#112 = −32.0 mV（逐轮 sd **0.00**）、#73 = −27.0 mV（sd 0.00）；
+#   · 断线/坏通道：#97 = −1713、#29 = −1049、#98 = +742、#30 = +884、#99 = +1027 mV；
+#   两族之间 **23 倍**的空档（32 → 742），任何 σ0 ∈ [15, 100] mV 都能干净切开。
+#   取 30 mV（12 Ah LFP 静置下合理的单体不均衡量级）→ Δ_crit ≈ 98.7 mV：
+#   弱芯 χ² = (32/30)² = 1.14（远小于 10.83，保留），
+#   断线 χ² ≥ (742/30)² = 611（远超临界，回填）。
+CHI2_CRIT_1DOF_0001 = 10.828
+CELL_IMBALANCE_TOL_MV = 30.0
 
 # ---------------------------------------------------------------- 工况判别
 # 用户 2026-11-11 提问「你有办法判断电池箱是在充电还是放电吗，有时候并没有
@@ -256,6 +317,16 @@ KAPPA_HI = 1.0
 #: κ 的归一化尺度：OCV 斜率 10 mV/% 视为"完全可信"。
 KAPPA_SLOPE_REF = 10.0
 
+#: 状态相关 κ 调制（乘到 ``K_VOLT`` 上）——
+#: · 接近静置（|I| ≤ REST_I_MAX_A）：电压最可信 → 提速回拉；
+#: · 大电流放电/充电：OCV 估计受极化污染 → 更信安时积分，调低 κ；
+#: · 母线断开（open）：冻结快回拉（见 ``update`` 内 open 分支），只靠静置锚定慢校。
+#: 系数都贴着 119 轮 + 499 轮会话库标定的 ``K_VOLT=0.02`` 做小幅调制，
+#: 不推翻已验证的跟踪精度（C3/C16 仍须通过）。
+KAPPA_IDLE_BOOST = 1.3          # 接近静置时 κ 倍率
+KAPPA_HI_I_A = 100.0            # 电流超过此值（A）按最低 κ
+KAPPA_HI_CURRENT = 0.5          # 大电流放电/充电时的 κ 倍率（更信积分）
+
 #: 静置锚定的增益与单次幅度上限（%）。
 REST_GAIN = 0.3
 REST_CAP_PCT = 15.0
@@ -307,6 +378,17 @@ I_LIMIT_A = 200.0
 #: 若现场发现方向反了（开车 SOC 反涨），把这个改成 -1 即可，不用动别的。
 I_SIGN = 1.0
 
+#: 充电库仑效率（< 1）。充电时存进电池的比安时积分的少（副反应 / 自放电 /
+#: 被动均衡偷走的电流霍尔看不到），所以充电态 SOC 增量要按此系数打折；放电视
+#: 为可逆（= 1），只有充电打折。NCM 取 0.99，具体车可在 ``SocCfg`` / 内置表里覆盖。
+#: 旧配置缺这个字段时回落到它，不会崩。
+CHARGE_EFF_DEFAULT = 0.99
+
+# 温度-OCV 补偿（BMS 实测每模组 8 路 NTC，已通到 SocEstimator.update 的 temps_c）。
+# coef=0 即关闭，完全保留原行为；NCM 典型值约 -0.5 mV/°C（温度越高 OCV 越低）。
+OCV_TEMP_COEF_DEFAULT = 0.0
+OCV_TEMP_REF_C = 25.0
+
 # ---------------------------------------------------------------- 数据结构
 
 
@@ -314,13 +396,19 @@ class SocCfg:
     """一台车的 SOC 参数。换车只换这个对象，估算器本身不用改。"""
 
     __slots__ = ("number", "q_ah", "n_cells", "cells_per_module", "r0_mohm",
-                 "ocv_table", "i_sign", "chemistry")
+                 "ocv_table", "i_sign", "chemistry", "charge_eff",
+                 "ocv_temp_coef_mv_per_c", "ocv_temp_ref_c",
+                 "imbalance_tol_mv")
 
     def __init__(self, number: str = "", q_ah: float = Q_NOM_AH,
                  n_cells: int = N_CELLS, cells_per_module: int = CELLS_PER_MODULE,
                  r0_mohm: float = R0_MOHM,
                  ocv_table=OCV_TABLE, i_sign: float = I_SIGN,
-                 chemistry: str = "NCM"):
+                 chemistry: str = "NCM",
+                 charge_eff: float = CHARGE_EFF_DEFAULT,
+                 ocv_temp_coef_mv_per_c: float = OCV_TEMP_COEF_DEFAULT,
+                 ocv_temp_ref_c: float = OCV_TEMP_REF_C,
+                 imbalance_tol_mv: float = CELL_IMBALANCE_TOL_MV):
         self.number = number
         self.q_ah = float(q_ah)
         self.n_cells = int(n_cells)
@@ -329,12 +417,28 @@ class SocCfg:
         self.ocv_table = tuple((float(s), float(v)) for s, v in ocv_table)
         self.i_sign = float(i_sign)
         self.chemistry = chemistry
+        # 充电库仑效率；落在 (0, 1] 才合理，越界回落到默认，别让一条坏值把
+        # 充电态 SOC 推反方向或推爆。
+        ce = float(charge_eff)
+        self.charge_eff = ce if 0.0 < ce <= 1.0 else CHARGE_EFF_DEFAULT
+        # 温度-OCV 补偿系数（mV/°C）与参考温度（°C）。coef 可为任意实数，
+        # 0 = 关闭补偿；NCM 典型约 -0.5（温度越高 OCV 越低）。不做 (0,1] 限制。
+        self.ocv_temp_coef_mv_per_c = float(ocv_temp_coef_mv_per_c)
+        self.ocv_temp_ref_c = float(ocv_temp_ref_c)
+        # 单体允许不均衡 σ0（mV），卡方判"弱芯 vs 断线"的尺度（见
+        # CELL_IMBALANCE_TOL_MV）。必须 > 0，坏值回落默认。
+        it = float(imbalance_tol_mv)
+        self.imbalance_tol_mv = it if it > 0 else CELL_IMBALANCE_TOL_MV
 
     def to_dict(self) -> dict:
         return {"number": self.number, "q_ah": self.q_ah, "n_cells": self.n_cells,
                 "cells_per_module": self.cells_per_module, "r0_mohm": self.r0_mohm,
                 "ocv_table": [list(p) for p in self.ocv_table],
-                "i_sign": self.i_sign, "chemistry": self.chemistry}
+                "i_sign": self.i_sign, "chemistry": self.chemistry,
+                "charge_eff": self.charge_eff,
+                "ocv_temp_coef_mv_per_c": self.ocv_temp_coef_mv_per_c,
+                "ocv_temp_ref_c": self.ocv_temp_ref_c,
+                "imbalance_tol_mv": self.imbalance_tol_mv}
 
     @classmethod
     def from_dict(cls, data: dict) -> "SocCfg | None":
@@ -351,7 +455,12 @@ class SocCfg:
                       float(data.get("r0_mohm", R0_MOHM)),
                       table or OCV_TABLE,
                       float(data.get("i_sign", I_SIGN)),
-                      str(data.get("chemistry") or "NCM"))
+                      str(data.get("chemistry") or "NCM"),
+                      float(data.get("charge_eff", CHARGE_EFF_DEFAULT)),
+                      float(data.get("ocv_temp_coef_mv_per_c", OCV_TEMP_COEF_DEFAULT)),
+                      float(data.get("ocv_temp_ref_c", OCV_TEMP_REF_C)),
+                      float(data.get("imbalance_tol_mv",
+                                     CELL_IMBALANCE_TOL_MV)))
         except (TypeError, ValueError, IndexError):
             return None
         if cfg.q_ah <= 0 or cfg.n_cells <= 0 or not table_ok(cfg.ocv_table):
@@ -378,11 +487,11 @@ class CleanResult:
 
     __slots__ = ("cells", "bad_idx", "mean_mv", "median_mv", "gap_mv",
                  "residual", "module_offset", "ok", "n_raw", "n_unusable",
-                 "min_mv", "max_mv", "n_extreme_dropped")
+                 "min_mv", "max_mv", "n_extreme_dropped", "weak_idx")
 
     def __init__(self, cells, bad_idx, mean_mv, median_mv, gap_mv,
                  residual, ok, n_raw, n_unusable, module_offset=False,
-                 min_mv=0.0, max_mv=0.0, n_extreme_dropped=0):
+                 min_mv=0.0, max_mv=0.0, n_extreme_dropped=0, weak_idx=None):
         self.cells = cells            # 回填后的整串（长度 = n_cells）
         self.bad_idx = bad_idx        # 被判坏/回填的序号（1 基）
         self.mean_mv = mean_mv        # 健康电芯均值
@@ -403,6 +512,10 @@ class CleanResult:
         self.min_mv = min_mv
         self.max_mv = max_mv
         self.n_extreme_dropped = n_extreme_dropped  # 极值侧又剔掉的残余坏点数
+        # 被判定为**真实弱芯**（超出统计离群限、但偏差在物理允许不均衡内）的序号
+        # （1 基）。这些节的读值**保留、不回填**，只是标出来供界面/诊断区分
+        # "电池真的弱" 与 "采样线断了"。
+        self.weak_idx = list(weak_idx or ())
 
     @property
     def pack_mv(self) -> float:
@@ -543,16 +656,19 @@ def _robust_extremes(values) -> tuple[float, float, int]:
 
 
 def clean_cells(cells_mv, bad_mask=None, n_cells: int = 0,
-                cells_per_module: int = 0) -> CleanResult:
+                cells_per_module: int = 0,
+                imbalance_tol_mv: float = CELL_IMBALANCE_TOL_MV) -> CleanResult:
     """把一轮端电压清洗成可用的整串。
 
     ``cells_mv``：按序号排好的序列（元素可为 None / 0，表示这一节没读到）。
     ``bad_mask``：同样长度的布尔序列，True = 设备已标记为坏（报文里的 ``X``）。
     ``cells_per_module``：每个模组几节，用来判断"连续同向离群"是不是一整段
     模组偏移（0 = 不知道，按 ``n_cells // 8`` 猜）。
+    ``imbalance_tol_mv``：单体**允许不均衡**（σ0，见 ``CELL_IMBALANCE_TOL_MV``），
+    卡方判据的尺度；按车型可调（``SocCfg.imbalance_tol_mv``）。
 
     步骤：量程筛 → MAD/IQR 定离群门槛 → **按连续长度分"孤立断线"与"整段偏移"**
-    → 断线用健康均值回填（用户点名的口径），整段偏移保留真值只做提示。
+    → 孤立离群再用**卡方**分"真弱芯（保真值）"与"断线（回填）"。
     回填**只影响整串之和与显示**，不参与均值的二次计算（否则均值会被自己稀释，
     越替越偏）。
     """
@@ -655,6 +771,29 @@ def clean_cells(cells_mv, bad_mask=None, n_cells: int = 0,
                 keep[k] = True         # 整段偏移：读值是真的，别回填
         i = j
 
+    # ---- 孤立离群再分一次：断线（回填）vs 真弱芯（保真值）-----------------
+    # 上面只按"连续长度"分出了模组级偏移；剩下的孤立离群以前一律当断线回填，
+    # 于是**真的弱芯也被抹成均值**（E74 的 #112 恒 −32 mV，被回填成 4350，
+    # 界面只能从别的节里挑 min，既跳又少报）。
+    # 现在用卡方分开：χ²=(Δ/σ0)²，α=0.001（1 自由度）→ Δ_crit = 3.29·σ0。
+    #   · |Δ| ≤ Δ_crit：在"一节电芯可能有多不均衡"的物理范围里 → **是弱芯**，
+    #     保留真值（同时记进 weak_idx 供诊断）；
+    #   · |Δ| > Δ_crit：不可能是一节电芯（断线/坏通道读到轨值）→ 照旧回填。
+    # ⛔ 超量程 / 缺失（flag is None）**不参与**这一步：它们必然回填，这是
+    #    "整个模组采样线断了不能被当成真值"的非对称防护，别在这里放开。
+    # ⛔ σ0 不是整包实测离散（那只有 1~3 mV，10 mV 就"显著"），而是物理允许的
+    #    单体不均衡 —— 详见 CELL_IMBALANCE_TOL_MV 的标定说明。
+    tol = float(imbalance_tol_mv) if float(imbalance_tol_mv) > 0 else \
+        CELL_IMBALANCE_TOL_MV
+    broken_delta_mv = math.sqrt(CHI2_CRIT_1DOF_0001) * tol
+    weak_idx: list[int] = []
+    for k in range(n):
+        if keep[k] or flag[k] is None:
+            continue
+        if abs(float(values[k]) - median) <= broken_delta_mv:
+            keep[k] = True             # 弱芯：读值是真的，别回填
+            weak_idx.append(k + 1)
+
     accepted = [float(values[k]) for k in range(n) if keep[k]]
     if not accepted:                   # 全被判成孤立坏点：退回量程内全集
         accepted = list(healthy)
@@ -673,12 +812,32 @@ def clean_cells(cells_mv, bad_mask=None, n_cells: int = 0,
             fill.append(mean)
             bad_idx.append(k + 1)
 
-    # 极值只从 **keep=True 的真实读值** 里取，绝不用上面的 fill（回填值是均值）
-    lo_mv, hi_mv, n_drop = _robust_extremes(accepted)
+    # 极值从**量程内的真实读值 `healthy`** 里取，绝不用上面的 fill（回填值是均值）。
+    # ⛔ 为什么不是 `accepted`（=keep=True）：真机实测暴露一个跳动源 —— 某个真实
+    #    弱芯（如 4318mV，比一片 4350 的 pack 低 32mV）正好卡在 MAD/IQR 门槛边上，
+    #    `mad`/`iqr` 逐轮微小波动会让它**时而被判孤立离群(keep=False)、时而又保留**，
+    #    于是 min 在 4324↔4336 之间反复跳（实测 100 轮里 50 次，约 1.25% SOC），
+    #    底栏 min 肉眼可见地抖。`accepted` 会把这些**真实弱芯**一起剔掉，既跳又
+    #    不准（把 4318 报成 4324）。
+    #    `healthy` 只排除「超量程 / 设备打 X / 缺失」，保留所有在量程内的真值；
+    #    而 `_robust_extremes` 自带的「相邻间隙 > EXTREME_GAP_MV(30mV) 就丢」正是
+    #    用来挡断线野值（3900 那种离群会被丢），所以不会把故障读值当极值。
+    lo_mv, hi_mv, n_drop = _robust_extremes(healthy)
+    # 已经用卡方**确认为真弱芯**的节，不能被上面的"相邻间隙 > 30 mV 就丢"再踢掉：
+    # 间隙规则的目的是挡残留坏点，而弱芯是被证明"物理上就是电芯"的读数。
+    # 若不放行，一个 −90 mV 的真弱芯（与次弱间隙 63 mV）会被丢出极值 → 界面
+    # min 报成次弱那一节，SOC min 直接**高报**约 9%。实测 E74 的 #112 只低 32 mV、
+    # 与次弱 #73 差 5 mV，所以这条目前不改变任何读数；它是为更弱的情形兜底。
+    if weak_idx:
+        weak_vals = [float(values[k - 1]) for k in weak_idx
+                     if 0 < k <= len(values)]
+        if weak_vals:
+            lo_mv = min(lo_mv, min(weak_vals))
+            hi_mv = max(hi_mv, max(weak_vals))
 
     return CleanResult(fill, bad_idx, mean, med, gap, gap > MEAN_MED_MAX_MV,
                        ok, n_raw, n - n_raw, module_offset,
-                       lo_mv, hi_mv, n_drop)
+                       lo_mv, hi_mv, n_drop, weak_idx)
 
 
 # ---------------------------------------------------------------- 估算器
@@ -715,6 +874,7 @@ class SocEstimator:
         self._u_hist: list[tuple[float, float]] = []
         self._rest_since: float | None = None
         self.last: SocResult | None = None
+        self._cur_temp_c: float | None = None   # 本轮平均温度（°C），None=无温度
 
     # -- 对外 ---------------------------------------------------------
 
@@ -745,7 +905,8 @@ class SocEstimator:
                       读数就纯是零漂 —— 这是唯一能可靠学到零漂的时机。
         """
         cfg = self.cfg
-        clean = clean_cells(cells_mv, bad_mask, cfg.n_cells, cfg.cells_per_module)
+        clean = clean_cells(cells_mv, bad_mask, cfg.n_cells, cfg.cells_per_module,
+                            cfg.imbalance_tol_mv)
 
         if not clean.ok:
             flag = "NO_DATA" if clean.mean_mv <= 0 else "WEAK"
@@ -756,6 +917,12 @@ class SocEstimator:
 
         # --- 电流：零漂、方向 ---------------------------------------
         i_eff, i_valid = self._effective_current(i_meas, contactor_open, bms_ok)
+
+        # --- 工况判别：提前算，下面 κ 调制 / 充电效率要按状态走 ----------
+        # 分类器有滞回与趋势状态，**每轮必须只调一次**；后面 SocResult 复用同一结果。
+        mode = self._mode.classify(
+            ts=ts, mean_mv=clean.mean_mv, i_eff=i_eff, i_valid=i_valid,
+            contactor_open=contactor_open, bms_ok=bms_ok)
 
         # --- 时间步长 -----------------------------------------------
         gap = None
@@ -769,6 +936,7 @@ class SocEstimator:
             self._last_ts = float(ts)
 
         temp_c = _mean_temp(temps_c)
+        self._cur_temp_c = temp_c
         anchored = False
         initialised = False
         pol_mv = 0.0            # EKF 估出的 U1+U2+Uc（mV），原方法路径恒 0
@@ -799,7 +967,10 @@ class SocEstimator:
             elif not initialised:
                 # 1) 安时积分（骨架）
                 if i_valid and dt > 0:
-                    self.soc -= i_eff * dt / 3600.0 / cfg.q_ah * 100.0
+                    d_soc = i_eff * dt / 3600.0 / cfg.q_ah * 100.0
+                    if i_eff < 0:                  # 充电：库仑效率 < 1，存进去更少
+                        d_soc *= cfg.charge_eff
+                    self.soc -= d_soc
 
                 # 2) 电压回拉（κ 加权）。RESIDUAL 时不采信 —— 均值可能还被
                 #    没剔干净的断线拽着，这时候纠偏就是把错误焊进 SOC。
@@ -809,8 +980,16 @@ class SocEstimator:
                 if not clean.residual:
                     ocv_v = self._ocv_estimate(clean.mean_mv, i_eff) / 1000.0
                     soc_ocv = soc_from_ocv(ocv_v, cfg.ocv_table)
-                    k = kappa_at(self.soc, cfg.ocv_table) * K_VOLT
-                    self.soc += k * (soc_ocv - self.soc)
+                    if mode == "open":
+                        # 母线断开：电流必为 0，OCV 估计本身可信但噪声会逐轮把
+                        # 中心 soc 抖来抖去。冻结 κ 快回拉（只靠下方静置锚定做慢校，
+                        # 它自带 120 s 稳定窗口 + ±15% 封顶 + 0.3 增益的死区），
+                        # 避免放大跳变（探针实测单独放开会把中心 soc 跳变放大数倍）。
+                        pass
+                    else:
+                        k = (kappa_at(self.soc, cfg.ocv_table) * K_VOLT
+                             * self._kappa_gain(mode, i_eff, i_valid))
+                        self.soc += k * (soc_ocv - self.soc)
 
                 # 3) 静置锚定（唯一的强校正）
                 anchored = self._rest_anchor(clean, i_eff, i_valid, ts, temp_c)
@@ -850,7 +1029,8 @@ class SocEstimator:
         # 物理意义：放电时**最弱那节**先到截止电压 → 看 min；充电时**最高那节**
         # 先到截止 → 看 max。两个值都由 OCV 查表得到，共用同一个 IR + 极化补偿，
         # 所以间距只取决于电芯一致性，不会被主算法的积分漂移带跑。
-        ocv_bias_mv = (i_eff if i_valid else 0.0) * cfg.r0_mohm + pol_mv
+        ocv_bias_mv = (i_eff if i_valid else 0.0) * cfg.r0_mohm + pol_mv \
+            - self._ocv_temp_shift_mv()
         soc_min = soc_from_ocv((clean.min_mv + ocv_bias_mv) / 1000.0,
                                cfg.ocv_table)
         soc_max = soc_from_ocv((clean.max_mv + ocv_bias_mv) / 1000.0,
@@ -859,10 +1039,7 @@ class SocEstimator:
         soc_max = max(0.0, min(100.0, soc_max))
         if soc_min > soc_max:
             soc_min, soc_max = soc_max, soc_min
-        # ---- 工况判别：多信号分层，不再只赌电流符号 ----------
-        mode = self._mode.classify(
-            ts=ts, mean_mv=clean.mean_mv, i_eff=i_eff, i_valid=i_valid,
-            contactor_open=contactor_open, bms_ok=bms_ok)
+        # ---- 工况判别：见 update 开头（每轮只调一次，结果复用到这里）----
         # 用户 2026-11-11 定：只有**明确充电**才突出 max；放电、静置、
         # 母线断开、工况未知一律默认突出 min（保守口径：FSAE 更关心
         # "还能放多少电"）。底栏会同时标出工况，不会让人误以为在跑车。
@@ -897,7 +1074,9 @@ class SocEstimator:
         except (TypeError, ValueError):
             return 0.0, False
         # ⛔⛔ 判序是刻意的，**接触器全断必须排在轨值判断之前**（2026-11-11 改）：
-        #    · "母线全断 ⇒ 真实电流必为 0" 是**硬件级事实**，比任何电流读数都硬；
+        #    · "母线全断 ⇒ 真实电流必为 0" 是**硬件级事实**，比任何电流读数都硬，
+        #      也**不依赖 bms_ok** —— 真机常态是 BMS 报错（bms_ok=False）但接触器
+        #      已断开，母线断开⇒电流为 0 仍成立；
         #    · 而 `HALL_I` 上有 R71(20k) 下拉 —— 传感器没接 / 没供电 / 线断时
         #      ADC 必然读 0 V，固件把它换算成 **−250 A 轨值**（就是 ADC 码 0；
         #      实测取值只有 −250.00 / −249.88 / −249.76 / −249.63 / −249.51，
@@ -906,11 +1085,11 @@ class SocEstimator:
         #      `_rest_anchor` 首行 `if not i_valid: return False` 直接退出，
         #      **静置锚定在整段轨值会话里一次都不跑**（真机 3099/4929 帧、
         #      累计约 3 小时），SOC 只剩 κ 加权电压回拉；
-        #    · 提到前面之后，轨值帧在"母线全断 + BMS 正常"下返回 ``(0.0, True)``：
+        #    · 「接触器全断」分支不要求 bms_ok：母线断开 + 轨值帧返回 ``(0.0, True)``，
         #      不学零漂（|raw|=250 > BIAS_SAMPLE_MAX_A=20）、不积分（i_eff 恒 0），
         #      但**静置锚定能恢复**，这正是要的效果。
-        if contactor_open and bms_ok:
-            # 接触器全断 + BMS 正常 = 真实电流为 0，读数就是零漂，学它
+        if contactor_open is True:
+            # 母线全断 = 真实电流为 0，读数就是零漂，学它（不依赖 bms_ok）
             if math.isfinite(raw) and abs(raw) <= BIAS_SAMPLE_MAX_A:
                 self.i_bias += BIAS_GAIN * (raw - self.i_bias)
                 self.i_bias = max(-BIAS_LIMIT_A, min(BIAS_LIMIT_A, self.i_bias))
@@ -923,13 +1102,55 @@ class SocEstimator:
 
         return (raw - self.i_bias) * self.cfg.i_sign, True
 
+    def _ocv_temp_shift_mv(self) -> float:
+        """温度-OCV 补偿量（mV）：查表前要从电压里**减去**它。
+
+        物理：``OCV(T) = OCV(T_ref) + coef*(T - T_ref)``，NCM 的 coef 为负
+        （温度越高 OCV 越低）。要把测得（已做 IR 修正）的电压映射回 T_ref 表，
+        需要 ``+coef*(T-T_ref)`` 的修正；这里返回要**减去**的量
+        ``shift = coef*(T - T_ref)``，即查表电压用 ``V_lookup = V_meas - shift``。
+
+        仅在 (a) 配置了非零系数 且 (b) 本轮有温度读数时生效；否则返回 0
+        （完全保留原行为，coef 默认 0）。
+        """
+        coef = self.cfg.ocv_temp_coef_mv_per_c
+        if coef == 0.0 or self._cur_temp_c is None:
+            return 0.0
+        return coef * (self._cur_temp_c - self.cfg.ocv_temp_ref_c)
+
     def _ocv_estimate(self, mean_mv: float, i_eff: float) -> float:
         """端电压 → OCV（mV）。
 
         放电（``i_eff > 0``）时端电压低于 OCV，把 IR 压降加回去；充电反过来。
         这就是 Excel 里那条 ``OCV = V + 82 mV`` 的同一个式子。
+        温度补偿：减掉 ``_ocv_temp_shift_mv``（见其文档），把电压折算回
+        OCV 表标定的参考温度。
         """
-        return mean_mv + i_eff * self.cfg.r0_mohm
+        return mean_mv + i_eff * self.cfg.r0_mohm - self._ocv_temp_shift_mv()
+
+    def _kappa_gain(self, mode: str, i_eff: float, i_valid: bool) -> float:
+        """状态相关 κ 调制系数（乘到 ``K_VOLT`` 上）。
+
+        * ``open``：母线断开，冻结快回拉（见 ``update`` 内 open 分支说明）。
+        * 接近静置（``|I| ≤ REST_I_MAX_A``）：电压最可信 → 提速回拉；
+        * 大电流放电/充电：OCV 估计受极化污染 → 更信安时积分，调低 κ；
+        * 有电流读数但介于二者之间：在 1.0 与 ``KAPPA_HI_CURRENT`` 间线性过渡；
+        * 无电流读数（``i_valid=False``）：维持原 ``K_VOLT``（= 1.0）。
+
+        系数都贴着 119 轮 + 499 轮会话库标定的 ``K_VOLT=0.02`` 做小幅调制，
+        不推翻已验证的跟踪精度。
+        """
+        if mode == "open":
+            return 0.0
+        if not i_valid:
+            return 1.0
+        a = abs(i_eff)
+        if a <= REST_I_MAX_A:
+            return KAPPA_IDLE_BOOST
+        if a >= KAPPA_HI_I_A:
+            return KAPPA_HI_CURRENT
+        t = (a - REST_I_MAX_A) / (KAPPA_HI_I_A - REST_I_MAX_A)
+        return 1.0 + t * (KAPPA_HI_CURRENT - 1.0)
 
     def _reinit_from_ocv(self, clean: CleanResult, i_eff: float) -> None:
         """静置中断后按开路电压重新锚定。
@@ -969,7 +1190,8 @@ class SocEstimator:
         if float(ts) - self._rest_since < REST_WINDOW_S:
             return False
 
-        soc_ocv = soc_from_ocv(clean.mean_mv / 1000.0, self.cfg.ocv_table)
+        soc_ocv = soc_from_ocv(
+            (clean.mean_mv - self._ocv_temp_shift_mv()) / 1000.0, self.cfg.ocv_table)
         delta = soc_ocv - self.soc
         delta = max(-REST_CAP_PCT, min(REST_CAP_PCT, delta))
         self.soc += REST_GAIN * delta

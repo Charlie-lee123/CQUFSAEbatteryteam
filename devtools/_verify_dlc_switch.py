@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""验证「心率 DLC 单一开关」依赖的 dlc_host 契约（只读，不写 enabled.json、不卸载）。
+"""验证「DLC」按钮依赖的 dlc_host 契约（只读，不写 enabled.json、不卸载）。
 
 只确认：discover 能找到 heartbeatDLC 且 enabled、load 返回的插件实例有
-可调用的 show_panel（开关 ON 时 _on_dlc_switch 会调它）。不碰用户真实配置。
+可调用的 show_panel（点「DLC」时宿主 `_dlc_open_panel` 会调它）。
+不碰用户真实配置。
 """
 import os
 import sys
@@ -81,7 +82,7 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"  (shutdown 抛错，忽略) {type(exc).__name__}: {exc}")
 
-    print("PASS: 心率 DLC 单一开关所依赖的加载/入口契约成立")
+    print("PASS: 「DLC」按钮所依赖的加载 / 面板契约成立")
     return 0
 
 

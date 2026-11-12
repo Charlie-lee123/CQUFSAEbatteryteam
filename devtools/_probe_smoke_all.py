@@ -312,6 +312,20 @@ def settings_close(accept: bool) -> None:
     pump(150)
 
 
+def _fps_after_restore(prev_hz: int) -> int:
+    """「取消」还原之后**应该**得到的帧率。
+
+    ``ui_anim.set_frame_hz()`` 会把值夹到
+    ``[FPS_MIN, min(FPS_MAX_CAP, 显示器上限)]``。所以把 120（"跟随屏幕"哨兵）
+    还原到 60 屏上落成 60 是**正确行为**，不是"没还原"。
+    本探针直接构造 MainWindow（不走 main.py 的哨兵替换），`frame_hz()` 起手是
+    未夹过的 120，才需要这一步换算 —— 否则 60 Hz 屏上会稳定假红。
+    """
+    from ui_anim import FPS_MAX_CAP, FPS_MIN, display_max_hz
+    cap = min(int(FPS_MAX_CAP), int(display_max_hz()))
+    return max(int(FPS_MIN), min(cap, int(prev_hz)))
+
+
 def dialog_controls(dialog):
     """把面板里的滑杆 / 开关 / 数字框 / 下拉框按类别收一遍。"""
     from ui_controls import ChevronComboBox, ChevronSpinBox, GlassSlider, Switch
@@ -366,6 +380,11 @@ def run() -> None:
     sys.stderr = _Tee(sys.stderr)
     _patch_modals()
     _start_watchdog()
+
+    # 自动化里不弹「装串口驱动」的模态框：插着的设备如果真的没驱动，那个框会
+    # 把跑测试的进程堵死（实测让 selftest 卡 3 分半）。产品里这个开关只读环境
+    # 变量，正常运行不会设置它。⚠️ 必须在任何 MainWindow 创建之前。
+    os.environ.setdefault("SA_SKIP_DRIVER_PROMPT", "1")
 
     APP = QApplication(sys.argv)
     from ui_theme import apply_scheme, detect_system_scheme, ui_font
@@ -458,10 +477,15 @@ def run() -> None:
         else:
             def scroll_groups():
                 bar = scroll.verticalScrollBar()
-                span = max(1, bar.maximum())
                 for frac in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0):
-                    bar.setValue(int(span * frac))
+                    bar.setValue(int(max(1, bar.maximum()) * frac))
                     pump(90)
+                # ⚠️ 面板里有几处**异步长高**（车辆行的隐藏动画、长文本换行），
+                #    滚到底之后 maximum 还会再变大一点（实测差 7px）。所以按
+                #    "再夹一次直到不动"来判，而不是只夹一次就断言。
+                for _ in range(3):
+                    bar.setValue(bar.maximum())
+                    pump(80)
                 if bar.value() != bar.maximum():
                     STATE.append(f"设置面板滚动条没到底（{bar.value()}/{bar.maximum()}）")
                 bar.setValue(0)
@@ -596,7 +620,7 @@ def run() -> None:
                    f"取消后材质强度没还原：{prev_glass} → {glass_strength()}")
             expect(material() == prev_material,
                    f"取消后材质没还原：{prev_material} → {material()}")
-            expect(frame_hz() == prev_fps,
+            expect(frame_hz() == _fps_after_restore(prev_fps),
                    f"取消后动画帧率没还原：{prev_fps} → {frame_hz()}")
             expect(abs(window.txt_rx.font().pointSizeF() - float(prev_font)) < 0.01,
                    "取消后接收区字号没还原："

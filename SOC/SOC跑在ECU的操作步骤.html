@@ -63,9 +63,9 @@ figcaption{margin-top:8px;font-size:8.8pt;color:var(--muted)}
  a{color:var(--ink)}
 }
 @page{size:A4;margin:15mm 14mm 16mm}
-</style></head><body><main class="page"><div class="cover"><h1>SOC 跑在 ECU 上 · 电控同学操作指南</h1><div class="sub">SerialAssistant 2.7 · 重庆大学方程式赛车队 E74 · 供电控同学的总操作步骤</div><div class="sub"><span class="badge">SOC 上 ECU</span><span class="badge">125 串 / 12.041 Ah</span><span class="badge">高电压 NCM</span></div></div><nav class="toc"><h2>目录</h2><ol><li><a href="#sec1">1. 为什么把 SOC 放到 ECU 上跑</a></li><li><a href="#sec2">2. 系统架构（总览）</a></li><li><a href="#sec3">3. ECU 从 BMS 接收什么（输入数据契约）</a></li><li><a href="#sec4">4. SOC 算法步骤（移植要点，语言无关）</a></li><li><a href="#sec5">5. E74 参数一页纸（直接抄进代码）</a></li><li><a href="#sec6">6. ECU 输出给 C125（输出数据契约）</a></li><li><a href="#sec7">7. 联调与验收判据（怎么知道算对了）</a></li><li><a href="#sec8">8. 用 SerialAssistant 当验证工具</a></li><li><a href="#sec9">附录 A：改代码 / 调参前必读</a></li><li><a href="#sec10">附录 B：参考文献</a></li></ol></nav><h2 id="sec1">1. 为什么把 SOC 放到 ECU 上跑</h2>
+</style></head><body><main class="page"><div class="cover"><h1>SOC 跑在 ECU 上 · 电控同学操作指南</h1><div class="sub">SerialAssistant 2.7 · 2026 中国大学生方程式 · 重庆大学方程式赛车队 E74</div><div class="sub"><span class="badge">SOC 上 ECU</span><span class="badge">125 串 / 12.041 Ah</span><span class="badge">高电压 NCM</span></div></div><nav class="toc"><h2>目录</h2><ol><li><a href="#sec1">1. 为什么把 SOC 放到 ECU 上跑</a></li><li><a href="#sec2">2. 系统架构（总览）</a></li><li><a href="#sec3">3. ECU 从 BMS 接收什么（输入数据契约）</a></li><li><a href="#sec4">4. SOC 算法步骤（移植要点，语言无关）</a></li><li><a href="#sec5">5. E74 参数一页纸（直接抄进代码）</a></li><li><a href="#sec6">6. ECU 输出给 C125（输出数据契约）</a></li><li><a href="#sec7">7. 联调与验收判据（怎么知道算对了）</a></li><li><a href="#sec8">8. 用 SerialAssistant 当验证工具</a></li><li><a href="#sec9">附录 A：改代码 / 调参前必读</a></li><li><a href="#sec10">附录 B：参考文献</a></li></ol></nav><h2 id="sec1">1. 为什么把 SOC 放到 ECU 上跑</h2>
 <p>一句话：<strong>BMS 负责"把原始采样发出来"，SOC 计算与显示都放在 ECU（你们的主控制器）上完成。</strong></p>
-<ul><li>电池箱里的 <code>BMS_Master</code> 用的是 STM32F103C8T6，主要跑 isoSPI 采集、接触器保护、故障诊断这些<strong>硬实时任务</strong>。让它再跑 SOC 估算，既挤占算力，又要在固件里塞一张 26 点 OCV 标定表和一组实测阈值，维护成本高。</li><li>SOC 本身逻辑不重，但它依赖一张实测的 OCV–SOC 表、一组来自真机数据的阈值，还要做"零漂在线学习""静置软锚定"这类长期校正。这些放在 <strong>ECU</strong> 上跑最合适：算力充裕，又能直接把算好的结果经 CAN 送给 C125 仪表盘。</li><li>结论：<strong>BMS 只发原始采样（电压 / 温度 / 电流 / 接触器状态），ECU 算 SOC，C125 只显示。</strong> 这套分工也是 SerialAssistant（PC 端参考实现）已经在跑的同一套算法。</li></ul>
+<ul><li>电池箱里的 <code>BMS_Master</code> 用的是 STM32F103C8T6，主要跑 isoSPI 采集、接触器保护、故障诊断这些<strong>硬实时任务</strong>。让它再跑 SOC 估算，既挤占算力，又要在固件里塞一张 62 点 OCV 标定表和一组实测阈值，维护成本高。</li><li>SOC 本身逻辑不重，但它依赖一张实测的 OCV–SOC 表、一组来自真机数据的阈值，还要做"零漂在线学习""静置软锚定"这类长期校正。这些放在 <strong>ECU</strong> 上跑最合适：算力充裕，又能直接把算好的结果经 CAN 送给 C125 仪表盘。</li><li>结论：<strong>BMS 只发原始采样（电压 / 温度 / 电流 / 接触器状态），ECU 算 SOC，C125 只显示。</strong> 这套分工也是 SerialAssistant（PC 端参考实现）已经在跑的同一套算法。</li></ul>
 <blockquote>本文档是给电控同学的总操作指南：ECU 要接收什么数据、算法怎么写、算完往哪发、怎么验收。所有公式和参数都来自已经在 PC 端验证过的实现，可直接移植。</blockquote>
 <hr>
 <h2 id="sec2">2. 系统架构（总览）</h2>
@@ -275,17 +275,24 @@ else:
 <tr><td>电流</td><td><code>BIAS_GAIN</code> / <code>BIAS_LIMIT_A</code> / <code>BIAS_SAMPLE_MAX_A</code> / <code>I_LIMIT_A</code></td><td>0.25 / 5.0 / 20.0 / 200.0</td></tr>
 <tr><td>报文</td><td><code>STICKY_ROUNDS</code></td><td>10</td></tr>
 </tbody></table>
-<h3>5.3 OCV–SOC 表（26 点，线性插值，表外不外推）</h3>
+<h3>5.3 OCV–SOC 表（62 点，线性插值，表外不外推）</h3>
 <table><thead><tr><th>SOC %</th><th>OCV V</th><th>SOC %</th><th>OCV V</th><th>SOC %</th><th>OCV V</th><th>SOC %</th><th>OCV V</th></tr></thead><tbody>
-<tr><td>0</td><td>3.0818</td><td>15</td><td>3.6908</td><td>40</td><td>3.8208</td><td>70</td><td>4.1400</td></tr>
-<tr><td>2</td><td>3.4516</td><td>20</td><td>3.7128</td><td>45</td><td>3.8595</td><td>75</td><td>4.2066</td></tr>
-<tr><td>4</td><td>3.5595</td><td>25</td><td>3.7337</td><td>50</td><td>3.9038</td><td>80</td><td>4.2695</td></tr>
-<tr><td>6</td><td>3.6099</td><td>30</td><td>3.7582</td><td>55</td><td>3.9546</td><td>85</td><td>4.3236</td></tr>
-<tr><td>8</td><td>3.6385</td><td>35</td><td>3.7872</td><td>60</td><td>4.0118</td><td>90</td><td>4.3672</td></tr>
-<tr><td>10</td><td>3.6581</td><td></td><td></td><td>65</td><td>4.0744</td><td>95</td><td>4.4016</td></tr>
-<tr><td></td><td></td><td></td><td></td><td></td><td></td><td>97</td><td>4.4155</td></tr>
-<tr><td></td><td></td><td></td><td></td><td></td><td></td><td>99</td><td>4.4558</td></tr>
-<tr><td></td><td></td><td></td><td></td><td></td><td></td><td>100</td><td>4.4981</td></tr>
+<tr><td>0</td><td>3.0818</td><td>25.2742</td><td>3.7349</td><td>51.8435</td><td>3.9216</td><td>78.413</td><td>4.2504</td></tr>
+<tr><td>0.3654</td><td>3.2102</td><td>26.9347</td><td>3.7425</td><td>53.504</td><td>3.9387</td><td>80.0735</td><td>4.2704</td></tr>
+<tr><td>2.026</td><td>3.4554</td><td>28.5953</td><td>3.7509</td><td>55.1646</td><td>3.9563</td><td>81.7341</td><td>4.2896</td></tr>
+<tr><td>3.6867</td><td>3.5504</td><td>30.2559</td><td>3.7595</td><td>56.8252</td><td>3.9747</td><td>83.3947</td><td>4.3075</td></tr>
+<tr><td>5.3473</td><td>3.5988</td><td>31.9165</td><td>3.7687</td><td>58.4858</td><td>3.9937</td><td>85.0552</td><td>4.3242</td></tr>
+<tr><td>7.0078</td><td>3.6270</td><td>33.5771</td><td>3.7783</td><td>60.1464</td><td>4.0135</td><td>86.7158</td><td>4.3397</td></tr>
+<tr><td>8.6684</td><td>3.6462</td><td>35.2376</td><td>3.7887</td><td>61.807</td><td>4.0339</td><td>88.3763</td><td>4.3542</td></tr>
+<tr><td>10.329</td><td>3.6611</td><td>36.8982</td><td>3.7993</td><td>63.4676</td><td>4.0547</td><td>90.0369</td><td>4.3675</td></tr>
+<tr><td>11.9895</td><td>3.6733</td><td>38.5588</td><td>3.8106</td><td>65.1282</td><td>4.0760</td><td>91.6974</td><td>4.3797</td></tr>
+<tr><td>13.6501</td><td>3.6836</td><td>40.2194</td><td>3.8224</td><td>66.7888</td><td>4.0976</td><td>93.3579</td><td>4.3910</td></tr>
+<tr><td>15.3107</td><td>3.6925</td><td>41.88</td><td>3.8346</td><td>68.4494</td><td>4.1195</td><td>95.0185</td><td>4.4017</td></tr>
+<tr><td>16.9713</td><td>3.7003</td><td>43.5405</td><td>3.8475</td><td>70.11</td><td>4.1415</td><td>96.679</td><td>4.4126</td></tr>
+<tr><td>18.6319</td><td>3.7072</td><td>45.2011</td><td>3.8611</td><td>71.7706</td><td>4.1637</td><td>98.3395</td><td>4.4278</td></tr>
+<tr><td>20.2925</td><td>3.7140</td><td>46.8617</td><td>3.8753</td><td>73.4312</td><td>4.1858</td><td>100</td><td>4.4981</td></tr>
+<tr><td>21.953</td><td>3.7207</td><td>48.5223</td><td>3.8901</td><td>75.0918</td><td>4.2078</td><td></td><td></td></tr>
+<tr><td>23.6136</td><td>3.7277</td><td>50.1829</td><td>3.9055</td><td>76.7524</td><td>4.2294</td><td></td><td></td></tr>
 </tbody></table>
 <p>两端锚点：<strong>SOC 100% ↔ 4.4981 V，SOC 0% ↔ 3.0818 V。</strong> 完整表也在 <code>soc_est.py</code> 的 <code>OCV_TABLE</code> 里，可直接复制。</p>
 <blockquote>⛔ 改任何阈值，必须用 119 轮历史日志 + 499 轮会话库重新标定。⚠️ 现成车 <code>A08-2026</code> 是 <code>20/20/20/20/26</code> 不规则模组，扁平索引不成立，会显示 <code>--</code>，属已知边界不是 bug。</blockquote>

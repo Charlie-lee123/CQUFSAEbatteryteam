@@ -6298,6 +6298,12 @@ def _heal_polluted_keys(settings: QSettings) -> None:
         print("      （若这确是你手动改的配置，请到「设置 → 定制功能」重新设置一遍）")
 
 
+# 自动化里不弹「装串口驱动」的模态框：插着的设备如果真的没驱动，那个框会
+# 把跑测试的进程堵死（实测让 selftest 卡 3 分半）。产品里这个开关只读环境变量，
+# 正常运行不会设置它。⚠️ 必须是**进程级**设置，且在任何 MainWindow 创建之前。
+os.environ.setdefault("SA_SKIP_DRIVER_PROMPT", "1")
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     # ⚠️ 起手环境必须和 main.py 一致：**Fusion + 应用字体（MiSans 12.5）**。

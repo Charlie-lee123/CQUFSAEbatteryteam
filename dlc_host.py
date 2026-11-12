@@ -8,7 +8,7 @@
    与 exe 同级 ``dlc/``（便携版手动放）；
 2. 校验清单字段、API 版本、最低主程序版本；
 3. 把一个插件目录加进 ``sys.path``，``importlib`` 载入 ``create(ctx)``；
-4. 给插件一个受限的 ``HostContext``：注册入口按钮、拿数据目录、写日志。
+4. 给插件一个受限的 ``HostContext``：注册面板回调、拿数据目录、写日志。
 
 ⛔ 三条硬边界：
 - 不碰主程序的 QSettings（插件配置走独立 JSON 文件，见 ``enabled.json``）；
@@ -509,10 +509,33 @@ class HostContext:
         return self._window
 
     def add_launcher(self, text: str, callback, tooltip: str = "") -> None:
-        """在右侧配置栏注册一颗插件入口按钮。"""
+        """注册插件面板回调（宿主不再生成独立入口按钮，由「DLC」面板调用）。"""
         adder = getattr(self._window, "_dlc_add_launcher", None)
         if callable(adder):
             adder(str(text), callback, tooltip)
+
+    def open_panel(self, plugin_id: str) -> bool:
+        """打开已安装插件的面板；插件未启用 / 没有面板时返回 False。"""
+        opener = getattr(self._window, "_dlc_open_panel", None)
+        if callable(opener):
+            try:
+                return bool(opener(str(plugin_id)))
+            except Exception:                   # noqa: BLE001 - 打开面板失败不该冒泡
+                app_log.exception("打开插件面板失败")
+        return False
+
+    def request_uninstall(self, plugin_id: str) -> bool:
+        """插件面板里的「卸载」入口：宿主确认后停实例、卸载（先备份）。
+
+        ⛔ 必须由宿主执行：插件在运行中被删目录会连自己的模块文件一起消失。
+        """
+        remover = getattr(self._window, "_dlc_request_uninstall", None)
+        if callable(remover):
+            try:
+                return bool(remover(str(plugin_id)))
+            except Exception:                   # noqa: BLE001 - 卸载失败不该冒泡
+                app_log.exception("卸载插件失败")
+        return False
 
     def data_dir(self, plugin_id: str) -> Path:
         """插件数据目录：卸载插件不会连带删掉这里的历史数据。"""
@@ -530,146 +553,3 @@ class HostContext:
         loader = getattr(self._window, "_init_dlc", None)
         if callable(loader):
             loader()
-
-
-class DlcManagerDialog:
-    """DLC 管理对话框的工厂（Qt 依赖惰性导入，避免拖慢主窗 import）。"""
-
-    @staticmethod
-    def create(ctx: HostContext, parent=None):
-        from PySide6.QtCore import Qt, QUrl
-        from PySide6.QtGui import QDesktopServices
-        from PySide6.QtWidgets import (
-            QDialog, QFileDialog, QHBoxLayout, QLabel, QListWidget,
-            QMessageBox, QPushButton, QVBoxLayout,
-        )
-
-        class _Dialog(QDialog):
-            def __init__(self) -> None:
-                # 没显式给 parent 时挂到主窗，避免对话框漂在别的显示器上
-                super().__init__(parent or ctx.main_window)
-                self._ctx = ctx
-                self._infos: list[PluginInfo] = []
-                self.setWindowTitle("DLC")
-                self.resize(560, 380)
-                root = QVBoxLayout(self)
-                root.setSpacing(10)
-                intro = QLabel(
-                    "DLC 是可选扩展，不随主程序发布。安装后会在右侧配置栏多出一颗入口按钮；"
-                    "禁用或卸载后主程序行为不变。")
-                intro.setWordWrap(True)
-                root.addWidget(intro)
-                self.list = QListWidget()
-                self.list.currentRowChanged.connect(lambda _row: self._sync())
-                root.addWidget(self.list, 1)
-                self.lbl_path = QLabel()
-                self.lbl_path.setWordWrap(True)
-                root.addWidget(self.lbl_path)
-
-                buttons = QHBoxLayout()
-                self.btn_install = QPushButton("从 ZIP 安装 …")
-                self.btn_toggle = QPushButton("禁用")
-                self.btn_remove = QPushButton("卸载")
-                self.btn_open = QPushButton("打开下载页")
-                self.btn_close = QPushButton("关闭")
-                for button in (self.btn_install, self.btn_toggle, self.btn_remove,
-                               self.btn_open, self.btn_close):
-                    buttons.addWidget(button)
-                root.addLayout(buttons)
-                self.btn_install.clicked.connect(self._install)
-                self.btn_toggle.clicked.connect(self._toggle)
-                self.btn_remove.clicked.connect(self._remove)
-                self.btn_open.clicked.connect(self._open_page)
-                self.btn_close.clicked.connect(self.accept)
-                self._refresh()
-
-            # -- 列表 --------------------------------------------------------
-            def _refresh(self) -> None:
-                self._infos = discover()
-                self.list.clear()
-                for info in self._infos:
-                    label = info.label if info.enabled else f"{info.label} · 已禁用"
-                    self.list.addItem(label)
-                    item = self.list.item(self.list.count() - 1)
-                    item.setToolTip(info.summary or info.name)
-                    item.setData(Qt.ItemDataRole.UserRole, info.id)
-                if self._infos:
-                    self.list.setCurrentRow(0)
-                self.lbl_path.setText(
-                    f"安装目录：{user_dir()}\n"
-                    f"插件 API v{DLC_API} · 主程序 v{ctx.app_version} · "
-                    f"共 {len(self._infos)} 个扩展（鼠标悬停看说明）")
-                self._sync()
-
-            def _current(self) -> PluginInfo | None:
-                row = self.list.currentRow()
-                return self._infos[row] if 0 <= row < len(self._infos) else None
-
-            def _sync(self) -> None:
-                info = self._current()
-                self.btn_toggle.setEnabled(info is not None)
-                self.btn_remove.setEnabled(info is not None)
-                self.btn_toggle.setText("启用" if info and not info.enabled else "禁用")
-
-            # -- 操作 --------------------------------------------------------
-            def _install(self) -> None:
-                path, _ = QFileDialog.getOpenFileName(
-                    self, "选择 DLC 安装包", "", "DLC 安装包 (*.zip)")
-                if not path:
-                    return
-                try:
-                    info = install_zip(path)
-                except (ValueError, OSError, zipfile.BadZipFile) as exc:
-                    QMessageBox.warning(self, "安装失败", str(exc))
-                    return
-                self._refresh()
-                ctx.log(f"从 ZIP 安装了 {info.name} v{info.version}")
-                ctx.reload_now()
-                QMessageBox.information(
-                    self, "安装完成",
-                    f"已安装 {info.name} v{info.version}。\n"
-                    f"入口按钮：右侧「串口配置」栏底部。")
-
-            def _toggle(self) -> None:
-                info = self._current()
-                if info is None:
-                    return
-                set_enabled(info.id, not info.enabled)
-                self._refresh()
-                if info.enabled:
-                    QMessageBox.information(
-                        self, "需要重启",
-                        "已禁用。已加载的插件会在下次启动主程序时不再加载。")
-                else:
-                    ctx.reload_now()
-                    QMessageBox.information(
-                        self, "已启用",
-                        "启用完成；若入口按钮没有立刻出现，重启一次主程序即可。")
-
-            def _remove(self) -> None:
-                info = self._current()
-                if info is None:
-                    return
-                answer = QMessageBox.question(
-                    self, "确认卸载",
-                    f"卸载 {info.name}？\n插件文件会先备份成 ZIP，已记录的 CSV 数据保留。\n"
-                    f"已加载的入口按钮在下次启动时消失。",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                if answer != QMessageBox.StandardButton.Yes:
-                    return
-                try:
-                    backup = uninstall(info)
-                except (ValueError, OSError) as exc:
-                    QMessageBox.warning(self, "卸载失败", str(exc))
-                    return
-                self._refresh()
-                QMessageBox.information(
-                    self, "已卸载",
-                    f"备份：{backup}" if backup else "已卸载（旧目录不存在，无需备份）")
-
-            def _open_page(self) -> None:
-                info = self._current()
-                url = (info.homepage if info else None) or f"{REPO_URL}/releases"
-                QDesktopServices.openUrl(QUrl(url))
-
-        return _Dialog()

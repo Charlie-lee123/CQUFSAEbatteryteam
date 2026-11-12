@@ -261,7 +261,10 @@ def q5_current() -> None:
     est = S.SocEstimator(cfg)
     est.reset(soc=50.0)
     for i in range(30):
-        est.update([3903.8] * 125, [40] * 40, i_meas=-250.0, ts=i * 2.0,
+        # 用当前 OCV 表动态算出 50% 对应的电压，别把旧表的 3.9038 V 写死：
+        # 换表后电压回拉会把 SOC 从 50 慢慢拽向反查值，硬编码会假红。
+        v50 = S.ocv_from_soc(50.0) * 1000.0
+        est.update([v50] * 125, [40] * 40, i_meas=-250.0, ts=i * 2.0,
                    contactor_open=False)
     rec("5.1 -250A 不积分（soc 恒 50）", abs(est.soc - 50.0) < 1e-6, f"soc={est.soc:.4f}")
     rec("5.2 -250A 不污染零漂（bias 恒 0）", abs(est.i_bias) < 1e-12, f"bias={est.i_bias:.4f}")

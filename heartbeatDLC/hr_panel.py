@@ -18,14 +18,14 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QColor, QDesktopServices, QFont, QPainter, QPalette, QPen,
 )
 from PySide6.QtWidgets import (
     QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QPlainTextEdit, QPushButton, QScrollArea, QStackedWidget,
-    QTabWidget, QVBoxLayout, QWidget,
+    QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+    QStackedWidget, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from .hr_protocol import (
@@ -323,10 +323,16 @@ class HeartbeatPanel(QWidget):
         self.chk_auto.toggled.connect(self._on_cfg_changed)
         self.btn_open_dir = QPushButton("打开数据目录")
         self.btn_open_dir.clicked.connect(self._open_data_dir)
+        # 卸载入口放在 DLC 面板里（用户 2026-11-12 口径：不再有独立的 DLC 管理框）
+        self.btn_uninstall = QPushButton("卸载 DLC")
+        self.btn_uninstall.setToolTip(
+            "卸载心率广播 DLC：插件文件先备份，已记录的 CSV 历史数据保留")
+        self.btn_uninstall.clicked.connect(self._request_uninstall)
         opts.addWidget(self.chk_csv)
         opts.addWidget(self.chk_auto)
         opts.addStretch(1)
         opts.addWidget(self.btn_open_dir)
+        opts.addWidget(self.btn_uninstall)
         root.addLayout(opts)
 
         self.txt_diag = QPlainTextEdit()
@@ -385,6 +391,20 @@ class HeartbeatPanel(QWidget):
 
     def _open_data_dir(self) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._data_dir)))
+
+    def _request_uninstall(self) -> None:
+        """面板内的「卸载 DLC」：确认与删文件都由宿主做，删之前必须先停本面板。
+
+        延后一拍再调：先让这次点击返回，宿主才能安全地在同一事件循环里
+        ``shutdown()`` 掉本实例（否则会在自己的槽里被销毁）。
+        """
+        remover = getattr(self._ctx, "request_uninstall", None)
+        if not callable(remover):
+            QMessageBox.information(
+                self, "卸载 DLC",
+                "当前运行方式不支持在面板内卸载，请从主界面的「DLC」入口处理。")
+            return
+        QTimer.singleShot(0, lambda: remover("heartbeatDLC"))
 
     # ------------------------------------------------------------------ 扫描
 

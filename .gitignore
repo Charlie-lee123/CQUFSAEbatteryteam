@@ -39,3 +39,6 @@ _net_out.txt
 assets/splash/*_frames/
 build_*.log
 devtools/_*_tmp/
+
+# 发布脚本留下来的日志（每次发布一份，没版本意义）
+release_od*.log

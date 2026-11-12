@@ -49,18 +49,56 @@ def main() -> int:
         # QTimer.singleShot(0, _init_dlc) 要等一拍事件循环才跑
         for _ in range(20):
             app.processEvents()
-        check("主窗口带「扩展 / DLC」按钮", hasattr(window, "btn_dlc"))
+        check("主窗口带「DLC」按钮", hasattr(window, "btn_dlc"))
+        check("「DLC」按钮文案正确",
+              hasattr(window, "btn_dlc") and window.btn_dlc.text() == "DLC")
+        # 2026-11-12 用户口径：「DLC 按钮放串口设置那里」—— 必须是串口配置卡
+        # 里的控件（跟着「打开历史数据」排），不再是接收区右侧功能列的一员。
+        check("「DLC」按钮在串口配置卡内",
+              hasattr(window, "btn_dlc")
+              and window._config_card.isAncestorOf(window.btn_dlc))
+        check("「DLC」按钮已离开接收区功能列",
+              hasattr(window, "btn_dlc")
+              and not window._rx_rail.isAncestorOf(window.btn_dlc))
         check("插件已被加载", "heartbeatDLC" in window._dlc_loaded)
-        # offscreen 下主窗没 show()，isVisible() 对所有子控件恒为 False；
-        # 要看的是「有没有被显式隐藏」，用 isVisibleTo(祖先)。
-        check("插件入口容器已显式显示",
-              window._dlc_launchers.isVisibleTo(window))
-        check("插件注册了 1 颗入口按钮", len(window._dlc_buttons) == 1)
-        check("入口按钮文字正确",
-              bool(window._dlc_buttons)
-              and window._dlc_buttons[0].text() == "心率 DLC")
+        # 新设计（2026-11-12 用户口径）：界面只留一颗「DLC」按钮，
+        # 不再动态生成插件入口按钮，插件只注册面板回调。
+        check("界面没有多余的插件入口按钮",
+              not hasattr(window, "_dlc_buttons")
+              or not window._dlc_buttons)
+        check("插件注册了 1 个面板回调", len(window._dlc_launcher_cbs) == 1)
+        # ⛔ 用户 2026-11-12 明确要求：主界面**只留一颗「DLC」按钮**。
+        # 遍历主窗全部控件，任何带「心率」字样的按钮/开关都算违规。
+        from PySide6.QtWidgets import QLabel, QMessageBox, QWidget  # noqa: PLC0415
+        _titled = [w for w in window.findChildren(QWidget)
+                   if hasattr(w, "text") and callable(w.text)]
+        _stray = []
+        for w in _titled:
+            try:
+                text = str(w.text())
+            except Exception:                   # noqa: BLE001 - 非文本控件直接跳过
+                continue
+            if "心率" in text and not isinstance(w, QLabel):
+                _stray.append(f"{type(w).__name__}:{text}")
+        check("界面没有任何「心率」按钮/开关", not _stray)
+        if _stray:
+            print("    违规控件：", _stray)
 
-        plugin = window._dlc_loaded.get("heartbeatDLC")
+        # ---- 单 DLC 直通流程（用户 2026-11-12 口径）---------------------
+        # ① 已安装 → 点「DLC」应当**直接**打开心率面板，不弹管理对话框
+        _info = window._heartbeat_dlc()
+        check("能识别到唯一 DLC", _info is not None and _info.id == "heartbeatDLC")
+        check("随包安装包可被找到", window._find_dlc_package() is not None)
+        window._on_dlc_clicked()
+        app.processEvents()
+        _plugin = window._dlc_loaded.get("heartbeatDLC")
+        check("点「DLC」直接进入 DLC 面板",
+              _plugin is not None and _plugin._panel is not None)
+        check("DLC 面板内有「卸载」按钮",
+              _plugin is not None and _plugin._panel is not None
+              and _plugin._panel.btn_uninstall.text() == "卸载 DLC")
+
+        plugin = _plugin
         if plugin is not None:
             plugin.show_panel()
             app.processEvents()
@@ -106,6 +144,51 @@ def main() -> int:
             plugin.shutdown()
             app.processEvents()
             check("shutdown 后面板引用已释放", plugin._panel is None)
+
+        # ---- ② 面板内「卸载」：宿主确认 → 停实例 → 删目录（先备份）---------
+        import main_window as _mw  # noqa: PLC0415 - 探针内局部导入
+
+        class _StubBox:
+            """把模态框换成固定答案，避免探针在离屏下卡住。"""
+            StandardButton = QMessageBox.StandardButton
+
+            @staticmethod
+            def question(*_a, **_k):
+                return QMessageBox.StandardButton.Yes
+
+            @staticmethod
+            def information(*_a, **_k):
+                return QMessageBox.StandardButton.Ok
+
+            warning = information
+
+        _orig_box = _mw.QMessageBox
+        _mw.QMessageBox = _StubBox
+        try:
+            _installed_dir = (dlc_host.user_dir() / "heartbeatDLC")
+            check("卸载前插件目录存在", _installed_dir.is_dir())
+            check("面板内卸载成功返回 True",
+                  window._dlc_request_uninstall("heartbeatDLC") is True)
+            app.processEvents()
+            check("卸载后插件目录已删除", not _installed_dir.exists())
+            check("卸载后插件已从运行表移除",
+                  "heartbeatDLC" not in window._dlc_loaded)
+            check("卸载后已彻底发现不到", window._heartbeat_dlc() is None)
+
+            # ③ 没装 → 点「DLC」走安装提示（这里回答 No，确认不会偷偷装上）
+            class _NoBox(_StubBox):
+                @staticmethod
+                def question(*_a, **_k):
+                    return QMessageBox.StandardButton.No
+
+            _mw.QMessageBox = _NoBox
+            window._on_dlc_clicked()
+            app.processEvents()
+            check("未安装时点「DLC」只提示不安装",
+                  window._heartbeat_dlc() is None
+                  and "heartbeatDLC" not in window._dlc_loaded)
+        finally:
+            _mw.QMessageBox = _orig_box
 
         window._shutdown_dlc()
         check("退出收尾后插件表清空", not window._dlc_loaded)

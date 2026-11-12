@@ -61,7 +61,9 @@ def test_table() -> None:
 
     close("A5 表外不外推（低端）", S.ocv_from_soc(-30), 3.0818, 1e-9)
     close("A6 表外不外推（高端）", S.soc_from_ocv(9.9), 100.0, 1e-9)
-    close("A7 斜率：平台段约 4.9 mV/%", S.slope_at(30), 4.90, 0.15)
+    # 62 点 OCV 表贴的是原始放电曲线的局部段（28.60~30.26% 段），
+    # 平台斜率约 5.18 mV/%；旧的 4.90 是 26 点稀疏表 25~30% 段的平均值。
+    close("A7 斜率：平台段约 5.2 mV/%", S.slope_at(30), 5.18, 0.15)
     close("A8 κ 平台段 < 0.6", S.kappa_at(25), 0.42, 0.06)
     close("A9 κ 驼峰段 = 1.0", S.kappa_at(70), 1.0, 1e-9)
 
@@ -109,6 +111,109 @@ def test_clean() -> None:
     cells[3] = 4000                     # 量程内、但离群 800 mV
     r = S.clean_cells(cells)
     check("B11 量程内离群被 MAD 抓到", r.bad_idx == [4], f"bad_idx={r.bad_idx}")
+
+    # ⛔ 真机实测回归（2026-11-12 连主控读到）：真实弱芯比一片 4350 的 pack 低
+    #    32 mV（4318），正好卡在 MAD/IQR 门槛边上。旧实现用 accepted(keep=True)
+    #    取极值时，mad/iqr 逐轮微波动会让它时而被判离群、时而保留，min 在
+    #    4324↔4336 反复跳（100 轮里 50 次，底栏 min 肉眼抖 ~1.25% SOC）。
+    #    极值必须稳定取到真实弱芯，同时断线野值仍要被间隙规则挡掉。
+    base = [4350] * 125
+    base[72] = 4318          # 真实弱芯（1-based 73）
+    base[70] = 4336          # 次弱（与弱芯间隙 18 mV < 30，使 4318 不被间隙规则丢）
+    base[12] = 4339
+    mins = set()
+    for k in range(24):
+        cc = list(base)
+        for i in range(125):
+            if i not in (72, 70, 12):
+                cc[i] = 4350 + ((i * 7 + k * 5) % 3) - 1   # 逐轮 ±1mV 确定性抖动
+        rr = S.clean_cells(cc, n_cells=125, cells_per_module=25)
+        mins.add(rr.min_mv)
+    check("B26 真实弱芯恒为 min（不随离群判据抖动）", mins == {4318.0},
+          f"min 取值集合={sorted(mins)}")
+    cc = list(base)
+    cc[5] = 3900             # 断线野值：离群 450 mV，远 > EXTREME_GAP_MV
+    rr = S.clean_cells(cc, n_cells=125, cells_per_module=25)
+    check("B27 断线野值不当极值（间隙规则兜底）", rr.min_mv == 4318.0,
+          f"min={rr.min_mv}")
+
+    # ---- K：卡方区分「真弱芯」与「采样线断」（用户 2026-11-12 点名）------
+    # 判据：χ²=(Δ/σ0)²，1 自由度 α=0.001 临界 10.828 → Δ_crit = 3.29·σ0。
+    # E74 σ0=30 mV → Δ_crit ≈ 98.7 mV。真实数据：弱芯 32/27 mV，断线 742~1713 mV。
+    crit = (S.CHI2_CRIT_1DOF_0001) ** 0.5 * S.CELL_IMBALANCE_TOL_MV
+    check("K1 Δ_crit = √χ²·σ0 ≈ 98.7 mV", 98.0 < crit < 99.5,
+          f"Δ_crit={crit:.2f} mV (σ0={S.CELL_IMBALANCE_TOL_MV})")
+
+    def _one_cell(delta_mv: float, tol: float | None = None):
+        cc = [4350] * 125
+        cc[10] = 4350 - delta_mv
+        kw = {} if tol is None else {"imbalance_tol_mv": tol}
+        return S.clean_cells(cc, n_cells=125, cells_per_module=25, **kw)
+
+    # 真弱芯：32 mV（E74 #112 实测值）—— 必须保真值、且被标成 weak
+    r32 = _one_cell(32)
+    check("K2 32 mV 弱芯保真值（不回填）且标记为 weak",
+          11 not in r32.bad_idx and 11 in r32.weak_idx,
+          f"bad={r32.bad_idx} weak={r32.weak_idx}")
+    check("K3 弱芯读值原样留在整串里（回填后 cells[10]=4318）",
+          abs(r32.cells[10] - 4318.0) < 1e-9, f"cells[10]={r32.cells[10]}")
+    # 弱芯要真的进均值，否则总压会把这一节的缺口抹掉
+    want_mean = (4350 * 124 + 4318) / 125
+    check("K4 弱芯参与均值（总压不少报）",
+          abs(r32.mean_mv - want_mean) < 1e-6,
+          f"mean={r32.mean_mv:.4f} 期望={want_mean:.4f}")
+
+    # 边界：χ² < 10.828 保真，> 临界回填
+    r90 = _one_cell(90)
+    r99 = _one_cell(99)
+    check("K5 90 mV 仍在物理不均衡内 → 保真",
+          11 not in r90.bad_idx, f"bad={r90.bad_idx}")
+    check("K6 99 mV 越过 χ² 临界 → 回填",
+          11 in r99.bad_idx and 11 not in r99.weak_idx,
+          f"bad={r99.bad_idx}")
+
+    # 断线/坏通道：E74 实测 −1049 / −1713 mV，另有高侧坏通道；两向都必须回填
+    for raw in (3301.0, 2637.0, 4550.0):
+        cc = [4350] * 125
+        cc[10] = raw
+        rr = S.clean_cells(cc, n_cells=125, cells_per_module=25)
+        check(f"K7 断线读数 {raw:.0f} mV 必须回填（不当弱芯）",
+              11 in rr.bad_idx and 11 not in rr.weak_idx,
+              f"bad={rr.bad_idx}")
+
+    # ⛔ 非对称防护不能被这一步放开：超量程/坏标记**无论 σ0 多大**都必须回填
+    cc = [4350] * 125
+    cc[10] = 0.0            # 断线读 0
+    cc[20] = 5000.0         # 超上限
+    rr = S.clean_cells(cc, n_cells=125, cells_per_module=25, imbalance_tol_mv=500)
+    check("K8 超量程/坏标记即使 σ0=500 也必回填",
+          11 in rr.bad_idx and 21 in rr.bad_idx
+          and 11 not in rr.weak_idx and 21 not in rr.weak_idx,
+          f"bad={rr.bad_idx}")
+
+    # σ0 按车型可调：放宽到 200 mV 时，150 mV 的真不均衡也保真
+    r150_lo = _one_cell(150)
+    r150_hi = _one_cell(150, tol=200.0)
+    check("K9 σ0 可配：默认回填、放宽容差后保真",
+          11 in r150_lo.bad_idx and 11 not in r150_hi.bad_idx
+          and 11 in r150_hi.weak_idx,
+          f"默认 bad={r150_lo.bad_idx} / tol=200 bad={r150_hi.bad_idx}")
+
+    # 已确认的弱芯不能被「相邻间隙 > 30 mV 就丢」再踢出极值
+    # （否则 −90 mV 的真弱芯会让 min 报成次弱那节，SOC min 高报约 9%）
+    cc = [4350] * 125
+    cc[10] = 4260          # Δ = −90 mV：χ²=9.0 < 10.83 → 真弱芯
+    cc[20] = 4323          # 次弱：与弱芯间隙 63 mV > EXTREME_GAP_MV
+    rr = S.clean_cells(cc, n_cells=125, cells_per_module=25)
+    check("K10 已确认弱芯仍当极值（不被 30 mV 间隙规则丢掉）",
+          rr.min_mv == 4260.0 and 11 in rr.weak_idx,
+          f"min={rr.min_mv} weak={rr.weak_idx}")
+    # 而没通过卡方的野值照旧被间隙规则挡住（3900：Δ=−450 → 回填）
+    cc[10] = 3900.0
+    rr = S.clean_cells(cc, n_cells=125, cells_per_module=25)
+    check("K11 未通过卡方的野值仍被回填、不当极值",
+          11 in rr.bad_idx and rr.min_mv == 4323.0,
+          f"min={rr.min_mv} bad={rr.bad_idx}")
 
     # 整模组偏高 100 mV：真实不均衡，**不该**被当坏点全回填
     cells = [3300] * 40 + [3200] * 85
@@ -318,6 +423,113 @@ def test_estimator() -> None:
     check("C19 坏配置返回 None", S.SocCfg.from_dict({"q_ah": 0}) is None)
     check("C20 非单调配置返回 None",
           S.SocCfg.from_dict({"ocv_table": [[0, 3.0], [10, 2.0]]}) is None)
+
+    # ---- 充电效率因子（2026-11 选 B）----
+    # 充电时存进电池的比安时积分的少：同 |电流| 同工况下，charge_eff=0.99 的
+    # SOC 涨幅应明显小于 charge_eff=1.0（κ 对两次运行对称，差异只来自效率因子）。
+    def charge_rise(ce: float) -> float:
+        c = S.SocCfg("E74", charge_eff=ce)
+        e = S.SocEstimator(c)
+        e.reset(soc=50.0)
+        t = 0.0
+        for _ in range(30):
+            t += 2.0
+            e.update([cell_mv(50.0, -12.0)] * 125, [40] * 40, i_meas=-12.0,
+                     ts=t, contactor_open=False)
+        return e.soc - 50.0
+
+    rise_full = charge_rise(1.0)
+    rise_eff = charge_rise(0.99)
+    check("C21 充电效率降低 SOC 涨幅", rise_eff < rise_full - 0.01,
+          f"full={rise_full:.4f} eff={rise_eff:.4f}")
+    close("C22 充电涨幅 ≈ 无效率 × 0.99", rise_eff / rise_full, 0.99, 0.03)
+
+    # ---- 状态相关 κ（2026-11 选 B）----
+    e = S.SocEstimator(cfg)
+    check("C23 open 态 κ 增益=0（冻结）",
+          e._kappa_gain("open", 0.0, True) == 0.0, str(e._kappa_gain("open", 0.0, True)))
+    check("C24 idle 态 κ 增益>1（提速回拉）",
+          e._kappa_gain("idle", 0.0, True) > 1.0,
+          str(e._kappa_gain("idle", 0.0, True)))
+    check("C25 大电流 κ 增益<1（更信积分）",
+          e._kappa_gain("discharge", 150.0, True) < 1.0,
+          str(e._kappa_gain("discharge", 150.0, True)))
+    check("C26 无电流读数 κ 增益=1（兜底）",
+          e._kappa_gain("idle", 0.0, False) == 1.0, "")
+
+    # open 态冻结：母线断开时中心 soc 不因 κ 抖动（静置锚定未满足前保持原值）
+    est = S.SocEstimator(cfg)
+    est.reset(soc=50.0)
+    last = 50.0
+    for i in range(20):                      # 40s < REST_WINDOW_S=120
+        v = S.ocv_from_soc(60.0) * 1000.0   # 电压对应 60% OCV，但母线断开
+        r = est.update([v] * 125, [40] * 40, i_meas=0.0, ts=i * 2.0,
+                       contactor_open=True)
+        last = r.soc
+    close("C27 open 态 κ 冻结（40s 内 soc 不动）", last, 50.0, 0.5)
+    # open 态静置锚定仍触发（死区慢校）：稳够 120s 后收敛到 OCV 60%
+    est = S.SocEstimator(cfg)
+    est.reset(soc=50.0)
+    fired = False
+    for i in range(90):                      # 180s > 120
+        v = S.ocv_from_soc(60.0) * 1000.0
+        r = est.update([v] * 125, [40] * 40, i_meas=0.0, ts=i * 2.0,
+                       contactor_open=True)
+        fired = fired or r.anchored
+    check("C28 open 态静置锚定仍触发（死区慢校）", fired, "")
+    close("C29 open 态锚定收敛到 OCV 60%", est.soc, 60.0, 1.0)
+
+    # ---- SocCfg 序列化含 charge_eff ----
+    c = S.SocCfg("E74", charge_eff=0.985)
+    d = c.to_dict()
+    check("C30 to_dict 含 charge_eff", abs(d.get("charge_eff") - 0.985) < 1e-9, str(d))
+    c2 = S.SocCfg.from_dict(d)
+    check("C31 from_dict 还原 charge_eff",
+          c2 is not None and abs(c2.charge_eff - 0.985) < 1e-9, str(c2))
+    c3 = S.SocCfg.from_dict({"q_ah": 12.0, "ocv_table": S.OCV_TABLE})
+    check("C32 缺 charge_eff 回落默认 0.99",
+          abs(c3.charge_eff - 0.99) < 1e-9, str(c3))
+    c4 = S.SocCfg("X", charge_eff=1.5)
+    check("C33 越界 charge_eff 回落默认", abs(c4.charge_eff - 0.99) < 1e-9, str(c4))
+
+    # 温度-OCV 补偿（BMS 实测每模组 8 路 NTC；默认 coef=0 完全不生效）
+    cfg_t = S.SocCfg("E74", ocv_temp_coef_mv_per_c=-0.5, ocv_temp_ref_c=25.0)
+    est_t = S.SocEstimator(cfg_t)
+    est_t._cur_temp_c = 25.0
+    check("C34 25°C（参考温度）补偿量=0",
+          abs(est_t._ocv_temp_shift_mv()) < 1e-9, str(est_t._ocv_temp_shift_mv()))
+    est_t._cur_temp_c = 45.0
+    check("C35 45°C 补偿量=-10mV（-0.5*(45-25)）",
+          abs(est_t._ocv_temp_shift_mv() - (-10.0)) < 1e-9,
+          str(est_t._ocv_temp_shift_mv()))
+    est_t._cur_temp_c = 5.0
+    check("C36 5°C 补偿量=+10mV（-0.5*(5-25)）",
+          abs(est_t._ocv_temp_shift_mv() - 10.0) < 1e-9,
+          str(est_t._ocv_temp_shift_mv()))
+    # coef=0 / 无温度读数 → 完全不补偿（保留原行为）
+    est0 = S.SocEstimator(S.SocCfg("E74"))
+    est0._cur_temp_c = 45.0
+    check("C37 coef=0 时温度不生效", abs(est0._ocv_temp_shift_mv()) < 1e-9, "")
+    est_t._cur_temp_c = None
+    check("C38 无温度读数时不补偿", abs(est_t._ocv_temp_shift_mv()) < 1e-9, "")
+    # 行为：同一端电压，温度越高 OCV 越低 → 折算回 25°C 表后估出 SOC 越高
+    mv = 3903.8
+    est_t._cur_temp_c = 25.0
+    soc_25 = S.soc_from_ocv(est_t._ocv_estimate(mv, 0.0) / 1000.0, cfg_t.ocv_table)
+    est_t._cur_temp_c = 45.0
+    soc_45 = S.soc_from_ocv(est_t._ocv_estimate(mv, 0.0) / 1000.0, cfg_t.ocv_table)
+    check("C39 同电压 45°C 比 25°C 估出更高 SOC", soc_45 > soc_25 + 1e-6,
+          f"{soc_25:.4f}% vs {soc_45:.4f}%")
+    # 序列化往返携带温度参数
+    d_t = cfg_t.to_dict()
+    check("C40 to_dict 含温度补偿参数",
+          abs(d_t.get("ocv_temp_coef_mv_per_c") - (-0.5)) < 1e-9
+          and abs(d_t.get("ocv_temp_ref_c") - 25.0) < 1e-9, str(d_t))
+    ctb = S.SocCfg.from_dict(d_t)
+    check("C41 from_dict 还原温度补偿参数",
+          ctb is not None
+          and abs(ctb.ocv_temp_coef_mv_per_c - (-0.5)) < 1e-9
+          and abs(ctb.ocv_temp_ref_c - 25.0) < 1e-9, str(ctb))
 
 
 # ---------------------------------------------------------------- D 报文
@@ -562,6 +774,39 @@ def test_ui() -> None:
         check("E27 放宽窗口后恢复居中（夹紧是条件触发）", abs(off) <= 4,
               f"偏差 {off}px（栏宽 {bar.width()}）")
 
+        # ---- 「显示 SOC 读数」开关（用户 2026-11-12 要求"在设置里做一个 SOC 显示开关"）----
+        spec = next((s for s in customization.specs() if s["key"] == "soc_show"), None)
+        check("E28 设置里注册了 soc_show 且默认显示",
+              spec is not None and spec["kind"] == "bool"
+              and bool(customization.get("soc_show")), f"spec={spec}")
+        texts_before = [lbl.text() for lbl in win._soc_labels]
+        try:
+            customization.set("soc_show", False)
+            win._apply_soc_visible()
+            app.processEvents()
+            check("E29 关掉后四枚标签全部隐藏",
+                  all(not lbl.isVisibleTo(win._bottom_bar)
+                      for lbl in win._soc_labels),
+                  str([lbl.isVisibleTo(win._bottom_bar) for lbl in win._soc_labels]))
+            # 隐藏不能只"看不见"：还得把占位交出来，否则提示文字仍被挤在左半截
+            check("E30 隐藏后不占底栏位置（零宽 + 提示可放开）",
+                  all(lbl.width() == 0 for lbl in win._soc_labels)
+                  and win._toast_width_limit() == 0,
+                  f"w={[lbl.width() for lbl in win._soc_labels]} "
+                  f"limit={win._toast_width_limit()}")
+            check("E31 关掉只影响可见性：文本与估算状态都原样保留",
+                  [lbl.text() for lbl in win._soc_labels] == texts_before
+                  and win._soc_est is not None and win._soc_est.last is not None,
+                  f"texts={[lbl.text() for lbl in win._soc_labels]}")
+        finally:
+            customization.set("soc_show", True)
+            win._apply_soc_visible()
+            app.processEvents()
+        check("E32 重新打开后恢复可见且仍精确居中",
+              all(lbl.isVisibleTo(win._bottom_bar) for lbl in win._soc_labels)
+              and abs(group_offset()) <= 4,
+              f"offset={group_offset()}")
+
         # ---- 四状态 EKF 开关：开 = EKF，关 = 原来的固定增益融合 ----
         spec = next((s for s in customization.specs()
                      if s["key"] == "soc_ekf4"), None)
@@ -711,8 +956,8 @@ def test_guards() -> None:
     check("G11 轨值 + 母线全断 → 电流当 0 且**有效**（P1 新判序）",
           i_valid and i_eff == 0.0, f"i_eff={i_eff} valid={i_valid}")
     i_eff, i_valid = eff(-250.0, True, ok=False)
-    check("G12 轨值 + 母线全断但 BMS 报错 → 仍无效（bms_ok 是必要条件）",
-          not i_valid, f"valid={i_valid}")
+    check("G12 母线全断（即便 BMS 报错）电流仍归零且有效（零漂解耦 bms_ok）",
+          i_valid and i_eff == 0.0, f"i_eff={i_eff} valid={i_valid}")
     i_eff, i_valid = eff(-250.0, False)
     check("G13 轨值 + 母线闭合 → 仍无效（绝不放松）",
           not i_valid, f"valid={i_valid}")
@@ -741,10 +986,37 @@ def test_guards() -> None:
     check("G19 轨值帧不会把 -250 泄漏到界面",
           abs(est.last.i_eff) < 1e-12, f"i_eff={est.last.i_eff}")
 
+    # ---- 零漂解耦 bms_ok（2026-11 选 B 后新增）----
+    # 真机常态：母线全断 + BMS 报错（bms_ok=False）。旧判序要求 bms_ok=True 才把
+    # 电流当 0 且有效，结果静置锚定在整段「轨值 + 母线断开 + BMS 报错」会话里从不
+    # 触发。新逻辑：contactor_open 是硬件级事实，不依赖 bms_ok，照样学零漂 +
+    # 把电流当 0 且 valid，静置锚定才能跑起来。
+    est = S.SocEstimator(cfg)
+    est.reset(soc=50.0)
+    for i in range(40):
+        est.update([3903.8] * 125, [40] * 40, i_meas=1.89, ts=i * 2.0,
+                   contactor_open=True, bms_ok=False)
+    close("G20 母线全断+BMS报错仍学零漂", est.i_bias, 1.89, 0.05)
+    check("G21 母线全断+BMS报错 电流读为0（零漂解耦）",
+          abs(est.last.i_eff) < 1e-12, f"i_eff={est.last.i_eff}")
+    # （电流为 0 + 下方 G22 静置锚定触发 ⇒ i_valid 为 True，未落盘到 SocResult）
+    # 端到端：母线全断 + BMS 报错 + 电压稳 → 静置锚定仍能触发并收敛到 OCV
+    est = S.SocEstimator(cfg)
+    est.reset(soc=20.0)
+    fired = False
+    for i in range(90):
+        r = est.update([3903.8] * 125, [40] * 40, i_meas=-250.0, ts=i * 2.0,
+                       contactor_open=True, bms_ok=False)
+        fired = fired or r.anchored
+    check("G22 母线断开+BMS报错下静置锚定仍触发（零漂解耦的目的）",
+          fired, f"anchored={fired}")
+    close("G23 该工况下 SOC 收敛到 OCV 50%", est.soc, 50.0, 0.5)
+
 
 # ---------------------------------------------------------------- F 参数
 
 def test_profiles() -> None:
+    import soc_est as S
     import soc_profiles
 
     cfg = soc_profiles.cfg_for("E74-2026")
@@ -763,6 +1035,22 @@ def test_profiles() -> None:
           soc_profiles.vehicle_number("e74-2026") == "E74",
           soc_profiles.vehicle_number("e74-2026"))
     check("F9 内置表里有 E74", "E74" in soc_profiles.BUILTIN_PACKS, "")
+    if cfg:
+        # 温度-OCV 补偿：E74(NCM) 启用 -0.5 mV/°C，参考温度 25°C（OCV 表按室温标定）
+        close("F10 E74 温度补偿 -0.5mV/°C", cfg.ocv_temp_coef_mv_per_c, -0.5, 1e-9)
+        close("F11 E74 温度参考 25°C", cfg.ocv_temp_ref_c, 25.0, 1e-9)
+        # 卡方判据的 σ0：E74 取 30 mV（Δ_crit≈98.7，弱芯 32/27 保真、断线 742+ 回填）
+        close("F12 E74 单体允许不均衡 σ0 = 30 mV",
+              cfg.imbalance_tol_mv, 30.0, 1e-9)
+        # 序列化要把 σ0 带上，否则自定义车型存一轮就丢回默认
+        rt = S.SocCfg.from_dict(cfg.to_dict())
+        check("F13 σ0 能序列化往返",
+              rt is not None and abs(rt.imbalance_tol_mv - 30.0) < 1e-9,
+              f"往返={getattr(rt, 'imbalance_tol_mv', '?')}")
+        bad = S.SocCfg(imbalance_tol_mv=-5)
+        check("F14 σ0 坏值（≤0）回落默认，不抛异常",
+              abs(bad.imbalance_tol_mv - S.CELL_IMBALANCE_TOL_MV) < 1e-9,
+              f"{bad.imbalance_tol_mv}")
 
 
 # ---------------------------------------------------------------- H 配色

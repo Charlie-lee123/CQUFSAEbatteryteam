@@ -43,12 +43,14 @@ def make_index(code):
     return codes, by
 
 
-def run_checks(mw_codes, mw_by, us_codes, us_by, extra=None) -> bool:
+def run_checks(mw_codes, mw_by, us_codes, us_by, extra=None,
+               drv_data_ok: bool | None = None) -> bool:
     ok = True
 
-    def chk(label, cond):
+    def chk(label, cond, detail=""):
         nonlocal ok
-        print(f"  {'OK ' if cond else 'FAIL'} {label}")
+        print(f"  {'OK ' if cond else 'FAIL'} {label}"
+              + (f" —— {detail}" if detail and not cond else ""))
         ok = ok and cond
 
     def floats(c):
@@ -326,12 +328,33 @@ def run_checks(mw_codes, mw_by, us_codes, us_by, extra=None) -> bool:
     print("\n[Q] od79 v2.7（版本号 + 底栏定位时序 + 电流判序）")
     ver = mods.get("version", (None, None))[1]
     se = mods.get("soc_est", (None, None))[1]
+    sd = mods.get("soc_display", (None, None))[1]
     chk("version 模块进包", ver is not None)
     chk("soc_est 模块进包", se is not None)
+    # 2026-11-12 空载 SOC 显示门控：漏包会让底栏 min/max 冻结静默失效
+    chk("soc_display 模块进包", sd is not None)
+    if sd is not None:
+        chk("SocDisplayGate.decide 存在", sd.get("decide") is not None)
     if ver is not None:
         mod_code = mods["version"][0][0]
-        chk("包内版本号是 2.7",
-            "2.7" in {c for c in mod_code.co_consts if isinstance(c, str)})
+        # ⛔ 别把版本号写死：每次升版都要回来改一次，漏改就假红（2026-11-12 发 2.8
+        #    时就中了）。以**源码** version.VERSION 为准，比"包里是哪个版本"。
+        #    ⚠️ 这里不能读 src_idx —— 它在本函数后半段才建，会 UnboundLocalError。
+        want_version = ""
+        try:
+            import importlib.util as _ilu
+            _spec = _ilu.spec_from_file_location(
+                "_vsrc",
+                os.path.join(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__))), "version.py"))
+            _mod = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            want_version = str(_mod.VERSION)
+        except Exception:                       # noqa: BLE001
+            want_version = ""
+        chk(f"包内版本号是 {want_version}（与源码一致）",
+            bool(want_version)
+            and want_version in {c for c in mod_code.co_consts if isinstance(c, str)})
 
     chk("_schedule_place_soc 存在", mw_by.get("_schedule_place_soc") is not None)
     chk("_place_soc_settled 存在", mw_by.get("_place_soc_settled") is not None)
@@ -347,6 +370,15 @@ def run_checks(mw_codes, mw_by, us_codes, us_by, extra=None) -> bool:
         chk("_place_soc_settled 会清 pending 标志",
             "_place_soc_pending" in set(settled.co_names))
 
+    # od86：设置里新增「显示 SOC 读数」开关。漏包 = 开关点了没反应（静默失效），
+    # 所以既查符号在不在，也在下面查字节码与源码一致。
+    chk("_apply_soc_visible 存在（「显示 SOC 读数」开关）",
+        mw_by.get("_apply_soc_visible") is not None)
+    place = mw_by.get("_place_soc")
+    if place is not None:
+        chk("_place_soc 会跳过被隐藏的读数（isVisibleTo）",
+            "isVisibleTo" in set(place.co_names))
+
     def _sig(co):
         """字节码指纹：指令流 + 名字表 + 非 code 常量。"""
         return (co.co_code, co.co_names, co.co_varnames,
@@ -360,18 +392,73 @@ def run_checks(mw_codes, mw_by, us_codes, us_by, extra=None) -> bool:
             return make_index(compile(f.read(), path, "exec"))[1]
 
     src_idx = {}
-    for mod in ("soc_est", "main_window"):
+    for mod in ("soc_est", "main_window", "soc_display"):
         try:
             src_idx[mod] = _src_index(mod)
         except OSError:
             src_idx[mod] = {}
     for mod, index, fn in (("soc_est", se, "_effective_current"),
+                           ("soc_est", se, "clean_cells"),
                            ("main_window", mw_by, "_schedule_place_soc"),
-                           ("main_window", mw_by, "_place_soc_settled")):
+                           ("main_window", mw_by, "_place_soc_settled"),
+                           ("main_window", mw_by, "_apply_soc_visible"),
+                           ("soc_display", sd, "decide")):
         got = index.get(fn) if index else None
         want = src_idx.get(mod, {}).get(fn)
         chk(f"{mod}.{fn} 与当前源码逐字节一致（不是旧构建）",
             got is not None and want is not None and _sig(got) == _sig(want))
+
+    # ---- R. od90：USB 转串口驱动体检（drv_assist）----
+    print("\n[R] od90（随包驱动自检 / 提权安装）")
+    da = mods.get("drv_assist", (None, None))[1]
+    chk("drv_assist 模块进包", da is not None)
+    check_names = ("payload_dir", "install", "run_cli", "describe",
+                   "missing_keys", "needed_keys", "problem_devices",
+                   "_pnputil_ok")
+    missing_fn = [n for n in check_names if n not in da] if da else []
+    chk("drv_assist 关键函数都在包内（缺任一 = 驱动体检静默失效）",
+        da is not None and not missing_fn, str(missing_fn))
+    if da is not None:
+        mod_code = mods["drv_assist"][0][0]
+        # PAYLOADS 里的 dict 是**运行时**构造的（dict 不是常量），所以模块 co_consts
+        # 里能找到的是 BUILD_CONST_KEY_MAP 用的键元组；查它就等于查"PAYLOADS 进包了"。
+        chk("PAYLOADS 常量进包（驱动键表）",
+            any(isinstance(c, tuple)
+                and {"key", "label", "vendor", "vids", "infs"} <= set(c)
+                for c in mod_code.co_consts))
+        chk("PAYLOAD_VERSION 是字符串常量",
+            any(isinstance(c, str) and len(c) == 10 and c[4] == "-"
+                for c in mod_code.co_consts))
+    chk("_driver_gate_tick 存在（启动体检轮询）",
+        mw_by.get("_driver_gate_tick") is not None)
+    chk("_maybe_install_drivers 存在", mw_by.get("_maybe_install_drivers") is not None)
+    chk("_on_driver_install_done 存在",
+        mw_by.get("_on_driver_install_done") is not None)
+    # od97：打开成功却一直没数据时的点明（2026-11-12 用户「连上读不了数」）
+    chk("_arm_rx_silence_watch / _check_rx_silence 存在（静默提示）",
+        mw_by.get("_arm_rx_silence_watch") is not None
+        and mw_by.get("_check_rx_silence") is not None)
+
+    drv_src = {}
+    try:
+        drv_src["drv_assist"] = _src_index("drv_assist")
+    except OSError:
+        drv_src["drv_assist"] = {}
+    for mod, index, fn in (("drv_assist", da, "payload_dir"),
+                           ("drv_assist", da, "install"),
+                           ("drv_assist", da, "run_cli"),
+                           ("drv_assist", da, "_pnputil_ok"),
+                           ("main_window", mw_by, "_maybe_install_drivers"),
+                           ("main_window", mw_by, "_check_rx_silence")):
+        got = index.get(fn) if index else None
+        want = drv_src.get(mod, {}).get(fn) if mod == "drv_assist" else \
+            src_idx.get(mod, {}).get(fn)
+        chk(f"{mod}.{fn} 与当前源码逐字节一致（不是旧构建）",
+            got is not None and want is not None and _sig(got) == _sig(want))
+
+    # 驱动包本身是 data（不在 PYZ 里），漏打 = 用户机器上没有 inf 可装。
+    if drv_data_ok is not None:
+        chk("exe 里带着 drivers/ 驱动包（data 层）", drv_data_ok)
 
     return ok
 
@@ -398,7 +485,8 @@ def from_pyz(exe):
         ztoc = zar.toc
         toc = list(ztoc.keys()) if isinstance(ztoc, dict) else [t[0] for t in ztoc]
         wanted = ("main_window", "ui_settings", "perf_mode",
-                  "ui_perf_mode", "ui_brand", "soc_est", "version")
+                  "ui_perf_mode", "ui_brand", "soc_est", "version",
+                  "soc_display", "drv_assist")
         for mod in wanted:
             if mod not in toc:
                 print(f"FAIL PYZ.toc 缺模块 {mod}")
@@ -408,8 +496,14 @@ def from_pyz(exe):
         mw = built["main_window"]
         us = built["ui_settings"]
         extra = {mod: built[mod] for mod in ("perf_mode", "ui_perf_mode",
-                                             "ui_brand", "soc_est", "version")}
-        return mw[0], mw[1], us[0], us[1], extra
+                                             "ui_brand", "soc_est", "version",
+                                             "soc_display", "drv_assist")}
+        # drivers/ 是 data 层（不在 PYZ）：清单里必须真有 .inf，否则用户机器
+        # 上没有可安装的驱动包，体检会一直报"找不到驱动包"。
+        drv_data = any(
+            str(k).replace("\\", "/").lower().startswith("drivers/")
+            and str(k).lower().endswith(".inf") for k in top)
+        return mw[0], mw[1], us[0], us[1], extra, drv_data
     finally:
         try:
             os.remove(tmp_path)
@@ -421,7 +515,8 @@ def from_source():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     built = {}
     for mod in ("main_window", "ui_settings", "perf_mode",
-                "ui_perf_mode", "ui_brand", "soc_est", "version"):
+                "ui_perf_mode", "ui_brand", "soc_est", "version",
+                "soc_display", "drv_assist"):
         path = os.path.join(root, mod + ".py")
         with open(path, "rb") as f:
             code = compile(f.read(), path, "exec")
@@ -429,10 +524,14 @@ def from_source():
         built[mod] = (codes, by)
         print(f"[source] {mod}.py -> {len(codes)} code objects")
     extra = {mod: built[mod] for mod in ("perf_mode", "ui_perf_mode",
-                                         "ui_brand", "soc_est", "version")}
+                                         "ui_brand", "soc_est", "version",
+                                         "soc_display", "drv_assist")}
     mw = built["main_window"]
     us = built["ui_settings"]
-    return mw[0], mw[1], us[0], us[1], extra
+    drv_root = os.path.join(root, "drivers")
+    drv_data = any(name.lower().endswith(".inf")
+                   for _r, _d, files in os.walk(drv_root) for name in files)
+    return mw[0], mw[1], us[0], us[1], extra, drv_data
 
 
 def main() -> int:

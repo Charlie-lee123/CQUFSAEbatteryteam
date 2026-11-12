@@ -59,7 +59,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from soc_est import OCV_TABLE, SocCfg, ocv_from_soc, slope_at, soc_from_ocv
+from soc_est import (OCV_TABLE, SocCfg, ocv_from_soc, slope_at, soc_from_ocv,
+                     CHARGE_EFF_DEFAULT)
 
 __all__ = ["EkfParams", "EkfStep", "SocEKF4"]
 
@@ -160,6 +161,9 @@ class SocEKF4:
         self.cfg = cfg if cfg is not None else SocCfg()
         self.params = params if params is not None else EkfParams()
         self._table = self.cfg.ocv_table or OCV_TABLE
+        # 充电库仑效率：充电（i<0）时存进电池的比安时积分的少，按系数打折；
+        # 放电视为可逆（系数仍作用于 i>=0 但不改变符号/大小，恒等）。
+        self._charge_eff = getattr(self.cfg, "charge_eff", CHARGE_EFF_DEFAULT)
         self.reset()
 
     # -- 对外 ---------------------------------------------------------
@@ -266,7 +270,10 @@ class SocEKF4:
         denom = 3600.0 * _fin(self.cfg.q_ah, 12.041)
         if denom <= 0.0 or not math.isfinite(denom):
             return False                     # 容量非法 → 不积分（交由自愈）
-        z = z - i * dt / denom
+        # 充电效率：i<0（充电）时存进去的比安时积分的少，按 _charge_eff 打折；
+        # i>=0（放电/静置）恒等，不影响放电精度。
+        i_eff = i if i >= 0.0 else i * _fin(self._charge_eff, CHARGE_EFF_DEFAULT)
+        z = z - i_eff * dt / denom
         self.x = [z, u1, u2, uc]
 
         F = (1.0, a1, a2, a4)

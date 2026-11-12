@@ -1,0 +1,21 @@
+# Prolific PL2303 USB 转串口
+
+厂商：Prolific Technology Inc.
+版本：3.8.43.0（DriverVer 05/29/2024）
+签名：Microsoft Windows Hardware Compatibility Publisher（WHQL）
+来源：Microsoft Update Catalog 的 Prolific WHQL 包（Prolific 官网下载需填表单，改从微软官方目录取同一份厂商标署包）
+
+说明：
+  ⚠️ 3.5 以后的驱动不再支持老 PL2303HXA（插上会 Code
+  10）。本软件只在设备「根本没有驱动」时才走到安装，所以不会把现在能用的老适配器搞坏；但老 HXA 芯片装完仍可能不工作，属芯片级限制。
+
+## 文件清单（SHA256）
+
+  2554eb2ed30e4b77b7cca65f9174ad50c2f908b7c20f3671a3854d051d6b8c08     12710  ser2pl.cat
+  e0fcd8190e6c7d0811656d2556514ca49ecf8824e6f11fc9d28036606f18a616    144752  ser2pl.dll
+  cb0b7deca36437356cb78fba8c0ae2dd31f5f672dc079fbd835a2abe13398160      3691  ser2pl.inf
+  6a2cf4dc79ca5a489cc18a5473090331bde3fbc225b8c04f6ab7d2f3001259ee    290864  ser2pl.sys
+  608af1d835a261716f9feb8a51ab815b7e4f04ac9fd218dacc40b52013ca87cc    151880  ser2pl64.dll
+  988a54abfa535dd3516603cd72aa1f89c4f289cfbb96bdbe2a0531487c0a4968    335008  ser2pl64.sys
+
+合计 938,905 字节

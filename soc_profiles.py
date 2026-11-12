@@ -38,6 +38,17 @@ BUILTIN_PACKS: dict[str, dict] = {
         "r0_mohm": 6.8,
         "i_sign": 1.0,
         "chemistry": "NCM",
+        "charge_eff": 0.99,
+        # 温度-OCV 补偿：NCM 约 -0.5 mV/°C（温度越高 OCV 越低）。OCV 表按 ~25°C
+        # 标定（62 点放电曲线来自室温台架），所以 ref=25。coef 为文献保守值，
+        # 真机若有多温度放电曲线可再标定。
+        "ocv_temp_coef_mv_per_c": -0.5,
+        "ocv_temp_ref_c": 25.0,
+        # 单体允许不均衡 σ0（mV）—— 卡方判「真弱芯 vs 采样线断」的尺度（详见
+        # soc_est.CELL_IMBALANCE_TOL_MV）。E74 101 轮真机实测：真弱芯 #112 恒
+        # −32 mV、#73 恒 −27 mV；断线通道是 −1713/−1049/+742/+884/+1027 mV，
+        # 两族相差 23 倍。取 30 mV（Δ_crit≈99 mV）两者都判得干净。
+        "imbalance_tol_mv": 30.0,
         "ocv_table": [list(p) for p in OCV_TABLE],
     },
 }

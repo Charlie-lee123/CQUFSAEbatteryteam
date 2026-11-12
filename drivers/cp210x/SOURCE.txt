@@ -1,0 +1,23 @@
+# Silicon Labs CP2102 / CP2104 / CP2105 / CP2108
+
+厂商：Silicon Laboratories Inc.
+版本：11.6.0.420（DriverVer 08/14/2026）
+签名：Silicon Laboratories Inc.（文件）+ WHQL（silabser.cat）
+来源：CP210x Universal Windows Driver（官方原包完整解压），下载页 https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers
+
+说明：
+  多架构 INF，按 arch 子目录取 silabser.sys，⛔ 子目录结构不能拆平；包内 UpdateParam.bat /
+  UpdateParameters.reg 未被 INF 引用，为避免夹带脚本已删除。SLAB 许可协议随包保留。
+
+## 文件清单（SHA256）
+
+  4f612dbeeabb97218a190021746ca87ce60870259448dc94384f58238f3e31a7     32236  CP210x_Universal_Windows_Driver_ReleaseNotes.txt
+  d423c0202937441271dc0bc445ae3f9e024678cafd3070aaf104f345eef8885e      8371  SLAB_License_Agreement_VCP_Windows.txt
+  8e5c5231ec368b039cfd13f7b314e46682ec06c455b25ddc544f3b410eaf0b19     13868  silabser.cat
+  38e00414a04a2d525bdc61f4ae7cc12d42f90296c17bd793dfc244a2d5b58b84     13721  silabser.inf
+  92328e7293e68f67f3ae0f58d0f8eff1b127a68a36099e883193ada8a7f1a7f9    132840  arm/silabser.sys
+  dc1c36aa820726447d68257908aea6fcd91989bf6955921291f6cf5157f33919    155368  arm64/silabser.sys
+  6a870caf98b776827f74994ff284c693c67ca14d29844fa27855ef5c1af07e05    158440  x64/silabser.sys
+  def7e693d86b6ad158f000b53b301bde202dd284e6f5c4271517f6a8dd35a065    137960  x86/silabser.sys
+
+合计 652,804 字节

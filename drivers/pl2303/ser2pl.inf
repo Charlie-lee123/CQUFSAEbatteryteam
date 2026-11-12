@@ -1,0 +1,148 @@
+;
+;   ser2pl.INF (for Win7 / Win8 / Win8.1 / Win10)
+;
+;   Copyright (c) 2018, Prolific Technology Inc.
+
+
+
+[version]
+signature="$CHICAGO$"
+Class=Ports
+ClassGuid={4D36E978-E325-11CE-BFC1-08002BE10318}
+Provider=%PRO%
+DriverVer=05/29/2024,3.8.43.0
+;DLL Ver=08/29/2017,1.0.0.5
+CatalogFile=ser2pl.cat
+
+
+; ================= Device Install section =====================
+
+[ControlFlags]
+ExcludeFromSelect=*
+
+[Manufacturer]
+%PRO%=PRO,NT,NTAMD64
+
+[SourceDisksFiles]
+ser2pl.sys=1
+ser2pl64.sys=1
+ser2pl.dll=1
+ser2pl64.dll=1
+;WdfCoInstaller01009.dll=2
+;WdfCoInstaller01009.dll=3
+
+[SourceDisksNames]
+1=%DISK_NAME%,
+;2= %InstallDisk%,,,\x86
+;3= %InstallDisk%,,,\amd64
+
+[DestinationDirs]
+;;12 dirid = \Drivers 
+;;11 ; dirid = \system32 
+DefaultDestDir  = 12
+CoInstaller_CopyFiles86 = 11
+CoInstaller_CopyFiles64 = 11
+
+
+[PRO.NT]
+%DeviceDesc1% = ComPort, USB\VID_067B&PID_2303
+%DeviceDesc2% = ComPort, USB\VID_067B&PID_2304
+
+
+[PRO.NTAMD64]
+%DeviceDesc1% = ComPort, USB\VID_067B&PID_2303
+%DeviceDesc2% = ComPort, USB\VID_067B&PID_2304
+
+
+[ComPort.AddReg]
+HKR,,PortSubClass,1,01
+
+[ComPort.NT]
+CopyFiles=ComPort.NT.Copy
+CopyFiles=CoInstaller_CopyFiles86
+AddReg=ComPort.NT.AddReg
+
+[ComPort.NT.HW]
+AddReg=ComPort.HW.AddReg
+
+[ComPort.NT.Services]
+AddService = Ser2plx86, 0x00000002, Serial_Service_Inst.NT
+AddService = Serenum,,Serenum_Service_Inst
+
+[ComPort.NT.Copy]
+ser2pl.sys
+
+[CoInstaller_CopyFiles86]
+;WdfCoInstaller01009.dll
+ser2pl.dll
+
+[ComPort.NT.AddReg]
+HKR,,DevLoader,,*ntkern
+HKR,,NTMPDriver,,ser2pl.sys
+HKR,,EnumPropPages32,,"ser2pl.dll,SerialPortPropPageProvider"
+
+[ComPort.HW.AddReg]
+HKR,,"UpperFilters",0x00010000,"serenum"
+HKR,,"PL2303C1",0x00010001,10
+HKR,,"PL2303C2",0x00010001,0
+HKR,,"PL2303C3",0x00010001,4096
+
+[ComPort.NTAMD64]
+CopyFiles=ComPort.NTAMD64.Copy
+CopyFiles=CoInstaller_CopyFiles64
+AddReg=ComPort.NTAMD64.AddReg
+
+[ComPort.NTAMD64.HW]
+AddReg=ComPort.HW.AddReg
+
+[ComPort.NTAMD64.Services]
+AddService = Ser2pl, 0x00000002, Serial_Service_Inst.NTAMD64
+AddService = Serenum,,Serenum_Service_Inst
+
+[ComPort.NTAMD64.Copy]
+ser2pl64.sys
+
+[CoInstaller_CopyFiles64]
+;WdfCoInstaller01009.dll
+ser2pl64.dll
+
+[ComPort.NTAMD64.AddReg]
+HKR,,DevLoader,,*ntkern
+HKR,,NTMPDriver,,ser2pl64.sys
+HKR,,EnumPropPages32,,"ser2pl64.dll,SerialPortPropPageProvider"
+
+
+
+[Serial_Service_Inst.NT]
+DisplayName    = %Serial.SVCDESC%                            
+ServiceType    = 1                  ; SERVICE_KERNEL_DRIVER
+StartType      = 3                  ; SERVICE_DEMAND_START
+ErrorControl   = 1                  ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\ser2pl.sys                            
+LoadOrderGroup = Base
+
+[Serial_Service_Inst.NTAMD64]
+DisplayName    = %Serial.SVCDESC%                            
+ServiceType    = 1                  ; SERVICE_KERNEL_DRIVER
+StartType      = 3                  ; SERVICE_DEMAND_START
+ErrorControl   = 1                  ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\ser2pl64.sys                            
+LoadOrderGroup = Base
+
+[Serenum_Service_Inst]
+DisplayName    = %Serenum.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\serenum.sys
+LoadOrderGroup = PNP Filter
+
+
+[Strings]
+PRO = "Prolific"
+DeviceDesc1 = "Prolific USB-to-Serial Comm Port"
+DeviceDesc2 = "Prolific USB-to-GPIO/PWM Port"
+Serial.SVCDESC  = "Prolific Serial port WDF driver"
+Serenum.SVCDESC = "Serenum Filter Driver"
+DISK_NAME = "USB-Serial Cable Diskette"
+;InstallDisk="Installation disk or directory"

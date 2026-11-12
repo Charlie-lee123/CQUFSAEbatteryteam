@@ -13,15 +13,19 @@
 
 from __future__ import annotations
 
+import copy
+import os
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 # 建链挪进 SerialWorker 之后，界面层不再直接调 serial.* 了；这个 import 留着
 # 是因为串口异常的**语义**仍来自这个模块（后续在界面层写 except serial.SerialException
 # 时不必再想起来补 import）。
 from PySide6.QtCore import (
-    QElapsedTimer, QEvent, QPoint, QPointF, QRect, QRectF, QSettings, Qt, QTimer,
+    QElapsedTimer, QEvent, QPoint, QPointF, QRect, QRectF, QSettings, Qt, QThread,
+    QTimer, Signal,
 )
 from PySide6.QtGui import (
     QColor, QEnterEvent, QFontMetricsF, QGuiApplication, QImage, QKeySequence,
@@ -40,6 +44,7 @@ from serial_io import (
 )
 import app_log
 import dlc_host
+import drv_assist
 
 import perf_mode
 import rx_export
@@ -48,6 +53,7 @@ import rx_store
 import soc_est
 import soc_feed
 import soc_profiles
+from soc_display import SocDisplayGate
 import customization
 from ui_anim import (EASE, STANDARD, Reveal, Tween, animations_enabled,
                      in_out_cubic, in_out_quint, out_cubic)
@@ -105,6 +111,8 @@ RX_LINE_PRESETS = (500, 1000, 2000, 3000, 5000, 8000, 10000, 20000, 50000,
                    100000, 200000, 500000)
 MAX_HISTORY = 20
 TIMER_MIN_MS = 10
+# 本程序只发布一个 DLC（心率广播）。「DLC」按钮的语义固定为：没装就装、装了就近。
+_DLC_ID = "heartbeatDLC"
 # 发送区收起到只剩标题栏时的高度
 TX_COLLAPSED_H = TITLE_H + SHADOW_PAD * 2 + 12
 # 发送区**手动**折叠/展开的时长（用户原话"有点傻快"：原来 240ms 在 300→54 这段
@@ -205,6 +213,12 @@ RX_MERGE_MAX_MS = 200
 # 两截（"…Over Vol" + "tage"）—— 再接着攒一会儿等后半截，最多攒这么久。
 # 300ms 覆盖 USB 读线程的调度抖动；不以换行收尾的设备最坏多等这一拍才见字。
 RX_HOLD_MAX_MS = 300
+
+# 「打开成功但一个字节都没收到」的提示阀值。串口"打开成功"只代表句柄拿到了：
+# 波特率不对、TX/RX 接反、设备没上电，表现**完全一样** —— 状态栏写着"已打开"、
+# 接收区一片空白，用户只能猜（2026-11-12 用户原话「连上打开就开始读数，我读不了」）。
+# 8 秒足够让正常的设备吐第一帧（BMS 一轮报文远小于 1 秒），又不至于让人干等。
+RX_SILENCE_HINT_MS = 8000
 
 # 连接方式：串口 / 蓝牙广播。
 # 蓝牙广播那条路**只被动扫描 advertisement**，不配对、不连接（用户 2026-10-14
@@ -714,6 +728,31 @@ class _CoverLabel(QLabel):
             painter.end()
 
 
+class _DriverInstallWorker(QThread):
+    """后台把随程序附带的 USB 转串口驱动装进驱动库。
+
+    为什么要开线程：``drv_assist.install`` 里有两次真等待 —— UAC 等用户点"是"，
+    ``pnputil`` 逐个 inf 装 5~15 秒。同步跑会把主窗冻住（窗口变白、动画停摆），
+    用户会以为软件卡死。这里只负责等待与回收，退出码交回界面线程决定说什么。
+
+    ⚠️ 线程里**不碰任何 QWidget / QSettings**：结果只有 ``(退出码, 一句话)``，
+    由 ``done`` 信号送回主线程处理。
+    """
+
+    done = Signal(int, str)
+
+    def __init__(self, keys: list[str], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._keys = list(keys)
+
+    def run(self) -> None:
+        try:
+            code, message = drv_assist.install(self._keys)
+        except Exception as exc:                    # noqa: BLE001 - 线程不能抛
+            code, message = -1, f"驱动安装出错：{exc}"
+        self.done.emit(code, message)
+
+
 class MainWindow(QMainWindow):
     # 边缘带 → 系统缩放光标。**四个角（两条边的组合）必须排在单边前面**先比，
     # 否则"左|上"会被单边"左"提前命中、给成左右箭头（见 _edge_cursor_shape）。
@@ -745,9 +784,9 @@ class MainWindow(QMainWindow):
         self._ble_scanner: object | None = None      # BleBroadcastWorker（惰性导入，见 _ble_worker_cls）
         self._ble_seen: dict[str, dict] = {}
         self._ble_target = ""
-        # 可选 DLC（见 dlc_host）：单一开关模式。当前只有「心率广播 DLC」一个，
-        # 所以左侧 DLC 区只放一颗「心率 DLC」开关 + 一颗低调的「卸载」入口，
-        # 不再有「DLC 管理」按钮，也不再动态插入插件入口按钮。
+        # 可选 DLC（见 dlc_host）：当前只有「心率广播 DLC」一个。主界面只保留一颗
+        # 常驻「DLC」按钮（右侧功能栏底部），点它打开管理面板（安装 / 启用 / 卸载）；
+        # 启用后点面板里的「打开面板」即可查看心率可视化。
         self._dlc_loaded: dict[str, object] = {}
         self._dlc_launcher_cbs: dict[str, object] = {}   # 插件入口回调（按 launcher 文案存），开关 ON 时调用
         self._dlc_shutdown_done = False
@@ -1539,6 +1578,135 @@ class MainWindow(QMainWindow):
         # SOC：按当前车辆取参数（没配参数的车显示 --，功能对它完全惰性）
         self._init_soc()
 
+        # USB 转串口驱动体检：新机器插上 STLink / CH340 却没串口，用户会以为
+        # 软件坏了（详见 drv_assist 模块注释）。这里只在**确实缺驱动**时问一次，
+        # 装过 / 选过"以后再说"就不再打扰。
+        # ⚠️ 用轮询而不是一次性定时器：开屏动画播 3.5s，对话框盖在开屏上很难看；
+        #    而"开屏是否已退场"只能由 main.py 置的 ``_skip_startup_anim`` 反映，
+        #    它从 True 翻回 False 的时刻不固定（点一下开屏就立刻结束）。
+        # ⚠️ 位置：这段落在 ``_build_ui()`` 的**末尾**（``__init__`` 在 1155 行调它，
+        #    之后的 _tick_clock / _wire_shortcuts 仍由 __init__ 继续做），不是在
+        #    __init__ 的最后一行。语义等价 —— 都是"控件与实例属性全就位之后再建"。
+        # ⛔ 防重入：``_build_ui()`` 目前只被调一次，但将来若因主题重建之类再调一次，
+        #    这里会把 ``_driver_asked`` 清回 False 并重启 ``_driver_gate``，同一会话
+        #    就会重复弹框。用 ``_driver_asked`` 是否存在当哨兵 —— 它只在这里赋初值、
+        #    从不删除；⛔ 别改用 ``_driver_gate is not None``：轮询打到一次后
+        #    ``_driver_gate_tick`` 会把它置 None，那个哨兵当场失效。
+        if not hasattr(self, "_driver_asked"):
+            self._driver_busy = False
+            self._driver_asked = False  # 本会话问过没有（插拔两次不弹两次）
+            self._driver_ticks = 0      # 端口轮询的节拍计数（见 _poll_ports）
+            self._driver_gate: QTimer | None = QTimer(self)
+            self._driver_gate.setInterval(700)
+            self._driver_gate.timeout.connect(self._driver_gate_tick)
+            self._driver_gate.start()
+
+    def _driver_gate_tick(self) -> None:
+        """等开屏退场 + 主窗真的露出来，再做一次驱动体检，然后自己停掉。"""
+        if getattr(self, "_skip_startup_anim", False) or not self.isVisible():
+            return
+        gate, self._driver_gate = self._driver_gate, None
+        if gate is not None:
+            gate.stop()
+            gate.deleteLater()
+        self._maybe_install_drivers()
+
+    def _driver_declined(self) -> tuple[str, set[str]]:
+        """读出"问过哪些"：``("2026-11-12", {"cp210x"})``。
+
+        ``driver_setup`` 存成 ``<驱动包版本>|<用户点了以后再说的键，逗号分隔>``。
+        只存版本号不够：那样用户点过一次「以后再说」，这个版本就再也不提了，
+        可换成"他后插了一个我们从没问过的芯片"时又该提 —— 得知道当时拒的是哪个。
+        老格式（只有版本号、没有竖线）照样能解析，拒过的键算空集。
+        """
+        raw = str(QSettings("MimoWorks", "SerialAssistant").value(
+            "driver_setup", "") or "")
+        version, _, keys = raw.partition("|")
+        return version.strip(), {k.strip() for k in keys.split(",") if k.strip()}
+
+    def _driver_decline(self, need: list[str]) -> None:
+        """记下"这个版本、这些键，用户说以后再说"。"""
+        version, declined = self._driver_declined()
+        declined |= set(need)
+        QSettings("MimoWorks", "SerialAssistant").setValue(
+            "driver_setup",
+            f"{drv_assist.PAYLOAD_VERSION}|{','.join(sorted(declined))}")
+
+    def _start_driver_install(self, need: list[str]) -> None:
+        """起后台安装。调用方负责"已经问过用户"。"""
+        self._driver_busy = True
+        app_log.info(f"开始安装串口驱动：{drv_assist.describe(need)}")
+        self._toast("正在安装串口驱动，请在系统弹窗里允许管理员权限…", 6000)
+        worker = _DriverInstallWorker(need, self)
+        worker.done.connect(self._on_driver_install_done)
+        worker.finished.connect(worker.deleteLater)
+        self._driver_worker = worker        # 防 GC（父对象已挂，双保险）
+        worker.start()
+
+    def _maybe_install_drivers(self, force: bool = False) -> None:
+        """体检并（问过之后）安装随程序附带的 USB 转串口驱动。
+
+        **只在用户真的用不上时才说话**：判断依据是 ``needed_keys()`` —— 插着设备、
+        但我们带了对应驱动、而驱动库里还没有。没插设备的机器一声不响（这条是
+        2026-11-12 定的：早先按"库里缺哪家就问哪家"，结果每个新机器第一次启动
+        都被问一次「要不要装 CP2102」，而用户根本没有那个模块）。
+
+        ``force=True``：设备刚插上 / 打开串口刚失败。它只越过"这个版本问过了"，
+        **不越过"这个芯片我拒过"** —— 用户说过以后再说的芯片，除非他后来插了
+        别的我们没问过的芯片，否则不再提（``_driver_declined``）。
+        ``_driver_asked`` 再上一道锁：一个会话只弹一次，插拔两下不会弹两下。
+
+        ⛔ 只写 ``driver_setup`` 这一个键，**绝不**动用户的其它设置。
+        """
+        if self._driver_busy or self._driver_asked:
+            return
+        if os.environ.get("SA_SKIP_DRIVER_PROMPT"):
+            return              # 自动化/无头环境：模态框会把跑测试的进程堵死
+        if not drv_assist.payload_dir():
+            return              # exe 旁边没带驱动包，别拿空弹窗烦人
+        need = drv_assist.needed_keys()
+        if not need:
+            return
+        version, declined = self._driver_declined()
+        if version == drv_assist.PAYLOAD_VERSION:
+            if not force:
+                return          # 这个驱动包版本问过了
+            if set(need) <= declined:
+                return          # 还是上次拒绝的那几家，别追着问
+        self._driver_asked = True
+        box = QMessageBox(self)
+        box.setWindowTitle("串口驱动")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"插着的 {drv_assist.describe(need)} 还没有驱动。")
+        box.setInformativeText(
+            "装好驱动之后，它才会出现在端口列表里。\n"
+            "安装需要一次管理员授权，大约十秒。")
+        accept = box.addButton("现在安装", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("以后再说", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(accept)
+        box.exec()
+        if box.clickedButton() is not accept:
+            self._driver_decline(need)
+            app_log.info(f"用户暂不安装串口驱动：{drv_assist.describe(need)}")
+            return
+        self._start_driver_install(need)
+
+    def _on_driver_install_done(self, code: int, message: str) -> None:
+        """后台安装结束：刷新端口列表，如实说结果（不夸大成功）。"""
+        self._driver_busy = False
+        if code == 0:
+            app_log.info("串口驱动安装完成")
+            self._refresh_ports(announce=False)
+            self._toast("驱动已装好，插拔一次设备后即可在端口列表里选到", 5000)
+            return
+        if code == 5:
+            app_log.info("用户取消了驱动安装的管理员授权")
+            self._toast("已取消授权，驱动没有安装", 4000)
+            return
+        app_log.error(f"串口驱动安装失败：{message}（退出码 {code}）")
+        self._warn(f"{message}。\n\n可以稍后再试，或手动安装程序目录下 drivers "
+                   f"文件夹里的驱动。")
+
     def _auto_check_update(self) -> None:
         """启动时的自动检查更新（静默失败，绝不打扰）。"""
         from updater import UpdateChecker
@@ -1884,29 +2052,23 @@ class MainWindow(QMainWindow):
         hist_row.addWidget(self.btn_open_history, 1)
         col.addLayout(hist_row)
 
-        # ---- 可选 DLC：单一开关（当前只有「心率广播 DLC」一个）-----------------
-        # 只放一颗「心率 DLC」开关 + 一颗低调的「卸载」入口，代替原来的
-        # 「DLC 管理」按钮 + 动态插件入口按钮（见 dlc_host）。
-        self._dlc_switch = Switch("心率 DLC")
-        self._dlc_switch.setToolTip("开启 / 关闭心率广播 DLC（小米手环 BLE 心率）")
-        self._dlc_switch.toggled.connect(self._on_dlc_switch)
-
-        self._dlc_uninstall = InkButton("卸载", variant="ghost")
-        self._dlc_uninstall.setToolTip("卸载心率广播 DLC")
-        self._dlc_uninstall.clicked.connect(self._uninstall_dlc)
-
+        # 「DLC」常驻串口配置栏（用户 2026-11-12："DLC 按钮放串口设置那里"）：
+        # 和「打开历史数据」同一套排法（标签列占位 + 按钮吃满字段列），挨在它下面。
+        # 语义仍是单 DLC 直通：没装 → 提示安装，装了 → 直接进心率面板；
+        # 卸载在面板里的「卸载 DLC」。
+        # ⚠️ 不进 BUTTON_SPECS —— 那是「界面按钮」隐藏清单，允许隐藏等于让用户
+        #    把自己锁在 DLC 外面（和左下角设置按钮同一个理由）。
+        self.btn_dlc = InkButton("DLC", variant="ghost")
+        self.btn_dlc.setToolTip("心率广播 DLC：未安装时提示安装，已安装直接打开")
+        self.btn_dlc.clicked.connect(self._on_dlc_clicked)
         dlc_row = QHBoxLayout()
         dlc_row.setSpacing(10)
         dlc_spacer = QWidget()
         dlc_spacer.setFixedWidth(64)
+        # 窄档标签列收起时它跟着收（理由同 _hist_spacer）
         self._dlc_spacer = dlc_spacer
-        dlc_inner = QHBoxLayout()
-        dlc_inner.setSpacing(10)
-        dlc_inner.addWidget(self._dlc_switch)
-        dlc_inner.addWidget(self._dlc_uninstall)
-        dlc_inner.addStretch(1)
         dlc_row.addWidget(dlc_spacer)
-        dlc_row.addLayout(dlc_inner, 1)
+        dlc_row.addWidget(self.btn_dlc, 1)
         col.addLayout(dlc_row)
 
         col.addStretch(1)
@@ -2047,7 +2209,6 @@ class MainWindow(QMainWindow):
         self.btn_expand = IconButton(GLYPH_EXPAND, "接收区全屏显示（Esc 退出）",
                                      size=30, glyph_size=15)
         self.btn_expand.clicked.connect(self._toggle_expand)
-
         rail = QVBoxLayout()
         rail.setSpacing(10)
         # 分屏接管时亮出的串口开关：常驻竖栏顶部（普通态隐藏），见 _apply_snap_zoom。
@@ -4118,11 +4279,7 @@ class MainWindow(QMainWindow):
         # （1/4 屏截图里量到过：文字比底色块还宽）。
         self.btn_open_history.setMinimumWidth(146 if field_w <= 0 else 104)
         self._hist_spacer.setFixedWidth(spec["label_w"])
-        # DLC 入口（单一开关 + 卸载）跟「打开历史数据」同一套窄档收口：
-        # 标签列收起时占位一起收，控件下限也压到 104，免得文字戳出圆角底板。
         self._dlc_spacer.setFixedWidth(spec["label_w"])
-        self._dlc_switch.setMinimumWidth(146 if field_w <= 0 else 104)
-        self._dlc_uninstall.setMinimumWidth(146 if field_w <= 0 else 104)
 
         # 工具栏横/竖排。切换会改变内容自然高度，把"量过的高度"和"钉住的高度"一起
         # 作废 —— 否则下一次全屏转场会按旧行高插值（展开那一帧工具栏会被裁）。
@@ -5959,6 +6116,12 @@ class MainWindow(QMainWindow):
             # 设备列表由「刷新」按钮按需扫描，不走这个定时器。
             return
         self._reap_retired()      # 顺手给取消建链的 worker 收尸（见 _reap_retired）
+        # 「插上了但没驱动」这件事**不会**让端口名单发生变化（它压根没有 COM 口），
+        # 所以只能靠定时体检发现：每 4 拍（≈4s）查一次。没插设备时这里只是一次
+        # ctypes 枚举（3ms 量级，不进 pnputil），代价可以忽略。
+        self._driver_ticks += 1
+        if self._driver_ticks % 4 == 0:
+            self._maybe_install_drivers(force=True)
         ports = list_serial_ports()
         if ports == self._known_ports:
             return
@@ -6077,6 +6240,39 @@ class MainWindow(QMainWindow):
         self.pulse.pulse(1.0)
         # 这里不弹临时提示：图标、状态标签和状态灯已经给了反馈，
         # 再弹一条内容相近的提示只会在状态栏里重复一遍。
+        self._arm_rx_silence_watch()
+
+    def _arm_rx_silence_watch(self) -> None:
+        """打开成功后挂一次"怎么还没数据"的检查（见 RX_SILENCE_HINT_MS）。
+
+        只挂一次、只提示一次：真正的静默设备（例如只应答不主动发的从机）不该
+        被反复骚扰。收到任何字节就自然失效（比对 ``_rx_bytes`` 快照）。
+
+        ⚠️ 用**挂在窗口上的** QTimer，不用 ``QTimer.singleShot``：后者没有父对象，
+        窗口销毁之后仍会回调，撞上已析构的 C++ 对象会抛 RuntimeError（测试里
+        close 完再跑一拍就中招）。挂上去的定时器随窗口一起销毁。
+        """
+        self._rx_mark_at_open = self._rx_bytes
+        watch = getattr(self, "_rx_watch", None)
+        if watch is None:
+            watch = QTimer(self)
+            watch.setSingleShot(True)
+            watch.timeout.connect(self._check_rx_silence)
+            self._rx_watch = watch
+        watch.start(RX_SILENCE_HINT_MS)
+
+    def _check_rx_silence(self) -> None:
+        if not self._port_connected or self._worker is None:
+            return                       # 这期间关了 / 换了口，别拿旧账说话
+        if self._rx_bytes != getattr(self, "_rx_mark_at_open", -1):
+            return                       # 有数据进来了，一切正常
+        port = self._worker.port
+        app_log.warning(f"串口已打开但 {RX_SILENCE_HINT_MS // 1000} 秒没有收到数据：{port}")
+        # ⚠️ 只改状态文字 + 一条限时提示，⛔ 不弹模态框 —— 用户可能只是还没让
+        #    设备上电，弹框属于打断。
+        self._set_state(f"{port} 已打开，但没有收到数据 —— 检查波特率与接线")
+        self._toast("串口连上了，但一直没收到数据：确认波特率、TX/RX 接线，"
+                    "以及设备是否已上电", 8000)
 
     def _on_open_failed(self, message: str) -> None:
         """建链失败（端口不存在 / 被占用 / 蓝牙对端不在）。"""
@@ -6092,8 +6288,35 @@ class MainWindow(QMainWindow):
         for widget in self._config_widgets():
             widget.setEnabled(True)
         self._set_state("未打开")
-        self._warn(f"打不开 {port}：\n{message}\n\n"
-                   "端口可能被占用，或设备已拔出、不在范围内。")
+        # 最常见的一次失败其实是"设备插着但驱动没装"——那种情况下端口根本不会
+        # 出现在列表里，用户只能随便选一个或者是空着点开，报错内容又和驱动毫无
+        # 关系。这里把话挑明，并且**在同一个框里**给一次当场装掉的机会
+        #（⛔ 不要再叠第二个「要不要装驱动」的框：连续两个模态框很粗暴，
+        #   而且第二个框的信息第一个框刚说过）。
+        try:
+            need = drv_assist.needed_keys()
+        except Exception:                 # noqa: BLE001 - 体检失败不影响报错
+            need = []
+        if not need or self._driver_busy:
+            self._warn(f"打不开 {port}：\n{message}\n\n"
+                       "端口可能被占用，或设备已拔出、不在范围内。")
+            return
+        self._driver_asked = True          # 已经在这个框里问过了，别再弹第二个
+        box = QMessageBox(self)
+        box.setWindowTitle("打不开串口")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(f"打不开 {port}")
+        box.setInformativeText(
+            f"{message}\n\n"
+            "端口可能被占用，或设备已拔出、不在范围内。\n\n"
+            f"另外：插着的 {drv_assist.describe(need)} 还没有驱动 —— "
+            "装好之后它才会出现在端口列表里。")
+        install = box.addButton("安装驱动", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("知道了", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(install)
+        box.exec()
+        if box.clickedButton() is install:
+            self._start_driver_install(need)
 
     def _close_port(self, message: str = "") -> None:
         # 先把关口里剩下的那一批吐出来，别丢掉设备最后发的那几个字节
@@ -7701,6 +7924,11 @@ class MainWindow(QMainWindow):
         self._soc_cfg = None
         self._soc_est = None
         self._soc_feed = None
+        # 显示门控是纯状态机；换车 / 切 EKF 开关时重建基准（不带旧车读数）
+        self._soc_display_gate = SocDisplayGate()
+        # 「显示 SOC 读数」开关先落地：后面三条出口（没参数 / 正常 / 异常）都会
+        # 刷文本并摆位，可见性必须在那之前定好，否则隐藏的标签会被摆一次。
+        self._apply_soc_visible()
         try:
             self._soc_cfg = soc_profiles.cfg_for(customization.current_vehicle() or "")
             if self._soc_cfg is None:
@@ -7773,6 +8001,21 @@ class MainWindow(QMainWindow):
             # "不显示其他报错信息"）。数值本身仍用估算结果，只把状态灯压平。
             state = "ok"
         parts = soc_est.format_soc_parts(res, self._soc_cfg)
+        # 母线断开时冻结 min/max 显示（只改显示文本，不动 SocResult / 导出 / 回测）。
+        # 用浅拷贝替身走原 format_soc_parts，完整保留工况标记、"  ±" 告警后缀、
+        # 总电压与占位符契约；只覆盖 soc_min/soc_max 两个数值。
+        if res is not None and res.clean is not None and res.clean.ok:
+            g_min, g_max = self._soc_display_gate.decide(
+                res.mode, res.flag, res.soc_min, res.soc_max)
+            if g_min is not None and g_max is not None:
+                shown = copy.copy(res)
+                shown.soc_min = g_min
+                shown.soc_max = g_max
+                parts = soc_est.format_soc_parts(shown, self._soc_cfg)
+        elif res is not None:
+            # 无可用数据：只推进门控状态（沿用上次 + 清待确认），
+            # 显示文本保持 "SOC --" 占位符契约不变。
+            self._soc_display_gate.decide(res.mode, res.flag, None, None)
         self._set_soc_parts(parts, state,
                             emphasis=(res.emphasis if res is not None else ""))
 
@@ -7831,7 +8074,12 @@ class MainWindow(QMainWindow):
         sized = []
         for lbl in labels:
             lbl.adjustSize()
-            if lbl.text():
+            # 只有"有文字 + 没被设置里关掉"的标签才参与摆位。
+            # ⚠️ 判可见性用 isVisibleTo(bar) 而不是 isVisible()：开窗之前所有子控件
+            #    的 isVisible() 都是 False（父窗口还没显示），那样开局会把整组
+            #    当成隐藏、SOC 读数一枚都不摆。isVisibleTo 只看**自己有没有被
+            #    显式 hide**，与父窗口是否已显示无关。
+            if lbl.text() and lbl.isVisibleTo(bar):
                 sized.append((lbl, lbl.width(), lbl.height()))
             else:
                 lbl.setGeometry(0, 0, 0, 0)
@@ -7897,6 +8145,22 @@ class MainWindow(QMainWindow):
         self._place_soc_pending = False
         self._place_soc()
 
+    def _apply_soc_visible(self) -> None:
+        """按设置里的「显示 SOC 读数」开关收起 / 放出底栏那四枚标签。
+
+        ⛔ 只动**可见性**，不动估算：`_soc_est` / 积分 / 零漂 / 显示门控全照常跑，
+           重新打开开关立刻是连续读数（否则关十分钟再开会从 OCV 重新锚定、
+           读数跳一下 —— 那正是用户一直在投诉的"跳"）。
+        ⛔ **不清空文本**：关掉后标签仍持有上一轮的文本与动态属性，只是 hide；
+           清空会让重新打开时先闪一帧「SOC --」再填值。
+        隐藏后的摆位由 :meth:`_place_soc` 自己过滤（它按 isVisibleTo 判），
+        所以这里只负责切换 + 触发一次重摆。
+        """
+        show = bool(customization.get("soc_show"))
+        for lbl in getattr(self, "_soc_labels", ()) or ():
+            lbl.setVisible(show)
+        self._schedule_place_soc()
+
     def _toast_width_limit(self) -> int:
         """提示文字能用到哪里为止：到 SOC 那一组的最左边缘（留 12px 间隙）。
 
@@ -7907,8 +8171,12 @@ class MainWindow(QMainWindow):
         toast = getattr(self, "lbl_toast", None)
         if not labels or toast is None or not self._soc_active():
             return 0
-        shown = [lbl for lbl in labels if lbl.text()]
+        bar = getattr(self, "_bottom_bar", None)
+        shown = [lbl for lbl in labels
+                 if lbl.text() and (bar is None or lbl.isVisibleTo(bar))]
         if not shown:
+            # 设置里关掉了 SOC 显示 → 底栏正中整块空出来，提示可以用到右边状态文字
+            # 之前（再夹就是白缩一段）。返回 0 = 调用方不做省略。
             return 0
         return min(lbl.x() for lbl in shown) - 12 - toast.x()
 
@@ -8524,6 +8792,11 @@ class MainWindow(QMainWindow):
         if "startup_maximized" in custom_changes:
             # 起手姿态当场摆一次（不然用户得重启才看得到自己改了什么）
             self._apply_startup_maximized()
+        if "soc_show" in custom_changes:
+            # 只是收/放底栏那四枚标签（估算不停，见 _apply_soc_visible）
+            self._apply_soc_visible()
+            app_log.info("SOC 显示已" +
+                         ("打开" if bool(customization.get("soc_show")) else "关闭"))
         if "soc_ekf4" in custom_changes:
             # 换 SOC 算法 = 积分/滤波状态全部作废重来（⛔ 不能把上一套算法的
             # 中间状态带过去，否则 SOC 会带着旧积分跳一下）
@@ -8928,12 +9201,122 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- 可选 DLC
 
-    def _heartbeat_dlc_info(self) -> object | None:
-        """找到本机已安装的心率广播 DLC（当前唯一一个）；没有返回 None。"""
-        for info in dlc_host.discover():
-            if info.id == "heartbeatDLC":
-                return info
-        return None
+    def _heartbeat_dlc(self):
+        """本程序只有一个 DLC：返回它的 PluginInfo（不可用也算装过），没装返回 None。"""
+        return next((i for i in dlc_host.discover() if i.id == _DLC_ID), None)
+
+    def _on_dlc_clicked(self) -> None:
+        """「DLC」按钮：没装 → 提示安装；装了 → 直接进 DLC 面板。
+
+        ⛔ 用户 2026-11-12 口径：本程序只做这一个 DLC，不再有中间的管理对话框，
+        点一下就应该是「装」或「进」；卸载放在 DLC 面板里。
+        """
+        info = self._heartbeat_dlc()
+        if info is None or info.error:
+            if info is not None and info.error:
+                app_log.warning(f"DLC 不可用，转为重新安装：{info.error}")
+            self._install_dlc_flow()
+            return
+        if not info.enabled:
+            dlc_host.set_enabled(info.id, True)
+        if not self._dlc_open_panel(info.id):
+            QMessageBox.warning(
+                self, "DLC",
+                "心率广播 DLC 打不开：插件可能缺少依赖（bleak）或已损坏。\n"
+                "可在 DLC 面板里卸载后重新安装。")
+
+    def _find_dlc_package(self):
+        """找随包的 DLC 安装包（exe 同级 / dlc 子目录 / 开发期发布目录）。
+
+        找不到返回 None，由调用方退化成「让用户选 ZIP」。
+        """
+        base = (Path(sys.executable).resolve().parent
+                if getattr(sys, "frozen", False)
+                else Path(__file__).resolve().parent)
+        roots = [base, base / "dlc", base / "发布"]
+        found: list[Path] = []
+        for root in roots:
+            try:
+                found.extend(root.glob("heartbeatDLC-*.zip"))
+            except OSError:
+                continue
+        if not found:
+            return None
+        return max(found, key=lambda p: p.name)
+
+    def _install_dlc_flow(self) -> None:
+        """未安装：优先用随包 ZIP 一键安装，没有就立刻弹文件选择（不废话）。"""
+        package = self._find_dlc_package()
+        if package is not None:
+            answer = QMessageBox.question(
+                self, "安装 DLC",
+                f"尚未安装心率广播 DLC。\n\n检测到安装包：\n{package}\n\n现在安装吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        else:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择心率广播 DLC 安装包", "", "DLC 安装包 (*.zip)")
+            if not path:
+                QMessageBox.information(
+                    self, "未安装 DLC",
+                    "尚未安装心率广播 DLC。\n\n"
+                    f"可到发布页下载安装包（*.zip）：\n{dlc_host.REPO_URL}/releases\n\n"
+                    "下载后点「DLC」再选一次即可。")
+                return
+            package = Path(path)
+        try:
+            info = dlc_host.install_zip(package)
+        except Exception as exc:                    # noqa: BLE001 - 安装失败要能说清原因
+            app_log.error(f"DLC 安装失败：{type(exc).__name__}: {exc}")
+            QMessageBox.warning(self, "安装失败", str(exc))
+            return
+        app_log.info(f"DLC 已安装：{info.id} v{info.version}")
+        self._init_dlc()
+        if self._dlc_open_panel(info.id):
+            QMessageBox.information(
+                self, "安装完成",
+                f"心率广播 DLC v{info.version} 已安装并打开。\n"
+                f"以后点「DLC」就直接进这个面板。")
+        else:
+            QMessageBox.information(
+                self, "安装完成",
+                f"心率广播 DLC v{info.version} 已安装，但面板没能打开，请重启程序。")
+
+    def _dlc_request_uninstall(self, plugin_id: str) -> bool:
+        """供插件面板调用：确认后停实例、卸载文件（先备份），返回是否卸掉。"""
+        info = next((i for i in dlc_host.discover() if i.id == plugin_id), None)
+        if info is None:
+            QMessageBox.information(self, "卸载 DLC", "没有找到已安装的 DLC。")
+            return False
+        answer = QMessageBox.question(
+            self, "卸载 DLC",
+            f"确定卸载「{info.name}」？\n\n"
+            f"插件文件会先备份成 ZIP；已记录的心率 CSV 历史数据保留。\n"
+            f"卸载后点「DLC」会重新提示安装。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        plugin = self._dlc_loaded.pop(plugin_id, None)
+        if plugin is not None:
+            shutdown = getattr(plugin, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception as exc:            # noqa: BLE001 - 收尾失败也要继续删
+                    app_log.error(f"DLC {plugin_id} 收尾失败：{exc}")
+        try:
+            backup = dlc_host.uninstall(info)
+        except Exception as exc:                    # noqa: BLE001
+            app_log.error(f"DLC 卸载失败：{type(exc).__name__}: {exc}")
+            QMessageBox.warning(self, "卸载失败", str(exc))
+            return False
+        app_log.info(f"DLC 已卸载：{plugin_id}（备份 {backup}）")
+        QMessageBox.information(
+            self, "已卸载",
+            f"心率广播 DLC 已卸载。\n备份：{backup}" if backup
+            else "心率广播 DLC 已卸载。")
+        return True
 
     def _init_dlc(self) -> None:
         """发现并加载启用的 DLC。可重复调用（安装/启用后立即生效），按 id 去重。
@@ -8951,120 +9334,41 @@ class MainWindow(QMainWindow):
             plugin = dlc_host.load(info, ctx)
             if plugin is not None:
                 self._dlc_loaded[info.id] = plugin
-        # 单一开关模式：启动时若已启用，直接打开面板，让「开关 ON」与
-        # 「面板已开」一致（旧版是启用后再点入口按钮才开）。
-        cb = self._dlc_launcher_cbs.get("心率 DLC")
-        if cb is not None:
-            try:
-                cb()
-            except Exception as exc:            # noqa: BLE001
-                app_log.error(f"心率 DLC 启动失败：{exc}")
+        # ⛔ 启动时不自动弹插件面板：界面只留一颗「DLC」按钮，点了才拉起
+        # （避免每次启动都跳一个窗口）。
         app = QApplication.instance()
         if app is not None and not self._dlc_aboutquit_wired:
             self._dlc_aboutquit_wired = True
             app.aboutToQuit.connect(self._shutdown_dlc)
-        self._sync_dlc_switch()
 
     def _dlc_add_launcher(self, text: str, callback, tooltip: str = "") -> None:
-        """插件上下文注册入口回调（单一开关模式下不再单独生成按钮）。
-
-        旧版会把每个插件的入口做成一颗独立按钮插进左侧栏；现在只有一颗
-        「心率 DLC」开关，开关 ON 时直接调这里存下的回调（即插件的 show_panel）。
-        """
+        """插件上下文注册面板回调（不生成按钮，只存起来由「DLC」按钮调用）。"""
         self._dlc_launcher_cbs[text] = callback
 
-    def _on_dlc_switch(self, checked: bool) -> None:
-        """单一「心率 DLC」开关：ON = 启用 + 加载 + 启动；OFF = 停止 + 禁用。"""
-        info = self._heartbeat_dlc_info()
-        if info is None or info.error:
-            if checked:
-                self._dlc_switch.setChecked(False)
-            QMessageBox.information(self, "心率 DLC",
-                                    "未检测到心率广播 DLC，无法切换。")
-            return
-        if checked:
-            dlc_host.set_enabled(info.id, True)
-            info = self._heartbeat_dlc_info()   # 重新读，让 enabled 同步
-            if info is None or info.error:
-                self._dlc_switch.setChecked(False)
-                return
-            if info.id not in self._dlc_loaded:
-                plugin = dlc_host.load(info, dlc_host.HostContext(self))
-                if plugin is not None:
-                    self._dlc_loaded[info.id] = plugin
-            cb = self._dlc_launcher_cbs.get("心率 DLC")
-            if cb is not None:
-                try:
-                    cb()
-                except Exception as exc:            # noqa: BLE001
-                    app_log.error(f"心率 DLC 启动失败：{exc}")
-        else:
-            plugin = self._dlc_loaded.pop(info.id, None)
-            if plugin is not None:
-                shutdown = getattr(plugin, "shutdown", None)
-                if callable(shutdown):
-                    try:
-                        shutdown()
-                    except Exception as exc:        # noqa: BLE001
-                        app_log.error(f"心率 DLC 关闭失败：{exc}")
-            dlc_host.set_enabled(info.id, False)
-        self._sync_dlc_switch()
+    def _dlc_open_panel(self, plugin_id: str) -> bool:
+        """打开指定插件的面板（如心率窗口）。
 
-    def _uninstall_dlc(self) -> None:
-        """卸载心率广播 DLC：先停运行中的插件实例，再删文件（已自动备份）。"""
-        info = self._heartbeat_dlc_info()
-        if info is None:
-            QMessageBox.information(self, "心率 DLC", "未检测到心率广播 DLC。")
-            return
-        plugin = self._dlc_loaded.pop(info.id, None)
-        ans = QMessageBox.question(
-            self, "卸载心率 DLC",
-            f"确定卸载「{info.name}」？\n卸载会删除插件文件（已自动备份到本地）。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if ans != QMessageBox.StandardButton.Yes:
-            if plugin is not None:
-                self._dlc_loaded[info.id] = plugin   # 反悔：恢复运行实例
-            self._sync_dlc_switch()
-            return
-        if plugin is not None:                       # 确认卸载：先停实例，再删文件
-            shutdown = getattr(plugin, "shutdown", None)
-            if callable(shutdown):
-                try:
-                    shutdown()
-                except Exception as exc:            # noqa: BLE001
-                    app_log.error(f"心率 DLC 关闭失败：{exc}")
+        已加载就直接用实例的 ``show_panel``；未加载则按需加载一次（仅在插件
+        已启用时）。返回是否真的打开了面板。
+        """
+        plugin = self._dlc_loaded.get(plugin_id)
+        if plugin is None:
+            info = next((i for i in dlc_host.discover() if i.id == plugin_id), None)
+            if info is None or info.error or not info.enabled:
+                return False
+            plugin = dlc_host.load(info, dlc_host.HostContext(self))
+            if plugin is None:
+                return False
+            self._dlc_loaded[plugin_id] = plugin
+        opener = getattr(plugin, "show_panel", None)
+        if not callable(opener):
+            return False
         try:
-            backup = dlc_host.uninstall(info)
-            QMessageBox.information(self, "卸载完成",
-                                    f"心率广播 DLC 已卸载。\n备份：{backup}")
-        except Exception as exc:                    # noqa: BLE001
-            app_log.error(f"心率 DLC 卸载失败：{exc}")
-            QMessageBox.warning(self, "卸载失败", f"卸载失败：{exc}")
-            if plugin is not None:
-                self._dlc_loaded[info.id] = plugin
-        self._sync_dlc_switch()
-
-    def _sync_dlc_switch(self) -> None:
-        """让开关 / 卸载按钮反映当前 DLC 的安装与启用状态。"""
-        if not hasattr(self, "_dlc_switch"):
-            return
-        self._dlc_switch.blockSignals(True)
-        try:
-            info = self._heartbeat_dlc_info()
-            installed = info is not None and not info.error
-            on = bool(installed and info.enabled and info.id in self._dlc_loaded)
-            self._dlc_switch.setChecked(on)
-            self._dlc_switch.setEnabled(installed)
-            self._dlc_uninstall.setEnabled(installed)
-        finally:
-            self._dlc_switch.blockSignals(False)
-        if not installed:
-            self._dlc_switch.setToolTip("未安装心率广播 DLC")
-            self._dlc_uninstall.setToolTip("未安装心率广播 DLC")
-        else:
-            self._dlc_switch.setToolTip(
-                "开启 / 关闭心率广播 DLC（小米手环 BLE 心率）")
-            self._dlc_uninstall.setToolTip("卸载心率广播 DLC")
+            opener()
+        except Exception as exc:                # noqa: BLE001 - 插件面板不能拖垮主窗
+            app_log.error(f"DLC {plugin_id} 面板打开失败：{exc}")
+            return False
+        return True
 
     def _shutdown_dlc(self) -> None:
         """退出前让插件停掉自己的 QThread（幂等，closeEvent 与 aboutToQuit 双保险）。"""

@@ -72,7 +72,12 @@ a = Analysis(
     binaries=[],
     # mcp/ 目录要跟着走：设置面板「AI 接入」复制的那段接入包靠它自包含
     #（源码在包内，Agent 不需要联网 clone 仓库）。见 mcp_bridge.py。
-    datas=[('assets', 'assets'), ('mcp/serial_assistant_mcp.py', 'mcp')],
+    # drivers/ 是五家 USB 转串口芯片的签名驱动包（stlink/ch34x/cp210x/ftdi/
+    # pl2303），由 drv_assist 释放后调 pnputil 装进驱动库 —— 赛场没网，必须随身带。
+    # ⛔ 这个目录**必须存在**（见 drivers/README.md 的收录规则）：缺了就是不声不响
+    #    地少一个「插上就能用」的能力，所以这里不做存在性判断，宁可打包时报错。
+    datas=[('assets', 'assets'), ('mcp/serial_assistant_mcp.py', 'mcp'),
+           ('drivers', 'drivers')],
     # splash_motion 只在 splash_anim._start_motion() 里被**函数内** import，
     # 是 PYZ 收集的唯一引用点；显式列进 hiddenimports 做双保险（零体积成本）。
     # _snap_worker 是 main_window 顶部的普通 import，静态分析能收到；同样列进来
@@ -85,6 +90,10 @@ a = Analysis(
                    #   （只有开关打开时才走到），静态分析容易漏。漏包会让开关
                    #   静默回退原算法、界面毫无提示 —— 显式收进来做双保险。
                    'soc_ekf',
+                   # 2026-11-12 空载 SOC 显示门控：main_window 顶部普通 import，
+                   # 静态分析能收到；显式列一份做双保险。漏包会让底栏 min/max
+                   # 冻结失效（回到用户报的「静置读数波动」），且是静默回归。
+                   'soc_display',
                    # ⛔⛔ 2026-11-08 修「在线车辆库」全挂：urllib/socket 走主机名要用
                    #    idna 编解码器（encodings.idna），它内部 import unicodedata。
                    #    之前把 unicodedata 排掉 → 冻结环境里 idna 加载失败 →

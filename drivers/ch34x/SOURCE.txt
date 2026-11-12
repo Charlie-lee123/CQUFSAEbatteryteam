@@ -1,0 +1,27 @@
+# WCH CH340 / CH341 USB 转串口
+
+厂商：wch.cn（南京沁恒）
+版本：4.0.2026.02（DriverVer 02/11/2026）
+签名：Microsoft Windows Hardware Compatibility Publisher（WHQL）
+来源：WCH 官网 CH341SER.ZIP（包内 CH341SER 目录下的平铺文件集）
+
+说明：
+  多架构**单张** INF：`[SourceDisksFiles]` 里 x86 与 x64 的文件都在，所以目录里必须全带（少一个
+  pnputil 就会报缺文件）。已剔掉包里用不到的 SETUP.EXE / DRVSETUP64（厂商安装器，我们走 pnputil 直装）以及
+  Win98/9x 专用的 S98/VXD。⚠️ CH341SER.INF 自身没有 Authenticode 签名（INF 不是 PE
+  文件，这不是问题），驱动包的整体性由 CH341SER.CAT 保证 —— 该 cat 与其余 .sys/.dll 全部
+  Valid（WHQL）。
+
+## 文件清单（SHA256）
+
+  d1f001401a28e43e20a3ed9ccfd5267a11fef4a9846183bab6a2cdb10acb4237     63792  CH341M64.SYS
+  9e79736e949897b8ff8e959e2b6b67ead2ad061a4c63f72bfa70995023ef7e05     61096  CH341PORTS.DLL
+  98707b112d079e05241298d1ab19bac83e0a18d8334a5bc096c359a169838a0b     72872  CH341PORTSA64.DLL
+  222f91aaeeda5d8348552f0edbb9125948dbfa38daccefab7ca001efc70ffc74     49280  CH341PT.DLL
+  cb0fb42b6b3ba62aff1999132df9a41f3993f7f79ede4b020048240934bf4f91     67704  CH341PTA64.DLL
+  83078d87254ee4f52f08498c0458f27308c7ab857278eda59f8ec5bfd5e1d5ce     74384  CH341S64.sys
+  b5f2ef9fcdfaac86243d47b26e77bc3378cabdef18eba3e04975c6403756bd28     14510  CH341SER.CAT
+  1bbb1dfe5e311f53c2ae3928493dd884cabc12f992c7414a9509b28bf1f729df      9390  CH341SER.INF
+  bd849760a396ce7e9b0bf04ce49d528db63cae2056a0b3187363c602c15110cf     53904  CH341SER.sys
+
+合计 466,932 字节

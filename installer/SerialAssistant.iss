@@ -40,6 +40,7 @@
 #define SrcExe         AddBackslash(SourcePath) + "..\发布\" + ExeName
 #define SrcExeDir      AddBackslash(SourcePath) + "..\发布"
 #define SrcIcon        AddBackslash(SourcePath) + "..\发布\app.ico"
+#define SrcDrivers     AddBackslash(SourcePath) + "..\drivers"
 #define ArtDir         AddBackslash(SourcePath) + "art"
 #define OutDir         AddBackslash(SourcePath) + "..\发布"
 
@@ -136,6 +137,23 @@ Source: "{#SrcExe}"; DestDir: "{app}"; Flags: ignoreversion
 ; 图标单独放一份：快捷方式指它而不是 50MB 的 exe（Windows 从大 exe 抽图标
 ; 会超时退化成白纸，见 devtools\_desktop_shortcut.py 的说明）
 Source: "{#SrcIcon}"; DestDir: "{app}"; Flags: ignoreversion
+
+; USB 转串口驱动包（STLink / CH340 / CP210x / FTDI / PL2303）随安装包释放。
+; ⚠️ 这里**只释放、不安装**：装驱动要管理员权限，而本安装器默认是 per-user
+;    免管理员（PrivilegesRequired=lowest）。真正的安装由主程序首次启动时
+;    征求同意后提权完成（drv_assist.install → pnputil）。这样免安装版 exe 和
+;    安装版走的是**同一条**逻辑，不会出现"安装版能用、绿色版不能用"的分裂。
+; ⛔ 目录结构必须保持（drivers\<芯片键名>\*.inf），主程序按子目录找 inf。
+Source: "{#SrcDrivers}\*"; DestDir: "{app}\drivers"; \
+    Flags: ignoreversion recursesubdirs createallsubdirs
+; 心率广播 DLC 的安装包随程序一起放 {app}\dlc：用户点「DLC」时能一键装，
+; 不必自己去找 ZIP（用户 2026-11-12 口径：本程序只做这一个 DLC）。
+; ⛔ 放的是 ZIP 不是解包目录 —— dlc_host.discover() 只认 manifest.json，
+;    不会被这个 zip 误当成"已安装"。
+; ⛔ 这一行故意不加 #if 守卫：DLC 包是本安装包的必需件，
+;    缺了就让编译直接失败（比"装完点 DLC 找不到安装包"更容易发现）。
+Source: "{#SrcExeDir}\heartbeatDLC-1.0.0.zip"; DestDir: "{app}\dlc"; \
+    Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#ExeName}"; WorkingDir: "{app}"

@@ -1,0 +1,17 @@
+# STMicroelectronics STLink 虚拟串口（VCP）
+
+厂商：STMicroelectronics
+版本：2.01（DriverVer 06/08/2017）
+签名：STMicroelectronics（GRENOBLE 2）SAS
+来源：从本机 Windows 驱动库导出（pnputil /export-driver oem57.inf）；官方包为 STSW-LINK009，下载页 https://www.st.com/en/development-tools/stsw-link009.html
+
+说明：
+  VCP 走系统内置 usbser.sys，包内只有 inf + x64 catalog；debug 口用的
+  stlink_dbg_winusb.inf 不在这里（本软件只用串口）。
+
+## 文件清单（SHA256）
+
+  9d9e021291488ff994b6fa01b87fa6236b3afdfe9fec6958acd333a42ed682d7      8671  STLinkVCP_x64.cat
+  a090e4402cf2ee7861f8cb37b975d79f5f5d6c0be32c28f00ab01a32360f0489      2030  stlink_vcp.inf
+
+合计 10,701 字节

@@ -374,6 +374,13 @@ def main() -> int:
         import dlc_host
         return dlc_host.check_runtime(sys.argv)
 
+    # 驱动安装分支：由**提权后的自身**执行（父进程按 runas 拉起，见
+    # drv_assist.install）。必须在建 QApplication 之前返回 —— 这个进程只做
+    # pnputil，不显示任何界面。子进程是同一个 exe，所以不需要额外分发安装器。
+    if "--install-drivers" in sys.argv:
+        import drv_assist
+        return drv_assist.run_cli(sys.argv)
+
     # MCP 接入包导出：不进界面，把"交给 Agent 自动部署"的那段文本写成文件。
     # console=False 打不出字，所以走文件（也是验证"源码真的进了包"的落地证据）。
     if "--mcp-payload" in sys.argv:
