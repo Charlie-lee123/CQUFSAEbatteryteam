@@ -65,7 +65,7 @@ STICKY_ROUNDS = 10
 class RoundData:
     """一轮完整的采样。字段名与 :meth:`soc_est.SocEstimator.update` 对齐。"""
 
-    __slots__ = ("cells", "bad", "temps", "i_meas", "pack_v_raw",
+    __slots__ = ("cells", "bad", "temps", "i_meas",
                  "contactor_open", "bms_ok", "complete", "n_samples")
 
     def __init__(self):
@@ -73,7 +73,6 @@ class RoundData:
         self.bad: list = []            # 设备打 X 的位置
         self.temps: list = []          # 温度（°C）
         self.i_meas = None             # 设备上报电流（A）
-        self.pack_v_raw = None         # 设备上报总压（V）—— E74 这个传感器已坏
         self.contactor_open = None     # 接触器是否全断（True/False/None=没这行）
         self.bms_ok = True
         self.complete = False          # 是否收到了 CVMax 收尾行
@@ -190,7 +189,9 @@ class RoundCollector:
         cvi = CVI_RE.search(line)
         if cvi:
             try:
-                self._round.pack_v_raw = float(cvi.group(1))
+                # 设备上报总压（group 1）传感器已坏、无人消费，但保留解析作
+                # 格式校验：坏行仍走 ValueError 分支，不污染 i_meas。
+                float(cvi.group(1))
                 self._round.i_meas = float(cvi.group(2))
             except ValueError:
                 pass

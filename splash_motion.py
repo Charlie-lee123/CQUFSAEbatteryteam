@@ -62,7 +62,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QRect, QRectF, Qt
 from PySide6.QtGui import (QColor, QImage, QLinearGradient, QPainter, QPixmap,
                            QRadialGradient)
 
@@ -282,6 +282,102 @@ def _seg(t: float, a: float, b: float) -> float:
 
 _GAUSSIAN_ERROR: str | None = None      # 供探针断言（⛔ 不许再静默降级）
 
+# ---- numpy 可选化（2026-11 瘦身）-------------------------------------------
+# numpy 只为「高斯模糊」一个用途服务（19.6MB OpenBLAS 连带）。缺 numpy（打包版
+# excludes 后）时：MotionRenderer 必须仍能构造、开屏仍能播，模糊走纯 Qt 降采样
+# 近似（_gaussian_qt）。⚠️ 缺失必须**留痕**：_GAUSSIAN_ERROR + app_log.warning
+# 各一次（沿用既有痕迹机制），探针 / 日志可据此确认走了降级。
+_NUMPY_ERR: str | None = None           # numpy 不可用的原因（留痕/日志用）
+_NUMPY_CHECKED = False
+_QT_DEGRADE_WARNED = False              # 降级告警只发一次
+
+
+def _numpy_ok() -> bool:
+    """numpy 是否可用（首次探测后缓存；打包版缺 numpy 时恒 False）。"""
+    global _NUMPY_CHECKED, _NUMPY_ERR
+    if not _NUMPY_CHECKED:
+        _NUMPY_CHECKED = True
+        try:
+            import numpy                # noqa: F401 - 只探可用性，不留引用
+        except Exception as _exc:       # noqa: BLE001
+            _NUMPY_ERR = repr(_exc)
+    return _NUMPY_ERR is None
+
+
+def _warn_qt_degrade() -> None:
+    """缺 numpy 的降级留痕（一次性）：``_GAUSSIAN_ERROR`` + app_log.warning。"""
+    global _QT_DEGRADE_WARNED, _GAUSSIAN_ERROR
+    if _QT_DEGRADE_WARNED:
+        return
+    _QT_DEGRADE_WARNED = True
+    _GAUSSIAN_ERROR = _NUMPY_ERR or "numpy unavailable"
+    try:
+        import app_log
+        app_log.warning(f"开屏高斯模糊降级：numpy 不可用({_GAUSSIAN_ERROR})，"
+                        f"改用纯 Qt 降采样近似")
+    except Exception:                   # noqa: BLE001
+        pass
+
+
+def _gaussian_qt(pix, sigma):
+    """纯 Qt 高斯近似（numpy 缺失时的降级路径）：降采样 → 升采样低通。
+
+    原理：k 倍降采样再升回 ≈ 半径 k/2 的低通；取 **k = 2σ**（随 sigma 换算，
+    不写死）与 numpy 路径的核半径 r=2σ（见 _gaussian）对齐，屏幕上的模糊尺度
+    与真高斯基本一致。降采样按**逐级减半**逼近（每级 SmoothTransformation 的
+    均值滤波叠加起来更接近高斯、比一步到位少振铃），最后升回原尺寸。
+    ``pix`` 接受 QPixmap 或 QImage，返回**同类型**（与 numpy 路径的返回约定
+    一致）；QPixmap 形态保持 dpr。QImage 形态全程只用 QImage/QPainter，可在
+    预热线程里跑（QPixmap 只能 GUI 线程）。
+    """
+    if sigma <= 0.05 or pix is None:
+        return pix
+    if isinstance(pix, QPixmap) and pix.isNull():
+        return pix
+    if isinstance(pix, QImage) and pix.isNull():
+        return pix
+    try:
+        is_pix = isinstance(pix, QPixmap)
+        if is_pix:
+            dpr = pix.devicePixelRatioF() or 1.0
+            img = pix.toImage()
+        else:
+            dpr = None
+            img = pix
+        img = img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+        w, h = img.width(), img.height()
+        if w < 4 or h < 4:
+            return pix
+        # 总缩小倍率 k = 2σ（与 numpy 核半径 r=2σ 对齐）；目标工作宽按 k 换算。
+        k = max(2.0, float(sigma) * 2.0)
+        target_w = max(2, int(round(w / k)))
+        target_h = max(2, int(round(h * target_w / w)))
+        small = img
+        while small.width() > target_w * 2 and small.width() > 8:
+            small = small.scaled(small.width() // 2, max(2, small.height() // 2),
+                                 Qt.AspectRatioMode.IgnoreAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
+        small = small.scaled(target_w, target_h,
+                             Qt.AspectRatioMode.IgnoreAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
+        out = small.scaled(w, h,
+                           Qt.AspectRatioMode.IgnoreAspectRatio,
+                           Qt.TransformationMode.SmoothTransformation)
+        if not is_pix:
+            return out
+        res = QPixmap.fromImage(out)
+        res.setDevicePixelRatio(dpr)
+        return res
+    except Exception as exc:            # noqa: BLE001 - 降级路径绝不能再抛
+        global _GAUSSIAN_ERROR
+        _GAUSSIAN_ERROR = repr(exc)
+        try:
+            import app_log
+            app_log.warning(f"开屏高斯模糊 Qt 降级失败：{exc!r}")
+        except Exception:               # noqa: BLE001
+            pass
+        return pix
+
 
 def _gaussian(pix, sigma):
     """真高斯模糊，``pix`` 可为 QPixmap 或 uint8 (h,w,4) ndarray（返回同类型）。
@@ -306,12 +402,19 @@ def _gaussian(pix, sigma):
     从未生效，淡入全程是一张 793px 图放大 6× 的糊图（用户一眼看穿
     「高斯模糊不是降低分辨率」）。正确写法是 ``"hwck,k->hwc"``。
     ⛔ 降级必须留痕：``_GAUSSIAN_ERROR`` + app_log，探针要断言它为 None。
+    ⛔ numpy 可选化：缺 numpy（打包版 excludes）时不再静默返回原图，而是
+    留痕一次（_warn_qt_degrade）后走 ``_gaussian_qt`` 纯 Qt 降采样近似，
+    开屏模糊效果仍在；ndarray 形态只在 numpy 路径产生，缺 numpy 时不可达。
     """
     global _GAUSSIAN_ERROR
     if sigma <= 0.05 or pix is None:
         return pix
     if isinstance(pix, QPixmap) and pix.isNull():
         return pix
+    if not _numpy_ok():
+        # 缺 numpy（打包版）：warn 一次留痕，然后走纯 Qt 降级近似 —— 必须仍能出图。
+        _warn_qt_degrade()
+        return _gaussian_qt(pix, sigma)
     try:
         import numpy as np
         from numpy.lib.stride_tricks import sliding_window_view
@@ -481,6 +584,10 @@ class MotionRenderer:
     def _ensure_prep(self):
         """惰性建立预热所需的 4 张 numpy 图（13 档共用，淡入结束一起释放）。
 
+        ⛔ numpy 可选化：缺 numpy（打包版）时槽位 4~7 改放 QImage（无 ndarray），
+        ``_gaussian`` / ``_compose_image`` 按输入类型自动分流到 Qt 降级链
+        （_gaussian_qt / _compose_image_qt）；槽位 0~3 与剪切规则完全一致。
+
         ⛔⛔ od47 竖线根治：淡入模糊的源图**只能是图标**。完整 lockup 里含
         divider 和文字，真高斯（sigma 最大 18 逻辑 px）会把它们的墨迹晕过
         图标 clip 右缘（那里只退让 1.5px），淡入阶段就显出一条竖影 ——
@@ -492,7 +599,6 @@ class MotionRenderer:
         prep = getattr(self, "_blur_prep", None)
         if prep is not None:
             return prep
-        import numpy as np
         base = self._pixmap(self._clear_w)
         if base is None:
             return None
@@ -504,6 +610,39 @@ class MotionRenderer:
         work_img = base_img.scaled(work_w, work_h,
                                    Qt.AspectRatioMode.KeepAspectRatio,
                                    Qt.TransformationMode.SmoothTransformation)
+        # 退让分隔线左缘 AA 余量（见 _DIV_CUT_GUARD 注释）——否则那列残影
+        # 会被高斯晕成一条「提前出现」的竖直淡带。两条路径共用同一换算。
+        cut_frac = self._spec.divider_x - _DIV_CUT_GUARD
+        if not _numpy_ok():
+            # ⛔ numpy 缺失（打包版）：不产生任何 ndarray。槽位 4~7 放 QImage：
+            #    [4]=完整清晰图（淡出补偿基准，key=1.0 实际不用）、[5]=图标-only
+            #    清晰图（底噪补偿基准）、[6]=完整 work 小图（淡出模糊源）、
+            #    [7]=图标-only work 小图（淡入 13 档模糊源）。几何、work 尺寸、
+            #    divider 退让与 numpy 路径逐位一致 —— 差异只在模糊算法本身。
+            cut_w = max(0, int(round(work_img.width() * cut_frac)))
+            cut_p = max(0, int(round(phys_w * cut_frac)))
+            icon_full = base_img.convertToFormat(
+                QImage.Format.Format_ARGB32_Premultiplied)
+            painter = QPainter(icon_full)
+            painter.setCompositionMode(
+                QPainter.CompositionMode.CompositionMode_Clear)
+            painter.fillRect(QRect(cut_p, 0, phys_w - cut_p, phys_h),
+                             Qt.GlobalColor.transparent)
+            painter.end()
+            icon_work = work_img.convertToFormat(
+                QImage.Format.Format_ARGB32_Premultiplied)
+            painter = QPainter(icon_work)
+            painter.setCompositionMode(
+                QPainter.CompositionMode.CompositionMode_Clear)
+            painter.fillRect(QRect(cut_w, 0, icon_work.width() - cut_w,
+                                   icon_work.height()),
+                             Qt.GlobalColor.transparent)
+            painter.end()
+            prep = (dpr, phys_w, phys_h, QPixmap.fromImage(work_img),
+                    base_img, icon_full, work_img, icon_work)
+            self._blur_prep = prep
+            return prep
+        import numpy as np
         base_rgba = base_img.convertToFormat(QImage.Format.Format_RGBA8888)
         base_u8 = np.frombuffer(base_rgba.constBits(), dtype=np.uint8).reshape(
             phys_h, base_rgba.bytesPerLine() // 4, 4)[:, :phys_w, :].copy()
@@ -513,9 +652,6 @@ class MotionRenderer:
         w_act, h_act = wi.width(), wi.height()
         work_arr = np.frombuffer(wi.constBits(), dtype=np.uint8).reshape(
             h_act, wi.bytesPerLine() // 4, 4)[:, :w_act, :].copy()
-        # 退让分隔线左缘 AA 余量（见 _DIV_CUT_GUARD 注释）——否则那列残影
-        # 会被高斯晕成一条「提前出现」的竖直淡带。
-        cut_frac = self._spec.divider_x - _DIV_CUT_GUARD
         cut_w = max(0, int(round(w_act * cut_frac)))
         cut_p = max(0, int(round(phys_w * cut_frac)))
         icon_work_arr = work_arr.copy()
@@ -533,7 +669,11 @@ class MotionRenderer:
         ⛔ od47d：全程只用 QImage / numpy —— QImage 是值类型且可重入，
         **可以在线程池里并行**；QPixmap 只能 GUI 线程，留到 ``_compose``。
         实测 13 档合成串行 373ms（占预热 617ms 的大头），并行后大幅下降。
+        ⛔ numpy 可选化：``small`` 是 QImage（缺 numpy 时的降级形态）时
+        分流到 ``_compose_image_qt``；ndarray 路径一字未动。
         """
+        if isinstance(small, QImage):
+            return self._compose_image_qt(small, key, base_arr)
         import numpy as np
         phys_w, phys_h = self._blur_prep[1:3]
         qimg = QImage(np.ascontiguousarray(small).data,
@@ -556,6 +696,36 @@ class MotionRenderer:
                           + ou.astype(np.uint16) * wi) // 255).astype(np.uint8)
                 out = QImage(np.ascontiguousarray(mixed).data, phys_w, phys_h,
                              4 * phys_w, QImage.Format.Format_RGBA8888).copy()
+        return out
+
+    def _compose_image_qt(self, small: QImage, key: float,
+                          base_img: QImage) -> QImage:
+        """Qt 降级版合成（缺 numpy 时由 _compose_image 分流进来）。
+
+        与 numpy 版同构：① 小图升回全分辨率（SmoothTransformation）；
+        ② key≤0.25 的轻档底噪补偿 —— 与图标-only 清晰图按 w=key/0.25 线性
+        混合。QPainter 的 SourceOver + setOpacity 恰好是线性插值
+        （out·(1−a) + base·a），与 numpy 版 ``(base·(255−wi)+out·wi)/255``
+        等价（a = wi/255），保证淡入末帧与清晰档无缝衔接。
+        ⛔ 全程只用 QImage / QPainter —— 可在预热线程里跑。
+        """
+        phys_w, phys_h = self._blur_prep[1:3]
+        out = small.scaled(phys_w, phys_h,
+                           Qt.AspectRatioMode.IgnoreAspectRatio,
+                           Qt.TransformationMode.SmoothTransformation)
+        if key <= 0.25 + 1e-6:
+            wi = int(round(min(1.0, key / 0.25) * 255.0))
+            if 0 < wi < 255:
+                res = QImage(phys_w, phys_h,
+                             QImage.Format.Format_ARGB32_Premultiplied)
+                res.fill(Qt.GlobalColor.transparent)
+                p = QPainter(res)
+                p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                p.drawImage(0, 0, out)
+                p.setOpacity(wi / 255.0)
+                p.drawImage(0, 0, base_img)
+                p.end()
+                out = res
         return out
 
     def _compose(self, small, key: float, base_arr) -> QPixmap:

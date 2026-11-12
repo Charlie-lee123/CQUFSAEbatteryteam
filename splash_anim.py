@@ -41,8 +41,13 @@ from pathlib import Path
 try:                                  # ⛔ cv2 已从打包里砍掉（exe -41.5MB，冷启动
     import cv2                        #    快 1s 的主因）：只有帧序列路径（planA
 except Exception:                     #    回退）需要它，planB 走 splash_motion 的
-    cv2 = None                        #    numpy 高斯。
-import numpy as np
+    cv2 = None                        #    高斯（splash_motion 里 numpy 已可选）。
+# ⛔ numpy 只服务 cv2 帧序列路径（np. 全文件仅 _decode_frame / prewarm_async 两处，
+#    且两者都以 cv2 存在为前提：_frames_for 在 cv2 is None 时早退、prewarm_async
+#    在 cv2 is None 时早退）。故 numpy 的 import 跟 cv2 绑定：打包版 cv2=None →
+#    不 import → spec excludes 加 'numpy' 才安全（splash_motion 的 Qt 高斯降级兜底）。
+if cv2 is not None:
+    import numpy as np
 
 from PySide6.QtCore import (QElapsedTimer, QPoint, QPointF, QRect, QRectF,
                             QSettings, Qt, QTimer, QUrl)
@@ -373,7 +378,6 @@ class _SplashWindow(QWidget):
         # 帧序列并行预解码（ThreadPoolExecutor，见 _fr_begin）
         self._dec_pool: concurrent.futures.ThreadPoolExecutor | None = None
         self._dec_futs: dict = {}          # idx -> Future[QImage]
-        self._dec_want = 0                 # 主线程已消费到的下一帧
         self._pix_size: tuple | None = None  # worker 缩放的目标物理尺寸
         self._done = False
         self._video_live = False      # 视频层是否已接管显示（接管后不再画海报）
@@ -413,9 +417,6 @@ class _SplashWindow(QWidget):
         self._motion_total = 3.0
         self._fade_ms = _FADE_MS     # 淡出时长（ms）；_start_motion 按所选 MotionSpec 覆盖（planA=400）
         self._mt = 0.0
-        # 主窗构造触发点 = 文字擦满那一刻（spec.t_text_end×1000）；
-        # _start_motion() 会用所选 MotionSpec 覆盖，这里只是安全初值。
-        self._motion_hold_ms = 1900.0
         self._land_ready = False          # 主窗真实落点已注入（播完才放行淡出）
 
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint
@@ -569,7 +570,6 @@ class _SplashWindow(QWidget):
         self._motion_spec = spec
         self._fade_ms = float(self._motion_spec.fade_ms)
         self._motion_total = float(spec.t_total)
-        self._motion_hold_ms = float(spec.t_text_end) * 1000.0
         self._mt = 0.0
         # od46：clamp 累计 dt，构造期不冻结时钟。`wall_intervals` 是**原始墙钟
         # 间隔**（stutter/max/p95/eq_fps 基于它，否则 clamp 后 stutter 恒 0）；
@@ -1029,7 +1029,6 @@ class _SplashWindow(QWidget):
             return False
         self._pix, self._pix_buf = pair
         self._fr_idx = idx
-        self._dec_want = idx + 1
         self.update()
         if perf is not None:
             now = time.perf_counter()

@@ -100,13 +100,6 @@ def cfg_for(vehicle: str) -> SocCfg | None:
     return None
 
 
-def supported() -> list[str]:
-    """所有能算 SOC 的车号（内置 + 自定义），供设置界面列出来。"""
-    numbers = set(BUILTIN_PACKS)
-    numbers.update(str(k) for k in _load_raw())
-    return sorted(numbers)
-
-
 def save_pack(cfg: SocCfg) -> bool:
     """写一台车的参数（``cfg.number`` 是车号）。写失败返回 False，不抛。"""
     number = (cfg.number or "").strip().upper()

@@ -159,11 +159,6 @@ RESIZE_BAND = 6
 COMPACT_L1_W = 980
 COMPACT_L2_W = 720
 COMPACT_L3_W = 460
-# 窗口"长大/缩小"快照覆盖层总开关（2026-11-01 暂时关闭）。
-# ⛔ 真机上点「还原」会卡死，进程内三种复现路径都测不出来；覆盖层是唯一"在窗口
-#    状态切换期间再开一个顶层窗口"的机制，先整体关掉保证不卡 —— 没动画也比卡死好。
-#    重启这个功能前必须先复现并定位卡死，别直接改回 True。
-_WINDOW_MORPH = False
 COMPACT_HYST = 24
 
 # 每一档的具体数值。``config_w`` 是**整个卡片**的宽（含卡片自己 2×(SHADOW_PAD+CARD_PAD)
@@ -798,8 +793,7 @@ class MainWindow(QMainWindow):
         self._rx_bytes = 0
         self._tx_bytes = 0
         self._history: list[str] = []
-        # 时钟宽度是否已经精确量过（见 _arm_clock；构造期量要 580ms）
-        self._clock_ready = False
+        # 时钟宽度：构造期不精确量（首次 fontMetrics 要 580ms，见 _tick_clock）
         self._settings = QSettings("MimoWorks", "SerialAssistant")
         self._cards: list[Card] = []
         # 主题过渡（见 _animate_theme）：补间惰性创建，起止方案记在这里
@@ -1041,7 +1035,6 @@ class MainWindow(QMainWindow):
         # _refresh_caption_ui）。补间结束才 showFullScreen() —— 那时几何已经等于
         # 显示器矩形，状态切换无跳变。这是用户要的"位置/尺寸连续变化"。
         self._fs_animating = False
-        self._fs_target: QRect | None = None
         self._closing = False            # 关闭淡出的重入闸
         self._snap_zoom = False          # 分屏窄档自动"最大化接收区"是否由我们接管
         self._snap_pending = False       # 已预约一次延迟重算（防 resizeEvent 自激）
@@ -1080,11 +1073,6 @@ class MainWindow(QMainWindow):
         # DWM 原生还原动画抑制标记（还原覆盖层动画期间关，收尾恢复）。
         self._dwm_transition_off = False
         self._snap_zoom_saved = None     # 自动隐藏前的可见性，恢复时按它还原
-        # 最大化/还原的"长大/缩小"快照覆盖层（ToolTip 级窗口：不吃输入、不抢焦点）
-        self._morph_label = None
-        self._morph_tween: Tween | None = None
-        self._morph_from: QRect | None = None
-        self._morph_to: QRect | None = None
         # 「进入全屏 / 全屏→分屏」的**真·长大/缩小**覆盖层（见 _play_window_cover）。
         # ⛔ 为什么不用 Tween：实测覆盖层的 Tween 在进全屏那一拍只走 4 帧/300ms
         #    （主窗重建版式把共享 ticker 挤掉了），观感等于没动画。这里用**独立**
@@ -1764,16 +1752,6 @@ class MainWindow(QMainWindow):
         pattern = "0000-00-00 00:00:00" if with_date else "00:00:00"
         return self.lbl_clock.fontMetrics().horizontalAdvance(pattern) + 2
 
-    def _arm_clock(self) -> None:
-        """``show`` 之后第一次精确量时钟宽度，并清掉构造期的估算值。
-
-        ⛔ 构造期**绝不调用** ``_clock_width``：首次 fontMetrics 的
-        ``horizontalAdvance`` 要 **580ms**（字体引擎冷启动），一次就够把开屏
-        卡死；``_build_ui`` 里两次调用合计 1.159s，占主窗构造的 90%。
-        """
-        self._clock_ready = True
-        self._tick_clock()
-
     def _tick_clock(self) -> None:
         """把接收区右上角的时钟刷到当前时刻，精确到秒。
 
@@ -1787,8 +1765,8 @@ class MainWindow(QMainWindow):
         # 之后要显式请卡片重排一次。宽度没变就什么都不做（每秒一次的常态）。
         self._clock_ticks = getattr(self, "_clock_ticks", 0) + 1
         # ⛔ 构造期不量字体宽度（首次 horizontalAdvance 要 580ms，字体引擎冷
-        #    启动）；等定时器跑到第 3 拍（那时早已 show）再精确量一次。
-        ready = self._clock_ready or self._clock_ticks > 2
+        #    启动）；定时器跑到第 3 拍（那时早已 show）之后才精确量。
+        ready = self._clock_ticks > 2
         width = (self._clock_width(with_date) if ready
                  else 9 * len("0000-00-00 00:00:00" if with_date
                               else "00:00:00") + 8)
@@ -2798,6 +2776,19 @@ class MainWindow(QMainWindow):
         self._search_pinned = bool(matches)
         self._render_matches()
 
+    def _make_selection(self, cursor: QTextCursor,
+                        color: QColor) -> QTextEdit.ExtraSelection:
+        """构造一个带背景色的 ExtraSelection（搜索高亮 / 告警行共用）。
+
+        只合并**构造**：消费端各自把返回值挂进自己的 selection 列表或属性。
+        """
+        fmt = QTextCharFormat()
+        fmt.setBackground(color)
+        selection = QTextEdit.ExtraSelection()
+        selection.cursor = cursor
+        selection.format = fmt
+        return selection
+
     def _render_matches(self) -> None:
         document = self.txt_rx.document()
         selections = []
@@ -2805,12 +2796,8 @@ class MainWindow(QMainWindow):
             cursor = QTextCursor(document)
             cursor.setPosition(start)
             cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-            fmt = QTextCharFormat()
-            fmt.setBackground(match_fill(position == self._match_index))
-            selection = QTextEdit.ExtraSelection()
-            selection.cursor = cursor
-            selection.format = fmt
-            selections.append(selection)
+            selections.append(self._make_selection(
+                cursor, match_fill(position == self._match_index)))
         self._set_search_selections(selections)
 
         if not self._matches:
@@ -2868,7 +2855,6 @@ class MainWindow(QMainWindow):
             # 连点：进入全屏的真窗口补间可能还在跑，停掉后状态位必须一起清
             # （Tween.stop() 不触发 on_finished，不清会让 _fs_animating 永久残留）。
             self._fs_animating = False
-            self._fs_target = None
             # ⛔⛔ 2026-11-04 录屏+关键帧目检三轮迭代**定案**：退出方向分两级。
             #    【主路径：覆盖层快照缩放】进入全屏 ~600ms 后已空闲缓存全屏快照
             #    （_fs_idle_pix，点击现场零抓屏）→ 先铺覆盖层（此刻主窗仍是带
@@ -3024,7 +3010,6 @@ class MainWindow(QMainWindow):
         self._morph_unfreeze()
         self._geo_animating = False
         self._fs_animating = False
-        self._fs_target = None
         self._want_fullscreen = False
         self._pending_restore_fs = False
         self._fs_rect = None
@@ -3097,77 +3082,18 @@ class MainWindow(QMainWindow):
     def _on_window_fade(self, value) -> None:
         self.setWindowOpacity(max(0.0, min(1.0, float(value))))
 
-    # -- 最大化/还原：快照覆盖层做"长大/缩小" ------------------------------
+    # -- 历史记录：最大化/还原的"长大/缩小"快照覆盖层（已废弃） --------------
     #
     # 用户 2026-10-31（第四次）：「最大化/最小化仍然没有流畅的连续动画」。
     # 主窗口的全屏状态必须**立刻**落地（延迟 showFullScreen → isFullScreen()
     # 动画期为 False → 边缘缩放/标题栏/自测全挂），不能给主窗口做几何补间。
-    # 解法：把切换**前**的画面铺在一个 `Qt.ToolTip` 级窗口上（工具提示窗口天然
-    # 不吃鼠标、不抢焦点、不进任务栏），让它连续缩放+淡出，露出下面已切换好的
-    # 真窗口 —— 观感就是窗口在长大/缩小。
-    # ⛔ 失败安全：覆盖层不显示时最多等于"没有动画"，主窗口始终可见/已切换。
-
-    def _begin_window_morph(self, pixmap, start: QRect):
-        """把切换**前**的画面铺到置顶小窗上。
-
-        ⛔ 必须在**状态切换之前**调用：先 showFullScreen 再建覆盖层，中间会有一帧
-        新布局裸露出来 —— 逐帧看在用户眼里就是"闪"。
-        """
-        if not _WINDOW_MORPH:
-            return None
-        if pixmap is None or not animations_enabled() or not self.isVisible():
-            return None
-        from PySide6.QtWidgets import QLabel
-        label = QLabel(None)
-        label.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint
-                             | Qt.WindowStaysOnTopHint
-                             | Qt.NoDropShadowWindowHint)
-        label.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        label.setPixmap(pixmap)
-        label.setScaledContents(True)
-        label.setGeometry(start)
-        label.setWindowOpacity(1.0)
-        label.show()
-        label.raise_()
-
-        old, self._morph_label = self._morph_label, label
-        if old is not None:
-            try:
-                old.hide()
-                old.deleteLater()
-            except Exception:        # noqa: BLE001 - 覆盖层清理失败不该影响主流程
-                pass
-        return label
-
-    def _run_window_morph(self, label, start: QRect, end: QRect,
-                          duration: int = 240) -> None:
-        """状态切换完成后启动覆盖层缩放+淡出（label 由 _begin_window_morph 建）。"""
-        if label is None or not animations_enabled() or start == end:
-            return
-        label.raise_()               # 状态切换后可能被主窗盖住，抬回最上层
-        if self._morph_tween is None:
-            self._morph_tween = Tween(duration, out_cubic, self._on_morph_frame,
-                                      self._on_morph_finished, parent=self)
-        self._morph_from = QRect(start)
-        self._morph_to = QRect(end)
-        self._morph_tween.start(0.0, 1.0, duration)
-
-    def _on_morph_frame(self, t: float) -> None:
-        label, a, b = self._morph_label, self._morph_from, self._morph_to
-        if label is None or a is None or b is None:
-            return
-        label.setGeometry(
-            int(round(a.x() + (b.x() - a.x()) * t)),
-            int(round(a.y() + (b.y() - a.y()) * t)),
-            int(round(a.width() + (b.width() - a.width()) * t)),
-            int(round(a.height() + (b.height() - a.height()) * t)))
-        label.setWindowOpacity(max(0.0, 1.0 - t))
-
-    def _on_morph_finished(self) -> None:
-        label, self._morph_label = self._morph_label, None
-        if label is not None:
-            label.hide()
-            label.deleteLater()
+    # 曾用方案：把切换**前**的画面铺在一个 `Qt.ToolTip` 级窗口上（工具提示窗口
+    # 天然不吃鼠标、不抢焦点、不进任务栏），让它连续缩放+淡出，露出下面已切换
+    # 好的真窗口 —— 观感就是窗口在长大/缩小。
+    # ⛔ 废弃原因：真机上点「还原」被 showFullScreen/showNormal 阻塞卡死，
+    #    进程内三种复现路径都测不出来，先行方案 _begin_window_morph 等 4 个
+    #    方法与 _WINDOW_MORPH 总开关已整体删除。现行方案见 _win_geo_morph
+    #    （退出全屏的真窗口补间）与 _begin_window_cover（od55 覆盖层）。
 
     def _reveal_window(self, from_alpha: float, duration: int = 150) -> None:
         """从不透明度 from_alpha 淡到 1.0（打开软件 / 最大化 / 还原用）。
@@ -3337,7 +3263,7 @@ class MainWindow(QMainWindow):
         """对**真窗口**做几何补间（退出全屏用）：从满屏矩形连续缩到普通矩形。
 
         用户 2026-11-01：「还原还是没有动画」—— 之前的 opacity 淡入不是
-        "位置/尺寸连续变化"。快照覆盖层方案（_WINDOW_MORPH）会被
+        "位置/尺寸连续变化"。更早的快照覆盖层方案（见上方历史记录）会被
         showFullScreen/showNormal 阻塞卡住 = 闪，已弃用；这里直接对真窗口
         setGeometry：状态已落地（showNormal 已返回），剩下的只是画面在缩。
         ⛔ 补间期间 ``_geo_animating=True``：_remember_normal_geometry 不记
@@ -3392,7 +3318,6 @@ class MainWindow(QMainWindow):
             self._sync_fullscreen_padding()
             self._fs_rect = (self.screen().geometry() if self.screen()
                              else QRect(self.geometry()))
-            self._fs_target = None
             self._refresh_caption_ui()
             for delay in (180, 600):
                 self._schedule_verify(delay)
@@ -4693,7 +4618,6 @@ class MainWindow(QMainWindow):
         self._morph_unfreeze()
         self._geo_animating = False
         self._fs_animating = False      # 连点最大化：上一段进全屏补间到此作废
-        self._fs_target = None
         self._fs_left_rect = None
         # 开屏期间（main.py 设 `_skip_startup_anim`）：跳过所有启动动画，
         # 直接把窗口摆成全屏 —— 开屏盖着看不出来，也省掉 260ms 补间/淡入的
@@ -6931,17 +6855,26 @@ class MainWindow(QMainWindow):
         if not animations_enabled():
             bar.setValue(target)
             return
-        if self._rx_scroll_tween is None:
-            self._rx_scroll_tween = Tween(180, out_cubic, self._on_rx_scroll,
-                                          parent=self)
-        # 起点是**当前值**，随数据不断改向也不会"咔"一下（可打断）。
-        self._rx_scroll_tween.start(bar.value(), target, 180)
+        self._rx_scroll_smooth(target)
 
     def _on_rx_scroll(self, value) -> None:
         try:
             self.txt_rx.verticalScrollBar().setValue(int(round(value)))
         except RuntimeError:
             pass
+
+    def _rx_scroll_smooth(self, target: int, duration: int = 180) -> None:
+        """懒建接收区滚动补间并从**当前值**滚到 target（out_cubic，可随时打断）。
+
+        「跟随到底」与「暂停恢复追底」共用同一条补间：起点取当前值，随数据
+        不断改向也不会"咔"一下；``duration`` 只决定这一段的时长，缓动曲线、
+        回调与目标值取整方式完全一致。
+        """
+        if self._rx_scroll_tween is None:
+            self._rx_scroll_tween = Tween(180, out_cubic, self._on_rx_scroll,
+                                          parent=self)
+        self._rx_scroll_tween.start(
+            self.txt_rx.verticalScrollBar().value(), target, duration)
 
     def _flush_paused_frames(self) -> None:
         """恢复滚动：把暂停期间攒下的帧一次性刷进接收区，然后追底。
@@ -7079,10 +7012,7 @@ class MainWindow(QMainWindow):
         #    影响落点（视口变高只会让 maximum 变小，target 在它下面，不会被夹）。
         smooth = animations_enabled() and abs(bar.value() - target) >= 3
         if smooth:
-            if self._rx_scroll_tween is None:
-                self._rx_scroll_tween = Tween(180, out_cubic, self._on_rx_scroll,
-                                              parent=self)
-            self._rx_scroll_tween.start(bar.value(), target, 200)
+            self._rx_scroll_smooth(target, 200)
         else:
             if self._rx_scroll_tween is not None:
                 self._rx_scroll_tween.stop()
@@ -7299,14 +7229,9 @@ class MainWindow(QMainWindow):
         # 整行底色只是把"就是这一行"指出来）。
         cursor = QTextCursor(block)
         cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
-        fmt = QTextCharFormat()
         fill = QColor(qcolor("temp_warn"))
         fill.setAlpha(ALERT_FILL_ALPHA)
-        fmt.setBackground(fill)
-        selection = QTextEdit.ExtraSelection()
-        selection.cursor = cursor
-        selection.format = fmt
-        self._alert_selection = selection
+        self._alert_selection = self._make_selection(cursor, fill)
         self._alert_cursor = cursor
         self._alert_text = block.text()
         self._apply_extra_selections()
@@ -8050,10 +7975,6 @@ class MainWindow(QMainWindow):
                 style.polish(lbl)
                 lbl.update()
         self._place_soc()
-
-    def _set_soc_text(self, text: str, state: str) -> None:
-        """兼容旧调用：只设主标签。新代码走 :meth:`_set_soc_parts`。"""
-        self._set_soc_parts(("", text, "", ""), state)
 
     def _place_soc(self) -> None:
         """把「工况 / min / max / 总电压」当成**一组**钉在底栏正中央。

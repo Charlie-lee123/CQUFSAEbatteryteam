@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 import app_log
-from version import REPO_URL, VERSION
+from version import VERSION
 
 DLC_API = 1
 _ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{2,47}$")
@@ -112,8 +112,6 @@ class PluginInfo:
     id: str
     name: str
     version: str
-    summary: str
-    homepage: str
     entry: str
     path: Path                 # manifest.json 所在目录（即 Python 包目录）
     root: Path                 # 该插件所属的 dlc 根目录
@@ -182,8 +180,6 @@ def discover() -> list[PluginInfo]:
                 id=str(plugin_id),
                 name=str(raw.get("name") or plugin_id),
                 version=str(raw.get("version") or "?"),
-                summary=str(raw.get("summary") or ""),
-                homepage=str(raw.get("homepage") or f"{REPO_URL}/releases"),
                 entry=str(raw.get("entry") or plugin_id),
                 path=manifest.parent,
                 root=root,
