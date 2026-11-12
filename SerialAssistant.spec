@@ -126,11 +126,6 @@ a = Analysis(
         # 的 numpy 可分离卷积替代；帧序列路径因 *_frames/ 被过滤在打包版不可达，
         # splash_anim 里剩余 cv2 调用点均已加 `cv2 is None` 防御性降级。
         'cv2',
-        # ---- 2026-11 瘦身：砍掉 numpy（exe -23.9MB：OpenBLAS 19.6 + pyd 4.3）----
-        # 它只为「高斯模糊」一个用途服务：splash_motion 的可分离卷积。缺 numpy 时
-        # splash_motion._gaussian 留痕后走 _gaussian_qt 纯 Qt 降采样近似，开屏仍
-        # 正常播放；splash_anim 的 numpy import 已跟 cv2 绑定（cv2=None 不 import）。
-        'numpy',
         'tkinter', 'unittest', 'pydoc', 'doctest', 'xmlrpc',
         'distutils', 'setuptools', 'pip',
         # ---- 2026-10-24（2.4 二次瘦身；每条都查过 import 链）----
