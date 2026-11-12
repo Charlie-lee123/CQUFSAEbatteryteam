@@ -3974,6 +3974,37 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
             cap_pitches |= {b - a for a, b in zip(dots, dots[1:])}
         assert len(cap_pitches) == 1, f"封顶折行后列距不一致：{capped_lines!r}"
 
+        # ---- 1e2) 位数不足的电压值（用户 2026-11-12 截图："为什么现在读取的
+        #     电压数据没有对齐，电压数据是四位数，不够的添零"）。
+        #     真机固件是 ``printf("%d.%d", 序号, mV)`` —— **一个零都不补**，所以
+        #     读到 402 mV 的电芯时设备发出来就是 "23.402"（比别的格少一格），
+        #     整行后半段左移。修法：这类行也当电压数据行，值按既有约定**往左**
+        #     补到 4 位（与温度 "1.5" -> "1.05" 同一条路）。
+        short_row = align_indexes(
+            "Voltage4:\n13.3765 14.3769 23.402 24.5185 25.5346").split("\n")[1]
+        assert "23.0402" in short_row, \
+            f"位数不足的电压值没补到四位：{short_row!r}"
+        short_dots = [k for k, ch in enumerate(short_row) if ch == "."]
+        assert len({b - a for a, b in zip(short_dots, short_dots[1:])}) == 1, \
+            f"补零之后列距仍不等（没对齐）：{short_row!r}"
+        # ⛔ 补的是**左**边的零（402 mV），不是右边（那会变成 4020 mV 的健康电芯）
+        assert "23.4020" not in short_row, f"补到右边去了：{short_row!r}"
+        # 温度行落在电压段里时一个字符都不能动：补零会造出 "01.0017" 这种假数据
+        # （也躲不掉按 mV 阈值整片标绿）
+        assert align_indexes("Voltage1:\n1.17 2.17 3.19 4.20") == \
+            "Voltage1:\n1.17 2.17 3.19 4.20", "温度行被当成电压值补零了"
+        # 单个短值（0 号点那行）保持原样 —— 老用例，别被上面的放宽改坏
+        assert align_indexes("Voltage1:\n0.38") == "Voltage1:\n0.38"
+        # "标题与数据同一行"的老固件写法（rx_export 模块注释里明确支持）不是
+        # 纯数据行，走 _pad_line —— 那一支也要把位数不足的值补到 4 位，否则
+        # 同一种数据"标题独占一行"时对齐、"标题和数据同行"时错位。
+        assert "02.0425" in align_indexes("Voltage1:  01.3858  02.425  03.3850"), \
+            align_indexes("Voltage1:  01.3858  02.425  03.3850")
+        # 比 4 位还长的 token 不是 mV 值（16 位 ADC 最大 6553 mV）：不补、不裁，
+        # 免得"改动接收到的数据内容"（用户 2026-10-24 点名）
+        assert align_indexes("Voltage1:\n1.38111 2.3765") == \
+            "Voltage1:\n1.38111 02.3765"
+
         # ---- 1f) 半行缓发（用户 2026-10-11 截图：分包把一行劈成两帧，出现
         #     "Over Vol"/"tage" 这种莫名其妙的换行）。没以换行收尾的半行要先
         #     攒住，等下一批接上再整行排版显示。
@@ -4464,6 +4495,22 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
         # 采集区会整片被标绿（用户报的"标绿的区间不能到温度采集部分去"）。
         high_t, low_t = value_spans(" 1.22   2.22", 3750, 3800)
         assert high_t == [] and low_t == [], (high_t, low_t)
+        # ⚠️ 2026-11-12：位数**不足**的电压值（坏电芯 425 mV 发出来是 "02.425"）
+        # 必须照常判红/绿 —— 以前它连颜色都不上，"定位最近异常"也跳不到它，
+        # 一颗欠压到 425 mV 的电芯在界面上完全隐形。判据是"这一段里出现过
+        # 正好 4 位的值"（_volt_block），所以真温度行仍然一个都不判。
+        # ⛔ 样本必须用**真 3 位**的 "2.425"：写成 "2.0425" 是 4 位小数，改之前就判得出来，
+        #    这条断言等于什么都没测（2026-11-12 独立验收当场抓出来的）。
+        _h, _l = value_spans(" 1.3858   2.425   3.3850", 3100, 4600)
+        assert _l == [(10, 5)] and _h == [], (_h, _l)
+        assert value_spans(" 1.17   2.17", 3100, 4600) == ([], []), \
+            "温度值被按 mV 判了（会整片标绿）"
+        # 反向：电压行里的位数不足值不能再被按温度判成"低温"标黄
+        assert temp_error_spans(" 1.3858   2.425   3.3850", 20, 60) == [], \
+            "电压行被按温度阈值标黄了"
+        # 冷天单数字温度（5℃ 发出来是 "1.5"）仍要判越界
+        assert temp_error_spans(" 1.5   2.25", 20, 60) == [(1, 3)], \
+            "5℃ 没被判成低于下限"
         assert bms_error_spans("xx BMS ERROR yy") == [(3, 9)]
         assert bms_error_spans("BMS OK") == []
 
@@ -5641,6 +5688,20 @@ def check_export_data(app: QApplication) -> None:
     assert rounds[0]["volt"][1] == [3848, 3847, 3846, 3845], rounds[0]["volt"][1]
     assert rounds[0]["temp"] == [[25, 26, 24, 25]], rounds[0]["temp"]
 
+    # 1b) 位数不足的值：设备是 ``printf("%d.%d")``（一个零都不补），读到 425 mV
+    #     的电芯就发 "2.425"。补零方向必须是**左**（0425 = 425 mV）—— 往右补会
+    #     读成 4250 mV 的**健康**电芯，把欠压故障藏起来（2026-11-12，固件同一帧
+    #     报的是 "4.23 Under Voltage"，判据 < 3100 mV，只有 425 成立）。
+    #     温度同理：单数字温度 "1.5" 是 5 ℃，不是 50 ℃。
+    sess_short = rx_export.Session()
+    sess_short.configure([3, 3], [2, 2])
+    sess_short.feed("Voltage1: 1.3765 2.425 3.5185\n")
+    sess_short.feed("Temperature1: 1.5 2.17\n")
+    sess_short.feed("BMS OK")
+    rs = sess_short.rounds()
+    assert rs and rs[0]["volt"][0] == [3765, 425, 5185], rs[0]["volt"][0]
+    assert rs[0]["temp"][0] == [5, 17], rs[0]["temp"][0]
+
     # 2) CSV：一行 = 一轮里的一个模组；电芯写 mV 整数
     os.makedirs("_check", exist_ok=True)
     out_csv = os.path.join("_check", "selftest_export.csv")
@@ -6142,6 +6203,12 @@ def check_protocol_rules(app: QApplication) -> None:
         assert result["cells"] == [[3851, 3849, 3850], [3848, 3847]], result["cells"]
         assert result["temps"] == [[25, 26]], result["temps"]
         assert result["errors"] == 1, f"BMS Error 应计 1 处，实得 {result['errors']}"
+        # ⚠️ 2026-11-12：位数不足的电芯不能被**静默丢掉**（固件 "%d.%d" 直出，
+        # 425 mV 的死芯发出来是 "2.425"）。以前 cell_value 卡死 \d{4}，试跑会
+        # 把 3 个电芯报成 2 个，用户以为"协议没问题 / 电芯少了"。
+        short = rx_protocol.sample_parse("Voltage1: 1.3851 2.425 3.3850")
+        assert short["cells"] == [[3851, 425, 3850]], short["cells"]
+        assert "3 个电芯" in short["note"], short["note"]
 
         # 3) 默认口径 = 改协议之前的硬编码：Voltage→电压段、Pack→其它段
         assert ui_highlight.section_of("Voltage1: 01.3851") == ui_highlight.SECTION_VOLT
@@ -6338,6 +6405,11 @@ def main() -> int:
     # ⛔ 取消选车必须走 select_vehicle("")：只写 custom/vehicle 镜像键没用
     #    （_load_store 优先认 vehicles JSON 里的 current，见 pin_rx_grid_defaults 的说明）。
     import customization as _cu_main
+    # ⛔ 车号选择也要还（2026-11-12 实测）：select_vehicle("") 写的是 vehicles
+    #    JSON 里的 current，**不在 QSettings 快照里** —— 下面那两次全局还原都
+    #    盖不到它，于是每跑一次自测，用户选的车就没了（同一天踩到两次：
+    #    强杀进程一次、正常跑完一次）。清空之前先记下，收尾时用正规入口切回去。
+    _saved_vehicle = _cu_main.current_vehicle()
     _cu_main.select_vehicle("")
     global_settings.sync()
     # ⛔ 历史文件也要隔离（2026-10-24 补）：各用例都会构造 MainWindow
@@ -6407,6 +6479,11 @@ def main() -> int:
     for key, value in global_snapshot.items():
         global_settings.setValue(key, value)
     global_settings.sync()
+    # 车号：必须走 select_vehicle（只写 custom/vehicle 镜像键没用，
+    # _load_store 优先认 vehicles JSON 里的 current）。放在**最后一次
+    # QSettings 还原之后**，否则镜像键又被覆盖回去。
+    if _saved_vehicle:
+        _cu_main.select_vehicle(_saved_vehicle)
 
     print(f"\n{len(CHECKS) - failed}/{len(CHECKS)} 项通过")
     return 1 if failed else 0

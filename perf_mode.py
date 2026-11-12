@@ -72,10 +72,13 @@ BMS_ERROR_LINE = re.compile(r"^\s*BMS\s+ERR", re.IGNORECASE)
 
 #: 采样 token：``19.3051``、``19.3051 X``（X = 设备自己标的坏点）。
 #: 前后都要卡住，别把 ``13.3184`` 吃成 ``3.3184``。
+#: ⚠️ 位数下限是 1 而不是 2（2026-11-12）：设备 ``printf("%d.%d")`` 不补零，
+#:    5 ℃ 的传感器发出来是 ``1.5``、4 mV 的死芯是 ``2.4`` —— 卡 2 位会把它们
+#:    整条漏掉（不参与中位数、也不被整流），假数据里留着一颗"没修过的"坏点。
 CELL_TOKEN = re.compile(
-    r"(?<!\S)(?P<idx>\d{1,3})\.(?P<val>\d{2,8})(?P<mark>\s+X)?(?=\s|$)")
+    r"(?<!\S)(?P<idx>\d{1,3})\.(?P<val>\d{1,8})(?P<mark>\s+X)?(?=\s|$)")
 TEMP_TOKEN = re.compile(
-    r"(?<!\S)(?P<idx>\d{1,2})\.(?P<val>\d{2,8})(?P<mark>\s+X)?(?=\s|$)")
+    r"(?<!\S)(?P<idx>\d{1,2})\.(?P<val>\d{1,8})(?P<mark>\s+X)?(?=\s|$)")
 
 PACK_V = re.compile(r"(?<![\w.])V\s*=\s*(-?\d+(?:\.\d+)?)")
 CV_MAX = re.compile(r"CVMax\s*=\s*(-?\d+)", re.IGNORECASE)
@@ -93,12 +96,13 @@ BMS_DETAIL = (
 
 
 def _digits(body: str, width: int) -> int:
-    """把小数部分按协议宽度取整（与 ``rx_protocol._values`` 同一口径）。"""
+    """把小数部分按协议宽度取整（与 ``rx_protocol._values`` / ``rx_export``
+    同一口径：位数不足**左**补零，``.425`` -> 425 mV，不是 4250）。"""
     body = body.lstrip(".")
     if not body:
         return 0
     try:
-        return int((body + "0" * width)[:width])
+        return int(body[:width].zfill(width))
     except ValueError:
         return 0
 

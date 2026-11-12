@@ -14,7 +14,7 @@ r"""协议规则：把"这段 BMS 文本怎么读"从硬编码里抽出来，做
   "schema": 1,
   "module_header": "\\s*Voltage\\d*\\s*:",          // 电压段标题（段边界/模组起点）
   "temp_header":   "\\s*Temperature\\d*\\s*:",      // 温度段标题
-  "cell_value":    "^(?P<idx>\\d+)(?P<val>\\.\\d{4})(?!\\d)",   // 电芯采样 token
+  "cell_value":    "^(?P<idx>\\d+)(?P<val>\\.\\d{1,4})(?!\\d)",   // 电芯采样 token
   "cell_width":    4,                               // 电压取几位（mV）
   "temp_value":    "^(?P<idx>\\d+)(?P<val>\\.\\d+)$",           // 温度采样 token
   "temp_width":    2,                               // 温度取几位（℃）
@@ -52,11 +52,16 @@ REQUIRED = ("module_header", "temp_header", "cell_value", "cell_width",
             "temp_value", "temp_width", "error_pattern")
 
 # 默认规则：与 ui_highlight 里原先的硬编码**逐字节等价**（见模块注释）。
+# ⚠️ 2026-11-12 唯一的一处偏离：``cell_value`` 的小数位数从 ``\d{4}`` 放宽成
+#    ``\d{1,4}``。真机固件是 ``printf("%d.%d", 序号, mV)``（一个零都不补），一颗
+#    425 mV 的坏电芯发出来是 ``2.425`` —— 卡死 4 位会把这一条**静默丢掉**，试跑
+#    出来的电芯数比实际少一个，用户会以为"协议没问题 / 电芯少了"。
+#    放宽后``_values`` 的**左**补零负责把它读成 425（不是 4250），见那个函数的注释。
 DEFAULT = {
     "schema": SCHEMA,
     "module_header": r"\s*Voltage\d*\s*:",
     "temp_header": r"\s*Temperature\d*\s*:",
-    "cell_value": r"^(?P<idx>\d+)(?P<val>\.\d{4})(?!\d)",
+    "cell_value": r"^(?P<idx>\d+)(?P<val>\.\d{1,4})(?!\d)",
     "cell_width": 4,
     "temp_value": r"^(?P<idx>\d+)(?P<val>\.\d+)$",
     "temp_width": 2,
@@ -225,7 +230,12 @@ def sample_parse(text: str, profile: dict | None = None) -> dict:
 
 
 def _values(text: str, pattern: re.Pattern, width: int) -> list[int]:
-    """从一段文字里按 token 取采样值：``val`` 去掉点号后取前 ``width`` 位。"""
+    """从一段文字里按 token 取采样值：``val`` 去掉点号后取前 ``width`` 位。
+
+    位数不足往**左**补零（``.425`` -> 0425 = 425 mV），与 ``rx_export._value_of``、
+    ``perf_mode._digits``、``ui_highlight`` 的补零方向保持一致 —— 往右补会把
+    425 mV 的坏电芯读成 4250 mV 的健康电芯（2026-11-12 修，见 _value_of 的注释）。
+    """
     out: list[int] = []
     for token in text.split():
         match = pattern.fullmatch(token)
@@ -237,7 +247,7 @@ def _values(text: str, pattern: re.Pattern, width: int) -> list[int]:
         if not body:
             continue
         try:
-            out.append(int((body + "0" * width)[:width]))
+            out.append(int(body[:width].zfill(width)))
         except ValueError:
             continue
     return out
