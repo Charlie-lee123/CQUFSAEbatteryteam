@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
 
@@ -107,8 +107,8 @@ def _blur_pixmap(pix: QPixmap, sigma: float = _SIGMA_LOGICAL) -> QPixmap:
 class PerfModeOverlay(QWidget):
     """盖在主窗口上的一层提示。``play()`` 一次跑完整段动画。"""
 
-    CARD_W = 382
-    CARD_H = 134
+    CARD_W = 300
+    CARD_H = 90
     HOLD_MS = 1150
 
     def __init__(self, parent: QWidget) -> None:
@@ -237,38 +237,8 @@ class PerfModeOverlay(QWidget):
         painter.setPen(QPen(qcolor("line_strong"), 1.0))
         painter.drawRoundedRect(rect, 20.0, 20.0)
 
-        left = rect.left() + 26.0
-        top = rect.top() + 24.0
-
-        # 状态点（黑白灰系统里靠"实心/空心"区分状态，不引第三种彩色）
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(qcolor("ink") if self._entering
-                         else QColor(qcolor("ink_3")))
-        painter.drawEllipse(QPointF(left + 4.0, top + 10.0), 4.0, 4.0)
-
+        # 卡片里只保留这一行字：没有任何描述、英文标注、状态点或分隔线。
+        text = "进入性能模式" if self._entering else "退出性能模式"
         painter.setPen(qcolor("ink"))
-        painter.setFont(ui_font(14.5, QFont.Weight.DemiBold))
-        painter.drawText(QRectF(left + 18.0, top - 2.0,
-                                rect.width() - 60.0, 26.0),
-                         Qt.AlignmentFlag.AlignLeft
-                         | Qt.AlignmentFlag.AlignVCenter, "性能模式")
-
-        painter.setPen(qcolor("ink_3", 180))
-        painter.setFont(ui_font(8.0))
-        painter.drawText(QRectF(rect.right() - 170.0, top - 2.0, 144.0, 26.0),
-                         Qt.AlignmentFlag.AlignRight
-                         | Qt.AlignmentFlag.AlignVCenter, "PERFORMANCE")
-
-        line_y = top + 40.0
-        painter.setPen(QPen(qcolor("line_strong"), 1.0))
-        painter.drawLine(QPointF(left, line_y),
-                         QPointF(rect.right() - 26.0, line_y))
-
-        painter.setPen(qcolor("ink_2"))
-        painter.setFont(ui_font(11.0))
-        text = ("已开启 · 数据展示切换为稳定视图" if self._entering
-                else "已关闭 · 数据展示恢复原始视图")
-        painter.drawText(QRectF(left, line_y + 12.0,
-                                rect.width() - 52.0, 24.0),
-                         Qt.AlignmentFlag.AlignLeft
-                         | Qt.AlignmentFlag.AlignVCenter, text)
+        painter.setFont(ui_font(15.0, QFont.Weight.DemiBold))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)

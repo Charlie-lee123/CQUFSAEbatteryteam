@@ -2850,7 +2850,7 @@ class MainWindow(QMainWindow):
 
     def _on_escape(self) -> None:
         # 接收区展开优先：那是"更重"的状态，用户按 Esc 期待的是退出它。
-        # 其次是窗口全屏（软件本身盖任务栏的全屏）；搜索条最后收。
+        # 其次是窗口铺满（盖任务栏的全屏 / 留任务栏的最大化）；搜索条最后收。
         if self._expanded:
             self._collapse_receive()
             return
@@ -2861,8 +2861,39 @@ class MainWindow(QMainWindow):
             # 原先这里什么都不做 —— 窗口会自己长完全屏，Esc"失灵"一次。
             self._reverse_enter_to_normal()
             return
-        if self.isFullScreen():
-            # 普通几何平时由 _remember_normal_geometry 持续记忆（在全屏状态
+        if self._is_filled():
+            # ⛔⛔ keep 模式（保留任务栏）出口对称：入口 startup_fullscreen 的
+            #    keep 早退分支**故意不播** S2 覆盖层（它按 isFullScreen 设计，套到
+            #    最大化态会错位）。出口也必须同样跳过 —— 直接 showNormal + 落位，
+            #    ⛔ 不走 _fresh_snapshot_pixmap / _begin_window_cover /
+            #    _run_window_cover，否则会多播一段「全屏版式快照缩放」，真机上
+            #    任务栏真实存在，错位/露边缘直接可见。default(keep=False) 完全
+            #    走下面原 S2 覆盖层路径，逐字不变。
+            if self._keep_taskbar():
+                self._finish_window_cover()      # 幂等清掉可能残留的覆盖层
+                self._fs_animating = False
+                self._want_fullscreen = False
+                self._pending_restore_fs = False
+                self._fs_rect = None
+                self._fs_left_rect = None
+                self._verify_token += 1          # 作废启动时排的延迟核对
+                self._state_ts = time.monotonic()
+                # 复用 _do_restore 的落位语义：showNormal 后落回 _normal_geometry
+                # （keep 模式进最大化前 startup_fullscreen:4620 已记忆，必有值；
+                # 极端边界为 None 时 showNormal 自身会恢复 Qt 记的最大化前几何）。
+                self._expect_normal = True
+                try:
+                    self.showNormal()
+                    if (self._normal_geometry is not None
+                            and QRect(self.geometry()) != QRect(self._normal_geometry)):
+                        self.setGeometry(self._normal_geometry)
+                finally:
+                    self._expect_normal = False
+                self._sync_fullscreen_padding()
+                self._set_corner_preference(int(self.winId()), round_=True)
+                self._refresh_caption_ui()
+                return
+            # 普通几何平时由 _remember_normal_geometry 持续记忆（在铺满状态
             # 调 saveGeometry 存下来的是满屏矩形，不能用），直接退出即可
             # ⚠️ 先把"想要全屏"降下来：启动时排的那两次延迟核对可能还没跑，
             # 不降的话它会把用户刚退出的窗口又拽回全屏。
@@ -3047,6 +3078,26 @@ class MainWindow(QMainWindow):
         if cur != QRect(target):
             self._win_geo_morph(cur, QRect(target))
 
+    # ------------------------------------------- 「最大化保留任务栏」模式判定
+    #
+    # 用户开关「最大化时保留任务栏」（customization.maximize_keep_taskbar，默认
+    # 关=老行为）。打开后"最大化"从 showFullScreen（整窗盖任务栏）改成标准
+    # showMaximized（铺满工作区、留任务栏）。下面两个 helper 是所有模式分叉的
+    # 唯一入口 —— ⛔ 别在别处散写 customization.get / isFullScreen 判断。
+    def _keep_taskbar(self) -> bool:
+        """最大化时是否保留任务栏（设置开关，默认 False=盖任务栏老行为）。"""
+        return bool(customization.get("maximize_keep_taskbar"))
+
+    def _is_filled(self) -> bool:
+        """当前是否处于「铺满态」。
+
+        keep_taskbar 模式下铺满态是 isMaximized（留任务栏），否则是 isFullScreen
+        （盖任务栏）。⛔ 只用于「判断是否已铺满」的语义点；查询 Qt 真实全屏状态
+        的点（如 _bg_is_fs 快照标记、_enforce_native_fullscreen 内部）仍应直接
+        用 isFullScreen()，不要替换。
+        """
+        return self.isFullScreen() or (self._keep_taskbar() and self.isMaximized())
+
     def _toggle_fullscreen(self) -> None:
         """自绘标题栏中间那颗键：全屏（铺满+藏任务栏）⇄ 普通窗口。
 
@@ -3068,10 +3119,12 @@ class MainWindow(QMainWindow):
                 # 连点：还原补间在途 → 折返长大。startup_fullscreen 本就从
                 # **当前矩形**起跑（几何连续），直接复用。
                 self.startup_fullscreen()
-            elif self.isFullScreen():
+            elif self._is_filled():
                 # 2026-11-02 用户第七轮：「算了，分屏状态下点击右上角最大化还是恢复成
-                # 整个软件最大化」—— 分屏态不再切成接收区最大化，仍走整窗全屏
+                # 整个软件最大化」—— 分屏态不再切成接收区最大化，仍走整窗铺满
                 # （startup_fullscreen 内部会先 _leave_snap_zoom 还原分屏藏起的卡片）。
+                # _is_filled：盖任务栏模式=全屏、留任务栏模式=最大化，两者都按"退出铺满"
+                # 复用 _on_escape（它内部已按 _is_filled 判定），进入则 startup_fullscreen。
                 self._on_escape()
             else:
                 self.startup_fullscreen()
@@ -3822,7 +3875,8 @@ class MainWindow(QMainWindow):
         """标题栏中间那颗键跟着窗口状态换面孔（最大化 ⇄ 还原）+ 刷新提示语。"""
         bar = getattr(self, "_caption_bar", None)
         if bar is not None:
-            bar.set_maximized(self.isFullScreen() or self._fs_animating)
+            # 留任务栏模式下铺满态是 isMaximized，标题栏同样要显示"还原"图标
+            bar.set_maximized(self._is_filled() or self._fs_animating)
 
     def _remember_normal_geometry(self) -> None:
         """窗口处于**普通态**时持续记忆几何 —— 退出全屏/还原展开要靠它。
@@ -4287,8 +4341,10 @@ class MainWindow(QMainWindow):
                     f"[restore] 从最小化还原：isFullScreen={self.isFullScreen()} "
                     f"isMaximized={self.isMaximized()} state={state} "
                     f"want_fs={self._want_fullscreen} card_pad={self._card_pad}")
+                # ⛔ 保留任务栏模式：从任务栏还原后系统自己会回 Maximized（留任务栏），
+                #    不需要"转真全屏 / 重钉 / 延迟核对"这套（会把任务栏又盖掉）。
                 if (self._want_fullscreen and not self.isMaximized()
-                        and not self.isFullScreen()):
+                        and not self.isFullScreen() and not self._keep_taskbar()):
                     # ⚠️ 还原这 220ms 里窗口是"普通态"，但用户要的是全屏：先把
                     #    _pending_restore_fs 置真让 padding 收 0（避免卡片阴影 3px
                     #    被当成四周缝），startup_fullscreen 真正落地后再清掉。
@@ -4298,10 +4354,10 @@ class MainWindow(QMainWindow):
                 #    （200% DPI 还原常把标志残留成 True、窗口其实没铺满），只要用户
                 #    仍想要全屏就立刻重钉。延迟一拍等窗口上屏，避免被 DWM/Qt 吞。
                 if (self._want_fullscreen and not self._expect_normal
-                        and not self.isMinimized()):
+                        and not self.isMinimized() and not self._keep_taskbar()):
                     QTimer.singleShot(30, self._enforce_native_fullscreen)
                 QTimer.singleShot(80, self._sync_fullscreen_padding)
-                if self._want_fullscreen:
+                if self._want_fullscreen and not self._keep_taskbar():
                     self._schedule_verify(260)
             # 系统直接**改小**全屏窗口（Win+方向键 / Snap 面板 / 拖标题栏到边缘）：
             # 这不是我们的退全屏路径（那条走 _on_escape + _win_geo_morph，且
@@ -4327,8 +4383,11 @@ class MainWindow(QMainWindow):
             #    原生最大化动画掐断（用户："最大化依旧没有动画"）。等原生动画
             #    落定（~220ms）再转全屏，观感是先连续长大、再补上任务栏那一截。
             # singleShot 派发：不在状态切换的回调里再切状态（会重入）。
+            # ⛔ 保留任务栏模式：Maximized 就是我们要的铺满态，绝不能再 220ms 后
+            #    调 startup_fullscreen 转成盖任务栏真全屏（实测 T=400ms 盖屏）。
             if (state & Qt.WindowState.WindowMaximized
-                    and not self.isFullScreen() and not self._expect_normal):
+                    and not self.isFullScreen() and not self._expect_normal
+                    and not self._keep_taskbar()):
                 QTimer.singleShot(220, self.startup_fullscreen)
             # 全屏 ⇄ 普通的每一次切换都会走到这儿，标题栏那颗键的面孔在这里统一刷
             self._refresh_caption_ui()
@@ -4498,6 +4557,12 @@ class MainWindow(QMainWindow):
         返回值：``((左, 上, 右, 下), 显示器矩形)``（物理像素），非 win32 或无
         句柄时返回 None —— 供 ``_verify_fullscreen`` 把"到底铺没铺满"记进日志。
         """
+        # ⛔⛔「保留任务栏」模式：整段是"藏任务栏"逻辑（setWindowState(FullScreen)
+        #    + 钉 rcMonitor 整显示器），留任务栏模式下绝不能跑。本函数被 11 处调用，
+        #    一处短路即可全覆盖（含 _verify_fullscreen 的延迟重钉、changeEvent /
+        #    showEvent 的最小化还原兜底）。showMaximized 自己对齐 rcWork，无需钉屏。
+        if self._keep_taskbar():
+            return None
         # Qt 层重新声明全屏：连续的 showNormal → showFullScreen 存在**落地
         # 竞态**（前者的状态延迟落地会覆盖后者，offscreen 测试必现），不重新
         # 声明的话 isFullScreen 会悄悄变 False、任务栏跟着回来。
@@ -4592,6 +4657,10 @@ class MainWindow(QMainWindow):
         `_want_fullscreen` 置回真的那一瞬间抢跑，把窗口拽回全屏
         （自测「普通态没落下去」就是这么假挂的）。直接调用（token=None）不受限。
         """
+        # ⛔ 保留任务栏模式：没有任何"该全屏"的核对可做（最大化态已铺满工作区），
+        #    显式门禁，别依赖 _want_fullscreen（拨开关时会置真）。
+        if self._keep_taskbar():
+            return
         if token is not None and token != self._verify_token:
             return
         if (not self._want_fullscreen or self._expect_normal
@@ -4639,6 +4708,27 @@ class MainWindow(QMainWindow):
         self._geo_animating = False
         self._fs_animating = False      # 连点最大化：上一段进全屏补间到此作废
         self._fs_left_rect = None
+        # ⛔⛔「最大化保留任务栏」模式早退（用户开关 maximize_keep_taskbar）：
+        #    走标准 showMaximized —— 它自己就对齐工作区 rcWork（真机实测
+        #    vs_rcWork=[0,0,0,0]，任务栏可见），⛔ 不再调 _enforce_native_fullscreen
+        #    （会 setWindowState(FullScreen) + 钉 rcMonitor 盖任务栏）、不排
+        #    _schedule_verify（会延迟重钉）、不播 S2 覆盖层（它按 isFullScreen 设计，
+        #    套到最大化态会错位）。系统原生最大化动画本身就是连续的，无需自定义补间。
+        #    ⚠️ 这条分支优先于下面的 _skip_startup_anim 分支：keep 是用户显式选择，
+        #    且两者都"不播动画直接摆位"，keep 分支更简洁。
+        if self._keep_taskbar():
+            self.showMaximized()
+            self._sync_fullscreen_padding()
+            self.raise_()
+            self.activateWindow()
+            # 开屏路径 opacity 可能是 0（淡入中），摆位后恢复 1.0（幂等）
+            self.setWindowOpacity(1.0)
+            self._fs_rect = (self.screen().availableGeometry() if self.screen()
+                             else QRect(self.geometry()))
+            self._fs_idle_pix = None
+            self._fs_idle_ts = 0.0
+            self._refresh_caption_ui()
+            return
         # 开屏期间（main.py 设 `_skip_startup_anim`）：跳过所有启动动画，
         # 直接把窗口摆成全屏 —— 开屏盖着看不出来，也省掉 260ms 补间/淡入的
         # 重排开销，把 GPU/CPU 让给开屏视频（用户 2026-11-03："感觉有点小卡"）。
@@ -4850,24 +4940,41 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(1500, self, self._start_snap_worker)
 
     def _apply_startup_maximized(self) -> None:
-        """设置面板里拨了「启动时最大化」→ 当场按新选择摆一次窗口。
+        """设置面板拨「启动时最大化」/「最大化时保留任务栏」→ 当场按新选择摆窗口。
 
-        不这么做的话用户得重启才看得到反馈（这个开关字面上只管"下次打开"，
-        但拨完能立刻看到变化更省事），关掉时复用 ``_on_escape`` 那条链 ——
-        它顺手把"想要全屏"降下来，且展开态优先收展开。
+        两个开关共用这**一个**重摆入口（⛔ 别拆成两套）：它们落盘后都由
+        _apply_settings_result 调到这里。不这么做用户得重启才看得到反馈。
 
-        ⛔「想要全屏」先严格跟随开关：无论当下是全屏还是普通态、收起还是展开，
-        标志位立刻等于配置。旧实现只在过渡分支里（startup_fullscreen /
-        _on_escape 内部）写它 —— 一旦因状态判断没进分支（例如窗口还卡在进全屏
-        动画途中 isFullScreen 已为真、或接收区正展开），标志位就停在旧值，
-        表现为「拨回开却没当场要全屏」、或关掉后仍被 _verify_fullscreen 钉回全屏。
+        ⛔「想要全屏」先严格跟随 startup_maximized 开关：无论当下是全屏还是普通态、
+        收起还是展开，标志位立刻等于配置。旧实现只在过渡分支里写它 —— 一旦因
+        状态判断没进分支（如窗口还卡在进全屏动画途中、或接收区正展开），标志位
+        就停在旧值，表现为「拨回开却没当场要全屏」或关掉后仍被重钉回全屏。
+
+        已铺满但「保留任务栏」实现方式与当前值不符时，原地换模式（切任务栏
+        出现/消失）：⛔ 不走 S2 覆盖层动画（一次性模式切换，播两段会打架）——
+          · 切到"留任务栏"：isFullScreen → showNormal + showMaximized；
+          · 切回"盖任务栏"：isMaximized → startup_fullscreen（它内部走 showFullScreen）。
+        ⛔ 切换路上 showNormal 会发 WindowStateChange，changeEvent 各钩子已按
+        _keep_taskbar 加门禁，不会被反钉回旧模式。
         """
         self._want_fullscreen = bool(customization.get("startup_maximized"))
         if self._want_fullscreen:
-            if not self.isFullScreen() and not self._expanded:
+            if self._is_filled():
+                # 已铺满：若当前实现方式与新 keep 值不符，原地换模式
+                keep = self._keep_taskbar()
+                if keep and not self.isMaximized():
+                    self.showNormal()
+                    self.showMaximized()
+                    self._sync_fullscreen_padding()
+                    self._fs_rect = (self.screen().availableGeometry()
+                                     if self.screen() else QRect(self.geometry()))
+                    self.setWindowOpacity(1.0)
+                elif not keep and not self.isFullScreen():
+                    self.startup_fullscreen()
+            elif not self._expanded:
                 self.startup_fullscreen()
         else:
-            if self.isFullScreen() or self._expanded:
+            if self._is_filled() or self._expanded:
                 self._on_escape()
         self._refresh_caption_ui()
 
@@ -4924,17 +5031,27 @@ class MainWindow(QMainWindow):
         # 大小（用户点名）。之前就是全屏 → 回全屏；之前是普通窗口 → 回原位。
         # 同样用**客户区矩形**（与 _remember_normal_geometry 一致），
         # saveGeometry/restoreGeometry 会被 DWM 的不可见边框带上偏移。
-        self._pre_expand_fullscreen = self.isFullScreen() or was_snap
+        # ⛔ keep 模式下"展开前铺满态"是 isMaximized（留任务栏最大化），用
+        #    _is_filled 统一判定；否则会把它误记成普通态、收起时错回普通窗口。
+        #    默认关模式 _is_filled()==isFullScreen()，老行为完全不变。
+        self._pre_expand_fullscreen = self._is_filled() or was_snap
         self._pre_expand_geometry = (None if self._pre_expand_fullscreen
                                      else self.geometry())
-        # ⚠️ showFullScreen **必须无条件调用**：收起后 isFullScreen() 会短暂
-        # 返回 True（状态标志没落地的窗口期），凭它跳过的话，紧跟着的卡片
-        # 显隐切换会让全屏状态悄悄落回普通态 —— 第二次展开就"失效"了。
-        # showFullScreen 幂等，重复调用无副作用。
-        self.showFullScreen()
+        # ⚠️ 铺满状态切换**必须无条件调用**：收起后状态标志会短暂残留 True
+        # （没落地的窗口期），凭它跳过的话紧跟着的卡片显隐切换会让铺满态悄悄
+        # 落回普通态 —— 第二次展开就"失效"了。幂等，重复调用无副作用。
+        # ⛔ keep 模式：用 showMaximized 代替 showFullScreen（保留任务栏），且
+        #    不调 _enforce_native_fullscreen（它是钉整屏盖任务栏的逻辑）——
+        #    showMaximized 自己对齐工作区，展开动画仍正常走。默认关模式两行
+        #    与原来逐字等价。
+        if self._keep_taskbar():
+            self.showMaximized()
+        else:
+            self.showFullScreen()
         self.raise_()
         self.activateWindow()
-        self._enforce_native_fullscreen()
+        if not self._keep_taskbar():
+            self._enforce_native_fullscreen()
         # ⛔ 动画必须在**窗口尺寸已经落地**之后才起跑，否则中途会整屏跳一次
         #    （见 _settle_window_state 的实测数据）。
         self._settle_window_state(True)
@@ -4988,15 +5105,20 @@ class MainWindow(QMainWindow):
         if app is None:
             return
         if fullscreen:
-            want = self.screen().geometry().size() if self.screen() else None
+            # ⛔ keep 模式：showMaximized 的客户区比工作区外溢 13px（已知限制），
+            #    用整屏尺寸判据永远等不到 → 退用状态判据（want=None）。
+            #    默认关模式仍走整屏尺寸判据，逐字不变。
+            want = (None if self._keep_taskbar()
+                    else (self.screen().geometry().size() if self.screen() else None))
         else:
             want = self._pre_expand_geometry.size() if self._pre_expand_geometry else None
         deadline = time.perf_counter() + timeout_ms / 1000.0
         while time.perf_counter() < deadline:
             got = self.size()
             if want is None:
-                # 没有明确目标尺寸：以"状态真的切过去了"为准
-                if self.isFullScreen() == fullscreen:
+                # 没有明确目标尺寸：以"状态真的切过去了"为准（_is_filled 兼容
+                # keep 模式的最大化铺满；默认关模式等价 isFullScreen）。
+                if self._is_filled() == fullscreen:
                     break
             elif got == want:
                 break
@@ -5698,10 +5820,16 @@ class MainWindow(QMainWindow):
     def _restore_window_state(self) -> None:
         """退出展开时把窗口状态还原到"点全屏按钮之前"，并**等它落地**。"""
         if self._pre_expand_fullscreen:
-            self.showFullScreen()
+            # ⛔ keep 模式：展开前是"留任务栏最大化"，收起就回最大化（留任务栏），
+            #    不钉整屏；默认关模式仍 showFullScreen + 钉屏，逐字不变。
+            if self._keep_taskbar():
+                self.showMaximized()
+            else:
+                self.showFullScreen()
             self.raise_()
             self.activateWindow()
-            self._enforce_native_fullscreen()
+            if not self._keep_taskbar():
+                self._enforce_native_fullscreen()
             self._settle_window_state(True)
             return
         # 回到普通窗口 —— "想要全屏"跟着降下来，别让延迟核对又把它拽回去
@@ -5763,7 +5891,7 @@ class MainWindow(QMainWindow):
 
     def _reassert_pre_expand_geometry(self) -> None:
         """收起动画结束后再确认一次窗口几何（见 _collapse_receive 的说明）。"""
-        if self._expanded or self.isFullScreen() or self._pre_expand_geometry is None:
+        if self._expanded or self._is_filled() or self._pre_expand_geometry is None:
             return
         if self.geometry() != self._pre_expand_geometry:
             self.setGeometry(self._pre_expand_geometry)
@@ -7557,30 +7685,54 @@ class MainWindow(QMainWindow):
         self._align_section = SECTION_OTHER
         self._stamp_anchor_seen = False
         self._stamp_last_monotonic = 0.0
-        text = "\n".join(rows)
-        # 性能模式下回放也要整流：历史文件可能是**开启之前**写的（里面还留着
-        # 坏点/BMS Error），不处理的话一打开历史就露馅。对已整流过的文件是
-        # 幂等的（见 perf_mode 的两条约束）。
-        if self._perf_on:
-            text = self._perf_sanitizer.feed(text)
-        # ⛔ 空行与实时**同一条规则**（`ui_highlight.gap_lines`）：每个
-        #    VoltageN: / TemperatureN: / BMS 状态、以及每个时间戳之上各空一行，
-        #    其它位置一个空行都没有。历史文件可能是老版本写的（那时 feed 把空行
-        #    全滤掉了），所以这里**按规则重建**而不是信文件 —— 新老记录一个样子。
-        try:
-            text = "\n".join(gap_lines(text.split("\n")))
-        except Exception as exc:            # noqa: BLE001 - 规整失败就用原行
-            app_log.error(f"历史回放空行规整失败: {exc}")
-        # 历史文件里存的是**接收区当时显示的那一行行**（feed 在 _emit_block 里、
-        # 排版之后才调，见那边的注释），本来就带补零/网格；这里再跑一遍
-        # align_indexes 只是为了兜住"手改过/跨版本/极老的文件"，对正常文件是
-        # 幂等的（逐字比过：4137 行整篇排版 == 逐轮排版）。
-        try:
-            text = align_indexes(text, section=SECTION_OTHER,
-                                 max_row_chars=self._rx_max_row_chars(),
-                                 **self._rx_grid_hints())
-        except Exception as exc:            # noqa: BLE001 - 排版失败就用原文
-            app_log.error(f"历史回放排版失败: {exc}")
+        # ---- 回放排版缓存（历史加载性能）--------------------------------
+        # 同一份历史行 + 同一套排版参数下，perf 整流 / gap_lines / align_indexes
+        # 是纯函数：实测 35.8 万行这三步要 ~2.3s（align_indexes 单项 2.1s）。
+        # 按"行内容指纹 + 排版参数"缓存成品文本，重复打开直接命中、跳过整段排版。
+        # ⛔ 只缓存**文本**，setPlainText/高亮/贴底等一步不少 —— 行数、时间戳、
+        #    着色、内容与未缓存时逐字一致（见 devtools/_probe_history_load.py 的
+        #    CONSISTENCY 哈希）。缓存随主窗实例存活，最多留 2 份（成品约 9MB/份）。
+        import hashlib
+        _h = hashlib.sha256()
+        for _ln in rows:
+            _h.update(_ln.encode("utf-8", "replace"))
+            _h.update(b"\n")
+        _hints = self._rx_grid_hints()
+        cache_key = (_h.hexdigest(), self._rx_max_row_chars(),
+                     tuple(sorted((k, str(v)) for k, v in _hints.items())),
+                     bool(self._perf_on))
+        _cache = getattr(self, "_replay_text_cache", None)
+        if _cache is None:
+            _cache = self._replay_text_cache = {}
+        text = _cache.get(cache_key)
+        if text is None:
+            text = "\n".join(rows)
+            # 性能模式下回放也要整流：历史文件可能是**开启之前**写的（里面还留着
+            # 坏点/BMS Error），不处理的话一打开历史就露馅。对已整流过的文件是
+            # 幂等的（见 perf_mode 的两条约束）。
+            if self._perf_on:
+                text = self._perf_sanitizer.feed(text)
+            # ⛔ 空行与实时**同一条规则**（`ui_highlight.gap_lines`）：每个
+            #    VoltageN: / TemperatureN: / BMS 状态、以及每个时间戳之上各空一行，
+            #    其它位置一个空行都没有。历史文件可能是老版本写的（那时 feed 把空行
+            #    全滤掉了），所以这里**按规则重建**而不是信文件 —— 新老记录一个样子。
+            try:
+                text = "\n".join(gap_lines(text.split("\n")))
+            except Exception as exc:            # noqa: BLE001 - 规整失败就用原行
+                app_log.error(f"历史回放空行规整失败: {exc}")
+            # 历史文件里存的是**接收区当时显示的那一行行**（feed 在 _emit_block 里、
+            # 排版之后才调，见那边的注释），本来就带补零/网格；这里再跑一遍
+            # align_indexes 只是为了兜住"手改过/跨版本/极老的文件"，对正常文件是
+            # 幂等的（逐字比过：4137 行整篇排版 == 逐轮排版）。
+            try:
+                text = align_indexes(text, section=SECTION_OTHER,
+                                     max_row_chars=self._rx_max_row_chars(),
+                                     **self._rx_grid_hints())
+            except Exception as exc:            # noqa: BLE001 - 排版失败就用原文
+                app_log.error(f"历史回放排版失败: {exc}")
+            if len(_cache) >= 2:                # 只留最近两份，别把内存堆满
+                _cache.clear()
+            _cache[cache_key] = text
         self.txt_rx.setPlainText(text)
         # 先把"塞进几千行"的第一帧重排+绘制付掉：下面要按真实的最大滚动值定位，
         # 布局没落地时 bar.maximum() 还是旧的 0，定位会落空。
@@ -8865,8 +9017,12 @@ class MainWindow(QMainWindow):
             # 电压/温度范围变了、或「高亮异常数据」开关拨过：高亮器重读配置
             # 并重刷整篇着色
             self._rx_highlighter.refresh()
-        if "startup_maximized" in custom_changes:
-            # 起手姿态当场摆一次（不然用户得重启才看得到自己改了什么）
+        if ("startup_maximized" in custom_changes
+                or "maximize_keep_taskbar" in custom_changes):
+            # 两个开关共用 _apply_startup_maximized 这一个重摆入口（⛔ 别写两套）：
+            # 落盘后按新值当场摆一次 —— 若当前已铺满且实现方式与新的 keep 值不符，
+            # 原地换模式，用户点确定即看到任务栏出现/消失。bool 开关不走实时预览
+            # 回调，落盘后走这里就够（不用重启）。
             self._apply_startup_maximized()
         if "soc_show" in custom_changes:
             # 只是收/放底栏那四枚标签（估算不停，见 _apply_soc_visible）
@@ -9125,9 +9281,9 @@ class MainWindow(QMainWindow):
             geometry = (self._pre_expand_geometry if not self._pre_expand_fullscreen
                         and self._pre_expand_geometry is not None
                         else self._normal_geometry)
-        elif self.isFullScreen():
-            # 全屏状态关窗：saveGeometry 存下来的是满屏矩形，下次启动窗口会
-            # 带着"满屏尺寸的普通态"起来 —— 存平时记住的普通几何
+        elif self._is_filled():
+            # 铺满状态（全屏/留任务栏最大化）关窗：saveGeometry 存下来的是满屏
+            # 矩形，下次启动窗口会带着"满屏尺寸的普通态"起来 —— 存平时记住的普通几何
             geometry = self._normal_geometry
         else:
             geometry = self.geometry()          # 客户区矩形，见 _remember_normal_geometry
@@ -9177,8 +9333,10 @@ class MainWindow(QMainWindow):
         #    DWM/Qt 吞掉；等 ~30ms 窗口可见了再钉，才真正落到物理矩形。
         if getattr(self, "_was_minimized", False):
             self._was_minimized = False
+            # ⛔ 保留任务栏模式：系统从任务栏还原自己就回 Maximized，无需原生全屏
+            #    覆盖（那会盖掉任务栏）。
             if (self._want_fullscreen and not self._expect_normal
-                    and not self.isMinimized()):
+                    and not self.isMinimized() and not self._keep_taskbar()):
                 app_log.info(
                     f"[restore] showEvent 兜底：_want_fullscreen={self._want_fullscreen} "
                     f"isFullScreen={self.isFullScreen()} isMaximized={self.isMaximized()} "

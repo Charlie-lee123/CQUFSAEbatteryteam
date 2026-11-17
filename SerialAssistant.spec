@@ -126,6 +126,17 @@ a = Analysis(
         # 的 numpy 可分离卷积替代；帧序列路径因 *_frames/ 被过滤在打包版不可达，
         # splash_anim 里剩余 cv2 调用点均已加 `cv2 is None` 防御性降级。
         'cv2',
+        # ---- 2026-11-18（v2.9）：numpy 核心必留，只砍产品不用的子包 ----
+        # ⛔ numpy **不能整体排除**：ui_settings._veh_blur_pixmap（车号过渡
+        #    毛玻璃，:e6c6a9d 后恢复的真高斯）是真调用点，splash_motion 的
+        #    高质量开屏模糊也走它。整体排除会让两处观感退化。
+        # ⛔ numpy.linalg 也不能排：numpy 顶层 import 就经
+        #    numpy.matrixlib.defmatrix → numpy.linalg（实测屏蔽即 ImportError），
+        #    _umath_linalg.pyd 与 OpenBLAS 必须留。
+        # 以下子包全量搜索无任何产品调用（devtools 里的调用点不进包）；已用
+        # meta_path 屏蔽后实跑 splash_motion 高斯 / ui_perf_mode 模糊 /
+        # ui_settings._veh_blur_pixmap 全部通过，才加入排除表。
+        'numpy.fft', 'numpy.random', 'numpy.testing', 'numpy.ma', 'numpy.f2py',
         'tkinter', 'unittest', 'pydoc', 'doctest', 'xmlrpc',
         'distutils', 'setuptools', 'pip',
         # ---- 2026-10-24（2.4 二次瘦身；每条都查过 import 链）----
@@ -148,8 +159,25 @@ a = Analysis(
 )
 
 # 见上面 _DROP_BINARIES：Analysis 之后再滤二进制（hook 会把它们抓满）。
+# ⛔ hook-numpy.py 的 collect_dynamic_libs("numpy") 会把 numpy 包里**所有** .pyd
+#    无条件收进来，光在 excludes 里点名 Python 子包不会带走这些 C 扩展。
+#    产品只用 core/linalg；random 整组 + fft 的 C 扩展从不加载（实测见 excludes
+#    注释）。按路径前缀滤，兼容 cp312 等 ABI 后缀变化。
+_NUMPY_DROP_BIN_PREFIXES = (
+    'numpy/fft/_pocketfft_umath',
+    'numpy/random/',
+)
+
+
+def _drop_numpy_binary(path: str) -> bool:
+    """只滤 numpy 未被产品使用的 C 扩展；core / OpenBLAS / linalg 全部保留。"""
+    normalized = str(path).replace('\\', '/').lower()
+    return any(normalized.startswith(p) for p in _NUMPY_DROP_BIN_PREFIXES)
+
+
 a.binaries = [entry for entry in a.binaries
-              if os.path.basename(entry[0]).lower() not in _DROP_BINARIES]
+              if os.path.basename(entry[0]).lower() not in _DROP_BINARIES
+              and not _drop_numpy_binary(entry[0])]
 # datas 里也要滤（translations 是目录形式进来的，按规范化路径前缀匹配）
 # ⛔ 2026-11-04：开屏动画改为**原生几何绘制**（splash_motion.py，设计稿只作参考），
 #    逐帧 JPEG 序列（972 张 ≈93MB，占 exe 解压量 41%）不再需要 —— 它是启动要

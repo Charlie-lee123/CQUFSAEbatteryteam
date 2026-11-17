@@ -332,7 +332,6 @@ class UpdateChecker(QObject):
 
     def start(self) -> None:
         self._pass = 0
-        self._layer = 0
         self._candidates = []
         self._layer = self._first_usable_layer()
         self._apply_proxy_layer()
@@ -364,13 +363,13 @@ class UpdateChecker(QObject):
                 QNetworkProxyQuery(QUrl("https://cdn.jsdelivr.net")))[0]
         except Exception:                 # noqa: BLE001 - 取不到就按"系统代理"跑
             return 0
-        if proxy.type() != 0 and proxy.hostName():   # 0 = NoProxy
-            if not self._proxy_alive(proxy.hostName(), proxy.port()):
-                # 死代理：本机 Clash 若是同一个端口也一并跳过，直接直连
-                clash = CLASH_PROXY
-                if (proxy.hostName(), int(proxy.port())) == (clash[0], clash[1]):
-                    return 2
-                return 1
+        if (proxy.type() != 0 and proxy.hostName()   # 0 = NoProxy
+                and not self._proxy_alive(proxy.hostName(), proxy.port())):
+            # 死代理：本机 Clash 若是同一个端口也一并跳过，直接直连
+            clash = CLASH_PROXY
+            if (proxy.hostName(), int(proxy.port())) == (clash[0], clash[1]):
+                return 2
+            return 1
         return 0
 
     # -- 代理分层 --------------------------------------------------------

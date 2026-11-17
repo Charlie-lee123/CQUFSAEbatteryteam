@@ -21,7 +21,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QPoint, QRect, QRectF, QSize, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QDate, QPoint, QRect, QSize, QThread, QTimer, Qt, Signal
 from PySide6.QtNetwork import (
     QNetworkAccessManager,
 )
@@ -1025,62 +1025,75 @@ class VehicleLibraryDialog(QDialog):
 
 
 # ---------------------------------------------------------------- 选车号动画
-# 用户定稿（2026-11-13「推倒重来」）：点击切换车号 / 改模组数时，把「车号以下、
-# 屏幕正在显示的设置区」整片抓成位图 → 真高斯模糊 → 以全不透明（α=1）盖在上方，
-# 立刻把设置区换成切换后的新数据（清晰、已就位），停留一小段后再让模糊层淡出
-# （α→0），露出清晰的新数据。不做任何让位 / 占位行 / 逐模组交叉淡入（那些都是
-# 上一代被推翻的方案）。
-_VEH_BLUR_TOTAL_MS = 520      # 总时长 = HOLD + FADE
-_VEH_BLUR_HOLD_MS = 220       # 整片模糊停留在 α=1 的时长（糊住旧画面）
-_VEH_BLUR_FADE_MS = 300       # α 从 1 → 0 的淡出时长（露出清晰新数据）
+# 用户定稿（2026-11-13「只留一次局部高斯模糊，不要别的动画」）：切车号 / 改模组数时，
+# 把「在线车辆库按钮行以下的可见设置区」抓成清晰快照 → 再算它的高斯模糊版 →
+# 两张图交给覆盖层（底层不透明清晰图垫底、模糊图按 α 叠在上面）→ 极短一拍后把
+# 模糊图淡出（α 1→0），画面从"模糊"平滑过渡到"清晰的新数据"。
+# ⛔ 数据在抓图前就已经一帧到位：没有逐帧数据动画、没有主时钟、没有占位行/逐模组淡入。
+# ⛔ 两条顺序铁律：抓图前必须 `_veh_settle_layout()` 把几何推到终态；淡出前必须
+#    `_veh_resync()` 确认快照仍等于真实画面（不等就重抓，否则交接会跳一下）。
+# ⛔⛔ 淡出全程**不依赖覆盖层底下是什么**：底层是不透明快照，窗口表面上残留的旧
+#    像素一律看不见。别再退回"只画一层半透明模糊图"的写法 —— 那就是这个 bug。
 _VEH_SIGMA_MAX = 24.0         # 高斯强度（物理像素；图像按 1/4 计算，内部 σ/4）
 _VEH_BLUR_DIV = 4             # 1/4 降采样：全分辨率 6 档 551ms → 1/4 仅 26~31ms
-_VEH_TICK_MS = 8              # 补间节拍（≈120Hz，与旧方案一致）
-
-
+_VEH_HOLD_ONCE_MS = 50        # 「糊一下」的停顿（ms）
+_VEH_FADE_MS = 650            # 淡出时长（ms）
 
 class _FadeOverlay(QWidget):
-    """盖在一小块区域上的位图（可带高斯档），由外部时钟逐帧喂帧。
+    """两层合成：底下铺一张**不透明**清晰快照，上面叠同一块的模糊图按 α 淡出。
 
-    为什么需要：车辆节切车号 / 改模组数时 `_rebuild_module_rows` 会把整组行控件
-    删掉重建。2026-11-07 用户定稿的观感是「其他元素慢慢下移留出位置，参数整块
-    高斯模糊淡入」，所以这里不只做 alpha：外部会把**预生成好的高斯位图**按当前
-    sigma 混着喂进来，本控件只负责 fillRect + drawPixmap。
+    ⛔⛔ 这个控件**绝不能用 ``WA_TranslucentBackground``**（2026-11-15 真机录屏定位）。
+    带着半透明属性时，这块子控件的内容会被**合成两遍** —— 一遍在正确位置，另一遍
+    整体再偏移一个「控件自己在父控件里的坐标」。于是屏幕上同时出现两套模组行：
+    一套模糊、一套清晰，位移量恰好等于 ``_below_vehicle_rect()`` 的左上角
+    （本机 rect=(24,62) → 录屏量到 (+24,+62)；用户那次 rect=(24,151) →
+    从他那张截图里量到 (+24,+151)）。左侧还会剩一列被裁掉一半的字符残端，
+    那正是"上面那一层"被"下面那一层"盖住右半边之后的残余。
 
-    ⛔ 不用 QGraphicsOpacityEffect / QGraphicsBlurEffect（项目铁律：控件级离屏
-       合成会抽搐）。模糊全部在 numpy 里预生成，绘制阶段只有两次 drawPixmap。
+    取证过程（可复跑）::
+
+        .venv\\Scripts\\python.exe devtools/_probe_popup_veh.py popup   # 复现
+        .venv\\Scripts\\python.exe devtools/_probe_popup_veh.py opaque  # 改不透明后消失
+
+    判据不是肉眼：把抓下来的屏幕帧按行投影取文字带，``mark`` 模式给覆盖层画洋红
+    边框 + 左上角绿标，洋红框包围区里出现**两串间隔相同的行**即复现；``opaque``
+    模式下只剩一串、且与 ``sf02_base.png``（抓图位图）逐行对齐。
+
+    其余几条也必须保持：
+      * **底层用 `CompositionMode_Source` 整块替换**（连 alpha 一起写）：`SourceOver`
+        会把清晰图和旧像素混一层，等于又回到"盖不住"。
+      * **α 在绘制阶段乘**（`setOpacity`）：改 palette 或预乘到颜色里会把位图整体染色。
+      * **不用 QGraphicsOpacityEffect / QGraphicsBlurEffect**（项目铁律：控件级
+        离屏合成会抽搐）。模糊在 numpy 里预生成，绘制阶段只有两次 drawPixmap。
+      * **不透明是安全的**：``self.grab(rect)`` 抓回来的位图实测 alpha 恒 255
+        （``t01_raw`` / ``sf01_base`` / ``sf02_base`` 三张逐像素统计 100% ==255），
+        所以这块控件整块盖住、底下什么都不露。⛔ 哪天抓图开始带 alpha，必须先把
+        base 压到不透明，否则又变成"盖不住"。
     """
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
-        self._items: list[tuple[QPixmap, float]] = []
+        self._base: QPixmap | None = None      # 清晰快照（不透明，垫底）
+        self._blur: QPixmap | None = None      # 同一块的模糊图（按 α 叠在上面）
         self._alpha = 0.0
-        self._bg: QColor | None = None
-        self._visible_h: int | None = None
-        # ⛔⛔ 2026-11-07 修「车号选择残影 / 淡化发灰」：覆盖层必须是**透明背景**，
-        #    否则 Qt 会先用 palette 的 Window 颜色把整块刷成不透明实底，再叠我们的
-        #    α 图 —— 淡化中途看到的是「实底 + 半透明图」而非「真行 + 半透明图」，
-        #    既发灰又会在真行与覆盖层错位时显得像残影。透明背景才能和底下内容做
-        #    真正的 α 合成。
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        # ⛔⛔ 这里原来是 WA_TranslucentBackground=True —— 就是"两套内容叠着"的根因。
+        #    带这个属性时本控件的内容会被合成两遍（正确位置 + 再偏移一个自身坐标），
+        #    屏幕上一套模糊一套清晰。改成不透明子控件后叠影消失。
+        #    WA_NoSystemBackground + WA_OpaquePaintEvent：告诉 Qt 别先用 palette
+        #    刷底、并且本控件每次都会把自己的每个像素画满（paintEvent 里
+        #    CompositionMode_Source 整块替换 base，确实画满了）。
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.hide()
 
-    def show_frame(self, items, rect: QRect, alpha: float,
-                   bg: QColor | None = None,
-                   visible_h: int | None = None) -> None:
-        """items = [(位图, 权重)]；bg 不为 None 时先整块铺底色。
-
-        visible_h 不为 None 时只画位图**顶部**这么多逻辑像素（源图按设备像素
-        等比裁剪、1:1 映射，不压扁），其余区域保持透明让底下真控件正常显示。
-        None = 整块全画（车号切换动画走这条）。
-        """
+    def show_frame(self, base, blur, rect: QRect, alpha: float) -> None:
+        """base = 清晰快照，blur = 同一块的模糊图；rect 用**面板坐标**（与抓图同一个）。"""
         try:
-            self._items = [(pix, float(w)) for pix, w in items if w > 0.004]
+            self._base = base
+            self._blur = blur
             self._alpha = max(0.0, min(1.0, float(alpha)))
-            self._bg = bg
-            self._visible_h = (None if visible_h is None
-                               else max(0, int(visible_h)))
             if self.geometry() != rect:
                 self.setGeometry(rect)
             if not self.isVisible():
@@ -1091,38 +1104,27 @@ class _FadeOverlay(QWidget):
             self.clear()
 
     def clear(self) -> None:
-        self._items = []
-        self._bg = None
+        self._base = None
+        self._blur = None
         self._alpha = 0.0
-        self._visible_h = None
         try:
             self.hide()
         except RuntimeError:
             pass
 
     def paintEvent(self, event) -> None:          # noqa: N802 (Qt 命名)
-        if not self._items and self._bg is None:
+        if self._base is None:
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        if self._bg is not None:
-            painter.fillRect(self.rect(), self._bg)
-        full_h = self.height()
-        for pix, weight in self._items:
-            painter.setOpacity(self._alpha * weight)
-            if self._visible_h is None or full_h <= 0:
-                painter.drawPixmap(self.rect(), pix)
-                continue
-            h = min(int(self._visible_h), full_h)
-            if h <= 0:
-                continue
-            # pix 是 2× 设备像素位图、self 是逻辑像素：按高度比换算 dpr，
-            # 只取源图顶部对应的一段，用三参数重载做 1:1 映射（⛔ 绝不把整张
-            # 5 行位图压扁到当前高度 —— 那会变形）。
-            dpr = pix.height() / float(full_h)
-            target = QRectF(0, 0, self.width(), h)
-            source = QRectF(0, 0, pix.width(), h * dpr)
-            painter.drawPixmap(target, pix, source)
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_Source)
+        painter.drawPixmap(self.rect(), self._base)
+        if self._blur is not None and self._alpha > 0.0:
+            painter.setCompositionMode(
+                QPainter.CompositionMode.CompositionMode_SourceOver)
+            painter.setOpacity(self._alpha)
+            painter.drawPixmap(self.rect(), self._blur)
 
 
 class SettingsDialog(QDialog):
@@ -1194,10 +1196,42 @@ class SettingsDialog(QDialog):
         self.form = form
         body_layout.addLayout(form)
 
+        # 控件登记表要**最前面**建好：下面「车辆节之后、主题之前」提前生成的
+        # 逐车显示行数（volt_rows/temp_rows）以及「界面材质」都要先登记进这两张表，
+        # 否则 _build_custom_section 会覆盖/漏登（见下方主题一节之前的说明）。
+        self._custom_widgets: dict[str, QWidget] = {}
+        self._custom_rows: dict[str, tuple[QLabel, QWidget]] = {}
+
         # 2026-11-03 用户：「不要喧宾夺主，把车辆信息放在设置界面的最上面」——
         # 车辆（电池箱）是整个接收区排版的**前提**，放第一屏；主题/材质/开屏动画
         # 都排到它后面。
         self._build_vehicle_section(form)
+
+        # 「电压数据行数」「温度采集数据行数」：从「定制功能」里提到**主题上面**
+        # （用户 2026-11-14 截图点名："这两个放在主题的上面"）。这两个是逐车显示行数
+        # （volt_rows / temp_rows，0~64，0=自动），和主题/材质是同一组"界面观感"前置项，
+        # 不该沉到最底下的定制功能节里。
+        # 存储/默认值仍在 customization 的 register_int("volt_rows"/"temp_rows")，
+        # 这里只是把它们那两行提前生成（_build_custom_section 会跳过这两个 key）。
+        for row_key in ("volt_rows", "temp_rows"):
+            spec = next((s for s in customization.specs()
+                         if s["key"] == row_key), None)
+            if spec is None:
+                continue
+            spin = ChevronSpinBox()
+            spin.setRange(int(spec["minimum"]), int(spec["maximum"]))
+            spin.setValue(int(customization.get(row_key) or 0))
+            if spec["tip"]:
+                spin.setToolTip(spec["tip"])
+            spin.setFixedWidth(SPIN_COLUMN_W)
+            # connect 在 setValue 之后 —— 建面板时那一次赋值不该被当成"用户改了"
+            # （与 _build_custom_section 的 else 分支同一口径）。
+            spin.valueChanged.connect(
+                lambda val, k=row_key: self._on_rows_hint_changed(k, int(val)))
+            row_label = self._label(spec["label"])
+            form.addRow(row_label, spin)
+            self._custom_widgets[row_key] = spin
+            self._custom_rows[row_key] = (row_label, spin)
 
         self.cmb_theme = ChevronComboBox()
         self.cmb_theme.setFixedWidth(FIELD_W)
@@ -1207,13 +1241,11 @@ class SettingsDialog(QDialog):
         self.cmb_theme.setCurrentIndex(index if index >= 0 else 0)
         form.addRow(self._label("主题"), self.cmb_theme)
 
-        # 定制项的控件登记表要在**这一节之前**建好：「界面材质」虽然是
-        # customization 注册表里的枚举项，但它的行跟着「材质强度」一起摆在上面
-        # （见文件头说明），会先于 _build_custom_section 登记进这两张表。
-        self._custom_widgets: dict[str, QWidget] = {}
         # 面板刚建好时每个控件的**显示值**（custom_values 的基准，见 _snapshot_custom_baseline）
         self._custom_baseline: dict[str, object] = {}
-        self._custom_rows: dict[str, tuple[QLabel, QWidget]] = {}
+        # ⚠️ _custom_widgets / _custom_rows 两张登记表已在 form 建好之后立刻初始化
+        #    （见上方）：逐车显示行数（volt_rows/temp_rows）与「界面材质」都会提前登记，
+        #    这里不再重复初始化，避免把已登记的条目清空。
 
         # 材质强度：0~100 无级，**两种材质共用**这一根滑杆。
         # 0 = 清玻璃（几乎只剩一层很淡的底色），100 = 材质拉满（各自特征最明确）。
@@ -1666,7 +1698,10 @@ class SettingsDialog(QDialog):
         share_row.addWidget(self.btn_vehicle_library)
         share_row.addStretch(1)
         # 单参 addRow：横跨两列（左边缘与本节其它行对齐）
-        form.addRow(self._row(share_row))
+        # ⛔ 留引用：切换车号的局部高斯模糊以**这一行的底边**为起点（用户
+        #    2026-11-13「在线车库以下的地方全部高斯模糊」），见 _below_vehicle_rect。
+        self._vehicle_share_field = self._row(share_row)
+        form.addRow(self._vehicle_share_field)
 
         # 模块还没落地时按钮置灰 + 说清原因（别让用户点了没反应）
         share = _vehicle_share_module()
@@ -1789,6 +1824,23 @@ class SettingsDialog(QDialog):
             # 动画时好时坏。行数没变时 `_veh_apply_rows` 会原地改值（不重建控件），
             # 所以这一条既有动画、又不会丢焦点/抖布局。机制见 _veh_start()。
             self._veh_start(cells, temps)
+        else:
+            # 结构没变（比如选车但模组结构一模一样 / 取消选车）→ 不走过渡，但
+            # `_sync_grid_params_visibility` 刚刚翻过「旧三件套」三行的显隐，布局
+            # 高度和滚动条夹位都变了。不在这里同步落位 + 整块重绘的话，滚动条要等
+            # 下一拍事件循环才夹位，屏幕上会留下旧一帧的行 = 用户说的「显示行数
+            # 没跟模组数据一起动」。这一条保证「一帧之内全部到位、无残影」。
+            body = self.form.parentWidget()
+            if body is not None:
+                # ⛔⛔ 这里**绝不许**再用 setUpdatesEnabled(False) 包住落位。
+                #    2026-11-14 实测（_check/_probe_trail.py）：这块面板是
+                #    WA_TranslucentBackground 的半透明 top-level，更新关闭期间
+                #    背板会**整块变透明** —— 截出来直接是桌面壁纸，开回来再
+                #    repaint() 也补不回来。od116 只在 `_veh_start` 里回退了这种
+                #    写法，**这一支漏下来了**，是彻头彻尾的冗余代码（用户
+                #    2026-11-14：「有冗余代码干扰啊，我觉得是」）。
+                self._veh_settle_layout(body)
+            self._veh_repaint_all()
 
     def _sync_grid_params_visibility(self) -> None:
         """网格参数二选一的**唯一判据**：接收区此刻真正吃哪一套，就只显示哪一套。
@@ -1923,12 +1975,12 @@ class SettingsDialog(QDialog):
         lay.addStretch(1)
         return holder
 
-    def _rebuild_module_rows(self, cells: list[int], temps: list[int],
-                             reserve: bool = False) -> None:
-        """重建「模组 1..N」逐行控件（每行：电芯数量：N 个 + 温度采集数量：N 个）。
+    def _rebuild_module_rows(self, cells: list[int],
+                             temps: list[int]) -> None:
+        """重建「模组 1..N」逐行控件（每行：电芯个数 + 温度采集个数）。
 
-        ``reserve=True``：建完立刻用 `setRowVisible(False)` 压成 0 高 —— 给
-        ``_veh_start`` 的过渡用（新行先藏起来，由占位行扛高度，P3 起点再显形）。
+        ⛔ 只在过渡的落位阶段里调用（`_veh_start` ① / 未选车路径），调用时屏幕上
+        要么盖着不透明快照、要么根本还没上屏 —— 中途不重建，避免用户看到行数跳变。
         """
         while self._module_rows:
             self._module_rows.pop()
@@ -1958,68 +2010,126 @@ class SettingsDialog(QDialog):
             label = self._label(f"Module {index + 1}")
             field = self._row(row)
             self.form.insertRow(self._module_row_base + index, label, field)
+            # ⛔⛔ 必须**当场 show()**：新建的控件默认是 hidden，而
+            #    ``QWidgetItem::isEmpty()`` 对隐藏控件返回 true —— 布局会把这 5 行
+            #    当成不存在**压成 0 高**，等事件循环里的 show 落地才长出来。
+            #    于是 ``_veh_start`` 抓图时主题还在旧位置，抓完才往下挪 5×46=230px，
+            #    淡出全程又是两套行错位（`_check/_probe_lag.py` 量到 delta=+230）。
+            #    显式 show 之后布局当场就按真实行高排，抓图即终态。
+            label.show()
+            field.show()
             self._module_rows.append((label, field))
-            if reserve:
-                self.form.setRowVisible(self._module_row_base + index, False)
         # 记下这次真正画上去的结构，供 _sync_vehicle_rows 判断"下次是否要重建"
         # （结构相同就跳过重建，避免选车时的布局跳变）。
         self._shown_cells = list(cells)
         self._shown_temps = list(temps)
 
     def _below_vehicle_rect(self) -> QRect:
-        """对话框坐标系下，车辆区以下、body 底部以上的整块**可见**区域。
+        """「在线车辆库」按钮行以下 → 「取消/确定」按钮栏以上的可见整块。
 
-        用于「切换车号时整片高斯模糊」覆盖层：只取当前屏幕可见的部分
-        （裁剪到滚动视口），与用户「屏幕正在显示的部分都高斯模糊」一致。
-        返回 body 局部坐标（与 body.grab / _FadeOverlay 一致）。
+        ⛔ 返回**面板（self）坐标**。抓图 ``self.grab(rect)`` 与覆盖层
+        ``setGeometry(rect)`` 用同一个 rect，全程一根坐标系。
+        ⛔ 千万别改成 ``body.mapTo(self, ...)``：body 是 QScrollArea 的内容控件，
+        滚动后带偏移（实测差 252px），会把糊层整体下移、直接盖住「确定」按钮。
         """
-        body = self.form.parentWidget()
-        if body is None:
+        sa = self.findChild(QScrollArea)
+        vp = sa.viewport() if sa is not None else None
+        if vp is None:
             return QRect()
+        # 构造期 / 旧布局可能还没有这一行：退回选车行，保证不抛异常。
+        anchor = getattr(self, "_vehicle_share_field", None)
+        if anchor is None:
+            anchor = self._vehicle_field
         try:
-            veh_bottom = self._vehicle_field.mapTo(
-                body, QPoint(0, self._vehicle_field.height())).y()
+            share_bottom = anchor.mapTo(
+                self, QPoint(0, anchor.height())).y()
+            vp_top_left = vp.mapTo(self, QPoint(0, 0))
+            vp_bottom = vp.mapTo(self, QPoint(0, vp.height())).y()
+            left = vp_top_left.x()
+            right = vp.mapTo(self, QPoint(vp.width(), 0)).x()
         except RuntimeError:
             return QRect()
-        region_bottom = body.height()
-        sa = self.findChild(QScrollArea)
-        if sa is not None:
-            vp = sa.viewport()
-            if vp is not None:
-                try:
-                    top_local = vp.mapTo(body, QPoint(0, 0)).y()
-                    bot_local = vp.mapTo(body, QPoint(0, vp.height())).y()
-                except RuntimeError:
-                    top_local = 0
-                    bot_local = region_bottom
-                veh_bottom = max(veh_bottom, top_local)
-                region_bottom = min(region_bottom, bot_local)
-        top = max(0, int(veh_bottom))
-        height = max(0, int(region_bottom - veh_bottom))
-        if height <= 0:
+        top = max(share_bottom, vp_top_left.y())
+        bottom = vp_bottom
+        root = self.layout()
+        if root is not None and root.count() > 0:
+            item = root.itemAt(root.count() - 1)
+            bar = item.geometry() if item is not None else None
+            if bar is not None and not bar.isEmpty():
+                bottom = min(bottom, bar.top())
+        if bottom <= top or right <= left:
             return QRect()
-        return QRect(0, top, body.width(), height)
+        return QRect(int(left), int(top), int(right - left), int(bottom - top))
 
     def _veh_blur_pixmap(self, pix: "QPixmap | None") -> "QPixmap | None":
-        """1/4 降采样 + 真高斯（与 splash_motion._gaussian 同口径），返回可直接拉伸绘制的小位图。
+        """高质量毛玻璃：块平均降采样 → 可分离真高斯 → 平滑放大 → 1:1 贴图。
 
-        失败返回 None（覆盖层那一段就直接跳过，不崩动画）。
+        ⛔ 不是「把小位图交给 drawPixmap 拉伸」：那样等于降分辨率，文字会糊成
+        马赛克、还带一层次级波纹（用户 2026-11-13「要高级的高斯模糊」）。
+        这里按 ``ui_perf_mode._blur_pixmap`` 已验证的口径：
+          ① **块平均**降采样（理想低通，比隔点抽样少一大截高频噪点）；
+          ② ``splash_motion._gaussian`` 可分离真高斯，σ 按降采样比换算；
+          ③ SmoothTransformation 平滑放大回**原尺寸**；
+          ④ 保持原 dpr，覆盖层 1:1 贴图（不再二次缩放）。
+        另外做一次轻微的亮度/去饱和，让糊层像毛玻璃而不是一张灰蒙蒙的图。
+        失败返回 None（覆盖层那一段直接跳过，不崩动画）。
         """
         if pix is None or pix.isNull():
             return None
         try:
-            small = pix.scaled(
-                max(1, pix.width() // _VEH_BLUR_DIV),
-                max(1, pix.height() // _VEH_BLUR_DIV),
-                Qt.AspectRatioMode.IgnoreAspectRatio,
-                Qt.TransformationMode.SmoothTransformation)
+            import numpy as np
             import splash_motion
-            blurred = splash_motion._gaussian(
-                small, _VEH_SIGMA_MAX / float(_VEH_BLUR_DIV))
-            if blurred is None or blurred.isNull():
+            from PySide6.QtGui import QImage
+
+            dpr = pix.devicePixelRatioF() or 1.0
+            image = pix.toImage().convertToFormat(
+                QImage.Format.Format_RGBA8888)
+            width, height = image.width(), image.height()
+            if width < 8 or height < 8:
+                return pix
+            stride = image.bytesPerLine()
+            raw = np.frombuffer(image.constBits(), dtype=np.uint8,
+                                count=stride * height).reshape(height, stride)
+            arr = raw[:, : width * 4].reshape(height, width, 4).astype(np.float32)
+
+            div = _VEH_BLUR_DIV
+            small_w, small_h = width // div, height // div
+            if small_w < 8 or small_h < 8:
+                div = 2
+                small_w, small_h = width // div, height // div
+            # 块平均 = 理想低通；隔点抽样会在模糊图里残留次级波纹。
+            small = arr[: small_h * div, : small_w * div].reshape(
+                small_h, div, small_w, div, 4).mean(axis=(1, 3))
+            small = splash_motion._gaussian(
+                small.astype(np.float32), _VEH_SIGMA_MAX / float(div))
+            if small is None:
                 return None
-            return blurred
-        except Exception:            # noqa: BLE001
+            small = np.asarray(small, dtype=np.float32)
+
+            # 毛玻璃质感：轻微提亮 + 去饱和（保持黑白灰系统，不引第三种色）。
+            rgb = small[:, :, :3]
+            lum = rgb.mean(axis=2, keepdims=True)
+            rgb = np.clip(lum + (rgb - lum) * 0.82 + 6.0, 0.0, 255.0)
+            small = np.concatenate((rgb, small[:, :, 3:4]), axis=2)
+
+            out = np.clip(small, 0, 255).astype(np.uint8)
+            out = np.ascontiguousarray(out)
+            blurred = QImage(out.data, small_w, small_h, 4 * small_w,
+                             QImage.Format.Format_RGBA8888).copy()
+            result = QPixmap.fromImage(blurred).scaled(
+                width, height, Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            # ⚠️ PySide6 的 QPixmap 只有 setDevicePixelRatio（无 F 版本），
+            #    写 setDevicePixelRatioF 会 AttributeError → 被 except 吞掉 → 整段
+            #    模糊静默失效（2026-11-13 实测踩过）。
+            result.setDevicePixelRatio(dpr)
+            return result
+        except Exception as exc:      # noqa: BLE001 - 降级必须留痕，不能静默
+            try:
+                import app_log
+                app_log.warning(f"车号过渡高斯模糊降级：{exc!r}")
+            except Exception:        # noqa: BLE001
+                pass
             return None
 
     def _update_module_row_values(self, cells: list[int], temps: list[int]) -> None:
@@ -2043,17 +2153,17 @@ class SettingsDialog(QDialog):
         self._shown_cells = [int(v) for v in cells]
         self._shown_temps = [int(v) for v in temps]
 
-    # ------------------------------------------------ 选车号过渡（整片高斯模糊淡出）
+    # ------------------------------------------------ 选车号过渡（一次局部高斯模糊）
     #
-    # 一条主时钟（_VEH_BLUR_TOTAL_MS）只干一件事：把「车号以下、当前可见的设置区」
-    # 整片抓图 → 高斯模糊 → α=1 盖住旧画面 → 立刻换上新数据 → 停留 HOLD → 淡出 FADE。
-    # 没有占位行、没有逐模组交叉淡入、没有逐帧重排（那些都是上一代被推翻的方案）。
-    # 覆盖层复用 _FadeOverlay（透明背景，绘制阶段只有一次 drawPixmap，无 QGraphics*Effect）。
+    # 真实顺序就在 `_veh_start` 里，⛔ 别按旧注释理解成"先盖旧图、再换数据"：
+    #   换数据 → `_veh_settle_layout()` 同步落位 → 抓可见区 + 真高斯模糊 →
+    #   α=1 盖上并 repaint() → HOLD → 淡出 α 1→0 → `_veh_stop()` 清场。
+    # 唯一的动画是「模糊层渐隐」：数据在糊层底下**一帧到位**，没有逐帧重排 / 占位行 /
+    # 逐模组交叉淡入 / 主时钟 —— 那些都是被推翻的方案，别再往回加。
     #
-    # ⛔⛔ 覆盖层挂在**面板（self）**上，不是 body：body 在滚动区里，重建逐模组行时
-    # 它会重排 / 滚动条被夹位，挂在它上面的位图会跟着内容一起位移 —— 用户
-    # 2026-11-13 说的"从上往下"就是这个。挂面板上则钉死在屏幕坐标，底下的内容
-    # 怎么动都看不见；并且**先 repaint() 把糊层刷上屏，再去重建**。
+    # ⛔⛔ 覆盖层必须挂**面板（self）**，不许挂 body：body 在滚动区里，重建逐模组行时
+    # 会重排、滚动条会被夹位，挂在它上面的位图会跟着内容一起位移 —— 用户
+    # 2026-11-13 说的"从上往下"就是这个。
 
     def _veh_state(self) -> dict | None:
         return getattr(self, "_veh", None)
@@ -2095,19 +2205,87 @@ class SettingsDialog(QDialog):
         else:
             self._rebuild_module_rows(cells, temps)
 
-    def _veh_start(self, cells: list[int], temps: list[int]) -> None:
-        """切换车号 / 改模组数：整片「车号以下可见区」高斯模糊 → 淡出露新数据。
+    def _veh_settle_layout(self, body) -> None:
+        """把「表单 → 滚动内容 → 滚动条」**同步**推到终态（全程不进事件循环）。
 
-        顺序是硬约定（用户 2026-11-13："直接整片瞬间高斯模糊就可以了，不用从上
-        往下，然后准备好车辆数据之后淡出"）：
+        ⛔⛔ 抓图前必须调，否则抓的是"上一拍"的几何：`_rebuild_module_rows` 增删行、
+        `_sync_grid_params_visibility` 显隐旧三件套之后，`QScrollArea` 只会在**事件循环**
+        里按新 `sizeHint()` 重设内容控件尺寸、再把滚动条 range 与**夹位**算一遍。实测
+        （`_check/_probe_lag.py`）：主题行 at_grab=255 / settled=485 → **抓早了 230px**；
+        滚到底再切车号那一档差 92px（滚动条 2007 夹到 1915）。糊层比真实行高出一截，
+        淡出全程就是「模糊的旧位置 + 清晰的新位置」两套叠着 = 用户说的"错位/重影"。
 
-        ① 抓**当前**屏幕可见的旧画面（车号以下的设置区）→ 真高斯模糊；
-        ② 以 α=1 整片盖上并 ``repaint()`` **刷上屏** —— 此刻屏幕上是整片模糊；
-        ③ 才把设置区换成新数据（整段都在糊层底下，看不见过程），并当场算完布局；
-        ④ 停留 HOLD → 整片淡出，露出已经就位的新数据。
-
-        任何一步被打断都落到终态（清覆盖层 + 显示新行），绝不残影。
+        只调 `form.activate()` **不够**：form 只重排自己，内容控件尺寸和滚动条不归它管。
+        ⛔ 也别改成「抓完图再 processEvents()」：那会让新内容先裸奔一帧（闪）。
         """
+        form = self.form
+        sa = self.findChild(QScrollArea)
+        vp = sa.viewport() if sa is not None else None
+        outer = body.layout()
+        # 两遍：第一遍把 body 撑到新高度，第二遍 form 才按新的可用宽度重排
+        # （宽度会因滚动条出现/消失而变，行是居中排的，差一遍就会横向错开）。
+        for _ in range(2):
+            if outer is not None:
+                outer.invalidate()
+                outer.activate()
+            form.invalidate()
+            form.activate()
+            if vp is None:
+                continue
+            hint = body.sizeHint()
+            want = QSize(max(vp.width(), hint.width()),
+                         max(vp.height(), hint.height()))
+            if body.size() != want:
+                body.resize(want)
+            bar = sa.verticalScrollBar()
+            span = max(0, body.height() - vp.height())
+            if bar.maximum() != span:
+                bar.setRange(0, span)
+            if bar.value() > span:
+                bar.setValue(span)
+        if vp is not None:
+            vp.update()
+
+    def _veh_ensure_updates(self) -> None:
+        """贴糊层之前确认**控件更新是开着的**。
+
+        ⛔ 为什么要有这一条：`show_frame()` 结尾是 `self.update()`、
+        `_veh_start` 收尾是 `self.repaint()` —— 两者在 `WA_UpdatesDisabled`
+        状态下**都会被静默丢弃**。一旦被丢弃，覆盖层的后备存储会继续显示
+        **上一段的旧位图**：屏幕上还是旧行数，而所有 `grab()` 出来的都是新行数
+        （grab 从控件树重新渲染，看不到陈旧表面）—— 正是用户第 6 次报障那句
+        「你测试的效果和交付的效果不一样」。
+
+        正常情况下这里是空操作；只在有人误开更新开关时救一次。
+        """
+        try:
+            if not self.updatesEnabled():
+                self.setUpdatesEnabled(True)
+        except RuntimeError:
+            pass
+
+    def _veh_start(self, cells: list[int], temps: list[int]) -> None:
+        """切车号 / 改模组数：「在线车辆库按钮行以下可见区」整片高斯模糊，淡出露出新数据。
+
+        四步，顺序不可换（换任何一步都会变成"两套内容叠着"或"闪一帧裸内容"）：
+
+          ① **先落新数据**（``_veh_apply_rows`` + ``form.activate()`` +
+             ``_veh_settle_layout``，全在事件循环之外）—— 此刻屏幕还看不见；
+          ② 抓「此刻的可见区」并真高斯模糊 —— 它已经是新内容、已在终态几何上；
+          ③ 两张图交给覆盖层：清晰图垫底（不透明）、模糊图按 α=1 叠在上面；
+          ④ HOLD 后把模糊图淡出（α 1→0），画面落回覆盖层自己的清晰快照；
+             随后 ``_veh_stop()`` 撤掉覆盖层并整块重绘，与真实面板无缝交接。
+
+        ⛔⛔ "先落数据再抓图"：旧方案「先抓旧画面 → 盖住 → 底下换数据」里，
+        换数据会重建逐模组行、改 body 高度/滚动位置，冻结的旧图与落位后的新内容对不上，
+        淡出全程都是重影 —— 任何"旧→新"快照式过渡都有这个天生缺陷，补抓图只能缓解。
+        ⛔⛔ 淡出**不依赖覆盖层底下是什么**（见 ``_FadeOverlay``）：底层不透明，
+        窗口表面残留的旧像素全程看不见。别再退回单层半透明写法。
+        ⛔ 淡出前还有一道 ``_veh_resync()``：快照与真实画面若仍有差异就当场重对齐，
+        保证 α 走到 0 的那一帧与随后揭开的面板长得一样。
+        任何一步被打断（异常/连点）都落到终态：清覆盖层 + 显示新行，绝不残影。
+        """
+        self._veh_ensure_updates()
         body = self.form.parentWidget()
         if body is None or not getattr(self, "_veh_allow", False):
             # 面板还没上屏 / 动画被禁用：直接换行，不做过渡。
@@ -2118,11 +2296,35 @@ class SettingsDialog(QDialog):
             self._veh_apply_rows(cells, temps)
             return
 
-        # 打断上一段（若还在跑）：先停表 + 清覆盖层，避免两条主时钟同时写覆盖层。
+        # 打断上一段（若还在跑）：停表 + 清覆盖层，避免两段糊层叠写。
         self._veh_stop()
 
-        # ① 抓「车号以下、当前可见」的旧画面并模糊。
-        #   ⛔ 抓图前先清掉上一段残留的覆盖层，否则旧残影会被烤进快照。
+        # ① 先把新数据一帧落位（事件循环之外，屏幕上尚不可见）。
+        #    ⛔ 只 `form.activate()` 不算落位：QScrollArea 的内容控件尺寸、滚动条
+        #    range 和**夹位**都归它自己算（发生在事件循环里），抓图前必须同步推到
+        #    终态，否则糊层是一张「比真实行高 92~230px」的图（实测，见
+        #    _veh_settle_layout 的注释）。
+        try:
+            self._veh_apply_rows(cells, temps)
+            try:
+                self.form.activate()
+                bl = body.layout()
+                if bl is not None:
+                    bl.activate()
+            except RuntimeError:
+                pass
+            self._veh_settle_layout(body)
+        except Exception as exc:               # noqa: BLE001 - 兜底：落位失败直接清场
+            try:
+                import app_log
+                app_log.warning(f"车号过渡落位失败，已清场：{exc!r}")
+            except Exception:
+                pass
+            self._veh_stop()
+            return
+
+        # ② 抓「此刻可见区」（已是新内容、已按终态几何排好）并模糊。
+        #   ⛔ 抓图前先藏掉残留覆盖层（若有），否则旧糊层会被烤进新快照当成重影。
         old_overlay = getattr(self, "_veh_mask_full", None)
         if old_overlay is not None:
             try:
@@ -2132,29 +2334,24 @@ class SettingsDialog(QDialog):
                 pass
         rect = self._below_vehicle_rect()
         pix = None
+        raw = None
         if not rect.isNull() and rect.height() > 0:
             try:
-                grabbed = body.grab(rect)
+                # ⛔ self.grab（面板坐标）与覆盖层 setGeometry(rect) 同一坐标系，
+                #    已实测零帧偏移；抓的是「当前可见区」= 新内容，天然对齐。
+                grabbed = self.grab(rect)
             except RuntimeError:
                 grabbed = None
             if grabbed is not None and not grabbed.isNull():
+                raw = grabbed
                 pix = self._veh_blur_pixmap(grabbed)
 
-        # 没有可模糊的快照（极端：区域为空 / 面板还没排好版）→ 直接换数据收工。
+        # 没有可模糊的快照（极端：区域为空 / 面板还没排好版）→ 新数据已落位，收工。
         if pix is None or rect.isNull():
-            self._veh_apply_rows(cells, temps)
             self._veh_stop()
             return
 
-        # ② **先整片盖上去、当场刷上屏**，然后才动底下的内容。
-        #   这次的两处关键（用户 2026-11-13："直接整片瞬间高斯模糊就可以了，不用
-        #   从上往下，然后准备好车辆数据之后淡出"）：
-        #   · 覆盖层挂在**面板**上（以前挂 body）：body 在滚动区里，切车号重建逐
-        #     模组行时它会重排、滚动条还可能被夹位 —— 挂在它上面的位图会跟着内容
-        #     一起位移，观感就是"模糊层从上往下扫"。挂面板上就钉死在屏幕坐标，
-        #     底下怎么动都看不见。
-        #   · show_frame 之后立刻 repaint()：先把这一帧真的画上屏，再去重建行。
-        #     否则"重建"和"贴模糊层"谁先进合成器不确定，中间那一帧会露出新内容。
+        # ③ 以 α=1 整片盖上，然后**整块重画一次面板**（不是只重画糊层）。
         try:
             overlay = getattr(self, "_veh_mask_full", None)
             if overlay is None or overlay.parentWidget() is not self:
@@ -2162,106 +2359,214 @@ class SettingsDialog(QDialog):
                 self._veh_mask_full = overlay
         except RuntimeError:
             return
-        veil = self._veh_veil_rect(rect)
-        overlay.show_frame([(pix, 1.0)], veil, 1.0)
+        # 抓图与贴图用同一个 rect（都是面板坐标），无需任何换算。
+        # `raw` 垫底当不透明快照、`pix` 是它的模糊版 —— 淡出全程只由这两张图
+        # 决定，覆盖层底下留了什么旧像素都看不见（见 _FadeOverlay 的说明）。
+        overlay.show_frame(raw, pix, rect, 1.0)
+
+        # 把面板自身也整块刷一次。覆盖层底层已经不透明（淡出全程看不见底下），
+        # 所以这一条**不是**淡出干净的必要条件，只用来保证 `_veh_stop()` 揭开那一刻
+        # 面板表面已经是终态 —— 少一次"淡完才修干净"的抖动。
+        # ⛔ 不能只 `overlay.repaint()`：滚动条轨道、滚动区之外的兄弟控件不归覆盖层管。
+        # ⛔ 也别改成 `setUpdatesEnabled(False/True)` 包住整段：这块半透明面板
+        #    在更新关闭期间背板会整块变透明（实测截图直接看到桌面壁纸），回来
+        #    之后 `repaint()` 也补不回来。
         try:
-            overlay.repaint()                 # 同步刷屏：模糊此刻已在屏幕上
+            self.repaint()
         except RuntimeError:
             pass
 
-        # ③ 数据就位（整段都在糊层底下，屏幕上看不见任何过程）。
-        #    form.activate() 让布局**当场**算完、不等事件循环 —— 淡出开始时底下
-        #    已经是最终几何，正是"准备好车辆数据之后再淡出"。
-        self._veh_apply_rows(cells, temps)
-        try:
-            self.form.activate()
-        except RuntimeError:
-            pass
+        # ④ 极短的「糊一下」停顿后**淡出**模糊图（α 1→0），由覆盖层自己的不透明
+        #    快照接住画面 —— 底下露不出来，所以淡出里没有任何逐帧数据动画、也不会错位。
+        #    「代数」_veh_seq 仍是唯一取消凭证：后一次 _veh_start 会先 _veh_stop()
+        #    （seq +1），在途的 hold / fade 回调发现代数已变就直接返回或走到终态，
+        #    既不提前清屏、也不留下旧糊层。
+        seq = self._veh_next_seq()
+        # `raw` 有两个用途：垫底当不透明快照（见 _FadeOverlay），以及给
+        # `_veh_resync` 当比对基准（一样就连模糊都不用做，省 20+ ms）。
+        self._veh = {"rect": rect, "pix": pix, "raw": raw, "overlay": overlay,
+                     "seq": seq, "timer": None}
+        self._veh_dbg("START", f"seq={seq}")
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda s=seq: self._veh_hold_done(s))
+        self._veh["timer"] = timer        # 先存句柄，再启动：打断时必能 stop()
+        timer.start(_VEH_HOLD_ONCE_MS)
 
-        # ④ 停留 + 淡出（一条主时钟）。
-        state = {"rect": veil, "pix": pix, "overlay": overlay, "clock": None}
-        self._veh = state
-        self._veh_dbg("START")
-        from ui_anim import Tween
-        clock = Tween(_VEH_BLUR_TOTAL_MS, "linear",
-                     lambda k, s=state: self._veh_tick(s, k),
-                     lambda s=state: self._veh_finish(s),
-                     parent=self, min_interval_ms=_VEH_TICK_MS)
-        state["clock"] = clock
-        clock.start(0.0, 1.0, _VEH_BLUR_TOTAL_MS)
+    # （原 `_veh_veil_rect()` 恒等换算函数已删：2026-11-13 起 `_below_vehicle_rect()`
+    #  直接返回**面板坐标**，抓图 `self.grab(rect)` 与贴图用同一个 rect，全程一根
+    #  坐标系，不再需要 body→面板换算。⛔ 千万别恢复 `body.mapTo`：body 在滚动区里，
+    #  滚动后带偏移会把糊层整体推下去盖住「确定」按钮。该函数零调用，属冗余代码。）
 
-    def _veh_veil_rect(self, rect_body: QRect) -> QRect:
-        """body 局部坐标的那块区域 → **面板坐标**（覆盖层挂在面板上，见 _veh_start）。
+    def _veh_next_seq(self) -> int:
+        """递增并返回当前代次号（连点车号时用来作废旧回调）。"""
+        self._veh_seq = int(getattr(self, "_veh_seq", 0)) + 1
+        return self._veh_seq
 
-        覆盖层必须钉在屏幕坐标里：切车号时 body（滚动区内容）会重排、滚动条
-        可能被夹位，挂在 body 上的位图会跟着内容位移 = 用户看到的"从上往下"。
+    def _veh_hold_done(self, seq: int) -> None:
+        """单次停留到点：只有仍是**当前代次**才落终态。
+
+        连点车号时，后一次 ``_veh_start`` 会先 ``_veh_stop()``（停掉在途定时器 +
+        代数 +1），所以前一次在途的 singleShot 即便因 Qt 事件队列竞争晚到，也会
+        在第一行就返回 —— 既不提前清掉新糊层，也不把旧糊层留成残影。
         """
-        body = self.form.parentWidget()
-        if body is None:
-            return QRect(rect_body)
-        try:
-            top_left = body.mapTo(self, rect_body.topLeft())
-        except RuntimeError:
-            return QRect(rect_body)
-        return QRect(top_left, rect_body.size())
-
-    def _veh_tick(self, state: dict, k: float) -> None:
-        if self._veh_state() is not state:
+        if seq != getattr(self, "_veh_seq", 0) or self._veh_state() is None:
             return
+        self._veh_dbg("HOLD_DONE", f"seq={seq}")
+        self._veh_fade_out(seq)
+
+    @staticmethod
+    def _veh_pix_close(a, b) -> bool:
+        """两张位图是否「肉眼一样」（缩到 64×48 后算均方根色差，< 3 视为相同）。
+
+        只用于 ``_veh_resync`` 判断「快照和真实画面有没有变」——不需要精确，
+        只需要能把「同一画面」和「3 行 vs 5 行」这种量级的差别分开。
+        """
         try:
-            ms = k * _VEH_BLUR_TOTAL_MS
-            if ms <= _VEH_BLUR_HOLD_MS:
-                alpha = 1.0
-            else:
-                p = min(1.0, (ms - _VEH_BLUR_HOLD_MS) / max(1, _VEH_BLUR_FADE_MS))
-                alpha = 1.0 - (p * p)        # 末段加速清晰
-            overlay = state.get("overlay")
-            if overlay is None:
-                return
-            if alpha <= 0.002:
-                overlay.clear()
-                return
-            overlay.show_frame([(state["pix"], 1.0)], state["rect"], alpha)
-        except Exception as _exc:  # noqa: BLE001
-            self._veh_dbg("TICK_EXC", repr(_exc))
+            from PySide6.QtGui import QImage
+            if a is None or b is None or a.isNull() or b.isNull():
+                return False
+            if a.size() != b.size():
+                return False
+            ia = a.toImage().convertToFormat(QImage.Format.Format_RGB32).scaled(64, 48)
+            ib = b.toImage().convertToFormat(QImage.Format.Format_RGB32).scaled(64, 48)
+            tot = 0
+            n = 0
+            for y in range(48):
+                for x in range(64):
+                    ca = ia.pixel(x, y) & 0xFFFFFF
+                    cb = ib.pixel(x, y) & 0xFFFFFF
+                    tot += (((ca >> 16) & 255) - ((cb >> 16) & 255)) ** 2 \
+                        + (((ca >> 8) & 255) - ((cb >> 8) & 255)) ** 2 \
+                        + ((ca & 255) - (cb & 255)) ** 2
+                    n += 1
+            return (tot / max(1, n)) ** 0.5 < 3.0
+        except Exception:                    # noqa: BLE001 - 比对失败按"不一致"处理
+            return False
+
+    def _veh_resync(self, state: dict) -> None:
+        """淡出开始前，把快照**重新对齐到此刻的真实画面**。
+
+        覆盖层底层已经是不透明快照（见 ``_FadeOverlay``），所以这一步**不再**
+        负责"别让两套内容同时出现"——那件事已经由底层不透明结构性解决了。它现在
+        只负责另一件事：保证 α 走到 0 的那一帧与随后 ``_veh_stop()`` 揭开的真实
+        面板**长得一样**，否则交接时会跳一下。
+
+        为什么可能不一样：抓图那一拍到淡出开始之间隔了 50ms 的 HOLD，这期间滚动条
+        夹位、样式 polish、别的排队重绘都可能让布局再走一遍。α 还是 1 的时候重抓
+        一次最保险 —— 那时屏幕上只有模糊图，重抓不会有任何可见变化。
+
+        ⛔ 抓图前必须先 hide() 覆盖层，否则会把糊层自己烤进新位图（= 糊上加糊）。
+        ⛔ 抓完**立刻**把快照原样盖回去（finally 里），中间不留任何一帧裸奔。
+        """
+        rect = state.get("rect")
+        overlay = getattr(self, "_veh_mask_full", None)
+        old = state.get("pix")
+        old_raw = state.get("raw")
+        if (overlay is None or old is None or old_raw is None or rect is None
+                or rect.isNull() or rect.height() <= 0):
+            return
+        alpha = float(getattr(overlay, "_alpha", 1.0) or 1.0)
+        grabbed = None
+        try:
+            overlay.hide()
+            grabbed = self.grab(rect)
+        except RuntimeError:
+            return
+        finally:
+            # 无论抓图成败，都先把快照原样盖回去 —— 绝不留下"透明的一帧"。
+            try:
+                if not overlay.isVisible():
+                    overlay.show_frame(old_raw, old, rect, alpha)
+            except RuntimeError:
+                pass
+        if grabbed is None or grabbed.isNull():
+            return
+        # 先比**原始抓图**：一样就说明底下压根没变 → 连模糊都不用做（省 ~25ms）。
+        if self._veh_pix_close(old_raw, grabbed):
+            return
+        pix = self._veh_blur_pixmap(grabbed)
+        if pix is None:
+            return
+        state["raw"] = grabbed
+        state["pix"] = pix
+        try:
+            overlay.show_frame(grabbed, pix, rect, alpha)
+        except RuntimeError:
+            return
+        self._veh_dbg("RESYNC", "淡出前快照与真实画面不一致，已重新对齐")
+
+    def _veh_fade_out(self, seq: int) -> None:
+        """停留到点：把模糊图**淡出**（α 1→0），落到覆盖层自己的清晰快照上。
+
+        模糊图和清晰快照是同一块区域的两次取图（只差一道高斯），淡出等于
+        「模糊 → 清晰」在这两张图之间完成，与覆盖层底下是什么无关。没有逐帧数据
+        动画（用户 2026-11-14："高斯模糊要淡出，数据变化一帧到位，不要中间过程"）。
+        """
+        state = self._veh_state()
+        if state is None or seq != getattr(self, "_veh_seq", 0):
+            return
+        overlay = getattr(self, "_veh_mask_full", None)
+        if overlay is None or state.get("pix") is None:
+            self._veh_stop()
+            return
+        # ⛔⛔ 淡出前重新对齐快照（见 _veh_resync 的说明）。这一步是「两套内容同时
+        #    出现」这类报障的**结构性免疫**：α 还是 1 的时候先确认位图 == 真实画面，
+        #    再开始降 α。⛔ 别删、别挪到淡出中途（那时 α 已经 < 1，换图会闪）。
+        self._veh_resync(state)
+        self._veh_dbg("FADE_START", f"seq={seq}")
+        step_ms = 16.0
+        # 每帧 α 减步长 = 单帧时长 / 总淡出时长；自然匀速渐隐。
+        state["_fade_step"] = step_ms / max(1, _VEH_FADE_MS)
+        timer = QTimer(self)
+        timer.setSingleShot(False)
+        timer.timeout.connect(lambda s=seq: self._veh_fade_tick(s))
+        state["timer"] = timer          # 复用 timer 句柄：打断时 _veh_stop 会停它
+        timer.start(int(step_ms))
+
+    def _veh_fade_tick(self, seq: int) -> None:
+        """逐帧降低覆盖层 α，到 0 时落到终态（清覆盖层）。
+
+        代次已变（被新过渡覆盖/打断）或已无状态：直接返回，绝不碰当前覆盖层——
+        否则会误清掉新一段糊层（原 _veh_hold_done 的同一种代数守卫）。
+        """
+        if seq != getattr(self, "_veh_seq", 0) or self._veh_state() is None:
+            return
+        overlay = getattr(self, "_veh_mask_full", None)
+        if overlay is None:
+            self._veh_stop()
+            return
+        step = self._veh_state().get("_fade_step", 16.0 / max(1, _VEH_FADE_MS))
+        overlay._alpha = max(0.0, getattr(overlay, "_alpha", 1.0) - step)
+        try:
+            overlay.update()
+        except RuntimeError:
+            return
+        if overlay._alpha <= 0.0:
             self._veh_stop()
 
     def _veh_stop(self) -> None:
+        """落到终态：停掉在途定时器 + 清覆盖层 + 整块同步重绘。
+
+        淡出完成、被打断（连点车号 / 关面板 / 抓图失败 / 落位异常）都收到这里，
+        语义只有一条：**显示新行、不留残影**。淡出进行中调用也安全。
+        """
         state = self._veh_state()
         self._veh = None
+        self._veh_next_seq()             # 作废所有在途 singleShot 回调
         if state is not None:
-            self._veh_dbg("STOP")
-            clock = state.get("clock")
-            if clock is not None:
+            timer = state.get("timer")
+            if timer is not None:
                 try:
-                    clock.stop()
-                    clock.deleteLater()
+                    timer.stop()
+                    timer.deleteLater()
                 except RuntimeError:
                     pass
+            self._veh_dbg("STOP")        # 只记录真的打断过的一段，日志不刷屏
         overlay = getattr(self, "_veh_mask_full", None)
         if overlay is not None:
             try:
                 overlay.clear()
-            except RuntimeError:
-                pass
-
-    def _veh_finish(self, state: dict) -> None:
-        """落到终态：清覆盖层 + 整块重绘。新数据已由 _rebuild_module_rows 就位。"""
-        if self._veh_state() is not state:
-            return
-        self._veh_dbg("FINISH")
-        self._veh = None
-        overlay = getattr(self, "_veh_mask_full", None)
-        if overlay is not None:
-            try:
-                overlay.clear()
-            except RuntimeError:
-                pass
-        clock = state.get("clock")
-        if clock is not None:
-            try:
-                clock.stop()
-                clock.deleteLater()
             except RuntimeError:
                 pass
         self._veh_repaint_all()
@@ -2282,6 +2587,12 @@ class SettingsDialog(QDialog):
                 vp = sa.viewport()
                 if vp is not None:
                     vp.repaint()
+            # ⛔ 面板**自己**也得整块刷一次（2026-11-14 第 6 次报障）：这是一块
+            #    半透明 top-level，只 repaint 子控件（body / viewport）时，面板
+            #    自身那一层（毛玻璃背板、滚动区之外的兄弟控件、滚动条轨道）会
+            #    留下旧像素。淡出一降 α，那层旧像素就露出来 = "底下还有一套内容"。
+            #    整块同步重绘一次，把窗口表面直接推到终态。
+            self.repaint()
         except RuntimeError:
             pass
 
@@ -2631,8 +2942,10 @@ class SettingsDialog(QDialog):
                         + ChevronSpinBox.TEXT_MARGIN[2] + 6)
                 _spin_w = max(_spin_w, int(need))
         for spec in specs:
-            if spec["key"] == "material":
-                # 已经在「主题 / 材质强度」那一对里生成（见 _build_theme_section）
+            if spec["key"] in ("material", "volt_rows", "temp_rows"):
+                # 「界面材质」已在「主题 / 材质强度」那一对里生成；
+                # 「电压/温度数据行数」已提到主题**上方**（见 _build_theme_section
+                # 开头），_custom_widgets / _custom_rows 也已提前登记。
                 continue
             preview = None
             if spec["kind"] == "bool":

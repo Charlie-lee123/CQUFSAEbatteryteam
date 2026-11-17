@@ -8,7 +8,8 @@
   C. 保留 ui_settings 车号残影基础修复（透明底 + swap 当拍 clear）；
   D. 保留进全屏压 DWM 原生动画（_land）；
   E. od64 起：S2 单窗内交叉溶解（set_blend / painter.setOpacity / 陈旧退路）；
-  F. od64 起：车号让位裁剪（visible_h / skip_old / QRectF / _veh_visible_h）。
+  F. 车号过渡（现行设计）：先落数据 → 落位 → 抓图 → 盖 → 淡出前重对齐；
+     od119 起覆盖层 = 不透明清晰图垫底 + 模糊图按 α 叠加（底层不透明是关键）。
 
 用法：
   # 打包前自测（编译当前源码，验证断言本身不会假失败）
@@ -87,20 +88,20 @@ def run_checks(mw_codes, mw_by, us_codes, us_by, extra=None,
             "KeepAspectRatio" in set(stretch[0].co_names))
 
     # ---- C：车号残影基础修复 ----
+    # ⛔⛔ 2026-11-15 改口径：`_FadeOverlay` **不能**再带 WA_TranslucentBackground。
+    #    带半透明属性的子控件内容会被合成两遍（正确位置 + 再偏移一个自身坐标），
+    #    屏幕上就是「一套模糊 + 一套清晰」两套模组行 —— 用户报的那个叠影。
+    #    这条断言以前写反了（要求必须有 WA_TranslucentBackground），现在翻过来。
     print("\n[C] ui_settings 车号选择残影基础修复")
-    chk("_FadeOverlay 透明背景（WA_TranslucentBackground）",
-        any("WA_TranslucentBackground" in set(c.co_names)
-            for c in us_codes if c.co_name == "__init__"))
-    vt = us_by.get("_veh_tick")
-    chk("_veh_tick 存在", vt is not None)
-    if vt:
-        chk("swap 当拍 clear 覆盖层", "clear" in set(vt.co_names))
-        # rows_shown 是 state["rows_shown"] 的**字符串键**，落在 co_consts，
-        # 不是 co_names（属性名）；_veh_paint 是方法名，才在 co_names。
-        chk("显行后跳过 _veh_paint（rows_shown 守卫）",
-            "_veh_paint" in set(vt.co_names)
-            and "rows_shown" in {v for v in vt.co_consts
-                                 if isinstance(v, str)})
+    ov_inits = [c for c in us_codes
+                if c.co_name == "__init__"
+                and "WA_TranslucentBackground" in set(c.co_names)]
+    chk("_FadeOverlay.__init__ 可定位（唯一引用 WA_TranslucentBackground 的 __init__）",
+        len(ov_inits) == 1)
+    if ov_inits:
+        n = set(ov_inits[0].co_names)
+        chk("_FadeOverlay 是不透明子控件（WA_NoSystemBackground + WA_OpaquePaintEvent）",
+            {"WA_NoSystemBackground", "WA_OpaquePaintEvent"}.issubset(n))
 
     # ---- D：进全屏压 DWM ----
     print("\n[D] startup_fullscreen._land 压系统原生动画")
@@ -123,156 +124,72 @@ def run_checks(mw_codes, mw_by, us_codes, us_by, extra=None,
     chk("startup_fullscreen 有 0.90 / 0.99 陈旧度退路常量",
         sfs is not None and {0.9, 0.99}.issubset(floats(sfs)))
 
-    # ---- F：od64 车号让位裁剪 ----
-    print("\n[F] 车号让位 / 1:1 裁剪（od64 起）")
-    sf = us_by.get("show_frame")
-    chk("show_frame 支持 visible_h", sf is not None
-        and "visible_h" in sf.co_varnames)
-    chk("_veh_visible_h 存在", us_by.get("_veh_visible_h") is not None)
-    jobs = us_by.get("_veh_jobs")
-    chk("_veh_jobs 支持 skip_old（无旧块跳过空转）", jobs is not None
-        and "skip_old" in jobs.co_varnames)
-    chk("_FadeOverlay.paintEvent 用 QRectF 三参数裁剪",
-        any("QRectF" in set(c.co_names) and "_visible_h" in set(c.co_names)
+    # ---- F：车号过渡（现行设计）----
+    # ⛔ 2026-11-14 od116「推倒重来」之后，旧设计的 8 个函数
+    #    （_veh_tick / _veh_paint / _veh_swap / _veh_finish / _veh_grab_new /
+    #      _veh_visible_h / _veh_jobs / _veh_veil_rect）整体删除。
+    #    旧断言还留在这里的话，本脚本会**永远 FAIL**，等于安全网自己喊狼来了
+    #    （2026-11-14 就被它误导过一次）。所以整段换成「现行设计」的断言，
+    #    并把"旧函数不许复活"显式写成检查项。
+    print("\n[F] 车号过渡（现行设计：先落数据 → 落位 → 抓图 → 盖 → 淡出前重对齐）")
+    for name in ("_veh_start", "_veh_settle_layout", "_veh_resync",
+                 "_veh_pix_close", "_veh_ensure_updates", "_veh_fade_out",
+                 "_veh_stop", "_veh_repaint_all"):
+        chk(f"ui_settings.{name} 存在", us_by.get(name) is not None)
+
+    start = us_by.get("_veh_start")
+    if start:
+        sn = set(start.co_names)
+        chk("_veh_start 先落数据再抓图", "_veh_apply_rows" in sn and "grab" in sn)
+        chk("_veh_start 抓图前先落位", "_veh_settle_layout" in sn)
+        chk("_veh_start 贴糊层前确保更新开着", "_veh_ensure_updates" in sn)
+        chk("_veh_start 收尾整块重绘面板", "repaint" in sn)
+        chk("_veh_start 不再用 setUpdatesEnabled（已实测否决）",
+            "setUpdatesEnabled" not in sn)
+
+    fade = us_by.get("_veh_fade_out")
+    if fade:
+        chk("_veh_fade_out 淡出前重新对齐快照",
+            "_veh_resync" in set(fade.co_names))
+
+    rs = us_by.get("_veh_resync")
+    if rs:
+        rn = set(rs.co_names)
+        chk("_veh_resync 抓图前 hide 覆盖层（别把糊层烤进新图）", "hide" in rn)
+        chk("_veh_resync 用同一条模糊流水线", "_veh_blur_pixmap" in rn)
+        chk("_veh_resync 用 _veh_pix_close 判等", "_veh_pix_close" in rn)
+
+    for dead in ("_veh_tick", "_veh_paint", "_veh_swap", "_veh_finish",
+                 "_veh_grab_new", "_veh_visible_h", "_veh_jobs", "_veh_veil_rect"):
+        chk(f"旧设计 {dead} 已删除（⛔ 别复活）", us_by.get(dead) is None)
+
+    # od119：覆盖层改成「不透明清晰图垫底 + 模糊图按 α 叠上去」。
+    # 只画一层半透明模糊图时，淡出过程中覆盖层底下的窗口表面会露出来
+    # （上面可能还留着更早几帧的像素）= 用户反复报的"两套内容叠着"。
+    # ⛔ 同名 code object（paintEvent / __init__）有多个类，必须用"任一命中"。
+    sfs = [c for c in us_codes if c.co_name == "show_frame"]
+    chk("覆盖层 show_frame 收「清晰底图 + 模糊图」两张",
+        sfs and all({"base", "blur"}.issubset(set(c.co_varnames))
+                    for c in sfs))
+    chk("覆盖层 show_frame 已无 items/weight 列表参数",
+        sfs and all("items" not in set(c.co_varnames) for c in sfs))
+    chk("覆盖层 paintEvent 用 CompositionMode_Source 整块替换",
+        any("CompositionMode_Source" in set(c.co_names)
             for c in us_codes if c.co_name == "paintEvent"))
+    rb = us_by.get("_rebuild_module_rows")
+    if rb:
+        chk("_rebuild_module_rows 已删死参数 reserve（占位行机制早已不存在）",
+            "reserve" not in set(rb.co_varnames))
 
-    # ---- G：od65/od66 车号「切换方向」(has_old=True) 残影根治 ----
-    # od64 只修了 无旧块 路径（_veh_visible_h 1:1 裁剪）；有旧块(换车号/改模组数)
-    # 仍把 stale rect_old 全画，下行数时旧块底部叠到已上移设置项 = 残影。
-    # od65 第一版改用「动态 QRect(当前高度)」做 P1 几何 —— 但 _FadeOverlay.paintEvent
-    # 的 dpr = pix.height()/rect.height() 依赖覆盖层高度==整块 rect 高度，几何被缩成
-    # cur_h 后 dpr 算错，旧块被压扁成错位双份残影（用户「还是没有变化」的真因）。
-    # od66 修正：P1 几何**保持整块 rect_old**、只把可见高度裁剪到 cur_h（顶对齐 1:1、
-    # 不压扁），与无旧块路径同一套路。故本段验证「整块 rect_old + visible_h=cur_h 裁剪」，
-    # 而非「动态 QRect」—— 后者是已否决的 bug 做法。
-    print("\n[G] od66 车号切换(有旧块)残影根治（整块几何+visible_h 裁剪）")
-    vp = us_by.get("_veh_paint")
-    chk("_veh_paint 存在", vp is not None)
-    if vp:
-        names = set(vp.co_names)
-        consts = {v for v in vp.co_consts if isinstance(v, str)}
-        chk("P1 旧块跟随占位行高度收敛（引用 _veh_shift_ease）",
-            "_veh_shift_ease" in names)
-        chk("P1 旧块几何保持整块 rect_old（不动态构造 QRect 压扁）",
-            "rect_old" in consts and "QRect" not in names)
-        chk("P1 旧块按当前高度裁剪（show_frame 带 visible_h=cur_h）",
-            "cur_h" in vp.co_varnames)
-        chk("P1 读取占位行起止高度（h0/h1 字符串键）",
-            {"h0", "h1"}.issubset(consts))
+    # od73 自激环防护（仍然有效，别丢）：车号下拉必须连 `activated`，
+    # ⛔ 连 `currentIndexChanged` 会被程序化 rebuild 的 setCurrentIndex 自激，
+    #    把行数塌成 0（用户 2026-11-08 报过）。
+    build = us_by.get("_build_vehicle_section")
+    if build:
+        bn = set(build.co_names)
+        chk("车号下拉连 activated、不连 currentIndexChanged",
+            "activated" in bn and "currentIndexChanged" not in bn)
 
-    # ---- H：od68 车号动画残影终治 ----
-    # od67 仅 activate() 不足：QFormLayout 改 setFixedHeight 后默认复用缓存行高，
-    # 下方「主题/材质强度」行重排被推迟到下一轮事件循环 → car→car 切换仍有一帧
-    # 覆盖层压到主题 上。od68 改为先 invalidate 再 activate，让布局当拍重排；并加
-    # 「硬约束」：覆盖层显示底部绝不允许越过主题实时顶端（统一到对话框坐标，P1/P3
-    # 两条路径都夹）。本段断言这两处字节码特征。
-    print("\n[H] od68 车号动画残影终治（invalidate 当拍重排 + 硬约束夹紧）")
-    vt = us_by.get("_veh_tick")
-    chk("_veh_tick 存在", vt is not None)
-    if vt:
-        vt_names = set(vt.co_names)
-        chk("占位行高度变更后 invalidate + activate 让下方行当拍重排",
-            "invalidate" in vt_names and "activate" in vt_names)
-    vp = us_by.get("_veh_paint")
-    chk("_veh_paint 存在", vp is not None)
-    if vp:
-        vp_names = set(vp.co_names)
-        chk("硬约束夹紧：引用实时主题顶端 cmb_theme", "cmb_theme" in vp_names)
-        chk("硬约束夹紧：用 mapTo 统一到对话框坐标（非 form 局部坐标）",
-            "mapTo" in vp_names)
-        chk("硬约束夹紧：用 QPoint 做坐标换算（避免坐标混用夹成 0）",
-            "QPoint" in vp_names)
-
-    # ---- I：od69 覆盖层残留（旧块错位叠）根治 ----
-    # 根因：_veh_paint 只在 items 非空且 rect 有效时 show_frame；否则**什么都不做**，
-    # 覆盖层保留上一帧（P1 的旧块 rect_old / 旧内容）。高 DPI 低帧率时 P2 的 clear
-    # 被整帧跳过 → 旧块以旧几何停在屏幕上压住新块 = 用户「模糊块和清晰块错位叠」。
-    # 修法：无内容时主动 overlay.clear()；has_old P3 模糊档未就绪时用清晰新块顶上。
-    print("\n[I] od69 覆盖层无内容时主动清除（消除旧块错位残留）")
-    vp2 = us_by.get("_veh_paint")
-    if vp2:
-        vp2_names = set(vp2.co_names)
-        vp2_consts = {v for v in vp2.co_consts if isinstance(v, str)}
-        chk("无内容时主动 overlay.clear()（不留上一帧旧块）",
-            "clear" in vp2_names)
-        chk("has_old P3 模糊档未就绪时用清晰新块顶上（pix_new 字符串键）",
-            "pix_new" in vp2_consts)
-
-    # ---- J：od70/od77 抓快照前藏覆盖层 + 车号下拉改 activated（断自激塌陷）----
-    print("\n[J] od70/od77 抓快照前藏覆盖层 + 车号下拉 activated")
-    vstart = us_by.get("_veh_start")
-    chk("_veh_start 抓 pix_old 前隐藏覆盖层（含 hide）",
-        vstart is not None and "hide" in set(vstart.co_names))
-    vgn = us_by.get("_veh_grab_new")
-    chk("_veh_grab_new 抓 pix_new 前隐藏覆盖层（含 hide）",
-        vgn is not None and "hide" in set(vgn.co_names))
-    act_ok = any("activated" in set(c.co_names) for c in us_by.values())
-    chk("某方法里连了车号下拉 activated（断 0↔5 自激）", act_ok)
-
-    # ---- K：od71 动画中断必须落到终态 + 诊断日志 ----
-    # 根因：_veh_tick 只捕 RuntimeError 且 settle=False —— settle=False **不显行**，
-    # 任何中断都把逐模组行留在 reserve 隐藏 = 模组数=N 却没有行 + 残影。
-    print("\n[K] od71 动画中断落终态（settle）+ 诊断日志")
-    chk("_veh_dbg 诊断日志方法存在", us_by.get("_veh_dbg") is not None)
-    vt2 = us_by.get("_veh_tick")
-    chk("_veh_tick 异常时写 TICK_EXC 诊断（引用 _veh_dbg）",
-        vt2 is not None and "_veh_dbg" in set(vt2.co_names))
-    for name in ("_veh_start", "_veh_swap", "_veh_finish"):
-        c = us_by.get(name)
-        chk(f"{name} 写诊断日志（引用 _veh_dbg）",
-            c is not None and "_veh_dbg" in set(c.co_names))
-
-    # ---- M：od73 断「车号下拉自激 0↔5 反复切换」----
-    # 用户真机日志实测：打开面板 5 秒内 4 段 218↔0 动画反复。根因是
-    # _refresh_number_combo 硬置 blockSignals(False)、把外层屏蔽提前解除，
-    # 重建后 setCurrentIndex 回吐 currentIndexChanged → 被当成取消选车 → 自激。
-    print("\n[M] od73 车号下拉自激环防护")
-    op = us_by.get("_on_vehicle_picked")
-    chk("_on_vehicle_picked 同步期间屏蔽下拉信号（含 blockSignals）",
-        op is not None and "blockSignals" in set(op.co_names))
-    rc = us_by.get("_refresh_number_combo")
-    chk("_refresh_number_combo 保存并恢复原屏蔽状态（_prev_block 局部变量）",
-        rc is not None and "_prev_block" in rc.co_varnames)
-
-    # ---- N：od75 落定自愈 + 整块同步重绘 ----
-    # 用户截图：模组数=5 却一行 Module 都没有，下方内容整片上移 + 旧帧残留成淡重影
-    # （QScrollArea viewport 在高度塌陷后没全量重画）。落定时自愈行数 + 强制重绘。
-    print("\n[N] od75/od76 落定自愈行数 + body/viewport 同步重绘")
-    vf = us_by.get("_veh_finish")
-    chk("_veh_finish 存在", vf is not None)
-    if vf:
-        vf_names = set(vf.co_names)
-        chk("_veh_finish 自愈：行数不符时 _rebuild_module_rows",
-            "_rebuild_module_rows" in vf_names)
-        chk("_veh_finish 调整块重绘（含 _veh_repaint_all）",
-            "_veh_repaint_all" in vf_names)
-    vra = us_by.get("_veh_repaint_all")
-    chk("_veh_repaint_all 存在", vra is not None)
-    if vra:
-        rn = set(vra.co_names)
-        chk("_veh_repaint_all 含 viewport", "viewport" in rn)
-        chk("_veh_repaint_all 含同步 repaint", "repaint" in rn)
-
-    # ---- O：od77 无车号→有车号 的「先显形再聚焦」曲线 ----
-    # 用户 2026-11-11：「从无车号到有车号过渡的时候数据要高斯模糊」。
-    # 原先 σ 与 α 都是 p 的函数且方向相反（σ 最大时 α≈0、α 上来时 σ 已归零），
-    # 感知上只有"淡入"没有"聚焦"。od77 改成 α 用 out_cubic 在前 45% 时间拉到 1、
-    # σ 用 pow 0.45 延迟衰减，可见模糊窗口从 153ms 扩到 343ms。
-    # ⛔ 不验这条就无法区分 od76（无此修复）与 od77 —— 两者 [I]/[N] 段完全相同。
-    print("\n[O] od77 无车号→有车号：α 提前 / σ 延迟衰减")
-    vp = us_by.get("_veh_paint")
-    chk("_veh_paint 存在", vp is not None)
-    if vp:
-        fl = floats(vp)
-        # ⚠️ CPython 会把同一 code object 里相同的常量**去重**，两个 0.45
-        #    （α 提前系数、σ 衰减指数）在 co_consts 里只留一份 → 只能判存在。
-        chk("有 0.45 常量（α 提前 / σ 延迟衰减）", 0.45 in fl)
-        chk("分支变量 ap 存在（α 的独立进度）", "ap" in vp.co_varnames)
-        chk("has_old 分支保留原曲线（仍用 EASE）", "EASE" in set(vp.co_names))
-
-    # ---- P：od78 性能模式（队标双击/三击 + 文本整流 + 高斯模糊浮层） ----
-    # 这是本轮唯一的新功能，必须能从产物里证明"整流逻辑和入口都真的进包了"，
-    # 而不是只看 main_window 里有个空壳方法。
     print("\n[P] od78 性能模式（整流 + 手势 + 浮层）")
     mods = extra or {}
     pm = mods.get("perf_mode", (None, None))[1]
