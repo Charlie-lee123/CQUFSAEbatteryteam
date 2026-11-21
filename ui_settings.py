@@ -60,9 +60,18 @@ BUTTON_COLUMNS = 4
 # 「模组 i」里两个"数量"输入框的宽度。**手动输入**（用户 2026-10-22 明确），
 # 所以只要装得下 3 位数 + 内边距；左边写"电芯数量："、右边再没有量词了。
 MODULE_INPUT_W = 64
-# 独立下拉框（主题 / 界面材质 / 编码…）的宽度：**按内容定宽**，不再拉满整列。
-# 这些框里的值都很短（"深色""毛玻璃""utf-8"），铺满整行只会让人觉得空。
+# 独立下拉框（编码 / 蓝牙…）的宽度上限：**按内容定宽**，不再拉满整列。
+# 这些框里的值都很短（"utf-8"），铺满整行只会让人觉得空。
 FIELD_W = 210
+# 设置面板里**所有下拉框**统一的宽度（主题 / 界面材质 / 开屏动画 / SOC 数据来源 /
+# 历史数据采样间隔）。用户 2026-11-21 截图点名：「请把框的宽度缩小，而且要对齐」——
+# 当时主题与界面材质是 FIELD_W(210)、开屏动画因为"按最长条目 +80"被撑到 233，
+# 三只框右缘差 23px，材质强度那一行的滑杆更是一路顶到 490。
+# 定宽依据（12.5pt 真字体实测）：下拉框自身 chrome=48（边框 + 右侧 24px 箭头区），
+# 最长条目是开屏动画的「无（直接进入）」119px → 完整显示需 167，取 176 留 9px 余量。
+# ⚠️ 别再改回"按最长条目算"：那套算法只要换一条文案整组框就跟着变宽变窄，
+#    永远对不齐。要加长文案先看 119px 这条线。
+COMBO_W = 176
 # 面板整体的**兜底下限**（真正的宽度按内容算，见 __init__ 末尾那行）。
 # ⚠️ 不能再往下调：body 的最小宽由"最宽标签 187 + 18 + 最宽字段 362"决定，
 # 把下限设到 body 之下没用（内容仍然要那么宽），只会让面板在窄屏上被裁。
@@ -1025,50 +1034,21 @@ class VehicleLibraryDialog(QDialog):
 
 
 # ---------------------------------------------------------------- 选车号动画
-# 用户定稿（2026-11-13「只留一次局部高斯模糊，不要别的动画」）：切车号 / 改模组数时，
-# 把「在线车辆库按钮行以下的可见设置区」抓成清晰快照 → 再算它的高斯模糊版 →
-# 两张图交给覆盖层（底层不透明清晰图垫底、模糊图按 α 叠在上面）→ 极短一拍后把
-# 模糊图淡出（α 1→0），画面从"模糊"平滑过渡到"清晰的新数据"。
-# ⛔ 数据在抓图前就已经一帧到位：没有逐帧数据动画、没有主时钟、没有占位行/逐模组淡入。
-# ⛔ 两条顺序铁律：抓图前必须 `_veh_settle_layout()` 把几何推到终态；淡出前必须
-#    `_veh_resync()` 确认快照仍等于真实画面（不等就重抓，否则交接会跳一下）。
-# ⛔⛔ 淡出全程**不依赖覆盖层底下是什么**：底层是不透明快照，窗口表面上残留的旧
-#    像素一律看不见。别再退回"只画一层半透明模糊图"的写法 —— 那就是这个 bug。
+# 切车号 / 改模组数：数据一帧到位后，把「在线车辆库按钮行以下可见区」整片高斯模糊
+# 一下、再淡出露出新数据（观感与旧版一致）。实现极简：覆盖层盖住不透明清晰快照，
+# 模糊图在其上按 α 淡出；淡出期间**绝不重抓图**（旧版 resync 的 hide→grab→异步
+# update 有竞态窗口，是半透明多层残影的元凶）。连点靠统一 stop 互斥，不需要 seq。
 _VEH_SIGMA_MAX = 24.0         # 高斯强度（物理像素；图像按 1/4 计算，内部 σ/4）
 _VEH_BLUR_DIV = 4             # 1/4 降采样：全分辨率 6 档 551ms → 1/4 仅 26~31ms
-_VEH_HOLD_ONCE_MS = 50        # 「糊一下」的停顿（ms）
 _VEH_FADE_MS = 650            # 淡出时长（ms）
+_VEH_BLUR_SIDE_CHARS = 0      # 糊层左右各外扩几个字符宽（盖过视口边缘、不留清晰窄缝）
 
-class _FadeOverlay(QWidget):
-    """两层合成：底下铺一张**不透明**清晰快照，上面叠同一块的模糊图按 α 淡出。
 
-    ⛔⛔ 这个控件**绝不能用 ``WA_TranslucentBackground``**（2026-11-15 真机录屏定位）。
-    带着半透明属性时，这块子控件的内容会被**合成两遍** —— 一遍在正确位置，另一遍
-    整体再偏移一个「控件自己在父控件里的坐标」。于是屏幕上同时出现两套模组行：
-    一套模糊、一套清晰，位移量恰好等于 ``_below_vehicle_rect()`` 的左上角
-    （本机 rect=(24,62) → 录屏量到 (+24,+62)；用户那次 rect=(24,151) →
-    从他那张截图里量到 (+24,+151)）。左侧还会剩一列被裁掉一半的字符残端，
-    那正是"上面那一层"被"下面那一层"盖住右半边之后的残余。
+class _VehFade(QWidget):
+    """两层合成：底下铺**不透明**清晰快照，上面叠同块模糊图按 α 淡出。
 
-    取证过程（可复跑）::
-
-        .venv\\Scripts\\python.exe devtools/_probe_popup_veh.py popup   # 复现
-        .venv\\Scripts\\python.exe devtools/_probe_popup_veh.py opaque  # 改不透明后消失
-
-    判据不是肉眼：把抓下来的屏幕帧按行投影取文字带，``mark`` 模式给覆盖层画洋红
-    边框 + 左上角绿标，洋红框包围区里出现**两串间隔相同的行**即复现；``opaque``
-    模式下只剩一串、且与 ``sf02_base.png``（抓图位图）逐行对齐。
-
-    其余几条也必须保持：
-      * **底层用 `CompositionMode_Source` 整块替换**（连 alpha 一起写）：`SourceOver`
-        会把清晰图和旧像素混一层，等于又回到"盖不住"。
-      * **α 在绘制阶段乘**（`setOpacity`）：改 palette 或预乘到颜色里会把位图整体染色。
-      * **不用 QGraphicsOpacityEffect / QGraphicsBlurEffect**（项目铁律：控件级
-        离屏合成会抽搐）。模糊在 numpy 里预生成，绘制阶段只有两次 drawPixmap。
-      * **不透明是安全的**：``self.grab(rect)`` 抓回来的位图实测 alpha 恒 255
-        （``t01_raw`` / ``sf01_base`` / ``sf02_base`` 三张逐像素统计 100% ==255），
-        所以这块控件整块盖住、底下什么都不露。⛔ 哪天抓图开始带 alpha，必须先把
-        base 压到不透明，否则又变成"盖不住"。
+    ⛔⛔ 绝不能用 ``WA_TranslucentBackground``：带半透明属性的子控件内容会被合成
+    两遍（正确位置 + 再偏移一个自身坐标），屏幕上一套模糊一套清晰 = 叠影。
     """
 
     def __init__(self, parent: QWidget) -> None:
@@ -1076,12 +1056,6 @@ class _FadeOverlay(QWidget):
         self._base: QPixmap | None = None      # 清晰快照（不透明，垫底）
         self._blur: QPixmap | None = None      # 同一块的模糊图（按 α 叠在上面）
         self._alpha = 0.0
-        # ⛔⛔ 这里原来是 WA_TranslucentBackground=True —— 就是"两套内容叠着"的根因。
-        #    带这个属性时本控件的内容会被合成两遍（正确位置 + 再偏移一个自身坐标），
-        #    屏幕上一套模糊一套清晰。改成不透明子控件后叠影消失。
-        #    WA_NoSystemBackground + WA_OpaquePaintEvent：告诉 Qt 别先用 palette
-        #    刷底、并且本控件每次都会把自己的每个像素画满（paintEvent 里
-        #    CompositionMode_Source 整块替换 base，确实画满了）。
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
@@ -1089,7 +1063,6 @@ class _FadeOverlay(QWidget):
         self.hide()
 
     def show_frame(self, base, blur, rect: QRect, alpha: float) -> None:
-        """base = 清晰快照，blur = 同一块的模糊图；rect 用**面板坐标**（与抓图同一个）。"""
         try:
             self._base = base
             self._blur = blur
@@ -1100,7 +1073,7 @@ class _FadeOverlay(QWidget):
                 self.show()
             self.raise_()
             self.update()
-        except RuntimeError:              # 面板已关，C++ 对象已销毁：静默收尾
+        except RuntimeError:              # 面板已关：静默收尾
             self.clear()
 
     def clear(self) -> None:
@@ -1152,6 +1125,10 @@ class SettingsDialog(QDialog):
         # 构造期的首次 _sync_vehicle_rows **不许**跑过渡动画（面板还没上屏，
         # 动画只会让打开面板那一瞬间的行数是"长到一半"的样子）。
         self._veh_allow = False
+        # 极简动画的三个实例字段：覆盖层 + 定时器各复用一个实例，不再每次新建。
+        self._veh_overlay: _VehFade | None = None
+        self._veh_timer: QTimer | None = None
+        self._veh_alpha = 0.0
         # 标题栏主题跟着本次打开的方案走（跟随系统则当场解析），showEvent 里应用
         self._scheme = (detect_system_scheme() if theme_mode == "system"
                         else theme_mode)
@@ -1234,7 +1211,7 @@ class SettingsDialog(QDialog):
             self._custom_rows[row_key] = (row_label, spin)
 
         self.cmb_theme = ChevronComboBox()
-        self.cmb_theme.setFixedWidth(FIELD_W)
+        self.cmb_theme.setFixedWidth(COMBO_W)
         for label, value in THEME_MODES:
             self.cmb_theme.addItem(label, value)
         index = self.cmb_theme.findData(theme_mode)
@@ -1253,21 +1230,29 @@ class SettingsDialog(QDialog):
         self.slider_glass = GlassSlider(Qt.Orientation.Horizontal)
         self.slider_glass.setRange(0, 100)
         self.slider_glass.setValue(max(0, min(100, int(glass))))
-        self.slider_glass.setMinimumWidth(190)
+        # 让"滑杆 + 数值"整行与三只下拉框**同宽**（用户 2026-11-21 截图点名
+        # "要对齐"：滑杆原来一路顶到 490，比 176 的框多出 145px，整块看着是斜的）。
+        # 滑杆自身 = COMBO_W - 数值标签 40 - 行内 spacing 10 = 126px，
+        # 0~100 无级拖动每档 1.26px，手感够用（数值另有一枚标签实时显示）。
+        _GLASS_LBL_W = 40
+        _GLASS_GAP = 10
+        self.slider_glass.setFixedWidth(COMBO_W - _GLASS_LBL_W - _GLASS_GAP)
         self.slider_glass.setToolTip(
             "拖动即可实时调整整个界面材质的强度（毛玻璃与液态玻璃共用）")
         self.lbl_glass = QLabel()
         self.lbl_glass.setFont(ui_font(11.5))
-        self.lbl_glass.setMinimumWidth(40)
+        self.lbl_glass.setFixedWidth(_GLASS_LBL_W)
         self.lbl_glass.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._refresh_glass_label(self.slider_glass.value())
         self.slider_glass.valueChanged.connect(self._on_glass_changed)
 
         glass_row = QHBoxLayout()
-        glass_row.setSpacing(10)
+        glass_row.setSpacing(_GLASS_GAP)
         glass_row.addWidget(self.slider_glass, 1)
         glass_row.addWidget(self.lbl_glass)
-        form.addRow(self._label("材质强度"), self._row(glass_row))
+        glass_field = self._row(glass_row)
+        glass_field.setFixedWidth(COMBO_W)
+        form.addRow(self._label("材质强度"), glass_field)
 
         # 「界面材质」：从「定制功能」里提到这里，紧跟在「材质强度」**下面**
         # （用户 2026-10-22："把材质强度放到界面材质的上面"）。这两个是一对 ——
@@ -1284,7 +1269,7 @@ class SettingsDialog(QDialog):
             self.cmb_material.setCurrentIndex(material_index if material_index >= 0 else 0)
             if material_spec.get("tip"):
                 self.cmb_material.setToolTip(material_spec["tip"])
-            self.cmb_material.setFixedWidth(FIELD_W)
+            self.cmb_material.setFixedWidth(COMBO_W)
             self.cmb_material.currentIndexChanged.connect(
                 lambda _idx, s=material_spec, c=self.cmb_material:
                 self._on_choice_changed(s, c))
@@ -1444,19 +1429,20 @@ class SettingsDialog(QDialog):
         # 2026-11-03 用户：「既然动画选择里面有无动画选项了那就不需要开屏动画
         # 开关了」—— 去掉总开关，只留下拉（第一项就是「无」）。
         self.cmb_splash = ChevronComboBox()
-        self.cmb_splash.addItem("无（直接进主界面）", "none")
+        # "主界面"两个字去掉：「无（直接进主界面）」实测 153px，是整组下拉里最长的
+        # 一条，会把统一框宽逼到 201（比 FIELD_W 还宽，等于没缩）；改「无（直接
+        # 进入）」后 119px —— 与 COMBO_W 的口径一致（见 COMBO_W 的注释）。
+        self.cmb_splash.addItem("无（直接进入）", "none")
         # 只列**方案**（planA / planB）：同一方案的浅色/深色是变体，播放时按当前
         # 主题自动挑（用户 2026-11-03：「只保留 planA、planB 这些选项，然后系统
         # 自动选择当前主题相同的动画」）。
         for plan in splash_anim.plans():
             self.cmb_splash.addItem(plan["label"], plan["id"])
         self.cmb_splash.addItem("自定义文件…", "custom")
-        # 宽度按**最宽条目**算：固定 FIELD_W 会把"跟随主题（自动选浅色/深色）"
-        # 截成"跟随主题（自动选浅色"（用户 2026-11-03 截图点名"框小了"）。
-        fm = self.cmb_splash.fontMetrics()
-        widest = max((fm.horizontalAdvance(self.cmb_splash.itemText(i))
-                      for i in range(self.cmb_splash.count())), default=0)
-        self.cmb_splash.setFixedWidth(max(FIELD_W, widest + 80))
+        # 2026-11-21 起**不再按最长条目放宽**（那套算法把它撑到 233，比旁边两只
+        # 210 的框多出 23px，用户点名"要对齐"）：整组统一 COMBO_W，最长条目
+        # 119px < 内容区 128px，不会被截。
+        self.cmb_splash.setFixedWidth(COMBO_W)
         index = self.cmb_splash.findData(splash_anim.choice())
         self.cmb_splash.setCurrentIndex(index if index >= 0 else 1)
         self.cmb_splash.currentIndexChanged.connect(self._on_splash_changed)
@@ -1771,7 +1757,6 @@ class SettingsDialog(QDialog):
         用一个重入闸把嵌套调用折叠成一次，彻底断掉这条链。
         """
         if getattr(self, "_veh_syncing", False):
-            self._veh_dbg("SYNC_REENTRY_SKIP")
             return
         self._veh_syncing = True
         try:
@@ -1818,27 +1803,16 @@ class SettingsDialog(QDialog):
         # 的 cell/temp 列表变了才动（改模组个数是另一条路径，不经这里）。
         if (tuple(cells) != tuple(self._shown_cells)
                 or tuple(temps) != tuple(self._shown_temps)):
-            # 2026-11-13 用户定稿：**每一次换车号都走同一条过渡**（整片高斯模糊 →
-            # 淡出露新数据），不再分"行数变没变"两种观感 —— 用户上一轮反馈
-            # "选择好了车号直接整片瞬间高斯模糊就可以了"，两种观感只会让人以为
-            # 动画时好时坏。行数没变时 `_veh_apply_rows` 会原地改值（不重建控件），
-            # 所以这一条既有动画、又不会丢焦点/抖布局。机制见 _veh_start()。
+            # 结构变了：走一次高斯模糊淡出（观感与旧版一致）。机制见 _veh_start。
             self._veh_start(cells, temps)
         else:
-            # 结构没变（比如选车但模组结构一模一样 / 取消选车）→ 不走过渡，但
-            # `_sync_grid_params_visibility` 刚刚翻过「旧三件套」三行的显隐，布局
-            # 高度和滚动条夹位都变了。不在这里同步落位 + 整块重绘的话，滚动条要等
-            # 下一拍事件循环才夹位，屏幕上会留下旧一帧的行 = 用户说的「显示行数
-            # 没跟模组数据一起动」。这一条保证「一帧之内全部到位、无残影」。
+            # 结构没变（选同结构车 / 取消选车）→ 不重播动画，但仍要同步落位 +
+            # 整块重绘：`_sync_grid_params_visibility` 刚翻过旧三件套显隐，布局高度
+            # 和滚动条夹位都变了，不推到终态就会留旧一帧行 = "显示行数没跟数据动"。
+            # ⛔ 绝不许用 setUpdatesEnabled(False) 包住落位：半透明 top-level 面板
+            #    关更新期间背板整块变透明（桌面壁纸），repaint() 补不回来。
             body = self.form.parentWidget()
             if body is not None:
-                # ⛔⛔ 这里**绝不许**再用 setUpdatesEnabled(False) 包住落位。
-                #    2026-11-14 实测（_check/_probe_trail.py）：这块面板是
-                #    WA_TranslucentBackground 的半透明 top-level，更新关闭期间
-                #    背板会**整块变透明** —— 截出来直接是桌面壁纸，开回来再
-                #    repaint() 也补不回来。od116 只在 `_veh_start` 里回退了这种
-                #    写法，**这一支漏下来了**，是彻头彻尾的冗余代码（用户
-                #    2026-11-14：「有冗余代码干扰啊，我觉得是」）。
                 self._veh_settle_layout(body)
             self._veh_repaint_all()
 
@@ -1858,26 +1832,53 @@ class SettingsDialog(QDialog):
                 for widget in pair:
                     widget.setVisible(legacy_on)
 
+    def _set_form_row_visible(self, widget: QWidget, visible: bool) -> None:
+        """按控件把**整行**（标签 + 字段）一起显隐。
+
+        ⛔ 用 ``QFormLayout.setRowVisible`` 而不是 ``widget.setVisible``：后者只藏
+        控件、行高仍占着，面板里会凭空多出一条空白缝（用户对空行很敏感）。
+        ⛔ 也别用 ``form.removeRow``：删了再插会把顺序打乱，且控件会被重新 parent。
+        """
+        form = getattr(self, "form", None)
+        if form is None or widget is None:
+            return
+        try:
+            row, _role = form.getWidgetPosition(widget)
+        except (RuntimeError, TypeError):
+            return
+        if row < 0:
+            return
+        try:
+            form.setRowVisible(int(row), bool(visible))
+        except (RuntimeError, TypeError):
+            widget.setVisible(bool(visible))
+
     def _sync_row_hint_widgets(self) -> None:
         """把「电压/温度数据行数」两个数字框摆成**当前这套参数**的值。
 
         用户 2026-11-13：「不是让你在设置里面弄一个电压显示行数和温度显示行数吗，
-        这个要跟着车号走」—— 所以：
+        这个要跟着车号走」；2026-11-21 又补一句：「电压数据和温度数据都要跟着车号
+        走，没有选择车号就不显示」—— 所以：
 
-        - 选了车 → 显示**这台车**存的两个行数（``customization.active_row_hints``）；
-        - 没选车 → 显示全局键（= 加这个功能时的老行为，一字不差）；
-        - 0 永远表示「自动」（选了车 = 一排一个模组，没选车 = 跟随设备列数）。
+        - 有车号档案（``active_profile()`` 不是 None）→ 两行**露出**，显示这台车
+          存的两个行数（``customization.active_row_hints``）；
+        - 没有车号（或那台车还没有逐模组档案）→ 两行**整行隐藏**。判据与
+          ``_sync_grid_params_visibility`` 同一条：同一时刻只让一套参数露面
+          （没档案时主窗走的是旧三件套，这两行没有意义）。
+        - 0 永远表示「自动」（= 一排一个模组）。
 
         ⛔ 这里必须 ``blockSignals``：``setValue`` 会触发 ``valueChanged`` →
         ``_on_rows_hint_changed`` 把刚读出来的值又写回去，换车时就会把 A 车的
         行数写进 B 车（"跟着车号走"直接失效）。
         """
         has_vehicle = customization.active_profile() is not None
-        if has_vehicle:
-            volt, temp = customization.active_row_hints()
-        else:
-            volt = int(customization.get("volt_rows") or 0)
-            temp = int(customization.get("temp_rows") or 0)
+        for key in self._VEHICLE_ROW_KEYS:
+            widget = self._custom_widgets.get(key)
+            if widget is not None:
+                self._set_form_row_visible(widget, has_vehicle)
+        if not has_vehicle:
+            return
+        volt, temp = customization.active_row_hints()
         for key, value in (("volt_rows", volt), ("temp_rows", temp)):
             widget = self._custom_widgets.get(key)
             if widget is None:
@@ -2059,6 +2060,16 @@ class SettingsDialog(QDialog):
                 bottom = min(bottom, bar.top())
         if bottom <= top or right <= left:
             return QRect()
+        # 2026-11-19：左右各外扩几个字符宽（用户点名"高斯模糊边界左右各扩展几个
+        # 字符长度"）—— 让糊层盖过视口边缘的控件，避免边界处留一条清晰窄缝。
+        # 用等宽数字 advance 当字符宽口径（与网格对齐同一套字体），夹在面板内。
+        try:
+            char_w = QFontMetrics(self.font()).horizontalAdvance("0")
+        except RuntimeError:
+            char_w = 0
+        side = int(char_w) * _VEH_BLUR_SIDE_CHARS if char_w > 0 else 0
+        left = max(0, left - side)
+        right = min(float(self.width()), right + side)
         return QRect(int(left), int(top), int(right - left), int(bottom - top))
 
     def _veh_blur_pixmap(self, pix: "QPixmap | None") -> "QPixmap | None":
@@ -2106,10 +2117,15 @@ class SettingsDialog(QDialog):
                 return None
             small = np.asarray(small, dtype=np.float32)
 
-            # 毛玻璃质感：轻微提亮 + 去饱和（保持黑白灰系统，不引第三种色）。
+            # 毛玻璃质感：轻微去饱和（保持黑白灰系统，不引第三种色）。
+            # ⛔ 不要在这里**提亮**（曾经 +6.0）：糊层一旦比面板底色亮，整块模糊
+            #    区域就成了一块"发白的矩形"，边界肉眼可见 —— 用户反复说的"残影"
+            #    有一半是这块矩形本身（真机逐帧：淡出结束后逐像素完全一致，没有
+            #    任何残留层，见 _check/ghost2/）。只去饱和、不动亮度，观感就是
+            #    "这片内容失焦"，而不是"贴了一层东西"。
             rgb = small[:, :, :3]
             lum = rgb.mean(axis=2, keepdims=True)
-            rgb = np.clip(lum + (rgb - lum) * 0.82 + 6.0, 0.0, 255.0)
+            rgb = np.clip(lum + (rgb - lum) * 0.82, 0.0, 255.0)
             small = np.concatenate((rgb, small[:, :, 3:4]), axis=2)
 
             out = np.clip(small, 0, 255).astype(np.uint8)
@@ -2154,42 +2170,8 @@ class SettingsDialog(QDialog):
         self._shown_temps = [int(v) for v in temps]
 
     # ------------------------------------------------ 选车号过渡（一次局部高斯模糊）
-    #
-    # 真实顺序就在 `_veh_start` 里，⛔ 别按旧注释理解成"先盖旧图、再换数据"：
-    #   换数据 → `_veh_settle_layout()` 同步落位 → 抓可见区 + 真高斯模糊 →
-    #   α=1 盖上并 repaint() → HOLD → 淡出 α 1→0 → `_veh_stop()` 清场。
-    # 唯一的动画是「模糊层渐隐」：数据在糊层底下**一帧到位**，没有逐帧重排 / 占位行 /
-    # 逐模组交叉淡入 / 主时钟 —— 那些都是被推翻的方案，别再往回加。
-    #
-    # ⛔⛔ 覆盖层必须挂**面板（self）**，不许挂 body：body 在滚动区里，重建逐模组行时
-    # 会重排、滚动条会被夹位，挂在它上面的位图会跟着内容一起位移 —— 用户
-    # 2026-11-13 说的"从上往下"就是这个。
-
-    def _veh_state(self) -> dict | None:
-        return getattr(self, "_veh", None)
-
-    def _veh_dbg(self, tag: str, extra: str = "") -> None:
-        """把关键节点写进 logs/vehicle_anim.log（永不抛异常），便于真机排查残影。"""
-        try:
-            import os as _os, time as _t
-            base = _os.environ.get("LOCALAPPDATA") or _os.path.expanduser("~")
-            folder = _os.path.join(base, "CQUFSAE-SerialAssistant", "logs")
-            _os.makedirs(folder, exist_ok=True)
-            parts = [f"{_t.strftime('%m-%d %H:%M:%S')}.{int(_t.time() * 1000) % 1000:03d}", tag]
-            fo = getattr(self, "_veh_mask_full", None)
-            if fo is not None:
-                try:
-                    g = fo.geometry()
-                    parts.append(
-                        f"ov_vis={fo.isVisible()},ov=({g.x()},{g.y()},{g.width()},{g.height()})")
-                except Exception:  # noqa: BLE001
-                    pass
-            if extra:
-                parts.append(extra)
-            with open(_os.path.join(folder, "vehicle_anim.log"), "a", encoding="utf-8") as fh:
-                fh.write(" ".join(parts) + "\n")
-        except Exception:  # noqa: BLE001
-            pass
+    # 顺序见 `_veh_start`：先落新数据 → 同步落位 → 抓终态图 + 高斯模糊 →
+    # α=1 盖上 → 单段定时器淡 α 1→0 → `_veh_stop()` 清场。覆盖层挂面板（self）。
 
     def _veh_apply_rows(self, cells: list[int], temps: list[int]) -> None:
         """把逐模组行换成新数据：**行数没变就原地改值**，变了才重建控件。
@@ -2265,30 +2247,16 @@ class SettingsDialog(QDialog):
             pass
 
     def _veh_start(self, cells: list[int], temps: list[int]) -> None:
-        """切车号 / 改模组数：「在线车辆库按钮行以下可见区」整片高斯模糊，淡出露出新数据。
+        """切车号 / 改模组数：数据一帧到位 → 整片高斯模糊一下 → 淡出露新数据。
 
-        四步，顺序不可换（换任何一步都会变成"两套内容叠着"或"闪一帧裸内容"）：
-
-          ① **先落新数据**（``_veh_apply_rows`` + ``form.activate()`` +
-             ``_veh_settle_layout``，全在事件循环之外）—— 此刻屏幕还看不见；
-          ② 抓「此刻的可见区」并真高斯模糊 —— 它已经是新内容、已在终态几何上；
-          ③ 两张图交给覆盖层：清晰图垫底（不透明）、模糊图按 α=1 叠在上面；
-          ④ HOLD 后把模糊图淡出（α 1→0），画面落回覆盖层自己的清晰快照；
-             随后 ``_veh_stop()`` 撤掉覆盖层并整块重绘，与真实面板无缝交接。
-
-        ⛔⛔ "先落数据再抓图"：旧方案「先抓旧画面 → 盖住 → 底下换数据」里，
-        换数据会重建逐模组行、改 body 高度/滚动位置，冻结的旧图与落位后的新内容对不上，
-        淡出全程都是重影 —— 任何"旧→新"快照式过渡都有这个天生缺陷，补抓图只能缓解。
-        ⛔⛔ 淡出**不依赖覆盖层底下是什么**（见 ``_FadeOverlay``）：底层不透明，
-        窗口表面残留的旧像素全程看不见。别再退回单层半透明写法。
-        ⛔ 淡出前还有一道 ``_veh_resync()``：快照与真实画面若仍有差异就当场重对齐，
-        保证 α 走到 0 的那一帧与随后揭开的面板长得一样。
-        任何一步被打断（异常/连点）都落到终态：清覆盖层 + 显示新行，绝不残影。
+        连点互斥靠开头统一 `_veh_stop()`（停表 + 撤覆盖层），不需要 seq 代数守卫；
+        淡出期间只改覆盖层 α，**绝不重抓图**（旧版 resync 竞态 = 叠影元凶）。
         """
         self._veh_ensure_updates()
+        # 先停掉在途淡出 + 撤旧覆盖层：连点车号天然互斥。
+        self._veh_stop()
         body = self.form.parentWidget()
-        if body is None or not getattr(self, "_veh_allow", False):
-            # 面板还没上屏 / 动画被禁用：直接换行，不做过渡。
+        if body is None or not self._veh_allow:
             self._veh_apply_rows(cells, temps)
             return
         from ui_anim import animations_enabled
@@ -2296,287 +2264,99 @@ class SettingsDialog(QDialog):
             self._veh_apply_rows(cells, temps)
             return
 
-        # 打断上一段（若还在跑）：停表 + 清覆盖层，避免两段糊层叠写。
-        self._veh_stop()
-
-        # ① 先把新数据一帧落位（事件循环之外，屏幕上尚不可见）。
-        #    ⛔ 只 `form.activate()` 不算落位：QScrollArea 的内容控件尺寸、滚动条
-        #    range 和**夹位**都归它自己算（发生在事件循环里），抓图前必须同步推到
-        #    终态，否则糊层是一张「比真实行高 92~230px」的图（实测，见
-        #    _veh_settle_layout 的注释）。
+        # ① 先落新数据 + 同步几何（全在事件循环外，此刻屏幕还看不见）。
+        self._veh_apply_rows(cells, temps)
         try:
-            self._veh_apply_rows(cells, temps)
-            try:
-                self.form.activate()
-                bl = body.layout()
-                if bl is not None:
-                    bl.activate()
-            except RuntimeError:
-                pass
-            self._veh_settle_layout(body)
-        except Exception as exc:               # noqa: BLE001 - 兜底：落位失败直接清场
-            try:
-                import app_log
-                app_log.warning(f"车号过渡落位失败，已清场：{exc!r}")
-            except Exception:
-                pass
-            self._veh_stop()
-            return
-
-        # ② 抓「此刻可见区」（已是新内容、已按终态几何排好）并模糊。
-        #   ⛔ 抓图前先藏掉残留覆盖层（若有），否则旧糊层会被烤进新快照当成重影。
-        old_overlay = getattr(self, "_veh_mask_full", None)
-        if old_overlay is not None:
-            try:
-                old_overlay.hide()
-                old_overlay.update()
-            except RuntimeError:
-                pass
-        rect = self._below_vehicle_rect()
-        pix = None
-        raw = None
-        if not rect.isNull() and rect.height() > 0:
-            try:
-                # ⛔ self.grab（面板坐标）与覆盖层 setGeometry(rect) 同一坐标系，
-                #    已实测零帧偏移；抓的是「当前可见区」= 新内容，天然对齐。
-                grabbed = self.grab(rect)
-            except RuntimeError:
-                grabbed = None
-            if grabbed is not None and not grabbed.isNull():
-                raw = grabbed
-                pix = self._veh_blur_pixmap(grabbed)
-
-        # 没有可模糊的快照（极端：区域为空 / 面板还没排好版）→ 新数据已落位，收工。
-        if pix is None or rect.isNull():
-            self._veh_stop()
-            return
-
-        # ③ 以 α=1 整片盖上，然后**整块重画一次面板**（不是只重画糊层）。
-        try:
-            overlay = getattr(self, "_veh_mask_full", None)
-            if overlay is None or overlay.parentWidget() is not self:
-                overlay = _FadeOverlay(self)
-                self._veh_mask_full = overlay
-        except RuntimeError:
-            return
-        # 抓图与贴图用同一个 rect（都是面板坐标），无需任何换算。
-        # `raw` 垫底当不透明快照、`pix` 是它的模糊版 —— 淡出全程只由这两张图
-        # 决定，覆盖层底下留了什么旧像素都看不见（见 _FadeOverlay 的说明）。
-        overlay.show_frame(raw, pix, rect, 1.0)
-
-        # 把面板自身也整块刷一次。覆盖层底层已经不透明（淡出全程看不见底下），
-        # 所以这一条**不是**淡出干净的必要条件，只用来保证 `_veh_stop()` 揭开那一刻
-        # 面板表面已经是终态 —— 少一次"淡完才修干净"的抖动。
-        # ⛔ 不能只 `overlay.repaint()`：滚动条轨道、滚动区之外的兄弟控件不归覆盖层管。
-        # ⛔ 也别改成 `setUpdatesEnabled(False/True)` 包住整段：这块半透明面板
-        #    在更新关闭期间背板会整块变透明（实测截图直接看到桌面壁纸），回来
-        #    之后 `repaint()` 也补不回来。
-        try:
-            self.repaint()
+            self.form.activate()
+            bl = body.layout()
+            if bl is not None:
+                bl.activate()
         except RuntimeError:
             pass
+        self._veh_settle_layout(body)
 
-        # ④ 极短的「糊一下」停顿后**淡出**模糊图（α 1→0），由覆盖层自己的不透明
-        #    快照接住画面 —— 底下露不出来，所以淡出里没有任何逐帧数据动画、也不会错位。
-        #    「代数」_veh_seq 仍是唯一取消凭证：后一次 _veh_start 会先 _veh_stop()
-        #    （seq +1），在途的 hold / fade 回调发现代数已变就直接返回或走到终态，
-        #    既不提前清屏、也不留下旧糊层。
-        seq = self._veh_next_seq()
-        # `raw` 有两个用途：垫底当不透明快照（见 _FadeOverlay），以及给
-        # `_veh_resync` 当比对基准（一样就连模糊都不用做，省 20+ ms）。
-        self._veh = {"rect": rect, "pix": pix, "raw": raw, "overlay": overlay,
-                     "seq": seq, "timer": None}
-        self._veh_dbg("START", f"seq={seq}")
-        timer = QTimer(self)
-        timer.setSingleShot(True)
-        timer.timeout.connect(lambda s=seq: self._veh_hold_done(s))
-        self._veh["timer"] = timer        # 先存句柄，再启动：打断时必能 stop()
-        timer.start(_VEH_HOLD_ONCE_MS)
-
-    # （原 `_veh_veil_rect()` 恒等换算函数已删：2026-11-13 起 `_below_vehicle_rect()`
-    #  直接返回**面板坐标**，抓图 `self.grab(rect)` 与贴图用同一个 rect，全程一根
-    #  坐标系，不再需要 body→面板换算。⛔ 千万别恢复 `body.mapTo`：body 在滚动区里，
-    #  滚动后带偏移会把糊层整体推下去盖住「确定」按钮。该函数零调用，属冗余代码。）
-
-    def _veh_next_seq(self) -> int:
-        """递增并返回当前代次号（连点车号时用来作废旧回调）。"""
-        self._veh_seq = int(getattr(self, "_veh_seq", 0)) + 1
-        return self._veh_seq
-
-    def _veh_hold_done(self, seq: int) -> None:
-        """单次停留到点：只有仍是**当前代次**才落终态。
-
-        连点车号时，后一次 ``_veh_start`` 会先 ``_veh_stop()``（停掉在途定时器 +
-        代数 +1），所以前一次在途的 singleShot 即便因 Qt 事件队列竞争晚到，也会
-        在第一行就返回 —— 既不提前清掉新糊层，也不把旧糊层留成残影。
-        """
-        if seq != getattr(self, "_veh_seq", 0) or self._veh_state() is None:
+        # ② 抓终态新图 → 真高斯模糊（抓图与贴图同一 rect、面板坐标）。
+        rect = self._below_vehicle_rect()
+        if rect.isNull() or rect.height() <= 0:
+            self._veh_repaint_all()
             return
-        self._veh_dbg("HOLD_DONE", f"seq={seq}")
-        self._veh_fade_out(seq)
-
-    @staticmethod
-    def _veh_pix_close(a, b) -> bool:
-        """两张位图是否「肉眼一样」（缩到 64×48 后算均方根色差，< 3 视为相同）。
-
-        只用于 ``_veh_resync`` 判断「快照和真实画面有没有变」——不需要精确，
-        只需要能把「同一画面」和「3 行 vs 5 行」这种量级的差别分开。
-        """
         try:
-            from PySide6.QtGui import QImage
-            if a is None or b is None or a.isNull() or b.isNull():
-                return False
-            if a.size() != b.size():
-                return False
-            ia = a.toImage().convertToFormat(QImage.Format.Format_RGB32).scaled(64, 48)
-            ib = b.toImage().convertToFormat(QImage.Format.Format_RGB32).scaled(64, 48)
-            tot = 0
-            n = 0
-            for y in range(48):
-                for x in range(64):
-                    ca = ia.pixel(x, y) & 0xFFFFFF
-                    cb = ib.pixel(x, y) & 0xFFFFFF
-                    tot += (((ca >> 16) & 255) - ((cb >> 16) & 255)) ** 2 \
-                        + (((ca >> 8) & 255) - ((cb >> 8) & 255)) ** 2 \
-                        + ((ca & 255) - (cb & 255)) ** 2
-                    n += 1
-            return (tot / max(1, n)) ** 0.5 < 3.0
-        except Exception:                    # noqa: BLE001 - 比对失败按"不一致"处理
-            return False
-
-    def _veh_resync(self, state: dict) -> None:
-        """淡出开始前，把快照**重新对齐到此刻的真实画面**。
-
-        覆盖层底层已经是不透明快照（见 ``_FadeOverlay``），所以这一步**不再**
-        负责"别让两套内容同时出现"——那件事已经由底层不透明结构性解决了。它现在
-        只负责另一件事：保证 α 走到 0 的那一帧与随后 ``_veh_stop()`` 揭开的真实
-        面板**长得一样**，否则交接时会跳一下。
-
-        为什么可能不一样：抓图那一拍到淡出开始之间隔了 50ms 的 HOLD，这期间滚动条
-        夹位、样式 polish、别的排队重绘都可能让布局再走一遍。α 还是 1 的时候重抓
-        一次最保险 —— 那时屏幕上只有模糊图，重抓不会有任何可见变化。
-
-        ⛔ 抓图前必须先 hide() 覆盖层，否则会把糊层自己烤进新位图（= 糊上加糊）。
-        ⛔ 抓完**立刻**把快照原样盖回去（finally 里），中间不留任何一帧裸奔。
-        """
-        rect = state.get("rect")
-        overlay = getattr(self, "_veh_mask_full", None)
-        old = state.get("pix")
-        old_raw = state.get("raw")
-        if (overlay is None or old is None or old_raw is None or rect is None
-                or rect.isNull() or rect.height() <= 0):
+            raw = self.grab(rect)
+        except RuntimeError:
+            raw = None
+        blur = self._veh_blur_pixmap(raw) if raw is not None and not raw.isNull() else None
+        if blur is None:
+            self._veh_repaint_all()
             return
-        alpha = float(getattr(overlay, "_alpha", 1.0) or 1.0)
-        grabbed = None
+
+        # ③ 覆盖层懒建一次、反复复用；α=1 盖上 + 整块重绘一次。
+        #    ⛔ 绝不 setUpdatesEnabled(False)：半透明 top-level 面板关更新期间
+        #    背板整块变透明（桌面壁纸），repaint() 补不回来。
         try:
-            overlay.hide()
-            grabbed = self.grab(rect)
+            overlay = self._veh_overlay
+            if overlay is None or overlay.parentWidget() is not self:
+                overlay = _VehFade(self)
+                self._veh_overlay = overlay
+            overlay.show_frame(raw, blur, rect, 1.0)
         except RuntimeError:
             return
-        finally:
-            # 无论抓图成败，都先把快照原样盖回去 —— 绝不留下"透明的一帧"。
-            try:
-                if not overlay.isVisible():
-                    overlay.show_frame(old_raw, old, rect, alpha)
-            except RuntimeError:
-                pass
-        if grabbed is None or grabbed.isNull():
-            return
-        # 先比**原始抓图**：一样就说明底下压根没变 → 连模糊都不用做（省 ~25ms）。
-        if self._veh_pix_close(old_raw, grabbed):
-            return
-        pix = self._veh_blur_pixmap(grabbed)
-        if pix is None:
-            return
-        state["raw"] = grabbed
-        state["pix"] = pix
-        try:
-            overlay.show_frame(grabbed, pix, rect, alpha)
-        except RuntimeError:
-            return
-        self._veh_dbg("RESYNC", "淡出前快照与真实画面不一致，已重新对齐")
+        self._veh_repaint_all()
 
-    def _veh_fade_out(self, seq: int) -> None:
-        """停留到点：把模糊图**淡出**（α 1→0），落到覆盖层自己的清晰快照上。
+        # ④ 单段定时器匀速淡 α（16ms/拍）。淡出期间不重抓图，落定即清场。
+        self._veh_alpha = 1.0
+        timer = self._veh_timer
+        if timer is None:
+            timer = QTimer(self)
+            timer.setTimerType(Qt.TimerType.PreciseTimer)
+            timer.setInterval(16)
+            timer.timeout.connect(self._veh_fade_tick)
+            self._veh_timer = timer
+        timer.start()
 
-        模糊图和清晰快照是同一块区域的两次取图（只差一道高斯），淡出等于
-        「模糊 → 清晰」在这两张图之间完成，与覆盖层底下是什么无关。没有逐帧数据
-        动画（用户 2026-11-14："高斯模糊要淡出，数据变化一帧到位，不要中间过程"）。
-        """
-        state = self._veh_state()
-        if state is None or seq != getattr(self, "_veh_seq", 0):
-            return
-        overlay = getattr(self, "_veh_mask_full", None)
-        if overlay is None or state.get("pix") is None:
-            self._veh_stop()
-            return
-        # ⛔⛔ 淡出前重新对齐快照（见 _veh_resync 的说明）。这一步是「两套内容同时
-        #    出现」这类报障的**结构性免疫**：α 还是 1 的时候先确认位图 == 真实画面，
-        #    再开始降 α。⛔ 别删、别挪到淡出中途（那时 α 已经 < 1，换图会闪）。
-        self._veh_resync(state)
-        self._veh_dbg("FADE_START", f"seq={seq}")
-        step_ms = 16.0
-        # 每帧 α 减步长 = 单帧时长 / 总淡出时长；自然匀速渐隐。
-        state["_fade_step"] = step_ms / max(1, _VEH_FADE_MS)
-        timer = QTimer(self)
-        timer.setSingleShot(False)
-        timer.timeout.connect(lambda s=seq: self._veh_fade_tick(s))
-        state["timer"] = timer          # 复用 timer 句柄：打断时 _veh_stop 会停它
-        timer.start(int(step_ms))
-
-    def _veh_fade_tick(self, seq: int) -> None:
-        """逐帧降低覆盖层 α，到 0 时落到终态（清覆盖层）。
-
-        代次已变（被新过渡覆盖/打断）或已无状态：直接返回，绝不碰当前覆盖层——
-        否则会误清掉新一段糊层（原 _veh_hold_done 的同一种代数守卫）。
-        """
-        if seq != getattr(self, "_veh_seq", 0) or self._veh_state() is None:
-            return
-        overlay = getattr(self, "_veh_mask_full", None)
+    def _veh_fade_tick(self) -> None:
+        """逐拍降覆盖层 α；到 0 收场。无 seq、无 resync。"""
+        overlay = self._veh_overlay
         if overlay is None:
             self._veh_stop()
             return
-        step = self._veh_state().get("_fade_step", 16.0 / max(1, _VEH_FADE_MS))
-        overlay._alpha = max(0.0, getattr(overlay, "_alpha", 1.0) - step)
+        self._veh_alpha -= 16.0 / max(1, _VEH_FADE_MS)
+        if self._veh_alpha <= 0.0:
+            self._veh_stop()
+            return
         try:
+            overlay._alpha = self._veh_alpha
             overlay.update()
         except RuntimeError:
-            return
-        if overlay._alpha <= 0.0:
             self._veh_stop()
 
     def _veh_stop(self) -> None:
-        """落到终态：停掉在途定时器 + 清覆盖层 + 整块同步重绘。
-
-        淡出完成、被打断（连点车号 / 关面板 / 抓图失败 / 落位异常）都收到这里，
-        语义只有一条：**显示新行、不留残影**。淡出进行中调用也安全。
-        """
-        state = self._veh_state()
-        self._veh = None
-        self._veh_next_seq()             # 作废所有在途 singleShot 回调
-        if state is not None:
-            timer = state.get("timer")
-            if timer is not None:
-                try:
-                    timer.stop()
-                    timer.deleteLater()
-                except RuntimeError:
-                    pass
-            self._veh_dbg("STOP")        # 只记录真的打断过的一段，日志不刷屏
-        overlay = getattr(self, "_veh_mask_full", None)
+        """停表 + 撤覆盖层 + 整块重绘，落终态。幂等；连点/关面板/异常都走这里。"""
+        timer = getattr(self, "_veh_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except RuntimeError:
+                pass
+        overlay = getattr(self, "_veh_overlay", None)
         if overlay is not None:
             try:
                 overlay.clear()
             except RuntimeError:
                 pass
+        self._veh_alpha = 0.0
         self._veh_repaint_all()
 
     def _veh_repaint_all(self) -> None:
-        """强制**整块同步重绘**（body + 滚动视口）。
+        """强制整块同步重绘（body + viewport + 面板自己），把窗口推到终态。
 
-        模组区高度变化后，QScrollArea 的 viewport 不会自动把「上移后的新内容」全量
-        重画，旧的一帧会淡淡留在屏幕上 = 用户截图那种「每一行上方都有半截重影」。
-        repaint() 同步，立刻用正确内容覆盖，不等事件循环。
+        ⛔⛔ 三段**一个都不能少**（2026-11-19 第 7 次报障）：QScrollArea 的 viewport
+        有独立 backing store，`self.repaint()` 只刷面板自己那一层，清不掉滚动区里的
+        旧帧 —— 覆盖层淡出揭开后，每个控件下方留半截旧内容（用户截图里的形态）。
+        · body.repaint()：滚动内容控件；
+        · viewport.repaint()：真正显示文字的那层（旧帧就留在这）；
+        · self.repaint()：面板自身的毛玻璃背板 / 滚动区外的兄弟控件 / 滚动条轨道。
+        淡出结束揭盖那一刻必须三层全部到位，否则残留旧像素 = "还是没解决"。
+        这三段是**真实控件重绘**，不是位图动画屎山，别再删。
         """
         try:
             body = self.form.parentWidget()
@@ -2587,11 +2367,6 @@ class SettingsDialog(QDialog):
                 vp = sa.viewport()
                 if vp is not None:
                     vp.repaint()
-            # ⛔ 面板**自己**也得整块刷一次（2026-11-14 第 6 次报障）：这是一块
-            #    半透明 top-level，只 repaint 子控件（body / viewport）时，面板
-            #    自身那一层（毛玻璃背板、滚动区之外的兄弟控件、滚动条轨道）会
-            #    留下旧像素。淡出一降 α，那层旧像素就露出来 = "底下还有一套内容"。
-            #    整块同步重绘一次，把窗口表面直接推到终态。
             self.repaint()
         except RuntimeError:
             pass
@@ -3033,7 +2808,7 @@ class SettingsDialog(QDialog):
                 combo.setCurrentIndex(index if index >= 0 else 0)
                 if spec.get("tip"):
                     combo.setToolTip(spec["tip"])
-                combo.setFixedWidth(FIELD_W)
+                combo.setFixedWidth(COMBO_W)
                 combo.currentIndexChanged.connect(
                     lambda _idx, s=spec, c=combo: self._on_choice_changed(s, c))
                 field = combo
@@ -3086,7 +2861,7 @@ class SettingsDialog(QDialog):
         if preview is not None:
             preview.setFont(mono_font(value))
             # 预览的逐字符配色取主题 token，重设一遍确保换主题后颜色跟上
-            preview.setText(self._preview_html(spec, raw))
+            preview.setText(self._preview_html())
         if self._on_custom is not None:
             self._on_custom(spec["key"], value)
 
@@ -3112,7 +2887,7 @@ class SettingsDialog(QDialog):
         return mixed.name()
 
     @classmethod
-    def _preview_html(cls, spec: dict, raw: int) -> str:
+    def _preview_html(cls) -> str:
         """预览文字的**逐字符配色**（用户 2026-10-12 点名，含同日纠正）。
 
         CQUFSAE 六个字母 = 电压超限红 / BMS 橙 / 温度黄 / 欠压绿 / 序号蓝 /
@@ -3158,7 +2933,7 @@ class SettingsDialog(QDialog):
         颜色走富文本逐字符配色（见 ``_preview_html``），换主题后重新拉一遍
         HTML 就能跟上（``_on_slider_changed`` 里做了）。
         """
-        label = QLabel(self._preview_html(spec, slider.value()))
+        label = QLabel(self._preview_html())
         label.setTextFormat(Qt.TextFormat.RichText)
         label.setFont(mono_font(self._slider_display_value(spec, slider.value())))
         # 上 1 下 1：这个标签的行高贴着文字，默认（上0下2）会把墨迹顶到上边缘、
@@ -3190,12 +2965,13 @@ class SettingsDialog(QDialog):
     def custom_values(self) -> dict:
         """「定制功能」区里被**改动过**的项 {key: value}，由主窗口统一落盘。"""
         changes: dict = {}
-        # 选了车 → 「电压/温度数据行数」属于那台车：改的时候已经落盘了（见
-        # _on_rows_hint_changed），⛔ 这里不能再当全局键报一遍，否则"没选车时的
-        # 默认行数"会被这台车的值悄悄覆盖掉（用户 2026-11-13："跟着车号走"）。
-        vehicle_on = customization.active_profile() is not None
         for spec in customization.specs():
-            if vehicle_on and spec["key"] in self._VEHICLE_ROW_KEYS:
+            # 「电压/温度数据行数」**永远是逐车值**：改的时候已经由
+            # ``_on_rows_hint_changed`` 落进车辆档案，没选车时这两行整行隐藏
+            # （用户 2026-11-21：「没有选择车号就不显示」）→ 无从改动。
+            # ⛔ 这里一律不当全局键报，否则"没选车时的默认行数"会被某台车的值
+            #    悄悄覆盖。
+            if spec["key"] in self._VEHICLE_ROW_KEYS:
                 continue
             widget = self._custom_widgets.get(spec["key"])
             if widget is None:

@@ -379,9 +379,18 @@ def test_wiring() -> None:
           "missing_keys()" not in mw.split("def _maybe_install_drivers")[1]
           .split("def _on_driver_install_done")[0])
     check("一个会话只问一次（_driver_asked）", "_driver_asked" in mw)
-    check("插上设备由端口轮询顺带发现（每 4 拍，无 COM 口也能查到）",
-          re.search(r"def _poll_ports.*?_driver_ticks % 4 == 0.*?"
+    # 节拍断言要跟着**常量**走，不能把字面量 `% 4` 钉死：轮询间隔从 1s 改成 4s
+    # 之后节拍语义（每 4 拍一查）没变，但源码里那个 4 已经提成了模块级常量
+    # （`DRIVER_CHECK_POLLS`，与 `PORT_WATCH_MS` 同一套写法）。钉字面量会让
+    # "以后再调间隔"又假红一次；而只断言变量名又看不出值有没有被偷偷改大。
+    # 所以拆成两条：**用什么算**（变量）+ **值是多少**（常量 = 4）。
+    check("插上设备由端口轮询顺带发现（每 DRIVER_CHECK_POLLS 拍，无 COM 口也能查到）",
+          re.search(r"def _poll_ports.*?_driver_ticks % DRIVER_CHECK_POLLS == 0.*?"
                     r"_maybe_install_drivers\(force=True\)", mw, re.S) is not None)
+    _tick = re.search(r"^DRIVER_CHECK_POLLS\s*=\s*(\d+)\s*$", mw, re.M)
+    check("驱动体检节拍仍是每 4 拍（常量值没被改大/改小）",
+          _tick is not None and int(_tick.group(1)) == 4,
+          _tick.group(0) if _tick else "没找到 DRIVER_CHECK_POLLS 定义")
     check("自动化环境可跳过弹框（SA_SKIP_DRIVER_PROMPT）",
           "SA_SKIP_DRIVER_PROMPT" in mw)
     # 这个键在整个 main_window 里只该出现**两处**：_driver_declined 读一次、

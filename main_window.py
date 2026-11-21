@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -62,8 +64,9 @@ from ui_backdrop import frost_tile, paint_backdrop
 from ui_brand import BrandHeader, CaptionBar
 from ui_highlight import (
     SECTION_OTHER, SECTION_TEMP, SECTION_VOLT, VOLT_HEADER_RE, RxHighlighter,
-    align_indexes, bms_error_spans, gap_lines, section_of, stamp_span,
-    temp_spans, value_spans,
+    align_indexes, align_text_by_round, bms_error_spans,
+    collapse_history_rows, gap_lines, repair_split_samples, section_of,
+    stamp_span, temp_spans, value_spans,
 )
 from ui_controls import (
     AlertButton, ChevronComboBox, ChevronSpinBox, FlashLabel, IconButton,
@@ -110,6 +113,24 @@ RX_LINES_MIN, RX_LINES_MAX = 500, 500_000
 RX_LINE_PRESETS = (500, 1000, 2000, 3000, 5000, 8000, 10000, 20000, 50000,
                    100000, 200000, 500000)
 MAX_HISTORY = 20
+
+# ---- 回放分页（用户 2026-11-21：「打开的时候不必加载全部数据，可以根据一定的
+# 策略加载，但是要确保滑动得很快的时候可以加载」）--------------------------
+# 打开时只灌**最后**这么多内容，滚到顶部附近再往前翻一页。策略：宁小勿大 ——
+# 一页的成本 = 排版 + 建块，越小越跟手；翻页是同步的，所以一页必须几十毫秒内做完。
+REPLAY_PAGE_LINES = 1200        # 近期数据：一页多少行（约 10~12 轮）
+REPLAY_PAGE_POINTS = 100        # 历史数据：一页多少个采样点
+# 历史数据一页的**行数上限**：一条采样点几行由数据源决定（E74 实测 24 行/点，
+# 别的车可能 8 行/点），只卡点数时"一页多高、要花多久"不可预测。1200 行 ≈ 50 点
+# ≈ 60ms（见 devtools/_perf_replay_hist.py），与近期 REPLAY_PAGE_LINES=1200 对齐 ——
+# 两条回放路径翻出来的"一页"看上去一样多。⛔ 按采样点整块追加，最多超出一条点。
+REPLAY_PAGE_MAX_LINES = 1200
+# 触发提前量（像素）：离顶部还有这么远就开始取下一页，快速拖动也来得及。
+REPLAY_PREFETCH_PX = 600
+# 回放态下接收区的块数上限要单独放宽：QPlainTextEdit 的 maximumBlockCount
+# **从头裁**，前插进去的行会被立刻裁掉（等于翻页无效）。这里给一个足够大的
+# 硬顶（约 14 页），仍然是有界的，不会无限吃内存。
+REPLAY_MAX_BLOCKS = 40_000
 TIMER_MIN_MS = 10
 # 本程序只发布一个 DLC（心率广播）。「DLC」按钮的语义固定为：没装就装、装了就近。
 _DLC_ID = "heartbeatDLC"
@@ -125,6 +146,19 @@ TX_ANIM_MS = 300
 # 60ms 远低于"一眨眼下"的感知阈值，却能把追加频率压掉近一个数量级 ——
 # 250 行/秒 + 同时最大化的场景里，P50 从 ~65fps 抬回 ~118fps（探针实测）。
 RX_COALESCE_MS = 24
+# 接收区「跟随到底」滚动补间的两档时长（毫秒），见 _follow_rx_bottom。
+# 慢档 180ms 是常态：每次追加都从当前位置起一段 180ms 的 out_cubic，人眼看到的
+# 是连续滑动。但数据**不停**时这段补间会被反复重启 —— 165Hz 屏幕上就是每帧
+# setValue() 一次，整个视口持续重绘（读数据时的第二大耗电源）。
+# 所以高速流（RX_APPEND_WINDOW_S 内追加了 ≥ RX_SCROLL_FAST_HZ 次）降到 60ms：
+# 仍是平滑补间（⛔ 不能改成"直接跳底"，用户明确要求平滑跟随），只是更快落定，
+# 两次追加之间补间能真的跑完，不再"永远在滚"。
+RX_SCROLL_MS_SLOW = 180
+RX_SCROLL_MS_FAST = 60
+RX_SCROLL_FAST_HZ = 2
+# 判"高速流"的滑动窗口（秒）：只看最近这段时间内的追加次数 —— 数据一歇下来就
+# 自动退回慢档，不做状态开关（免得出现"卡在快档上再也不平滑"的粘滞）。
+RX_APPEND_WINDOW_S = 1.0
 # Qt 的 QWIDGETSIZE_MAX 宏（(1<<24)-1）没有导出到 PySide6，自己写一个，
 # 用来把"折叠时夹住的最大高度"放开回"不限"。
 WIDGETSIZE_MAX = (1 << 24) - 1
@@ -134,9 +168,21 @@ WIDGETSIZE_MAX = (1 << 24) - 1
 # 单个数据行的自身高度不写死，由文档实际排版量出来（中文要留降部，比 fontMetrics 行距高一点）。
 TX_EDITOR_CHROME = 22
 
-# 自动扫描串口的轮询间隔（毫秒）。Windows 上 list_ports 走 SetupAPI，实测单次 7~20ms，
-# 一秒一次的开销可以忽略；再快也没有意义 —— 用户插完线到想看到反应，一秒足够。
-PORT_WATCH_MS = 1000
+# 自动扫描串口的轮询间隔（毫秒）。Windows 上 list_ports 走 SetupAPI，实测中位
+# 3.5ms / 峰值 6.4ms —— 单次不贵，但**每秒一次**就是每秒把 CPU 从深睡拉起一次；
+# 这软件整天挂在笔记本电池上跑，这种"一分钟六十次的空转"是白白耗掉的那部分。
+# 4 秒的代价是插上设备最多晚 4 秒出现在下拉框里（用户按「刷新」可以立刻看到），
+# 这是可接受的；换来的是这类唤醒次数降到 1/4。
+PORT_WATCH_MS = 4000
+
+# 驱动体检（`_maybe_install_drivers`）的节拍：每 N 次端口轮询查一次。
+# **保留原有节拍语义**（一直就是"每 4 拍"）：轮询间隔从 1s 改成 4s 之后，这一项
+# 自然从每 4s 变成每 16s，省下 3/4 —— 而它本身不需要再单独放慢，理由是它**不额外
+# 唤醒 CPU**：它挂在同一条 4s 定时器的回调里，只是在那次唤醒里多做 4ms 的
+# SetupAPI 枚举（`drv_assist.problem_devices()`；没插问题设备时不进 pnputil）。
+# 它发现的是"插上了但没驱动"——那种设备压根不出现在 COM 口名单里，所以不能
+# 只查启动那一次，否则用户后插的无驱动设备会被默默漏掉。
+DRIVER_CHECK_POLLS = 4
 
 # 无边框窗口"边缘缩放"的命中带宽（逻辑 px）。6 是本机 2x 缩放下的手感值：
 # 再窄要点得很准，再宽会吃掉页面外圈那 12px 留白里本该给卡片/标题栏的点击。
@@ -802,6 +848,11 @@ class MainWindow(QMainWindow):
         self._theme_to = ""
         # 接收区"跟随到底"的平滑滚动补间（见 _follow_rx_bottom）
         self._rx_scroll_tween: Tween | None = None
+        # 最近若干次"真的往接收区追加了一帧"的时刻（perf_counter 秒，见
+        # _note_rx_append / _rx_is_fast_stream）。只用来判"现在是不是高速流"，
+        # 从而给追底补间选快档还是慢档。maxlen 够装窗口内的所有追加（判据只看
+        # 最近 1 秒，正常几十次；给到 64 是留足余量，反正里面装的只是 float）。
+        self._rx_append_times: deque[float] = deque(maxlen=64)
         # 暂停时「时间戳/HEX/编码」工具栏的收展补间（见 _animate_opts_row）
         self._opts_tween: Tween | None = None
         self._opts_from = 0.0
@@ -818,6 +869,10 @@ class MainWindow(QMainWindow):
         self._settings_custom: dict = {}
         self._settings_hidden: list = []
         self._settings_previous = (0, "frosted", set(), 21)
+        # 「SOC 数据来源」也是实时预览项（下拉框一换底栏当场跟着变），取消面板时
+        # 要还回去。单独一个属性而不是塞进 _settings_previous：那个元组的解包点
+        # 在别处（_apply_settings_result），加字段容易漏一处就 ValueError。
+        self._settings_soc_source_prev = "calc"
         # 设置面板"整块放大/缩小"动画里的那张内容快照（见 _SettingsShot）
         self._settings_shot = _SettingsShot(self)
         # 入场落定时"同一拍真面板上屏、撤快照"的临时目标。硬切是**同步**的
@@ -832,7 +887,7 @@ class MainWindow(QMainWindow):
         self._settings_min_size = None
         # 动画期间的日志追加合并（见 _set_rx_coalesce）：0 = 不合并（常态）
         self._rx_coalesce_ms = 0
-        self._rx_coalesce_buffer: list[tuple[str, str]] = []
+        self._rx_coalesce_buffer: list[str] = []
         self._rx_coalesce_timer = QTimer(self)
         self._rx_coalesce_timer.setSingleShot(True)
         self._rx_coalesce_timer.timeout.connect(self._flush_rx_coalesced)
@@ -908,6 +963,19 @@ class MainWindow(QMainWindow):
         # 历史回放模式：为真时接收区显示的是本地留存数据，实时帧不写进画面
         # （但照常进 rx_history 与计数）。见 _open_history / _exit_replay。
         self._replay_active = False
+        # 回放的是哪一路数据：""=非回放、"recent"=近期数据（_open_history）、
+        # "long"=历史数据（_open_long_history）。两颗回放按钮共用 _replay_active
+        # 互斥，但**文案各管各的** —— 点哪颗进回放，哪颗就变「关闭 XX 数据」，
+        # 另一颗保持「打开 XX 数据」（见 _refresh_replay_ui）。退出一律清空。
+        self._replay_kind = ""
+        # 回放**分页**状态（用户 2026-11-21："打开的时候不必加载全部数据，可以
+        # 根据一定的策略加载，但是要确保滑动得很快的时候可以加载"）。None = 没有
+        # 可翻的更早内容；否则是 dict：
+        #   {"kind": "recent"/"long", "all": 全部行（仅 recent）,
+        #    "start": 已加载到第几行（仅 recent）, "interval"/"vehicle"（仅 long）,
+        #    "earliest": 本页最早 ts（long 翻页的 before_ts）, "has_more": bool}
+        # 滚到顶部附近时 `_maybe_replay_load_earlier` 取上一页并**前插**进文档。
+        self._replay_page: dict | None = None
         # 提示条高度补间的句柄（见 _replay_bar_anim）：None = 当前没有在跑。
         # 中途反向点击要"从当前高度折返"，所以必须留着上一段好打断。
         self._replay_tween: Tween | None = None
@@ -964,6 +1032,11 @@ class MainWindow(QMainWindow):
         self._align_section = SECTION_OTHER
         # 空行规则（模组标题/BMS 之上各一行）要跨帧知道"上一行是什么"
         self._rx_prev_line = ""
+        # 串口分包会把一个采样点劈成两帧：上一帧尾 "9."（序号+小数点，值还没到）、
+        # 下一帧头 "3890"（值）。这里暂存那个半截点的**序号**，等下一帧的纯数字
+        # 值到了再拼回 "9.3890"（见 _emit_block；同一块内跨行的情形由纯函数
+        # repair_split_samples 处理）。清屏时一并归零。
+        self._rx_half_sample = ""
         # 性能模式（用户 2026-11-11 的暗门）：队标双击进入、三击退出。
         # ⛔ **不持久化**：每次启动都从"关"开始 —— 上次开着忘了关，第二天拿
         #    假数据去查真故障，这是这个功能唯一可能造成实质伤害的路径。
@@ -1271,7 +1344,7 @@ class MainWindow(QMainWindow):
         self._align_send_button()
         # 接收区着色的蓝是分主题的，换主题要按新颜色重刷一遍
         self._rx_highlighter.refresh()
-        # ⚠️ polish 会把控件的 min-width 重置回样式表里的值（例如「打开历史数据」
+        # ⚠️ polish 会把控件的 min-width 重置回样式表里的值（例如「打开近期数据」
         # 那颗按钮 146px）—— 窄档收口过的宽度要按当前档位重新落一遍，否则在
         # 1/4 分屏下换一次主题，配置卡又被这 44px 顶回去。
         if self._compact_level >= 0:
@@ -1563,7 +1636,20 @@ class MainWindow(QMainWindow):
         # 分开放）；没选车时落通用文件（与旧版本同一份）。
         rx_history.load(customization.current_vehicle() or None)
 
+        # 历史数据（永不删除的会话库）现在是"按车号一本书、全部放在 历史数据\
+        # 子目录"（用户 2026-11-21）。把写线程提前拉起来，让它趁用户还在连串口
+        # 的时候先把老的单库 sessions.db 拆分完 —— 等到第一块数据才起线程，
+        # 那趟拆分就会压在接收路径上（详见 rx_store.warmup 的注释）。
+        rx_store.warmup()
+
         # SOC：按当前车辆取参数（没配参数的车显示 --，功能对它完全惰性）
+        # ⚠️ 这两行必须排在 _init_soc() **之前**：那里的占位文本要按数据来源选措辞
+        #    （"SOC --" 还是 "车端 SOC --"），见 _soc_placeholder。
+        self._soc_source = self._load_soc_source()   # "calc" / "read"
+        self._soc_read_last: float | None = None     # 车端最近一次上报的 SOC(%)
+        # 已经画到过底栏的车端值：SOC= 单独成一个串口块时（rounds 为空）靠它
+        # 决定要不要补刷一次，避免每块都重绘。
+        self._soc_read_last_shown: float | None = None
         self._init_soc()
 
         # USB 转串口驱动体检：新机器插上 STLink / CH340 却没串口，用户会以为
@@ -2005,18 +2091,23 @@ class MainWindow(QMainWindow):
         line_row.addWidget(self.cmb_rx_lines, 1)
         col.addLayout(line_row)
 
-        # 「打开历史数据」（用户 2026-10-13 点名）：在软件内打开本地留存的
-        # 接收数据，格式/风格/功能与实时接收一致。放在参数栏最下面 —— 它读的
-        # 正是上面"保留行数"落在本地的那份备份，挨着最顺。
-        # ⚠️ 它是**开关**（回放态下再点 = 返回实时），文案随状态在「打开历史数据」
-        #    /「关闭历史数据」之间切（见 _refresh_replay_ui）。两个文案都是 6 个字，
+        # 「打开近期数据」（用户 2026-10-13 点名，2026-11-21 改名）：在软件内打开
+        # 本地留存的接收数据，格式/风格/功能与实时接收一致。放在参数栏最下面 ——
+        # 它读的正是上面"保留行数"落在本地的那份备份（接收历史-{车号}.log），挨着最顺。
+        # ⚠️ 它与新增的「打开历史数据」严格分层：近期数据**每个时间戳记一行**、按
+        #    保留行数裁剪、用来看瞬时报错；历史数据来自会话库、永不删除、按采样
+        #    间隔显示、用来看长期电压变化。**文件名保持不变**，老用户数据自然
+        #    成为近期数据。
+        # ⚠️ 它是**开关**（回放态下再点 = 返回实时），文案随状态在「打开近期数据」
+        #    /「关闭近期数据」之间切（见 _refresh_replay_ui）。两个文案都是 6 个字，
         #    切换时按钮宽度不变，布局不会抖。
-        self.btn_open_history = InkButton("打开历史数据", variant="ghost")
+        self.btn_open_history = InkButton("打开近期数据", variant="ghost")
         # ⚠️ 这一颗**不进** _config_fields：它的最小宽度（102）来自文字，压到 66
-        #    会让"打开历史数据"六个字戳出按钮的圆角底板（1/4 屏截图里量到过）。
+        #    会让"打开近期数据"六个字戳出按钮的圆角底板（1/4 屏截图里量到过）。
         #    窄档的表单内容有 172px，56+10+102=168 放得下。
         self.btn_open_history.setToolTip(
-            "在接收区打开本地留存的接收数据；回放中再点一次返回实时"
+            "在接收区打开本地留存的近期数据：受保留行数上限、每个时间戳记一次，"
+            "用来看瞬时报错；回放中再点一次返回实时"
             "（格式与实时一致，可搜索 / 定位异常 / 复制）")
         self.btn_open_history.clicked.connect(self._open_history)
         hist_row = QHBoxLayout()
@@ -2024,11 +2115,29 @@ class MainWindow(QMainWindow):
         spacer = QWidget()
         spacer.setFixedWidth(64)
         # 这一格是"标签列"的占位（按钮左对齐到字段那一列）。窄档标签列收起时
-        # 它也要跟着收，否则 64px 白占着，「打开历史数据」被挤成「打开历…」。
+        # 它也要跟着收，否则 64px 白占着，「打开近期数据」被挤成「打开近…」。
         self._hist_spacer = spacer
         hist_row.addWidget(spacer)
         hist_row.addWidget(self.btn_open_history, 1)
         col.addLayout(hist_row)
+
+        # 「打开历史数据」（用户 2026-11-21 明确需求）：与上面的近期数据严格分层。
+        # 读的是会话库 sessions.db（append-only、永不删除），按设置里的「历史数据
+        # 采样间隔」抽帧回放，用来看长期电压变化。与近期回放共用 _replay_active、
+        # 两者互斥（任一回放态下点它都先返回实时）。同一套 64px 占位排法。
+        self.btn_open_long_history = InkButton("打开历史数据", variant="ghost")
+        self.btn_open_long_history.setToolTip(
+            "查看永不删除的历史数据，按设置里的采样间隔显示，用来看长期电压变化；"
+            "回放中再点一次返回实时")
+        self.btn_open_long_history.clicked.connect(self._open_long_history)
+        long_hist_row = QHBoxLayout()
+        long_hist_row.setSpacing(10)
+        long_spacer = QWidget()
+        long_spacer.setFixedWidth(64)
+        self._long_hist_spacer = long_spacer
+        long_hist_row.addWidget(long_spacer)
+        long_hist_row.addWidget(self.btn_open_long_history, 1)
+        col.addLayout(long_hist_row)
 
         # 「历史报错数据」（用户 2026-11-13 点名）：扫一遍本地留存的接收数据，
         # 把出现过的超温 / 超压 / 欠压 / BMS 报错逐条带时间戳列出来。和「打开历史
@@ -2048,7 +2157,7 @@ class MainWindow(QMainWindow):
         col.addLayout(err_row)
 
         # 「DLC」常驻串口配置栏（用户 2026-11-12："DLC 按钮放串口设置那里"）：
-        # 和「打开历史数据」同一套排法（标签列占位 + 按钮吃满字段列），挨在它下面。
+        # 和「打开近期数据 / 打开历史数据」同一套排法（标签列占位 + 按钮吃满字段列），挨在它下面。
         # 语义仍是单 DLC 直通：没装 → 提示安装，装了 → 直接进心率面板；
         # 卸载在面板里的「卸载 DLC」。
         # ⚠️ 不进 BUTTON_SPECS —— 那是「界面按钮」隐藏清单，允许隐藏等于让用户
@@ -2155,6 +2264,10 @@ class MainWindow(QMainWindow):
         # 时间戳和每个采样点的"序号"染蓝（见 ui_highlight）。纯装饰层：
         # 文档里的文字一个字符都没改，保存/搜索/复制走的仍是纯文本。
         self._rx_highlighter = RxHighlighter(self.txt_rx.document())
+        # 回放**往前翻页**：滚到顶部附近就再取一页更早的内容（见 _maybe_replay_load_earlier）。
+        # 挂在滚动条上而不是 wheelEvent 上：拖动滚动条、Home 键、PageUp 都能触发。
+        self.txt_rx.verticalScrollBar().valueChanged.connect(
+            self._maybe_replay_load_earlier)
         # 回放 ←→ 实时切换时那张"旧内容"淡出层（见 _RxShot / _cross_fade_rx）。
         # 挂 viewport 才能盖住正文；常隐藏，只在切换的那 160ms 里出现。
         self._rx_shot = _RxShot(self.txt_rx.viewport())
@@ -3011,7 +3124,7 @@ class MainWindow(QMainWindow):
                 #    在 showNormal 状态落地后 grab 目标版式真窗补建 B。
                 _pb = getattr(self, "_normal_idle_pix", None)
                 cover = self._begin_window_cover(
-                    fs_pix, fs_rect, with_bg=False,
+                    fs_pix, fs_rect,
                     pixmap_b=_pb, end=self._normal_geometry)
             if cover is not None:
                 # 压掉系统原生还原动画：覆盖层在播自己的，双重动画 = 抖。
@@ -3517,8 +3630,7 @@ class MainWindow(QMainWindow):
         return pix.scaled(nw, nh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
     def _begin_window_cover(self, pixmap, start: QRect,
-                            with_bg: bool = True, pixmap_b=None, end=None,
-                            want_crossfade: bool = True):
+                            pixmap_b=None, end=None):
         """把切换**前**的画面铺到一个置顶小窗上（不进任务栏、不抢焦点）。
 
         2026-11-07 od55：**单窗单张绘制**（取代 od46 的 A/B/bg 三个顶层窗）。
@@ -4270,11 +4382,13 @@ class MainWindow(QMainWindow):
         # 「一发」两个字，看不出这是个历史列表（1/4 屏截图里量到过）。
         if field_w > 0:
             self.cmb_history.setMinimumWidth(90)
-        # 「打开历史数据」的下限是 QSS 给的（实测 146px），不是 sizeHint 的 102 ——
-        # 窄档压到 104：六个字（84px）+ 圆角底板的左右留白，再小就会戳出底板
-        # （1/4 屏截图里量到过：文字比底色块还宽）。
+        # 「打开历史数据 / 打开近期数据」的下限是 QSS 给的（实测 146px），不是
+        # sizeHint 的 102 —— 窄档压到 104：六个字（84px）+ 圆角底板的左右留白，
+        # 再小就会戳出底板（1/4 屏截图里量到过：文字比底色块还宽）。
         self.btn_open_history.setMinimumWidth(146 if field_w <= 0 else 104)
+        self.btn_open_long_history.setMinimumWidth(146 if field_w <= 0 else 104)
         self._hist_spacer.setFixedWidth(spec["label_w"])
+        self._long_hist_spacer.setFixedWidth(spec["label_w"])
         self._dlc_spacer.setFixedWidth(spec["label_w"])
         # 「历史报错数据」的占位同理由 _hist_spacer 收起（窄档标签列收起时跟着收，
         # 否则按钮会被挤成「历史报…」；之前漏了这行，属性从没被读过也触发了死代码告警）。
@@ -4837,8 +4951,7 @@ class MainWindow(QMainWindow):
                 and (time.monotonic() - self._fs_idle_ts) > 0.45):
             self._cover_blend_start = 0.99
         _cover = self._begin_window_cover(
-            _cover_pix, _cover_from, pixmap_b=self._fs_idle_pix,
-            want_crossfade=True)
+            _cover_pix, _cover_from, pixmap_b=self._fs_idle_pix)
 
         def _land() -> None:
             # 延迟期间意图变了（连点/退出）：本次作废。只清理**自己的**覆盖层
@@ -6068,8 +6181,9 @@ class MainWindow(QMainWindow):
         （自测「收包合并与暂停继续」就挂在这）。暂停中/搜索定位中不动，免得
         把用户自己滚到的地方拽走。
 
-        推的时候走 ``_follow_rx_bottom``（180ms 补间）：这里是"收尾补一下"，
-        一步 setValue 就是最后一帧的硬跳（恢复暂停时实测差 8 行 ≈150px）。
+        推的时候走 ``_follow_rx_bottom``（平滑补间，时长两档见那里）：这里是
+        "收尾补一下"，一步 setValue 就是最后一帧的硬跳（恢复暂停时实测差
+        8 行 ≈150px）。
         """
         if self._paused or self._search_pinned:
             return
@@ -6172,7 +6286,7 @@ class MainWindow(QMainWindow):
     def _poll_ports(self) -> None:
         """定时器：插拔设备时自动**发现**（只刷新名单，不代用户打开）。
 
-        只在名单**真的变了**的时候才动界面 —— 否则每秒刷一次下拉框会把用户
+        只在名单**真的变了**的时候才动界面 —— 否则定时刷新一次下拉框会把用户
         正在输入/正在展开的列表打断，底部也会一直闪提示。
 
         以前这里还会顺手把新插上的设备连上（"插上就用"），用户后来明确否掉了：
@@ -6189,10 +6303,13 @@ class MainWindow(QMainWindow):
             return
         self._reap_retired()      # 顺手给取消建链的 worker 收尸（见 _reap_retired）
         # 「插上了但没驱动」这件事**不会**让端口名单发生变化（它压根没有 COM 口），
-        # 所以只能靠定时体检发现：每 4 拍（≈4s）查一次。没插设备时这里只是一次
-        # ctypes 枚举（3ms 量级，不进 pnputil），代价可以忽略。
+        # 所以只能靠定时体检发现：每 DRIVER_CHECK_POLLS 拍查一次。节拍语义没变
+        # （一直是 4 拍），但轮询间隔从 1s 变成 4s，于是这一项也跟着从 4s 变成 16s
+        # —— 它是这条回调里最贵的一步（要走 SetupAPI 枚举设备），而它不额外唤醒
+        # CPU（挂在同一次唤醒里），所以只需要跟着轮询一起变稀疏。没插设备时这里
+        # 只是一次 ctypes 枚举（3ms 量级，不进 pnputil）。
         self._driver_ticks += 1
-        if self._driver_ticks % 4 == 0:
+        if self._driver_ticks % DRIVER_CHECK_POLLS == 0:
             self._maybe_install_drivers(force=True)
         ports = list_serial_ports()
         if ports == self._known_ports:
@@ -6659,8 +6776,8 @@ class MainWindow(QMainWindow):
         if profile is not None:
             cells, temps = profile
             # 「电压数据行数 / 温度采集数据行数」是**逐车**存的（用户 2026-11-13
-            # 点名"这个要跟着车号走"）：0 = 自动（一排一个模组），>0 = 用户直接
-            # 指定显示成几行 —— 后者在 ui_highlight._grid_rows 里压过逐模组尺寸。
+            # 点名"这个要跟着车号走"）：0 = 自动（跟随设备分行），>0 = **每个模组
+            # 显示成几行**（用户 2026-11-21 当面定案，不是"整块几行"）。
             volt_rows, temp_rows = customization.active_row_hints()
             return {"volt_row_sizes": cells, "temp_row_sizes": temps,
                     "volt_rows_hint": volt_rows, "temp_rows_hint": temp_rows,
@@ -6734,19 +6851,32 @@ class MainWindow(QMainWindow):
         text = box.toPlainText()
         if not text or document.isEmpty():
             return False
+        orig_text = text
         bar = box.verticalScrollBar()
         at_bottom = bar.value() >= bar.maximum() - 1
         scroll = bar.value()
         cursor = box.textCursor()
         position, anchor = cursor.position(), cursor.anchor()
         try:
-            new_text = align_indexes(text, section=SECTION_OTHER,
-                                     max_row_chars=self._rx_max_row_chars(),
-                                     **self._rx_grid_hints())
+            hints = self._rx_grid_hints()
+            # 2026-11-21 缩行（如 25→10）场景：屏幕上已是拆成多行的排版，
+            # align_indexes 是「一行进一行出」，直接再 align 不会把已拆的行并回去
+            # → 缩行无效。与 _enter_replay 同口径：显式行数>0 时先 collapse_history_rows
+            # 摊平成「一个模组一行」，gap_lines 重建轮间空行，再按新行数重排。
+            # H=0（自动）不摊平：默认外观不许变。
+            if (hints.get("volt_rows_hint", 0) > 0
+                    or hints.get("temp_rows_hint", 0) > 0):
+                text = "\n".join(collapse_history_rows(text.split("\n")))
+                text = "\n".join(gap_lines(text.split("\n")))
+            # 按轮切段逐轮 align：整篇一次 align 会把 r_hint 按总点数摊薄，多轮时
+            # per_rows 塌成 1，用户设了行数却看起来没生效（见 align_text_by_round）。
+            new_text = align_text_by_round(text, section=SECTION_OTHER,
+                                           max_row_chars=self._rx_max_row_chars(),
+                                           **hints)
         except Exception as exc:            # noqa: BLE001 - 排版失败别把设置流程带走
             app_log.error(f"接收区重排失败: {exc}")
             return False
-        if new_text == text:
+        if new_text == orig_text:
             return False
         self._clear_alert_highlight()
         # 2026-11-02 用户：「选择车辆之后刷新数据也不要闪，也要有动画」——
@@ -6781,13 +6911,18 @@ class MainWindow(QMainWindow):
         self._fade_rx_shot()
         return True
 
-    def _export_profile_now(self) -> tuple:
+    def _export_profile_now(self, hints: dict | None = None) -> tuple:
         """导出用的逐模组尺寸 —— 与显示层同源（``_rx_grid_hints``）。
 
         有车辆档案 → 逐模组（各模组点数可不同）；老配置 → 只有一个「每模组电芯数」，
         用它乘模组个数展开；都没有 → 空列表，导出层退回「跟着设备分帧切」。
+
+        ``hints``：调用方**已经取过** ``_rx_grid_hints()`` 时直接传进来，省掉一次
+        QSettings 往返（``_emit_block`` 每帧都要同一份参数去排版，见那里）。
+        不传就现取，与旧行为一字不差。
         """
-        hints = self._rx_grid_hints()
+        if hints is None:
+            hints = self._rx_grid_hints()
         if "volt_row_sizes" in hints:
             return (list(hints["volt_row_sizes"]), list(hints["temp_row_sizes"]))
         n = int(hints.get("volt_cols_hint") or 0)
@@ -6797,7 +6932,7 @@ class MainWindow(QMainWindow):
         mods = int(customization.get("module_count") or 0)
         return ([n] * mods, [m] * mods if m > 0 else [])
 
-    def _feed_export(self, text: str) -> None:
+    def _feed_export(self, text: str, hints: dict | None = None) -> None:
         """把一块原始分帧文本喂给结构化导出缓存**和会话数据库**。
 
         两个消费者同源同位置：都是 ``align_indexes`` **之前**的原始文本 ——
@@ -6805,10 +6940,13 @@ class MainWindow(QMainWindow):
         会话库在 ``record_block`` 里只做入队（后台线程解析 + 批量落盘），
         **不阻塞**这条接收热路径。
 
+        ``hints``：``_emit_block`` 已经为同一帧取过的 ``_rx_grid_hints()``，透传
+        进去免得同一帧把车辆 JSON 解析两遍（见 ``_export_profile_now``）。
+
         ⚠️ 这里出任何异常都不能影响接收：落盘是附赠功能，接收是主功能。
         """
         try:
-            profile = self._export_profile_now()
+            profile = self._export_profile_now(hints)
             if profile != self._rx_export_profile:
                 self._rx_export_profile = profile
                 rx_export.session().configure(*profile)
@@ -6834,6 +6972,27 @@ class MainWindow(QMainWindow):
             text = self._perf_sanitizer.feed(text)
             if not text.strip():
                 return                  # 整块都是报错明细，删完就空了
+        # ⛔⛔ 串口分包会把一个采样点劈成两帧：上一帧尾 "9."（序号+小数点，值还没到）、
+        #    下一帧头 "3890"（值）。SAMPLE_RE 要求小数点后有数字，这两半都不认 →
+        #    断的 "9." 原样堆在屏上（用户截图："没接收完的数据也要排列好"）。这里
+        #    在 perf **之后**、_feed_export/_feed_soc/align_indexes **之前**接回去，
+        #    四条链路（显示/落盘/导出/SOC）看到同一份修复后的原始文本。
+        #    ① 块首：若上块暂存了半截序号，且本块开头是**纯数字 token**（`^\d+` 后
+        #       紧跟空白或结尾，排除 "9.3890" 这种完整点），就把「序号.」贴回去。
+        #       值可能就是整块（仅 "3890"），所以不要求 token 后面还有内容。
+        if self._rx_half_sample:
+            _m = re.match(r"^(\d+)(?=\s|$)", text)
+            if _m:
+                text = self._rx_half_sample + "." + text
+            self._rx_half_sample = ""   # 无论接没接上，这个暂存都已消费
+        #    ② 块尾：若本块以「序号.」结尾（点后无数字），暂存序号并把它从本块
+        #       **移除**（不能让断的 "9." 留在屏上），等下一块的值来了再拼。
+        _m = re.search(r"(\d+)\.\s*$", text)
+        if _m:
+            self._rx_half_sample = _m.group(1)
+            text = text[:_m.start(1)].rstrip()
+            if not text:
+                return                  # 整块只剩半截点，别喂空块给下游
         # ⛔ 帧**内部**的空行一律丢掉（2026-10-24 用户点名"不应该空行的地方
         #    空行了"）：设备分包时偶尔多送一个 \r\n，以前那在接收区里就是一行
         #    真空白，看着毫无道理。轮与轮之间那一行空行是**我们自己**用
@@ -6852,13 +7011,21 @@ class MainWindow(QMainWindow):
         # 结构化导出（CSV/JSON）：喂**原始**文本，必须在 align_indexes 之前 ——
         # 对齐会补零、把电压重排成「一排一个模组」的网格、在断线处插 X，
         # 那些都会让「第几个电芯」算错（见 rx_export 模块注释）。
-        self._feed_export(text)
+        # 排版参数（车辆档案 / 模组结构 / 断线阈值）**这一帧只取一次**：``_feed_export``
+        # 内部（``_export_profile_now``）和下面的 ``align_indexes`` 要的是同一份值。
+        # 以前各取一次 —— 一次 ``_rx_grid_hints()`` 实测 ≈94µs（选了车时
+        # ``active_profile`` 与 ``active_row_hints`` 各解析一遍车辆 JSON，每次新建
+        # QSettings），收包一密就是每秒几百次重复读注册表。
+        # ⛔ 只做"同一帧共享一次读取"，不跨帧缓存 —— 用户在设置里改完配置，下一帧
+        #    照样按新参数排版（"改完就看到"是硬要求，见 ui_settings 的说明）。
+        hints = self._rx_grid_hints()
+        self._feed_export(text, hints=hints)
         # SOC：同样拿原始文本（理由见 _feed_soc），对齐/补零之后再取数会把
         # "第几个电芯"算错。它自己是完全隔离的 —— 出任何问题都只落到日志里。
         self._feed_soc(text)
         text = align_indexes(text, section=self._align_section,
                              max_row_chars=self._rx_max_row_chars(),
-                             **self._rx_grid_hints())
+                             **hints)
         # 逐行推进段状态，同时看这一帧里有没有"新一轮的开头"。
         # ⚠️ 判据必须是**段状态从非电压段回到电压段**，不能只看"帧里有没有
         # Voltage1:"：电压数据分包成多帧、每帧都带 "Voltage1:" 标题时（真机
@@ -6942,15 +7109,18 @@ class MainWindow(QMainWindow):
         出现 —— 60ms 低于"一眨眼下"的感知阈值，肉眼无感。
         """
         if self._rx_coalesce_ms > 0:
-            self._rx_coalesce_buffer.append((text, display))
+            # 缓冲里只需要屏上文本：raw text 已在 _emit_block 入口记过历史，
+            # 这里再带一份纯属冗余（_flush_rx_display 从来不读它）。
+            self._rx_coalesce_buffer.append(display)
             if not self._rx_coalesce_timer.isActive():
                 self._rx_coalesce_timer.start(self._rx_coalesce_ms)
             return
-        self._flush_rx_display(text, display)
+        self._flush_rx_display(display)
 
-    def _flush_rx_display(self, text: str, display: str) -> None:
+    def _flush_rx_display(self, display: str) -> None:
         """真正往接收区写一帧（合并期由 ``_flush_rx_coalesced`` 批量调它）。"""
         self.txt_rx.appendPlainText(display)
+        self._note_rx_append()
         # 历史已在 _emit_block 入口记过（暂停/回放期间也记），这里不再喂 ——
         # 再喂一次会把每一帧写两遍。
         # appendPlainText 只在"视图本来就在底部"时才跟着走。暂停过又恢复时
@@ -6986,7 +7156,8 @@ class MainWindow(QMainWindow):
         self._rx_coalesce_timer.stop()
         if not buffered:
             return
-        self.txt_rx.appendPlainText("\n".join(display for _text, display in buffered))
+        self.txt_rx.appendPlainText("\n".join(buffered))
+        self._note_rx_append()
         if not self._search_pinned:
             self._follow_rx_bottom()
         if self._search_bar.isVisible():
@@ -7001,9 +7172,16 @@ class MainWindow(QMainWindow):
         """平滑跟随到底。
 
         原来是一步 ``setValue(maximum())`` —— 在高刷屏上就是"咔"地跳一格，
-        数据一密就抖。这里改走 ``ui_anim`` 的补间（180ms / out_cubic）：每次追加都
-        **从当前位置**起一段新的到最新底部的补间，数据不停时是一条连续的滚动。
+        数据一密就抖。这里改走 ``ui_anim`` 的补间：每次追加都**从当前位置**起一段
+        新的到最新底部的补间，数据不停时是一条连续的滚动。
         系统关掉动效（``animations_enabled()``）时直接落底，不强行动画。
+
+        **时长分两档**（见模块级 ``RX_SCROLL_MS_*``）：每帧都从当前位置重启一段
+        180ms 的补间，在"数据不停"时等价于补间永远跑不完 —— 每帧一次
+        ``setValue()``，视口跟着屏幕刷新率持续重绘，这是读数据时仅次于整卡闪烁的
+        持续耗电来源。所以最近 1 秒内追加过 ≥2 次（高速流）就用 60ms 的快档：
+        仍然平滑（⛔ 不是跳底 —— 平滑跟随是用户点名要的），但能在下一帧追加前
+        真的落定。数据歇下来后窗口自然滑出，自动退回 180ms 的慢档。
         """
         bar = self.txt_rx.verticalScrollBar()
         target = bar.maximum()
@@ -7012,7 +7190,39 @@ class MainWindow(QMainWindow):
         if not animations_enabled():
             bar.setValue(target)
             return
-        self._rx_scroll_smooth(target)
+        self._rx_scroll_smooth(
+            target, RX_SCROLL_MS_FAST if self._rx_is_fast_stream()
+            else RX_SCROLL_MS_SLOW)
+
+    def _note_rx_append(self) -> None:
+        """记一次"接收区真的追加了一帧"（供 ``_rx_is_fast_stream`` 判高速流）。
+
+        只在**真追加**的地方调（``_flush_rx_display`` / ``_flush_rx_coalesced``），
+        不挂在 ``_append_display`` 上：合并期往缓冲区里堆帧并不产生重绘，记进去会把
+        250 行/秒的流"误算"成低速（缓冲区一帧就攒了十几条）。
+        """
+        now = time.perf_counter()
+        self._rx_append_times.append(now)
+        # 顺手把滑出窗口的老时间戳剔掉：判据永远是"从**现在**往前 1 秒"，
+        # 不依赖窗口里残留多久。
+        while (self._rx_append_times
+               and now - self._rx_append_times[0] > RX_APPEND_WINDOW_S):
+            self._rx_append_times.popleft()
+
+    def _rx_is_fast_stream(self) -> bool:
+        """最近 ``RX_APPEND_WINDOW_S`` 秒内追加了 ≥ ``RX_SCROLL_FAST_HZ`` 次？
+
+        从新往旧数（快到慢）：够数就立刻停，绝大多数情况只看 1~2 个时间戳。
+        """
+        now = time.perf_counter()
+        recent = 0
+        for stamp in reversed(self._rx_append_times):
+            if now - stamp > RX_APPEND_WINDOW_S:
+                break
+            recent += 1
+            if recent >= RX_SCROLL_FAST_HZ:
+                return True
+        return False
 
     def _on_rx_scroll(self, value) -> None:
         try:
@@ -7020,16 +7230,18 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             pass
 
-    def _rx_scroll_smooth(self, target: int, duration: int = 180) -> None:
+    def _rx_scroll_smooth(self, target: int,
+                          duration: int = RX_SCROLL_MS_SLOW) -> None:
         """懒建接收区滚动补间并从**当前值**滚到 target（out_cubic，可随时打断）。
 
         「跟随到底」与「暂停恢复追底」共用同一条补间：起点取当前值，随数据
-        不断改向也不会"咔"一下；``duration`` 只决定这一段的时长，缓动曲线、
-        回调与目标值取整方式完全一致。
+        不断改向也不会"咔"一下；``duration`` 只决定这一段的时长（慢档
+        ``RX_SCROLL_MS_SLOW`` / 高速流快档 ``RX_SCROLL_MS_FAST``，见
+        ``_follow_rx_bottom``），缓动曲线、回调与目标值取整方式完全一致。
         """
         if self._rx_scroll_tween is None:
-            self._rx_scroll_tween = Tween(180, out_cubic, self._on_rx_scroll,
-                                          parent=self)
+            self._rx_scroll_tween = Tween(RX_SCROLL_MS_SLOW, out_cubic,
+                                          self._on_rx_scroll, parent=self)
         self._rx_scroll_tween.start(
             self.txt_rx.verticalScrollBar().value(), target, duration)
 
@@ -7041,15 +7253,15 @@ class MainWindow(QMainWindow):
         负责（见那里），批量刷入这一下必须先停掉可能还在跑的滚动补间、再直接落底。
         """
         frames, self._paused_frames = self._paused_frames, []
-        for text, display in frames:
+        for _text, display in frames:
             # ⚠️ 直接走 _flush_rx_display（不过合并缓冲）：批量 catch-up 就是要
             # 一次性落地，再攒 60ms 就又把"恢复后立刻看到最新数据"拖慢了。
-            self._flush_rx_display(text, display)
+            self._flush_rx_display(display)
         if self._rx_scroll_tween is not None:
             self._rx_scroll_tween.stop()
         if not self._search_pinned:
-            # 追底走**平滑补间**（180ms，见 _follow_rx_bottom）：暂停恢复时视口还在
-            # 变长（发送区展开 + 工具栏长回来），一步 setValue 只会落在"旧底部"，
+            # 追底走**平滑补间**（时长两档，见 _follow_rx_bottom）：暂停恢复时视口
+            # 还在变长（发送区展开 + 工具栏长回来），一步 setValue 只会落在"旧底部"，
             # 等布局落地后再"啪"地补一下 —— 那一下正是恢复动画的最后一跳。
             self._follow_rx_bottom()
             # ⚠️ 追底之后再补一次（340ms > 发送区收展的 300ms 动画）：恢复时如果
@@ -7267,6 +7479,27 @@ class MainWindow(QMainWindow):
             if not text.strip():
                 self._toast("接收区还没有数据", 2000)
                 return
+            # 用户 2026-11-21：「复制的数据也需要对齐，让"."对齐」。
+            # 屏上那份是**逐块**排的版：串口分包把一个模组劈成两块时，两块各自
+            # 按"块内点数"算列宽（见 ui_highlight.module_group_plans 的注释），
+            # 于是同一轮里不同模组的排宽可能不一样，贴到别处就看着"少了一格"。
+            # 这里按**整轮**再排一遍：align_indexes 对已排过版的文本是幂等的
+            # （实测同一轮连跑三次、两种视口宽下都逐字节相同），所以它只会把
+            # 整轮的序号宽/值宽统一，不会改掉屏上的形状。
+            # ⛔ 回放态不重排：历史里的断线 X 是**按当时阈值固化**进文本的，
+            #    重排会拿当前阈值重算边界、把旧的 X 抹掉（见 align_indexes 开头
+            #    把 " X " 还原成列间隔那段）。回放画面本来就已是整篇排好的。
+            # ⛔ 排版失败也必须能复制：落盘/导出是附赠，复制才是主功能。
+            if not self._replay_active:
+                try:
+                    text = align_indexes(
+                        text, section=SECTION_OTHER,
+                        max_row_chars=self._rx_max_row_chars(),
+                        **self._rx_grid_hints())
+                except Exception:                  # noqa: BLE001
+                    import traceback
+                    app_log.error("复制前重排失败（已按屏上原文复制）: "
+                                  + traceback.format_exc(limit=2))
         try:
             QApplication.clipboard().setText(text)
         except Exception as exc:                      # 剪贴板被占用等
@@ -7286,6 +7519,8 @@ class MainWindow(QMainWindow):
         self._align_section = SECTION_OTHER      # 画面清空 = 段状态归零
         # 空行规则要跨帧判断"上一行空不空"（见 _emit_block 的 gap_lines）
         self._rx_prev_line = ""
+        # 跨块半截采样点暂存也归零（清屏后不把旧块的半截值接到新块上）
+        self._rx_half_sample = ""
         # 整流器的段状态跟着归零（否则清屏后第一帧会被当成上一段的续传）。
         # getattr：_clear_receive 可能在 __init__ 早期就被调用，那时字段还没建。
         _sanitizer = getattr(self, "_perf_sanitizer", None)
@@ -7627,7 +7862,7 @@ class MainWindow(QMainWindow):
         return out, filled
 
     def _open_history(self) -> None:
-        """「打开 / 关闭历史数据」—— 这颗键是**开关**，不是单向入口。
+        """「打开 / 关闭近期数据」—— 这颗键是**开关**，不是单向入口。
 
         用户点名两次（先"要能打开本地留存数据"，再"再点一次就该关掉"）：所以
         回放态下再点它 = 返回实时，不是再灌一遍同一个文件。文案随状态变（见
@@ -7640,6 +7875,7 @@ class MainWindow(QMainWindow):
         这块只读画面里写）——顶部给一条返回实时的提示条。
         """
         if self._replay_active:
+            self._replay_kind = ""
             self._exit_replay()
             return
         import rx_history
@@ -7648,15 +7884,155 @@ class MainWindow(QMainWindow):
             self._toast("还没有本地留存的接收数据", 3000)
             return
         rows, filled = self._rows_with_stamps(rows)
-        self._enter_replay(rows)
+        # 只灌**最后一页**（用户 2026-11-21："打开的时候不必加载全部数据"）：
+        # 完整留存留在 `_replay_page["all"]` 里，滚到顶部再往前切一页
+        # （见 _maybe_replay_load_earlier / _replay_load_earlier_recent）。
+        # ⛔ 必须按时间戳轮边界切，不能截在半轮：时间戳是每轮第一个非空行。
+        total = len(rows)
+        start = max(0, total - REPLAY_PAGE_LINES)
+        for idx in range(start, total):
+            if stamp_span(rows[idx]) is not None:
+                start = idx
+                break
+        page_rows = list(rows[start:])
+        self._enter_replay(page_rows)
+        self._replay_page = {"kind": "recent", "all": rows, "start": start,
+                             "has_more": start > 0}
+        # 是「打开近期数据」这一路把回放开起来的：近期按钮变「关闭近期数据」、
+        # 历史按钮保持「打开历史数据」（见 _refresh_replay_ui）。
+        self._replay_kind = "recent"
+        self._refresh_replay_ui()
+        more = "（往上滚会自动加载更早的）" if start > 0 else ""
         if filled:
             self._toast(
-                f"已载入本地留存数据 {len(rows)} 行；这段历史接收时未开「显示时间戳」，"
-                "真实时刻无法还原，已用 [--:--:--] 占位。"
+                f"已载入本地留存数据 {len(page_rows)} / {total} 行{more}；这段历史接收时"
+                "未开「显示时间戳」，真实时刻无法还原，已用 [--:--:--] 占位。"
                 "此后落盘会始终记录真实时间", 7000)
         else:
-            self._toast(f"已载入本地留存数据 {len(rows)} 行（可搜索/定位异常/复制；"
-                        "点右上角返回实时）", 5000)
+            self._toast(f"已载入本地留存数据 {len(page_rows)} / {total} 行{more}"
+                        "（可搜索/定位异常/复制；点右上角返回实时）", 5000)
+
+    def _open_long_history(self) -> None:
+        """「打开历史数据」—— 永不删除的会话库，按采样间隔抽帧回放（用户明确需求）。
+
+        与「打开近期数据」（``_open_history``）严格分层：近期数据读接收历史文件、
+        每轮一行、按保留行数裁剪、看瞬时报错；这里读 ``rx_store`` 的 append-only
+        会话库，只按间隔抽帧、**从不删帧**，看长期电压变化。
+
+        两者共用 ``_replay_active``、互斥：任一回放态下点这颗都先返回实时（与
+        ``_open_history`` 的开关语义一致）；``_replay_kind`` 只记"是哪颗点进来
+        的"用于按钮文案，不参与互斥。采样间隔来自设置里的
+        固定档位 ``history_interval``（10/20/30/60/120/300 秒，选不到非法值），
+        车号取当前选择（空 = 全部）。采样在查询侧做，改间隔不用丢已存数据。
+        """
+        if self._replay_active:
+            self._replay_kind = ""
+            self._exit_replay()
+            return
+        try:
+            interval = int(customization.get("history_interval") or 10)
+        except Exception:                     # noqa: BLE001 - 设置读坏退回默认档
+            interval = 10
+        try:
+            vehicle = customization.current_vehicle() or None
+        except Exception:                     # noqa: BLE001 - 车号读坏就查全部
+            vehicle = None
+        rows, earliest, has_more = rx_store.history_page(
+            interval, vehicle, limit=REPLAY_PAGE_POINTS,
+            max_lines=REPLAY_PAGE_MAX_LINES)
+        if not rows:
+            self._toast("还没有历史数据", 3000)
+            return
+        self._enter_replay(rows)
+        # 只灌最后一页（用户 2026-11-21："打开的时候不必加载全部数据"）。往上滚时
+        # 用 `earliest` 当 before_ts 继续往前翻（见 _replay_load_earlier_long）。
+        self._replay_page = {"kind": "long", "interval": interval,
+                             "vehicle": vehicle, "earliest": earliest,
+                             "has_more": bool(has_more)}
+        # 是「打开历史数据」这一路把回放开起来的：历史按钮变「关闭历史数据」、
+        # 近期按钮保持「打开近期数据」（见 _refresh_replay_ui）。
+        self._replay_kind = "long"
+        self._refresh_replay_ui()
+        # 每桶恰好补一行时间戳 → 戳的行数就是采样点数
+        points = sum(1 for line in rows
+                     if line.startswith("[") and line.endswith("]"))
+        more = "，往上滚会自动加载更早的" if has_more else ""
+        scope = f"车号 {vehicle}" if vehicle else "全部车号"
+        self._toast(f"历史数据（{scope}）共 {points} 个采样点，间隔 {interval} 秒"
+                    f"{more}（永不删除，可搜索/定位异常/复制；点右上角返回实时）", 5000)
+
+    def _replay_text_for(self, rows) -> str:
+        """把回放行过一遍排版管线，返回可直接 ``setPlainText`` 的成品文本。
+
+        ---- 回放排版缓存（历史加载性能）--------------------------------
+        同一份历史行 + 同一套排版参数下，perf 整流 / gap_lines / align_indexes
+        是纯函数：实测 35.8 万行这三步要 ~2.3s（align_indexes 单项 2.1s）。
+        按"行内容指纹 + 排版参数"缓存成品文本，重复打开直接命中、跳过整段排版。
+        ⛔ 只缓存**文本**，setPlainText/高亮/贴底等一步不少 —— 行数、时间戳、
+           着色、内容与未缓存时逐字一致（见 devtools/_probe_history_load.py 的
+           CONSISTENCY 哈希）。缓存随主窗实例存活，最多留 8 份：分页之后一次
+           只处理一页（约 2 千行 / 成品几百 KB），8 份也不过分页来回翻的命中率。
+        """
+        import hashlib
+        _h = hashlib.sha256()
+        for _ln in rows:
+            _h.update(_ln.encode("utf-8", "replace"))
+            _h.update(b"\n")
+        _hints = self._rx_grid_hints()
+        cache_key = (_h.hexdigest(), self._rx_max_row_chars(),
+                     tuple(sorted((k, str(v)) for k, v in _hints.items())),
+                     bool(self._perf_on))
+        _cache = getattr(self, "_replay_text_cache", None)
+        if _cache is None:
+            _cache = self._replay_text_cache = {}
+        text = _cache.get(cache_key)
+        if text is not None:
+            return text
+        text = "\n".join(rows)
+        # ⛔ 历史文件里也有被串口劈开的采样点（同一份文本内的相邻两行，
+        #    上一行 "…08.3891     9." + 下一行 "3890    10.3897    "）：
+        #    SAMPLE_RE 认不出两半，断的 "9." 堆在屏上。先在文本层接回完整的
+        #    "9.3890"，后面的 perf/摊平/gap_lines/align_indexes 就都拿到
+        #    完整的点。纯函数、点数守恒、不改任何数字。缓存 key 用原始 rows
+        #    哈希，命中时文本已含修复结果，无需改 key。
+        text = "\n".join(repair_split_samples(text.split("\n")))
+        # 性能模式下回放也要整流：历史文件可能是**开启之前**写的（里面还留着
+        # 坏点/BMS Error），不处理的话一打开历史就露馅。对已整流过的文件是
+        # 幂等的（见 perf_mode 的两条约束）。
+        if self._perf_on:
+            text = self._perf_sanitizer.feed(text)
+        # 历史文件存的是"排版固化"的行（E74 每模组 25 点被存成 12+13 两行），
+        # align_indexes 是"一行进一行出"，光改行数设置回放不动。先摊平成
+        # "一个模组一行"，下面的 align_indexes 才能按当前行数设置重新分栏。
+        # ⛔ 只在用户**显式设了行数**时摊平：H=0（自动）时摊平会强制重排，
+        #    实测把温度模组从原来的 [4,4] 变成 [8]（视口够宽没拆）——默认外观
+        #    绝不能变。`_hints` 同时覆盖全局设置与选车后的 active_row_hints。
+        if (_hints.get("volt_rows_hint", 0) > 0
+                or _hints.get("temp_rows_hint", 0) > 0):
+            text = "\n".join(collapse_history_rows(text.split("\n")))
+        # ⛔ 空行与实时**同一条规则**（`ui_highlight.gap_lines`）：每个
+        #    VoltageN: / TemperatureN: / BMS 状态、以及每个时间戳之上各空一行，
+        #    其它位置一个空行都没有。历史文件可能是老版本写的（那时 feed 把空行
+        #    全滤掉了），所以这里**按规则重建**而不是信文件 —— 新老记录一个样子。
+        try:
+            text = "\n".join(gap_lines(text.split("\n")))
+        except Exception as exc:            # noqa: BLE001 - 规整失败就用原行
+            app_log.error(f"历史回放空行规整失败: {exc}")
+        # 历史文件里存的是**接收区当时显示的那一行行**（feed 在 _emit_block 里、
+        # 排版之后才调，见那边的注释），本来就带补零/网格；这里再跑一遍 align
+        # 是为了兜住"手改过/跨版本/极老的文件"。⚠️ 必须**按轮切段逐轮 align**：
+        # 整篇一次 align 会把行数按所有轮的总点数摊薄（多轮时塌成 1 行），
+        # 设了行数像没生效（见 ui_highlight.align_text_by_round）。
+        try:
+            text = align_text_by_round(text, section=SECTION_OTHER,
+                                       max_row_chars=self._rx_max_row_chars(),
+                                       **_hints)
+        except Exception as exc:            # noqa: BLE001 - 排版失败就用原文
+            app_log.error(f"历史回放排版失败: {exc}")
+        if len(_cache) >= 8:                # 只留最近几份，别把内存堆满
+            _cache.clear()
+        _cache[cache_key] = text
+        return text
 
     def _enter_replay(self, rows) -> None:
         """把给定行灌进接收区并进入回放模式。
@@ -7685,54 +8061,11 @@ class MainWindow(QMainWindow):
         self._align_section = SECTION_OTHER
         self._stamp_anchor_seen = False
         self._stamp_last_monotonic = 0.0
-        # ---- 回放排版缓存（历史加载性能）--------------------------------
-        # 同一份历史行 + 同一套排版参数下，perf 整流 / gap_lines / align_indexes
-        # 是纯函数：实测 35.8 万行这三步要 ~2.3s（align_indexes 单项 2.1s）。
-        # 按"行内容指纹 + 排版参数"缓存成品文本，重复打开直接命中、跳过整段排版。
-        # ⛔ 只缓存**文本**，setPlainText/高亮/贴底等一步不少 —— 行数、时间戳、
-        #    着色、内容与未缓存时逐字一致（见 devtools/_probe_history_load.py 的
-        #    CONSISTENCY 哈希）。缓存随主窗实例存活，最多留 2 份（成品约 9MB/份）。
-        import hashlib
-        _h = hashlib.sha256()
-        for _ln in rows:
-            _h.update(_ln.encode("utf-8", "replace"))
-            _h.update(b"\n")
-        _hints = self._rx_grid_hints()
-        cache_key = (_h.hexdigest(), self._rx_max_row_chars(),
-                     tuple(sorted((k, str(v)) for k, v in _hints.items())),
-                     bool(self._perf_on))
-        _cache = getattr(self, "_replay_text_cache", None)
-        if _cache is None:
-            _cache = self._replay_text_cache = {}
-        text = _cache.get(cache_key)
-        if text is None:
-            text = "\n".join(rows)
-            # 性能模式下回放也要整流：历史文件可能是**开启之前**写的（里面还留着
-            # 坏点/BMS Error），不处理的话一打开历史就露馅。对已整流过的文件是
-            # 幂等的（见 perf_mode 的两条约束）。
-            if self._perf_on:
-                text = self._perf_sanitizer.feed(text)
-            # ⛔ 空行与实时**同一条规则**（`ui_highlight.gap_lines`）：每个
-            #    VoltageN: / TemperatureN: / BMS 状态、以及每个时间戳之上各空一行，
-            #    其它位置一个空行都没有。历史文件可能是老版本写的（那时 feed 把空行
-            #    全滤掉了），所以这里**按规则重建**而不是信文件 —— 新老记录一个样子。
-            try:
-                text = "\n".join(gap_lines(text.split("\n")))
-            except Exception as exc:            # noqa: BLE001 - 规整失败就用原行
-                app_log.error(f"历史回放空行规整失败: {exc}")
-            # 历史文件里存的是**接收区当时显示的那一行行**（feed 在 _emit_block 里、
-            # 排版之后才调，见那边的注释），本来就带补零/网格；这里再跑一遍
-            # align_indexes 只是为了兜住"手改过/跨版本/极老的文件"，对正常文件是
-            # 幂等的（逐字比过：4137 行整篇排版 == 逐轮排版）。
-            try:
-                text = align_indexes(text, section=SECTION_OTHER,
-                                     max_row_chars=self._rx_max_row_chars(),
-                                     **self._rx_grid_hints())
-            except Exception as exc:            # noqa: BLE001 - 排版失败就用原文
-                app_log.error(f"历史回放排版失败: {exc}")
-            if len(_cache) >= 2:                # 只留最近两份，别把内存堆满
-                _cache.clear()
-            _cache[cache_key] = text
+        text = self._replay_text_for(rows)
+        # 回放态放宽块数上限：QPlainTextEdit 的 maximumBlockCount 是**从头裁**的，
+        # 保持 _rx_blocks（默认 5000）的话，前插更早内容会立刻被裁掉 = 翻页白翻。
+        # 见 REPLAY_MAX_BLOCKS 的注释（仍然是**有界**的，不会无限吃内存）。
+        self.txt_rx.setMaximumBlockCount(REPLAY_MAX_BLOCKS)
         self.txt_rx.setPlainText(text)
         # 先把"塞进几千行"的第一帧重排+绘制付掉：下面要按真实的最大滚动值定位，
         # 布局没落地时 bar.maximum() 还是旧的 0，定位会落空。
@@ -7753,10 +8086,106 @@ class MainWindow(QMainWindow):
         shot = self._grab_rx_shot()
         self._show_rx_shot(shot)
         self._replay_active = False
+        # 任何路径退出回放都要复位 kind，否则下次回放会沿用上次的按钮文案。
+        self._replay_kind = ""
+        # 分页状态一起清：返回实时之后就不该再有"往前翻一页"这种事。
+        self._replay_page = None
         self._refresh_replay_ui()
         self._clear_receive()
+        # 块数上限收回实时口径（回放态放宽过，见 _enter_replay）。
+        self.txt_rx.setMaximumBlockCount(self._rx_blocks)
         self._settle_rx_layout()
         self._fade_rx_shot()
+
+    def _maybe_replay_load_earlier(self, value: int) -> None:
+        """滚到顶部附近 → 取上一页更早的内容**前插**进文档（用户要求"不必加载全部"）。
+
+        为什么同步做、而不是丢给后台线程：一页只有 ``REPLAY_PAGE_LINES`` 行 /
+        ``REPLAY_PAGE_POINTS`` 个采样点，排版一次几十毫秒；同步做完可以立刻把
+        滚动条钉回原位（前插会让所有块下移，不补偿就会"跳"）。**快速拖动**时
+        滚动条会直接甩到 0，`valueChanged` 照样打到这里 —— 提前量
+        ``REPLAY_PREFETCH_PX`` 只是让慢速滚动时不至于先看到顶再等。
+        """
+        page = self._replay_page
+        if not self._replay_active or not page or not page.get("has_more"):
+            return
+        if page.get("loading"):
+            return
+        if value > REPLAY_PREFETCH_PX:
+            return
+        page["loading"] = True
+        try:
+            if page.get("kind") == "long":
+                self._replay_load_earlier_long(page)
+            else:
+                self._replay_load_earlier_recent(page)
+        except Exception as exc:                  # noqa: BLE001 - 翻页失败不影响现有画面
+            app_log.error(f"回放往前翻页失败: {exc}")
+            page["has_more"] = False
+        finally:
+            page["loading"] = False
+
+    def _replay_prepend(self, rows) -> None:
+        """把一行行内容前插到回放画面最前面，并把视口钉在原来那段文字上。
+
+        ⛔ 前插口径：``QTextCursor.MoveOperation.Start`` + ``insertText``，不用
+        ``setPlainText(新全文)`` —— 后者会把整篇重新建块（几千块几百毫秒），
+        而且滚动位置全丢。前插只影响新插入的那一批块。
+        """
+        if not rows:
+            return
+        text = self._replay_text_for(rows)
+        if not text:
+            return
+        bar = self.txt_rx.verticalScrollBar()
+        before_max = bar.maximum()
+        before_value = bar.value()
+        cursor = QTextCursor(self.txt_rx.document())
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        cursor.insertText(text + "\n")
+        # 布局落地之后才量得到新的 maximum；差额就是插入的那一页高度。
+        self._settle_rx_layout()
+        delta = bar.maximum() - before_max
+        if delta > 0:
+            bar.setValue(min(bar.maximum(), before_value + delta))
+
+    def _replay_load_earlier_recent(self, page: dict) -> None:
+        """近期数据：从整份留存里再往前切一页（按**轮边界**切，不劈开一轮）。"""
+        rows_all = page.get("all") or ()
+        start = int(page.get("start") or 0)
+        if start <= 0:
+            page["has_more"] = False
+            return
+        new_start = max(0, start - REPLAY_PAGE_LINES)
+        for idx in range(new_start, start):
+            if stamp_span(rows_all[idx]) is not None:
+                new_start = idx
+                break
+        else:
+            new_start = max(0, start - REPLAY_PAGE_LINES)
+        chunk = list(rows_all[new_start:start])
+        page["start"] = new_start
+        page["has_more"] = new_start > 0
+        self._replay_prepend(chunk)
+
+    def _replay_load_earlier_long(self, page: dict) -> None:
+        """历史数据：向 ``rx_store.history_page`` 要上一页（``before_ts`` 游标）。
+
+        返回的 ``earliest`` 就是下一次的 ``before_ts``，两页**不重复**：它是本页
+        最老桶的**末帧 ts**，`rx_store._bucket_stream` 会把这一整桶跳过（同桶的
+        更早帧本来就属于同一个采样点，不该再吐一遍）。
+        """
+        before = page.get("earliest")
+        if not before:
+            page["has_more"] = False
+            return
+        lines, earliest, has_more = rx_store.history_page(
+            page.get("interval") or 10, page.get("vehicle"),
+            limit=REPLAY_PAGE_POINTS, before_ts=before,
+            max_lines=REPLAY_PAGE_MAX_LINES)
+        page["earliest"] = earliest or before
+        page["has_more"] = bool(has_more)
+        self._replay_prepend(lines)
 
     def _settle_rx_layout(self) -> None:
         """把接收区的"第一帧大重排"当场画掉（同步，不等事件循环）。
@@ -7771,21 +8200,37 @@ class MainWindow(QMainWindow):
             pass
 
     def _refresh_replay_ui(self) -> None:
-        """回放模式下：显示返回实时的提示条、按钮文案改成"关闭"、换占位提示。
+        """按回放来源分别切两颗按钮的文案：点哪颗进的，哪颗就变「关闭」。
+
+        ``_replay_active`` 只决定"是不是回放态"（提示条、占位提示），两颗按钮
+        的文案由 ``_replay_kind`` 决定：
+
+          · 非回放：近期=「打开近期数据」、历史=「打开历史数据」；
+          · ``"recent"``：近期=「关闭近期数据」、历史=「打开历史数据」；
+          · ``"long"``：近期=「打开近期数据」、历史=「关闭历史数据」。
+
+        ⚠️ 六个文案都是 6 个字，切换时按钮宽度不变、布局不抖。
 
         提示条的显隐**不直接 show/hide**，走 ``_replay_bar_anim`` 的高度补间：
         一帧里凭空多出 50px 会把下面的日志框猛地顶下去。
         """
-        if self._replay_active:
-            self.btn_open_history.setText("关闭历史数据")
-            self._replay_bar_anim(True)
-            self.txt_rx.setPlaceholderText("正在查看本地留存数据（点右上角返回实时）")
-        else:
-            self.btn_open_history.setText("打开历史数据")
+        if not self._replay_active:
+            self.btn_open_history.setText("打开近期数据")
+            self.btn_open_long_history.setText("打开历史数据")
             self._replay_bar_anim(False)
             # 与 __init__ 一致：**不设**占位提示（Qt 只按"正文色×≈0.5"画它，
             # 永远比别处暗一半；详见 __init__ 里那段说明）。
             self.txt_rx.setPlaceholderText("")
+            return
+        if self._replay_kind == "long":
+            self.btn_open_history.setText("打开近期数据")
+            self.btn_open_long_history.setText("关闭历史数据")
+        else:
+            # "recent"（以及 _enter_replay 内部那次 kind 尚未落定的瞬态）
+            self.btn_open_history.setText("关闭近期数据")
+            self.btn_open_long_history.setText("打开历史数据")
+        self._replay_bar_anim(True)
+        self.txt_rx.setPlaceholderText("正在查看本地留存数据（点右上角返回实时）")
 
     def _replay_bar_height(self) -> int:
         """提示条展开后的高度（≈50）—— 按布局的 sizeHint 现算，别写死。
@@ -8156,6 +8601,11 @@ class MainWindow(QMainWindow):
         self._soc_cfg = None
         self._soc_est = None
         self._soc_feed = None
+        # 换车 / 换算法 = 「上次读数」全部作废：上一台车（或上一套算法）的数值
+        # 带到新上下文里比不显示更糟。车端上报值同理 —— 它属于旧车的 BMS。
+        self._soc_read_last = None
+        self._soc_read_last_shown = None
+        self._soc_calc_last = None
         # 显示门控是纯状态机；换车 / 切 EKF 开关时重建基准（不带旧车读数）
         self._soc_display_gate = SocDisplayGate()
         # 「显示 SOC 读数」开关先落地：后面三条出口（没参数 / 正常 / 异常）都会
@@ -8167,7 +8617,7 @@ class MainWindow(QMainWindow):
                 # 这台车没有 SOC 参数 = 不知道串数：性能模式**不推算总压**
                 # （猜串数会把 V= 换成一个更离谱的数）
                 self._perf_sanitizer.set_n_cells(0)
-                self._set_soc_parts(("", "SOC --", "", ""), "off")
+                self._set_soc_parts(self._soc_placeholder(), "off")
                 return
             # 性能模式换算总压要串数，与 SOC 用同一份车辆参数（单一真值源）
             self._perf_sanitizer.set_n_cells(self._soc_cfg.n_cells)
@@ -8189,7 +8639,7 @@ class MainWindow(QMainWindow):
             self._soc_feed = soc_feed.RoundCollector(
                 n_modules=max(1, self._soc_cfg.n_cells // per),
                 cells_per_module=per)
-            self._set_soc_parts(("", "SOC --", "", ""), "off")
+            self._set_soc_parts(self._soc_placeholder(), "off")
         except Exception:                     # noqa: BLE001 - 绝不拖垮主界面
             import traceback
             app_log.error("SOC 初始化失败: " + traceback.format_exc(limit=2))
@@ -8207,7 +8657,24 @@ class MainWindow(QMainWindow):
             return
         try:
             now = time.monotonic()
-            for data in self._soc_feed.feed(text):
+            rounds = self._soc_feed.feed(text)
+            # ⚠️ 时序要害（⛔ 别挪到循环之后）：报文里 ``SOC=80.40%`` 在 ``CVMax=``
+            #    **之后**才到，而 CVMax 已经收尾并 emit 了本轮 —— 车端读数只能靠
+            #    RoundCollector 的粘滞状态带过来（见 soc_feed.RoundCollector 注释）。
+            #    必须赶在 _apply_soc **之前**同步，「读取到的」模式才不会永远慢一轮。
+            if self._soc_feed.last_soc_read is not None:
+                self._soc_read_last = self._soc_feed.last_soc_read
+            if (not rounds and self._soc_source == "read"
+                    and self._soc_read_last is not None
+                    and self._soc_read_last != self._soc_read_last_shown):
+                # 报文里 SOC= 本来就在 CVMax= 之后；被串口缓冲切成单独一块时
+                # rounds 为空，下面那个循环一次都不跑 —— 不在这里补刷就要等到
+                # 下一整轮才看得见新车端读数（用户点名的"慢一轮"）。
+                self._refresh_soc_now()
+            for data in rounds:
+                if data.soc_read is not None:
+                    # 同一块里 SOC 行先于 CVMax 时本轮自带读数（比粘滞值更贴合本轮）
+                    self._soc_read_last = data.soc_read
                 res = self._soc_est.update(
                     data.cells, data.temps, data.i_meas, ts=now,
                     bad_mask=data.bad,
@@ -8248,8 +8715,82 @@ class MainWindow(QMainWindow):
             # 无可用数据：只推进门控状态（沿用上次 + 清待确认），
             # 显示文本保持 "SOC --" 占位符契约不变。
             self._soc_display_gate.decide(res.mode, res.flag, None, None)
-        self._set_soc_parts(parts, state,
-                            emphasis=(res.emphasis if res is not None else ""))
+        # 缓存"算出来的"这一份：切换数据来源时要用它重绘（见 _refresh_soc_now）——
+        # ⛔ 不复用 _apply_soc 重跑一遍，那会再推进一次显示门控的状态。
+        self._soc_calc_last = (parts, state,
+                               res.emphasis if res is not None else "")
+        self._render_soc(*self._soc_calc_last)
+
+    def _render_soc(self, parts, state: str, emphasis: str = "") -> None:
+        """底栏 SOC 区**唯一**的刷文本出口：按「数据来源」决定画哪一份。
+
+        两种来源共用同一组四枚标签，差别只在这里：
+          · ``calc``：算出来的（min / max / 总压 + 焦点语义），原样下发；
+          · ``read``：车端上报（工况 / 车端 SOC / 空 / 总压），见 _soc_read_parts。
+        """
+        if self._soc_source == "read":
+            parts, state = self._soc_read_parts(parts)
+            # min/max 的 focus/dim 焦点语义在读取模式下不成立（只剩一枚读数）
+            emphasis = ""
+            self._soc_read_last_shown = self._soc_read_last
+        self._set_soc_parts(parts, state, emphasis)
+
+    def _soc_read_parts(self, parts) -> tuple[tuple[str, str, str, str], str]:
+        """「读取到的」模式下的四槽文本 + 状态。
+
+        槽位沿用算出来的那一份：工况槽（``[放电]`` / ``[静置]`` / 母线断开…）与
+        总电压跟数据来源无关，照原样显示；min / max 两槽换成**一枚**车端读数 +
+        一个空串 —— ``_place_soc`` 会跳过空标签，所以这一组仍然是"精确居中"的
+        两枚（工况 / 读数 / 总压共三枚）。
+
+        ⛔ 车端从没报过 SOC 就显示 ``车端 SOC --``，**不许**拿本地估算值顶上：
+           用户要看的是"车端到底报了多少"，糊上去反而误导（宁可空着说不知道）。
+        ⛔ 读取模式下不因为本地估算的 residual / module_offset 转橙：那些是**本地
+           算法**的健康度，与车端读数一点关系都没有。
+        """
+        mode_text = parts[0] if parts else ""
+        volt_text = parts[3] if len(parts) > 3 else ""
+        if self._soc_read_last is None:
+            return (mode_text, "车端 SOC --", "", volt_text), "off"
+        return (mode_text, f"车端 SOC {self._soc_read_last:.2f}%", "",
+                volt_text), "ok"
+
+    def _soc_placeholder(self) -> tuple[str, str, str, str]:
+        """还没有任何一轮读数时的占位文本（按当前来源选措辞）。"""
+        if self._soc_source == "read":
+            return "", "车端 SOC --", "", ""
+        return "", "SOC --", "", ""
+
+    def _load_soc_source(self) -> str:
+        """读设置里的「SOC 数据来源」，只会是 ``"calc"`` / ``"read"``。"""
+        try:
+            value = str(customization.get("soc_source") or "calc")
+        except Exception:                     # noqa: BLE001 - 配置读坏就当默认
+            return "calc"
+        return "read" if value == "read" else "calc"
+
+    def _set_soc_source(self, value) -> None:
+        """落地「SOC 数据来源」并**立刻**重绘一次底栏（估算链路一律不动）。
+
+        ⛔ 刷新只复用手上已有的文本/读数，**不**调 ``_init_soc()`` —— 那会把估算器
+           重建、OCV 读数从头锚定，用户会看见读数"跳"一下（点名投诉过）。
+        """
+        source = "read" if str(value) == "read" else "calc"
+        if source == self._soc_source:
+            return
+        self._soc_source = source
+        self._refresh_soc_now()
+
+    def _refresh_soc_now(self) -> None:
+        """按当前来源把底栏重绘一次（换来源 / 取消设置时用）。
+
+        有"最近一次算好的文本"就复用它（连同显示门控已定下的数值，见
+        ``_soc_calc_last``）；一次都还没算过就回到占位文本。
+        """
+        if self._soc_calc_last is None:
+            self._set_soc_parts(self._soc_placeholder(), "off")
+            return
+        self._render_soc(*self._soc_calc_last)
 
     def _set_soc_parts(self, parts, state: str, emphasis: str = "") -> None:
         """三枚标签统一刷文本 + 动态属性。
@@ -8440,6 +8981,8 @@ class MainWindow(QMainWindow):
         previous_fps = ui_anim.frame_hz()
         self._settings_previous = (previous_glass, previous_material,
                                    previous_hidden, previous_font, previous_fps)
+        # 「SOC 数据来源」的预览起点（取消时要还回这个值）
+        self._settings_soc_source_prev = self._soc_source
         dialog = SettingsDialog(self._theme_mode, previous_glass,
                                 BUTTON_SPECS, sorted(self._hidden_buttons),
                                 on_glass=self._apply_glass,
@@ -8962,7 +9505,7 @@ class MainWindow(QMainWindow):
         抓下来（见 ``_close_settings_dialog``），这里只负责应用。
         """
         if not accepted:
-            # 取消：把实时预览（强度、材质、按钮显隐、字号）一并还原 ——
+            # 取消：把实时预览（强度、材质、按钮显隐、字号、SOC 数据来源）一并还原 ——
             # 少还原一样，界面就会停在预览状态里。
             (previous_glass, previous_material, previous_hidden, previous_font,
              previous_fps) = self._settings_previous
@@ -8972,6 +9515,8 @@ class MainWindow(QMainWindow):
             self._apply_button_visibility()
             self._apply_rx_font_size(previous_font)
             ui_anim.set_frame_hz(previous_fps)
+            # 「SOC 数据来源」也是预览项：换回来并重绘底栏（估算状态不动）
+            self._set_soc_source(self._settings_soc_source_prev)
             return
         theme_mode, glass = self._settings_values
         # 「定制功能」由注册表统一管理：面板按 specs() 生成控件，这里统一落盘。
@@ -9037,12 +9582,22 @@ class MainWindow(QMainWindow):
             app_log.info("SOC 算法已切换为 " +
                          ("四状态 EKF" if bool(customization.get("soc_ekf4"))
                           else "固定增益融合"))
+        if "soc_source" in custom_changes:
+            # 只换「读哪个数」：估算 / 积分 / 零漂一行没动（见 _refresh_soc_now）
+            self._set_soc_source(customization.get("soc_source"))
+            app_log.info("SOC 数据来源已切换为 " +
+                         ("车端上报" if self._soc_source == "read" else "本地估算"))
         if any(k in custom_changes for k in ("module_count", "cells_per_module",
-                                             "temps_per_module", "broken_wire_mv")):
+                                             "temps_per_module", "broken_wire_mv",
+                                             "volt_rows", "temp_rows")):
             # 决策-3：排版配置改完，**已显示的旧文本**也要按新网格重排（滚动位置、
             # 光标/选中区、暂停态都保留，见 _relayout_rx_document）
             # broken_wire_mv：断线 X 也是排版产物 —— 改了阈值要把画面里旧的 X
             # 按新值重算（align_indexes 会先把旧标记还原成列间隔再重排）。
+            # volt_rows/temp_rows：没选车时这两个「电压/温度数据行数」也存在全局键
+            # （选车时存逐车档案、走 _schedule_vehicle_relayout），改了必须让已显示
+            # 的文本按新行数重排，否则用户看到"改了没生效"。custom_changes 里只在
+            # 没选车时才含这两个键，加进门控不会造成选车时重复重排。
             if self._relayout_rx_document():
                 app_log.info("接收区已按新排版配置重排")
         self._toast("设置已保存", 2500)
@@ -9079,6 +9634,9 @@ class MainWindow(QMainWindow):
         elif key == "material":
             # 换材质**当场**生效（用户点名"实时生效、不用重启"）
             self._apply_material(str(value))
+        elif key == "soc_source":
+            # 下拉框选中即预览：底栏那组读数当场换成另一种来源（不落盘）
+            self._set_soc_source(value)
         elif key == "vehicle":
             self._refresh_vehicle_badge()
             import rx_history

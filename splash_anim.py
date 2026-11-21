@@ -251,6 +251,41 @@ def _warm_font_on_main() -> None:
         pass
 
 
+# 主线程「动画时钟启动前」的一次性预热钩子（main.py 注册）。
+# ⛔⛔ 2026-11-19：main.py 以前用 ``QTimer.singleShot(0, _preload_main_module)``
+#    把 ``import main_window`` 全家桶（实测 ≈238ms）排在事件循环第一拍，本意是
+#    「此时画面还是纯底 lead」，但几何分支的时钟在 start() 里已经起播 —— 实测
+#    它落在动画第 0.17s、阻塞 238ms（`splash_perf.log` 的
+#    ``big_gaps[(0.0,104),(0.17,238),(0.41,123)]`` 实锤），用户看到的正是
+#    「开屏动了一下就顿住」。现在由 ``_start_motion`` 在 **show()+repaint() 之后、
+#    _elapsed.start() 之前**调用本钩子：底图已经上屏（用户看得见画面），动画
+#    时钟还没开始走 —— 同一笔钱花在静止底图上，一帧动画都不占。
+_PREWARM_HOOK = None
+
+
+def set_prewarm_hook(fn) -> None:
+    """注册「动画时钟启动前」的一次性同步钩子（异常隔离、只执行一次）。
+
+    必须在 ``play_configured()`` **之前**调用。钩子抛异常只记日志，绝不让
+    开屏失败。没有开屏（play 返回 None）时钩子不会被消费，调用方的 import
+    会在构造主窗时照常发生。
+    """
+    global _PREWARM_HOOK
+    _PREWARM_HOOK = fn
+
+
+def _run_prewarm_hook() -> None:
+    """执行并清空预热钩子（幂等；任何异常都静默降级）。"""
+    global _PREWARM_HOOK
+    hook, _PREWARM_HOOK = _PREWARM_HOOK, None
+    if hook is None:
+        return
+    try:
+        hook()
+    except Exception as exc:              # noqa: BLE001 - 预热失败不挡开屏
+        app_log.warning(f"开屏预热钩子失败：{exc}")
+
+
 def choice() -> str:
     value = str(_settings().value(_KEY_CHOICE, _DEFAULT_CHOICE) or _DEFAULT_CHOICE)
     # 旧配置存的是单个文件（preset:xxx）→ 归一成它所属的方案，老用户不用重选
@@ -353,10 +388,15 @@ def _motion_wanted_preset(preset: dict | str | None) -> bool:
 class _SplashWindow(QWidget):
     """置顶整屏黑底播放器：视频 / 动图 / 静态图。"""
 
-    def __init__(self, preset: dict, on_finished=None) -> None:
+    def __init__(self, preset: dict, on_finished=None,
+                 defer_start: bool = False) -> None:
         super().__init__(None)
         self._preset = preset
         self._on_finished = on_finished
+        # ⛔⛔ 2026-11-19：延迟起播（见 start_clock）。**只对几何分支有效** ——
+        #    视频/帧序列分支的时钟在自己的 _start_* 里启动，本标志对它们无效。
+        self._defer_start = bool(defer_start)
+        self._clock_started = False
         self._on_fade_start = None
         self._player = None
         self._audio = None
@@ -563,6 +603,11 @@ class _SplashWindow(QWidget):
         #    开屏底色）时一次性付掉：不增加双击响应（窗口已上屏），也不占
         #    任何一帧动画的时间。
         _warm_font_on_main()
+        # ⛔⛔ 2026-11-19：把 main.py 的一次性同步开销（import main_window 全家桶
+        #    实测 ≈238ms）在这里付掉 —— 此刻底图已 show()+repaint() 上屏、动画
+        #    时钟**尚未启动**（_elapsed.start() 在下面），所以这笔钱不占任何一帧
+        #    动画。见 set_prewarm_hook 的注释（旧法砸在动画第 0.17s 的实锤）。
+        _run_prewarm_hook()
         self._motion = splash_motion.MotionRenderer(
             scheme, _dpr, _sw, _sh, spec)
         _aud("motion_ready")  # 渲染器构造完（清晰 logo 就绪；模糊档后台预热）
@@ -581,10 +626,6 @@ class _SplashWindow(QWidget):
         self.raise_()
         self.activateWindow()
         self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
-        self._max_timer.start(_MAX_MS)
-        self._elapsed = QElapsedTimer()
-        self._elapsed.start()
-        self._pause_total = 0
         self._motion_timer = QTimer(self)
         # ⛔ 精确定时器（od46 真 bug 修复）：Windows 默认 CoarseTimer ≈15.6ms，
         #    5ms 间隔会被压到 ~60fps。对齐帧序列路径与 ui_anim 全局补间。
@@ -607,7 +648,47 @@ class _SplashWindow(QWidget):
         #    绘制本身是纯 drawPixmap/矢量，单帧 <1ms。
         self._motion_timer.setInterval(max(1, int(round(1000.0 / hz)) - 4))
         self._motion_timer.timeout.connect(self._motion_tick)
-        self._motion_timer.start()
+        # ⛔⛔ 2026-11-19：defer_start 模式（main.py 用）把「时钟启动」推迟到
+        #    ``start_clock()`` —— 调用方趁底图已上屏、动画尚未起播时先同步构造
+        #    主窗（实测 ≈270ms），那笔开销就落在静止画面上，动画第一帧起全程
+        #    无阻塞。真机遥测``big_gaps`` 实锤过：构造排在动画第 0.09s 时
+        #    造成 238ms 卡顿（用户感受就是「开屏动一下就顿住」）。
+        #    非 defer（默认）仍在这里启动，与旧行为一字不差。
+        if not self._defer_start:
+            self.start_clock()
+
+    def start_clock(self) -> None:
+        """启动动画时钟（幂等，只对几何分支有效）。
+
+        ``defer_start`` 模式由 main.py 在「底图已上屏 + 主窗构造完」之后调用；
+        普通模式由 ``_start_motion`` 末尾自动调用（等价旧行为）。
+        视频/帧序列分支没有 ``_motion_timer``，本方法对它们是 no-op。
+        """
+        if self._clock_started:
+            return
+        self._clock_started = True
+        # 兜底计时也从这一刻起算：defer 期间用户看到的是静止底图，不该被
+        # 8s 兜底提前收掉。
+        self._max_timer.start(_MAX_MS)
+        timer = getattr(self, "_motion_timer", None)
+        if timer is not None:
+            # ⛔ 2026-11-19：先把 t=0 的首帧**同步画掉**再启动计时。4K 全屏首绘
+            #    + 位图纹理上传实测 ≈240ms（splash_perf.log `big_gaps (0.0, 240)`
+            #    实锤），原本落在动画第一拍、用户看到的就是"一开就顿"。
+            #    ⛔ 必须在 _elapsed.start() **之前**画：几何分支读墙钟绝对值，
+            #    若把 240ms 算进进度会让第一帧直接跳到 0.24s（跳帧）。
+            try:
+                self.update()
+                self.repaint()
+            except RuntimeError:          # 窗口已析构（退出流程）
+                return
+        self._elapsed = QElapsedTimer()
+        self._elapsed.start()
+        self._pause_total = 0
+        self._last_wall = time.perf_counter()
+        self._mt = 0.0
+        if timer is not None:
+            timer.start()
 
     def _motion_tick(self) -> None:
         """几何分支：**直接读墙钟**推进进度（不累加、不钳制）。
@@ -633,7 +714,10 @@ class _SplashWindow(QWidget):
         # MotionRenderer._preheat_async）：不阻塞动画，模糊档逐帧补满。
         m = self._motion
         if getattr(m, "_preheat_pending", None):
-            _done = m._absorb_pending()
+            # ⛔ 每拍只转 1 档（见 MotionRenderer._absorb_pending 的 limit 说明）：
+            #    13 档一次性转换实测 123ms（big_gaps (0.41,123) 实锤），摊到
+            #    13 拍后单拍约 9ms，不会再整块卡住动画。
+            _done = m._absorb_pending(limit=1)
             if _done and not getattr(self, "_aud_preheat_done", False):
                 self._aud_preheat_done = True
                 _aud("preheat_done")  # 后台模糊档全部就绪
@@ -1531,8 +1615,13 @@ class _SplashWindow(QWidget):
                 app_log.error(f"开屏动画结束回调失败：{exc}")
 
 
-def play(preset: dict | None, on_finished=None) -> "_SplashWindow | None":
-    """播放一条开屏动画；返回播放器（没得播/失败返回 None）。"""
+def play(preset: dict | None, on_finished=None,
+         defer_start: bool = False) -> "_SplashWindow | None":
+    """播放一条开屏动画；返回播放器（没得播/失败返回 None）。
+
+    ``defer_start=True``：几何分支先 show 底图、暂不起播，等调用方
+    ``start_clock()``（见 ``_SplashWindow.start_clock``）。视频/帧序列分支忽略。
+    """
     global _active
     if not preset:
         return None
@@ -1541,7 +1630,7 @@ def play(preset: dict | None, on_finished=None) -> "_SplashWindow | None":
         app_log.warning(f"开屏动画文件不存在：{path}")
         return None
     try:
-        window = _SplashWindow(preset, on_finished)
+        window = _SplashWindow(preset, on_finished, defer_start=defer_start)
     except Exception as exc:              # noqa: BLE001
         app_log.warning(f"开屏动画创建失败：{exc}")
         return None
@@ -1556,17 +1645,23 @@ def play(preset: dict | None, on_finished=None) -> "_SplashWindow | None":
         except Exception:                 # noqa: BLE001
             pass
         return None
+    # 兜底：视频 / 帧序列分支不经过 _start_motion（几何分支已在那里消费掉钩子），
+    # 这里再调一次（幂等）确保 main.py 的预热不会丢。此时画面已上屏，最差等同旧行为。
+    _run_prewarm_hook()
     return window
 
 
-def play_configured(on_finished=None) -> "_SplashWindow | None":
-    """按设置播放；没有配置/失败返回 None（调用方据此直接显示主窗）。"""
+def play_configured(on_finished=None, defer_start: bool = False) -> "_SplashWindow | None":
+    """按设置播放；没有配置/失败返回 None（调用方据此直接显示主窗）。
+
+    ``defer_start`` 见 ``play``（几何分支延迟起播，供 main.py 先构造主窗）。
+    """
     try:
         preset = configured()
     except Exception as exc:              # noqa: BLE001
         app_log.warning(f"开屏动画配置读取失败：{exc}")
         return None
-    return play(preset, on_finished=on_finished)
+    return play(preset, on_finished=on_finished, defer_start=defer_start)
 
 
 # ---- 双击后预热（2026-11-03 用户：「在双击后和空白的 0.3s 就可以提前开始调用渲染」）

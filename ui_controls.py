@@ -955,6 +955,18 @@ class _PopupItemDelegate(QStyledItemDelegate):
 # 下拉（蓝牙设备那一栏）按最宽条目算出来的宽度会顶出屏幕右缘。
 _POPUP_SCREEN_MARGIN = 12
 
+# 弹层**最多显示几行**，多出来的靠视图自己的滚动条滚（用户 2026-11-21 点名
+# "这个太长太宽了"：历史采样间隔 30 档，弹层撑到 864px 高、直接跑出屏幕下缘）。
+# ⛔ 不能靠 QComboBox.setMaxVisibleItems —— 本机 Qt 6.12 + Fusion 下它**完全不
+#    生效**：真机实测原生 QComboBox（30 项 / maxVisibleItems=10）弹层照样是
+#    30 行的 926px，ChevronComboBox 是 30 行的 864px；设成 6 也只降到 661px。
+#    所以高度必须自己按"行高 × 行数"封顶，见 _cap_popup_height。
+_POPUP_MAX_ROWS = 8
+
+# 弹层竖向除"行"以外的一圈常量高度：QSS 的 padding 6+6 + 边框 1+1 + 容器布局 5+5。
+# 实测来源：30 行样式下容器高 864 = 30×28 + 24。改 QSS 的 padding/边框要同步改这里。
+_POPUP_CHROME_H = 24
+
 
 class ChevronComboBox(QComboBox):
     """下拉框。箭头用系统图标字体自绘的 chevron，不用 QSS 的三角。
@@ -1280,6 +1292,13 @@ class ChevronComboBox(QComboBox):
         #    超长条目由委托**省略号截断**（见 _PopupItemDelegate.paint）。
         screen_area = self.screen().availableGeometry()
         need = min(need, max(160, screen_area.width() - _POPUP_SCREEN_MARGIN * 2))
+        view = self.view()
+        # 条目超过行数上限（见 _POPUP_MAX_ROWS）时必须让人**看得出**下面还有：
+        # Qt 给下拉弹层的视图默认把竖向滚动条关掉（它自己用上下小箭头滚），
+        # 高度一封顶就变成"8 条之后还有 22 条"却毫无提示。这里把滚动条还回来。
+        # ⚠️ 宽度**不再加**滚动条那一列：上面那 28px 余量本来就含了它
+        #    （QSS 实测 10px），再加一次弹层只会更宽 —— 用户点名"太宽"。
+        view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         view.setMinimumWidth(max(self.width(), need))
 
     def _animate_popup_open(self) -> None:
@@ -1293,6 +1312,60 @@ class ChevronComboBox(QComboBox):
         最终位置，方向判断与动画就都对齐了。
         """
         QTimer.singleShot(0, self._start_popup_anim)
+
+    def _popup_row_metrics(self) -> tuple[int, int]:
+        """弹层的 (单行高, 除行以外的一圈高度)。
+
+        竖向那圈"非行"的高度**现场量**：视图内边距（QSS padding 6+6 + 边框 1+1，
+        恒 14px，与被压矮无关）+ 容器布局多出来的部分。量不到才退回实测常量。
+        """
+        view = self.view()
+        row_h = view.sizeHintForRow(0) if self.count() else 0
+        chrome = max(0, view.height() - view.viewport().height())
+        holder = view.window()
+        if holder is not None and view.height() > 0:
+            chrome += max(0, holder.height() - view.height())
+        if chrome <= 0:
+            chrome = _POPUP_CHROME_H
+        return row_h, chrome
+
+    def _snap_popup_rows(self, height: int) -> int:
+        """把弹层高度**向下取整到整行** —— 半截行比少一行难看得多。
+
+        屏幕下方空间不够时 ``_popup_place`` 会压矮弹层（列表自己滚），压出来的
+        高度不是行高的整数倍，最后一行就被切掉一半（用户 2026-11-21 截图里那条
+        只露出上半截的「100 秒」）。这里统一吸附：至少留一行，多出来的零头丢掉。
+        """
+        row_h, chrome = self._popup_row_metrics()
+        if row_h <= 0 or height <= 0:
+            return height
+        rows = (height - chrome) // row_h
+        if rows < 1:
+            return height
+        return chrome + rows * row_h
+
+    def _cap_popup_height(self, geo: QRect) -> QRect:
+        """把弹层高度封顶到 ``_POPUP_MAX_ROWS`` 行（多出来的靠滚动条）。
+
+        Qt 的 ``maxVisibleItems`` 在本机 Qt 6.12 + Fusion 上是**死值**（见
+        ``_POPUP_MAX_ROWS`` 的实测记录，原生 QComboBox 同样不守），所以这里
+        自己算：行高取视图的 ``sizeHintForRow(0)``（= 委托的 ROW_H = 28）。
+
+        高度必须按"整行 + 一圈内边距"算：只靠"当前高度 - 行数×行高"反推不行 ——
+        已经被屏幕空间压矮过的弹层反推出来是 0，会把最后一行裁掉半截。
+
+        只在"条目数超过上限"时才动；已经被压矮的弹层不会再被抬高。
+        """
+        count = self.count()
+        if count <= _POPUP_MAX_ROWS:
+            return geo
+        row_h, chrome = self._popup_row_metrics()
+        if row_h <= 0:
+            return geo
+        cap = _POPUP_MAX_ROWS * row_h + chrome
+        if geo.height() <= cap:
+            return geo
+        return QRect(geo.x(), geo.y(), geo.width(), cap)
 
     def _popup_place(self, size=None) -> tuple[QRect, bool]:
         """算出弹层**该在哪**（尺寸沿用 Qt 算好的，只改位置）。
@@ -1309,6 +1382,7 @@ class ChevronComboBox(QComboBox):
             geo = QRect(0, 0, int(size.width()), int(size.height()))
         else:
             geo = container.geometry()
+        geo = self._cap_popup_height(geo)
         anchor = self.mapToGlobal(QPoint(0, 0))
         gap = 4
         below_top = self.mapToGlobal(QPoint(0, self.height())).y() + gap
@@ -1326,15 +1400,17 @@ class ChevronComboBox(QComboBox):
         # 都放不下（底栏最下面那几个），才真的翻到上方。
         room = screen_area.bottom() - gap - below_top
         if room >= min(geo.height(), 120):
+            # 压矮到屏幕可用空间之后**吸附到整行**（见 _snap_popup_rows）：否则
+            # 最后一行只露出上半截，看着像画坏了。
             return (QRect(x, below_top, width,
-                          min(geo.height(), room)), True)
+                          self._snap_popup_rows(min(geo.height(), room))), True)
         above_room = anchor.y() - gap - screen_area.top() - _POPUP_SCREEN_MARGIN
         above_h = max(64, min(geo.height(), above_room))
         # ⚠️ 上边界也夹一次：只有"窗口自己顶部在屏外"时才用得上（正常走不到），
         #    但既然下面是 max(64, …)，不夹就可能把弹层顶出屏幕。
         above_y = max(screen_area.top() + _POPUP_SCREEN_MARGIN,
                       anchor.y() - gap - above_h)
-        return QRect(x, above_y, width, above_h), False
+        return QRect(x, above_y, width, self._snap_popup_rows(above_h)), False
                      # 翻到上方
 
     def _start_popup_anim(self) -> None:

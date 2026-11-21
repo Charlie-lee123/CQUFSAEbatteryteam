@@ -1275,15 +1275,26 @@ def check_rx_history(app: QApplication) -> None:
         # 恢复默认，后续断言（文件行数）按默认上限算
         rx_history.set_max_lines(cap)
 
-        # 3c) 分车历史（用户 2026-10-23）：不同电池箱 → 不同文件，互不串档；
-        # 未选车落通用文件。用临时目录，绝不碰真实的 接收历史*.log。
-        assert rx_history.file_for(None) == "接收历史.log"
-        assert rx_history.file_for("E74-2026") == "接收历史-E74-2026.log"
-        assert rx_history.file_for('a/b:c*d?e"f<g>h|i') == "接收历史-a_b_c_d_e_f_g_h_i.log"
+        # 3c) 分车 + 分文件夹（用户 2026-11-21："把近期数据和历史数据分成不同的
+        #     文件夹，也要按照车号分"）：<基准>/近期数据/<车号>.log，未选车 →
+        #     未选择车号.log；老位置的 接收历史-<车号>.log 首次定位时自动搬进来。
+        assert rx_history.file_for(None) == "未选择车号.log"
+        assert rx_history.file_for("E74-2026") == "E74-2026.log"
+        assert rx_history.file_for('a/b:c*d?e"f<g>h|i') == "a_b_c_d_e_f_g_h_i.log"
         real_resolver = rx_history._resolve_dir
         rx_history._resolve_dir = lambda: tmp.parent     # 重定向到临时目录
         try:
+            # 老版本的文件（放在基准目录里，不带子目录）→ 应被搬进 近期数据
+            legacy = tmp.parent / "接收历史-E74-2026.log"
+            legacy.write_text("legacy row\n", encoding="utf-8")
             rx_history.switch_target("E74-2026")
+            assert rx_history._path == tmp.parent / "近期数据" / "E74-2026.log", \
+                f"近期数据没落到子目录：{rx_history._path}"
+            assert not legacy.exists(), "老位置的文件没搬进 近期数据"
+            assert any(full.endswith("E74-2026.log")
+                       for _n, full in rx_history.labels_of(tmp.parent)), \
+                rx_history.labels_of(tmp.parent)
+            assert "legacy row" in rx_history.all_lines(), "搬家后老内容没读回来"
             rx_history.feed("vehicle A row")
             rx_history.flush()
             rx_history.switch_target("X88-2026")
@@ -1297,7 +1308,11 @@ def check_rx_history(app: QApplication) -> None:
             assert "vehicle B row" not in rx_history.all_lines()
             rx_history.switch_target(None)
             assert rx_history._path is not None \
-                and rx_history._path.name == "接收历史.log"
+                and rx_history._path.name == "未选择车号.log" \
+                and rx_history._path.parent.name == "近期数据", rx_history._path
+            # 标签 = 文件名去 .log（不再剥「接收历史-」前缀）
+            labels = [name for name, _full in rx_history.labels_of(tmp.parent)]
+            assert "E74-2026" in labels and "未选择车号" in labels, labels
         finally:
             rx_history._resolve_dir = real_resolver
             rx_history.switch_target(None)   # 恢复通用文件，防污染后续断言
@@ -1312,6 +1327,17 @@ def check_rx_history(app: QApplication) -> None:
         rx_history.feed("x")
         rx_history.flush()          # 不应抛异常
         rx_history._path = saved_path
+
+        # 4b) 回放用的 all_lines() 必须含**未落盘的最新尾巴**（用户 2026-11-21 报
+        #     "近期数据没有最新的"）：flush 是 1 秒批量，只喂不刷时最新帧只在
+        #     _pending 内存里，文件里没有。all_lines() 若只读文件就会漏掉它。
+        rx_history._pending.clear()
+        rx_history.feed("PENDING_TAIL_20261121")
+        assert "PENDING_TAIL_20261121" not in saved_path.read_text(
+            encoding="utf-8"), "前提：这一行还没落盘"
+        assert "PENDING_TAIL_20261121" in rx_history.all_lines(), \
+            "all_lines() 漏了未 flush 的最新帧（近期数据会看不到最新内容）"
+        rx_history.flush()
 
         # 5) 设置面板有「打开记录」按钮（路径已指向临时文件）
         # 日志大节在 app_log.path() 为 None 时整节跳过（接收历史行挂在它里面），
@@ -1406,8 +1432,18 @@ def check_history_replay(app: QApplication) -> None:
 
         window = MainWindow()
         window._clear_receive()
-        assert window.btn_open_history.text() == "打开历史数据", \
-            "串口配置栏没有「打开历史数据」按钮"
+        assert window.btn_open_history.text() == "打开近期数据", \
+            "串口配置栏没有「打开近期数据」按钮（原「打开历史数据」已改名）"
+        # 2026-11-21 新增：独立的历史数据按钮（会话库、永不删除），与近期严格分层
+        assert window.btn_open_long_history.text() == "打开历史数据", \
+            "串口配置栏没有新增的「打开历史数据」按钮"
+        # 用户 2026-11-21：「历史数据显示的时间间隔选择要 10 的倍数，10s 10s 地加」
+        # → 档位从固定的 6 个改成 10~300 秒、10 秒一档（30 档）。
+        # ⛔ 断言写成"性质"而不是字面集合：档位是用户可配置的，写死具体数字
+        #    下次调档位又要改一次自测（"用户可配置数值的硬编码" 老坑）。
+        _hv = str(customization.get("history_interval"))
+        assert _hv.isdigit() and 10 <= int(_hv) <= 300 and int(_hv) % 10 == 0, \
+            f"history_interval 必须是 10 的倍数（10~300 秒），取到了 {_hv!r}"
         assert not window._replay_active, "刚开窗就进了回放模式"
         assert window._replay_bar.isHidden(), "未回放时提示条不该显示"
 
@@ -1434,10 +1470,17 @@ def check_history_replay(app: QApplication) -> None:
         window._open_history()
         app.processEvents()
         assert window._replay_active, "打开历史后没进入回放模式"
-        # 「打开历史数据」是一颗**开关**（用户点名"再点一次就关掉"）：进回放后
+        # 「打开近期数据」是一颗**开关**（用户点名"再点一次就关掉"）：进回放后
         # 文案必须跟着变，否则用户看不出这一下会退出回放。
-        assert window.btn_open_history.text() == "关闭历史数据", \
+        assert window.btn_open_history.text() == "关闭近期数据", \
             f"回放态下按钮文案没跟着状态变（还是「{window.btn_open_history.text()}」）"
+        # 2026-11-21 用户报障：点哪颗进回放，哪颗才变「关闭」。近期回放时历史
+        # 按钮必须保持「打开历史数据」，不能跟着一起变「关闭」。
+        assert window.btn_open_long_history.text() == "打开历史数据", \
+            (f"近期回放时历史按钮不该跟着变「关闭」："
+             f"{window.btn_open_long_history.text()!r}")
+        assert window._replay_kind == "recent", \
+            f"近期回放的 _replay_kind 不对：{window._replay_kind!r}"
         # 窗口没 show()，子控件 isVisible() 恒为 False —— 断言"要求显示"
         # （isHidden 为 False）而不是可见性。
         assert not window._replay_bar.isHidden(), "回放提示条没有显示"
@@ -1554,8 +1597,12 @@ def check_history_replay(app: QApplication) -> None:
         window._exit_replay()
         app.processEvents()
         assert not window._replay_active, "返回实时后回放标记没清"
-        assert window.btn_open_history.text() == "打开历史数据", \
-            "返回实时后按钮文案没变回「打开历史数据」"
+        assert window.btn_open_history.text() == "打开近期数据", \
+            "返回实时后按钮文案没变回「打开近期数据」"
+        assert window.btn_open_long_history.text() == "打开历史数据", \
+            "返回实时后历史按钮文案没复原"
+        assert window._replay_kind == "", \
+            f"返回实时后 _replay_kind 没清：{window._replay_kind!r}"
         # 收起也是 220ms 补间（从当前高度落到 0 才 hide、才把 max 归零）——
         # 直接断 isHidden() 会撞在补间中间（那时条还在收）。
         assert wait_for(app, lambda: window._replay_tween is None, 2.0), \
@@ -1565,15 +1612,58 @@ def check_history_replay(app: QApplication) -> None:
              f"{window._replay_bar.maximumHeight()}）")
         assert window._replay_bar.isHidden(), "返回实时后提示条没收起"
 
-        # 「打开历史数据」= 开关：回放态下再点一次必须**退出回放**，而不是再灌
+        # 「打开近期数据」= 开关：回放态下再点一次必须**退出回放**，而不是再灌
         # 一遍同一个文件。连点两次 → 打开又关闭，最终必须回到实时态。
         window._open_history()
         app.processEvents()
-        assert window._replay_active, "再点「打开历史数据」没进回放（开关失效）"
+        assert window._replay_active, "再点「打开近期数据」没进回放（开关失效）"
         window._open_history()
         app.processEvents()
         assert not window._replay_active, \
-            "回放态下再点「打开历史数据」没有关闭回放（开关失效）"
+            "回放态下再点「打开近期数据」没有关闭回放（开关失效）"
+
+        # ---- 两颗回放按钮各管各的文案（2026-11-21 用户报障）----
+        # 点「打开历史数据」→ 历史按钮变「关闭历史数据」、近期按钮保持「打开
+        # 近期数据」；再点一次 → 两颗都复原。近期回放时反过来（上面已断言）。
+        import rx_store
+        _saved_db = rx_store.db_path()
+        _long_db_dir = Path(tempfile.mkdtemp(prefix="rxlong_"))
+        rx_store.set_db_path(str(_long_db_dir / "sessions.db"))
+        try:
+            # 两帧相隔 30 秒：任何采样档位（10~300 秒）都能抽出至少一行。
+            rx_store.record_block(
+                "[2026-11-21 11:00:00]\nVoltage1:\n07.7700\nBMS OK",
+                "2026-11-21T11:00:00.000")
+            rx_store.record_block(
+                "[2026-11-21 11:00:30]\nVoltage1:\n08.8800\nBMS Error",
+                "2026-11-21T11:00:30.000")
+            assert rx_store.flush(8.0), "历史回放按钮用例：会话库 flush 超时"
+            window._open_long_history()
+            app.processEvents()
+            assert window._replay_active, "点「打开历史数据」没进回放"
+            assert window._replay_kind == "long", \
+                f"历史回放的 _replay_kind 不对：{window._replay_kind!r}"
+            assert window.btn_open_long_history.text() == "关闭历史数据", \
+                (f"历史按钮没变「关闭历史数据」："
+                 f"{window.btn_open_long_history.text()!r}")
+            assert window.btn_open_history.text() == "打开近期数据", \
+                (f"历史回放时近期按钮不该变「关闭」："
+                 f"{window.btn_open_history.text()!r}")
+            # 再点一次 = 退出回放，两颗按钮都复原
+            window._open_long_history()
+            app.processEvents()
+            assert not window._replay_active, "再点「打开历史数据」没退出回放"
+            assert window._replay_kind == "", \
+                f"退出历史回放后 _replay_kind 没清：{window._replay_kind!r}"
+            assert window.btn_open_history.text() == "打开近期数据", \
+                "退出历史回放后近期按钮没复原"
+            assert window.btn_open_long_history.text() == "打开历史数据", \
+                "退出历史回放后历史按钮没复原"
+        finally:
+            if window._replay_active:
+                window._exit_replay()
+                app.processEvents()
+            rx_store.set_db_path(_saved_db)
 
         # ---- 回放的展现形式必须和实时一模一样（2026-10-23 用户点名）----
         # 历史文件里存的是**设备原文**（未补零、未对齐，见 _on_received 的
@@ -3364,6 +3454,71 @@ def check_customization(app: QApplication) -> None:
                 ("设置面板里的字段没有对齐到同一条竖线："
                  + "、".join(f"{type(w).__name__}={left_x(w)}" for w in fields))
 
+            # 6a-1) 外观区那三只下拉框**同宽且左右缘都对齐**（用户 2026-11-21：
+            #     「请把框的宽度缩小，而且要对齐」）。以前主题/界面材质是 FIELD_W、
+            #     开屏动画按"最长条目 +80"算到 233，右缘差 23px。
+            from ui_settings import COMBO_W
+            appear = [("主题", dialog.cmb_theme),
+                      ("界面材质", dialog.cmb_material),
+                      ("开屏动画", dialog.cmb_splash)]
+            for name, w in appear:
+                assert w.width() == COMBO_W, \
+                    f"{name}下拉框宽 {w.width()} ≠ 统一宽度 {COMBO_W}"
+            rights = {left_x(w) + w.width() for _, w in appear}
+            assert len(rights) == 1, f"三只下拉框右缘不齐：{rights}"
+            # 材质强度那一行（滑杆 + 数值）也要与下拉框同宽、同右缘，
+            # 否则整块看着是斜的（滑杆原来一路顶到 490）。
+            glass_right = (dialog.lbl_glass.mapTo(dialog, QPoint(0, 0)).x()
+                           + dialog.lbl_glass.width())
+            assert glass_right == rights.pop(), \
+                f"材质强度那一行右缘 {glass_right} 与下拉框不一致"
+            # 最长条目必须能完整显示（框宽缩了但不能把字截了）。
+            from PySide6.QtWidgets import QStyle, QStyleOptionComboBox
+            for name, w in appear:
+                opt = QStyleOptionComboBox()
+                opt.initFrom(w)
+                opt.currentText = w.currentText()
+                cr = w.style().subControlRect(
+                    QStyle.ComplexControl.CC_ComboBox, opt,
+                    QStyle.SubControl.SC_ComboBoxEditField, w)
+                fmm = w.fontMetrics()
+                wide = max((fmm.horizontalAdvance(w.itemText(i))
+                            for i in range(w.count())), default=0)
+                assert wide <= cr.width(), \
+                    (f"{name}下拉框的内容区装不下最长的条目："
+                     f"需要 {wide}px，只有 {cr.width()}px")
+
+            # 6a-1b) SOC 数据来源只留正式措辞（用户 2026-11-21：「只显示括号内
+            #     的内容吧，改得正式一点」）—— 不许再出现"算出来的 / 读取到的"。
+            _soc_opts = [lab for spec in
+                         __import__("customization").specs()
+                         if spec["key"] == "soc_source"
+                         for lab, _v in spec["options"]]
+            assert _soc_opts == ["本地估算", "车端 BMS"], f"SOC 来源文案：{_soc_opts}"
+
+            # 6a-1c) 弹层高度必须封顶到 _POPUP_MAX_ROWS 行（用户 2026-11-21：
+            #     「这个太长太宽了」—— 30 档撑到 864px、跑出屏幕下缘）。
+            #     ⛔ 不能靠 QComboBox.setMaxVisibleItems：本机 Qt 6.12 + Fusion 下
+            #     它对原生和自绘下拉都不生效（实测），所以是自己算的。
+            from PySide6.QtCore import QRect as _QRect
+            from ui_controls import _POPUP_MAX_ROWS
+            _combo = dialog._custom_widgets.get("history_interval")
+            assert _combo is not None, "找不到历史采样间隔下拉"
+            assert _combo.count() >= 20, f"历史采样间隔档位太少：{_combo.count()}"
+            _row_h = _combo.view().sizeHintForRow(0)
+            assert _row_h > 0, f"拿不到弹层行高：{_row_h}"
+            _capped = _combo._cap_popup_height(_QRect(0, 0, 200, 9999))
+            assert _capped.height() <= _POPUP_MAX_ROWS * _row_h + 64, \
+                f"弹层没封顶：{_capped.height()}px（行高 {_row_h}）"
+            assert _capped.height() >= _POPUP_MAX_ROWS * _row_h, \
+                f"弹层被封得太矮：{_capped.height()}px"
+            # 屏幕空间不够时会被压矮 —— 压矮后必须是**整行**，不许留半截行。
+            assert _combo._snap_popup_rows(_capped.height()) == _capped.height(), \
+                "封顶后的高度不是整行"
+            _half = _capped.height() - _row_h // 2
+            assert _combo._snap_popup_rows(_half) < _half, \
+                "半截行没有被吸附到整行"
+
             # 6a-2) 滑轨不许压住内容（用户报"滑轨与内容区域重叠干涉"）：
             #     widgetResizable 会把字段拉到视口宽，不给 body 留右内边距的话
             #     字段右缘就贴着滚动条（实测间隙 0px）。要求至少 8px 空隙。
@@ -3806,6 +3961,92 @@ def check_config_parity_clock(app: QApplication) -> None:
         settings.sync()
 
 
+def check_replay_paging(app: QApplication) -> None:
+    """回放**分页**：打开时只灌最后一页，滚到顶部再往前翻。
+
+    用户 2026-11-21：「打开的时候不必加载全部数据，可以根据一定的策略加载，
+    但是要确保滑动得很快的时候可以加载」。这条压住三件事：
+
+    1. 打开后接收区里的块数**明显少于**留存总行数（= 没有全量加载）；
+    2. `_replay_page["has_more"]` 为真，且往前翻一页之后块数变多；
+    3. 翻到底之后 `has_more` 变假（不会无限要数据）。
+    """
+    import tempfile
+
+    import rx_history
+    from main_window import MainWindow, REPLAY_PAGE_LINES
+
+    settings = QSettings("MimoWorks", "SerialAssistant")
+    snapshot = {k: settings.value(k) for k in settings.allKeys()}
+    saved = (rx_history._path, rx_history._file_lines, tuple(rx_history._lines),
+             rx_history.max_lines())
+    saved_resolver = rx_history._resolve_dir
+    tmpdir = Path(tempfile.mkdtemp(prefix="rxpage_"))
+    window = None
+    rx_history._pending.clear()
+    rx_history._timer_stop()
+    try:
+        rx_history._resolve_dir = lambda: tmpdir
+        window = MainWindow()
+        assert rx_history._path is not None, "主窗构造后近期数据没有落点"
+        # 造 800 轮 × 3 行 = 2400 行，正好是两页
+        rounds = 800
+        lines: list[str] = []
+        for i in range(rounds):
+            hh, mm = 22 + i // 60, i % 60
+            lines.append(f"[2026-10-12 {hh % 24:02d}:{mm:02d}:00]")
+            lines.append("Voltage1:")
+            lines.append(f"01.{3800 + i % 100} 02.3820")
+        rx_history._path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        rx_history._lines.clear()
+        rx_history._lines.extend(lines)
+        rx_history._file_lines = len(lines)
+
+        window._open_history()
+        app.processEvents()
+        assert window._replay_active, "打开近期数据后没进入回放模式"
+        page = window._replay_page
+        assert page is not None, "没有记下分页状态（_replay_page 为空）"
+        loaded = window.txt_rx.blockCount()
+        assert loaded < len(lines), \
+            f"打开时把整份留存都灌进去了（{loaded} 块 / 共 {len(lines)} 行）"
+        assert page.get("has_more") is True, "2400 行只灌了一页，has_more 却为假"
+        assert page.get("start") > 0, f"分页起点不对：{page.get('start')}"
+
+        # 模拟"滚到顶上"（滚动条 value=0 会打到这里，快速甩到底也一样）
+        window._maybe_replay_load_earlier(0)
+        app.processEvents()
+        grown = window.txt_rx.blockCount()
+        assert grown > loaded, f"往前翻页没有加内容：{loaded} -> {grown} 块"
+        assert window._replay_page.get("has_more") is False, \
+            "翻到最前面之后 has_more 还是真（会无限要数据）"
+        assert window._replay_page.get("start") == 0, \
+            f"翻到底之后 start 应该归 0：{window._replay_page.get('start')}"
+
+        # 归还实时：块数上限要收回用户设置的口径，分页状态清空
+        window._exit_replay()
+        app.processEvents()
+        assert window._replay_page is None, "退出回放后分页状态没清"
+        assert window.txt_rx.maximumBlockCount() == window._rx_blocks, \
+            (f"退出回放后块数上限没还原：{window.txt_rx.maximumBlockCount()}"
+             f" ≠ {window._rx_blocks}")
+        assert REPLAY_PAGE_LINES > 0
+    finally:
+        rx_history._resolve_dir = saved_resolver
+        if window is not None:
+            window.close()
+        restore_settings(settings, snapshot)
+        settings.sync()
+        rx_history.set_max_lines(saved[3])
+        rx_history._lines.clear()
+        rx_history._lines.extend(saved[2])
+        rx_history._pending.clear()
+        rx_history._file_lines = saved[1]
+        rx_history._path = saved[0]
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def check_rx_merge_and_pause(app: QApplication) -> None:
     """收包合并 / 暂停-继续 / 串口开关挂哪儿。
 
@@ -3819,7 +4060,10 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
 
     # ⚠️ 必须放在函数**最开头**：函数里任何一处 `from X import Y` 都会让 Y 变成
     # 整个函数的局部名，在导入语句之前用它就是 UnboundLocalError（这个坑踩过）。
-    from ui_highlight import align_indexes, wire_break_spans, stamp_span
+    from ui_highlight import (
+        SAMPLE_RE, align_indexes, collapse_history_rows, repair_split_samples,
+        wire_break_spans, stamp_span,
+    )
 
     settings = QSettings("MimoWorks", "SerialAssistant")
     snapshot = {key: settings.value(key) for key in settings.allKeys()}
@@ -4180,6 +4424,95 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
         _shown2 = [t for t in window.txt_rx.toPlainText().split("\n") if "01.3800" in t]
         assert _shown2 and "X" not in _shown2[0], f"阈值归零后 X 还在：{_shown2}"
 
+        # ---- 1i) 历史回放：排版固化的采样行先摊平，行数设置才跟着变 ----
+        # 历史文件存的是"当时排版固化"的文本：E74 一模组 25 点电压被存成
+        # 12+13 两行、温度 8 点存成 4+4 两行。align_indexes 是"一行进一行出"
+        # （2026-10-24 起），不会把固化行重新拆/合 —— 光改电压/温度行数设置，
+        # 回放输出纹丝不动。摊平是回放链的前置纯函数，不碰主窗口/QSettings。
+        _hist: list[str] = ["[2026-11-18 10:00:00]"]
+        for _m in range(5):
+            _base = _m * 25 + 1
+            _hist.append("Voltage{0}:".format(_m + 1))
+            _hist.append(" ".join("{0}.3700".format(_j)
+                                  for _j in range(_base, _base + 12)))
+            _hist.append(" ".join("{0}.3700".format(_j)
+                                  for _j in range(_base + 12, _base + 25)))
+            _hist.append("")
+        for _m in range(5):
+            _base = _m * 8 + 1
+            _hist.append("Temperature{0}:".format(_m + 1))
+            _hist.append(" ".join("{0}.25".format(_j)
+                                  for _j in range(_base, _base + 4)))
+            _hist.append(" ".join("{0}.25".format(_j)
+                                  for _j in range(_base + 4, _base + 8)))
+            _hist.append("")
+        _hist.append("BMS OK")
+        _flat = collapse_history_rows(_hist)
+        _flat_txt = "\n".join(_flat)
+
+        def _seg_points(head: str, nxt: str, txt: str) -> list[int]:
+            _lines = txt.split("\n")
+            return [len(SAMPLE_RE.findall(_x))
+                    for _x in _lines[_lines.index(head) + 1:_lines.index(nxt)]
+                    if _x.strip()]
+
+        assert "" not in _flat, "历史里的原空行一律丢掉（gap_lines 会重建）"
+        assert collapse_history_rows(_flat) == _flat, "摊平必须幂等"
+        for _m in range(5):
+            _vn = ("Voltage{0}:".format(_m + 2) if _m < 4 else "Temperature1:")
+            _tn = ("Temperature{0}:".format(_m + 2) if _m < 4 else "BMS OK")
+            assert _seg_points("Voltage{0}:".format(_m + 1), _vn, _flat_txt) == [25], \
+                "电压模组没摊平成 1 行 25 点"
+            assert _seg_points("Temperature{0}:".format(_m + 1), _tn, _flat_txt) == [8], \
+                "温度模组没摊平成 1 行 8 点"
+        assert (sum(len(SAMPLE_RE.findall(_x)) for _x in _hist)
+                == sum(len(SAMPLE_RE.findall(_x)) for _x in _flat) == 165), \
+            "摊平动了采样点 token（前后必须守恒）"
+        _x_flat = "\n".join(collapse_history_rows(
+            ["Voltage1:", "01.3700 X 02.3700 03.3700", "04.3700 05.3700",
+             "", "BMS OK"]))
+        assert _x_flat.count("X") == 1, "断线 X 在摊平时丢了"
+        assert len(SAMPLE_RE.findall(_x_flat)) == 5, "带 X 的模组点数不对"
+        # 摊平之后接 align_indexes：显式行数必须真的改变分栏。
+        # ⚠️ 2026-11-21 语义**换成"每个模组各显示 N 行"**（用户当面定案，见
+        #    customization 的 tip 与 ui_highlight.align_indexes 的注释）。这里原来
+        #    写的是 (5, [25]) / (25, [5]*5) —— 那是"**整块** N 行"的折算口径：
+        #    整块 5 模组 125 点，5 行 → 每行 25 点 → 每个模组看见 [25]。现在按模组
+        #    切段后，单独一个模组（25 点）设 5 行就是 5+5+5+5+5，设 25 行就是
+        #    25 排各 1 点。口径变了，期望值必须跟着变，否则钉住的是被否决的老行为。
+        for _h, _want in ((0, [12, 13]), (5, [5] * 5), (25, [1] * 25)):
+            _out = align_indexes(_flat_txt, max_row_chars=200, volt_rows_hint=_h)
+            assert _seg_points("Voltage1:", "Voltage2:", _out) == _want, \
+                "摊平后 H={0} → V1 应当 {1} 行：{2}".format(
+                    _h, _want, _seg_points("Voltage1:", "Voltage2:", _out))
+        # 温度同理：一个模组 8 点，设 5 行 → 1+1+2+2+2（均分，相差 ≤1、末排只多不少）
+        for _h, _want in ((0, [8]), (5, [1, 1, 2, 2, 2]), (20, [1] * 8)):
+            _out = align_indexes(_flat_txt, max_row_chars=200, temp_rows_hint=_h)
+            assert _seg_points("Temperature1:", "Temperature2:", _out) == _want, \
+                "摊平后 H={0} → T1 应当 {1} 行：{2}".format(
+                    _h, _want, _seg_points("Temperature1:", "Temperature2:", _out))
+
+        # ---- 1j) 串口分包劈开的采样点：行尾 "9." + 下行行首 "3890" 拼回 "9.3890" ----
+        # 真机历史文件里固件 printf(" %d.%d ") 被帧边界切断，SAMPLE_RE 认不出
+        # 两半，断的 "9." 堆在屏上。回放链路先用 repair_split_samples 在文本层
+        # 接回；拼接只重排被切开的那一个点，不伪造、不改动任何数字。
+        _split = ["Voltage4:", " 01.3891  02.3892  9.", "3890  10.3897    "]
+        _joined = repair_split_samples(_split)
+        _joined_txt = "\n".join(_joined)
+        assert "9.3890" in _joined_txt, "被劈开的 9.3890 没接回去"
+        assert "10.3897" in _joined_txt, "下行剩余的点 10.3897 丢了"
+        assert "01.3891" in _joined_txt and "02.3892" in _joined_txt, \
+            "原有完整点被拼接动了"
+        # 点数守恒：只把被劈开的那一个点从「认不出」变成「认得出」，恰好多 1 个
+        assert len(SAMPLE_RE.findall(_joined_txt)) == \
+            len(SAMPLE_RE.findall("\n".join(_split))) + 1, \
+            "拼接后应当恰好多认出被劈开的那一个点"
+        # 尾部断的 "9." 必须从本块移除（等下一块的值），不能留在文本里
+        assert _joined[-1].strip() == "10.3897", "尾部断的 '9.' 没被移除"
+        # 正常数据行绝不能被误伤（原样返回）
+        _normal = ["01.3891   02.3892", "03.3893"]
+        assert repair_split_samples(_normal) == _normal, "正常采样行被误伤"
+
         # ---- 2) 暂停 = 冻结显示：画面一个像素都不动，新数据进后台队列；----
         #         继续 = 一次性刷进来并追底（恢复到最新读取的数据位置）
         # 暂停瞬间还要**自动定位**：视口顶与当前轮的时间戳之间恰好隔 7 行
@@ -4216,17 +4549,31 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
                         timeout=1.0), "暂停定位的滚动补间一直没停下"
         doc = window.txt_rx.document()
         from PySide6.QtGui import QTextCursor
-        # 定位后**应有某个时间戳行**落在视口顶下方 7 个视觉行处（第 8 行 =
-        # 时间戳）。⚠️ 不能取"视口顶往下第一个时间戳"来量：7 行上方恰好压着
-        # 上一轮的时间戳时（数据行折行 + 轮只有三两块时很容易），那个 y=0 的
-        # 会被误当成目标（真机实测踩过）。用 cursorRect 量（视觉行语义），
-        # 行高用时间戳行自身的高度（单行块）。
+        # 定位后**应有某个时间戳行**落在视口顶下方 keep 个视觉行处（第
+        # keep+1 行 = 时间戳）。⚠️ 不能取"视口顶往下第一个时间戳"来量：keep
+        # 行上方恰好压着上一轮的时间戳时（数据行折行 + 轮只有三两块时很容易），
+        # 那个 y=0 的会被误当成目标（真机实测踩过）。用 cursorRect 量（视觉行
+        # 语义），行高用时间戳行自身的高度（单行块）。
+        #
+        # ⛔⛔ keep **绝不能写死 7**：它是可配置项（定制功能 → 暂停定位行数，
+        #    最大化态另有一键、默认 0）。2026-11-21 本用例就是这样假红的 ——
+        #    用户真机把 `custom/pause_snap_lines` 调成了 10，定位精确落在第 11 行
+        #    （170px = 10×17），功能完全正确，却被 "7 行" 的硬编码断言判死，害得
+        #    我们以为 `_snap_to_round_start` 有 bug。以产品配置为准，并且反向
+        #    校验"配置真的被读到"（`_pause_snap_keep` 若永远返回 0，下一行会红）。
+        from customization import get as _cust_get
+        _keep_key = ("pause_snap_lines_max" if window._rx_t >= 0.5
+                     else "pause_snap_lines")
+        want_keep = max(0, int(_cust_get(_keep_key)))
+        assert window._pause_snap_keep() == want_keep, (
+            f"暂停定位行数没读配置：_pause_snap_keep()="
+            f"{window._pause_snap_keep()} 但 {_keep_key}={want_keep}")
         stamps = [b for b in range(doc.blockCount())
                   if stamp_span(doc.findBlockByNumber(b).text()) is not None]
         assert stamps, "数据里没有时间戳行，定位无从谈起"
         line_h = window.txt_rx.blockBoundingGeometry(
             doc.findBlockByNumber(stamps[0])).height()
-        target = 7 * line_h
+        target = want_keep * line_h
         best = None
         for b in stamps:
             c = QTextCursor(doc)
@@ -4235,7 +4582,8 @@ def check_rx_merge_and_pause(app: QApplication) -> None:
             if best is None or abs(y - target) < abs(best - target):
                 best = y
         assert abs(best - target) <= line_h / 2, \
-            (f"暂停定位不准：没有一个时间戳落在视口顶下方 7 行（{target:.0f}px）处，"
+            (f"暂停定位不准：没有一个时间戳落在视口顶下方 {want_keep} 行"
+             f"（{target:.0f}px）处，"
              f"最近的是 {best:.1f}px（行高 {line_h:.0f}）")
 
         # 激活态必须在按钮上看得出（字形染色）—— 用户反馈过"按了没反应"，
@@ -4477,9 +4825,11 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
         # ---- 3) 着色：规则本身（时间戳紫、序号蓝，区间分开断言）----
         assert stamp_span("[21:47:14] Voltage1:") == (0, 10)
         assert stamp_span(" 1.3820   2.3824") is None, "时间戳只认块首"
+        # 序号含小数点（"1." / "10."）—— 用户点名电池箱序号带 "."，小数点
+        # 跟序号同一支蓝，所以长度比纯序号多 1；值数字（3820）不在区间内。
         assert index_spans(" 1.3820   2.3824   3.3827  10.3825") == \
-            [(1, 1), (10, 1), (19, 1), (27, 2)]
-        assert index_spans("13.3821  25.3815") == [(0, 2), (9, 2)]
+            [(1, 2), (10, 2), (19, 2), (27, 3)]
+        assert index_spans("13.3821  25.3815") == [(0, 3), (9, 3)]
         assert index_spans("[21:47:14] Voltage1:") == [], \
             "行首的 Voltage1 不是序号"
         # 这些都不是序号，一个字符都不该染
@@ -6035,19 +6385,33 @@ def check_history_dir(app: QApplication) -> None:
         assert default_dir, "取不到默认历史目录"
 
         os.makedirs(tmp, exist_ok=True)
-        for name in ("接收历史-AAA-2026.log", "接收历史-BBB-2025.log"):
-            with open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
+        # 新布局：近期数据都在 <base>\近期数据\ 子目录里，文件名就是车号
+        # （用户 2026-11-21："把近期数据和历史数据分成不同的文件夹，也要按照车号分"）。
+        sub = os.path.join(tmp, rx_history.SUB_DIR)
+        os.makedirs(sub, exist_ok=True)
+        for name in ("AAA-2026.log", "BBB-2025.log"):
+            with open(os.path.join(sub, name), "w", encoding="utf-8") as fh:
                 fh.write("frame\n")
+        # 还没搬家的老文件（别的车号没切过去）：也要能被列出来，标签剥前缀
+        with open(os.path.join(tmp, "接收历史-CCC-2024.log"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("legacy\n")
         assert rx_history.set_directory(tmp) is True, "切换目录失败"
         assert os.path.abspath(rx_history.directory()) == os.path.abspath(tmp), \
             rx_history.directory()
         labels = [lab for lab, _p in rx_history.available_labels()]
         assert "AAA-2026" in labels and "BBB-2025" in labels, labels
+        assert "CCC-2024" in labels, f"老位置的文件名没被列出来：{labels}"
         target = rx_history.path_for_label("AAA-2026")
-        assert target and target.endswith("接收历史-AAA-2026.log"), target
+        assert target and target.endswith("AAA-2026.log"), target
+        assert os.path.join(rx_history.SUB_DIR, "AAA-2026.log") in target, target
+        legacy_target = rx_history.path_for_label("CCC-2024")
+        assert legacy_target and legacy_target.endswith("接收历史-CCC-2024.log"), \
+            legacy_target
         assert rx_history.path_for_label("没有这个") is None, "不存在的标签应返回 None"
         # 旧目录里的文件不能因为切换而被搬走/删掉
-        assert os.path.isfile(os.path.join(tmp, "接收历史-BBB-2025.log"))
+        assert os.path.isfile(os.path.join(tmp, "接收历史-CCC-2024.log"))
+        assert os.path.isfile(os.path.join(sub, "BBB-2025.log"))
 
         # 不可写目录：切换失败，且配置一个字不改（仍指向 tmp）
         blocker = os.path.join(tmp, "blocker")
@@ -6094,7 +6458,33 @@ def check_session_store(app: QApplication) -> None:
     conn = None
     rx_store.set_db_path(db_file)
     try:
-        # 0) 库还不存在：查询/统计/导出都要"空而不炸"（老版本升级上来就是这条路）
+        # 0) 布局（用户 2026-11-21：「历史数据也要按车号分文件夹」）：
+        #    <基准目录>/历史数据/<车号安全名>.db，未选车 = 未选择车号.db；
+        #    set_db_path 生效时 = 所有车号都落这一本（自测隔离的全部依据）。
+        assert rx_store.NO_VEHICLE_NAME == "未选择车号"
+        assert rx_store._safe_name('a/b:c*d?e"f<g>h|i') == "a_b_c_d_e_f_g_h_i"
+        assert rx_store.vehicle_db_path(None) == db_file, "覆盖生效时应只有那一本"
+        assert rx_store.vehicle_db_path("E74-2026") == db_file
+        assert rx_store.db_path() == db_file
+        # 没有覆盖时的纯路径（⛔ 先把 _base_override 指到临时目录再清覆盖，
+        # 保证这中间哪怕有别的线程来取路径也落不到用户真实目录里）
+        _saved_base = rx_store._base_override
+        rx_store._base_override = tmpdir
+        with rx_store._lock:
+            _saved_override = rx_store._db_override
+            rx_store._db_override = None
+        try:
+            sub = os.path.join(tmpdir, "历史数据")
+            assert rx_store.vehicle_db_path(None) == \
+                os.path.join(sub, "未选择车号.db"), rx_store.vehicle_db_path(None)
+            assert rx_store.vehicle_db_path("E74-2026") == \
+                os.path.join(sub, "E74-2026.db"), rx_store.vehicle_db_path("E74-2026")
+        finally:
+            with rx_store._lock:
+                rx_store._db_override = _saved_override
+            rx_store._base_override = _saved_base
+
+        # 0b) 库还不存在：查询/统计/导出都要"空而不炸"（老版本升级上来就是这条路）
         assert rx_store.count() == 0, "不存在的库应返回 0 帧"
         assert rx_store.stats()["count"] == 0
         assert rx_store.export_csv(csv_file, 3650) == 0
@@ -6154,6 +6544,174 @@ def check_session_store(app: QApplication) -> None:
             assert json.loads(row[0]) == [3901, 3902], row
         finally:
             window.close()
+
+        # 6) 历史数据分层查询 history_rows（会话库、永不删除）：
+        #    按采样间隔分桶取每桶最后一帧、按车号过滤、补时间戳、改间隔桶数变化。
+        #    ⚠️ 全程只写上面已 set_db_path 指走的**临时库**，绝不碰真实 sessions.db。
+        #    用固定 ts/车号的假帧直接插临时库（查询侧不解析 raw，原样透传即可）。
+        base = datetime(2026, 11, 20, 21, 0, 0)
+        hist_frames = [
+            # (相对秒, 车号, raw)；同桶多帧用来验"取最后一帧"
+            (0,  "H1", "MARK_A0"),
+            (5,  "H1", "MARK_A5"),        # 与 0 同 10s 桶 → 应取 A5
+            (12, "H1", "MARK_B12"),
+            (18, "H1", "MARK_B18"),       # 与 12 同桶 → 应取 B18
+            (25, "H1", "MARK_C25"),
+            (30, "H1", "[2026-11-20 21:00:30]\nMARK_STAMPED"),  # raw 自带戳
+            (40, "H1", "MARK_D40"),
+            (3,  "H2", "MARK_OTHER3"),    # 另一车号（过滤用）
+            (8,  "H2", "MARK_OTHER8"),
+        ]
+        for off, veh, raw in hist_frames:
+            ts = (base + timedelta(seconds=off)).isoformat(timespec="milliseconds")
+            conn.execute(
+                "INSERT INTO frames(ts, vehicle, module, cells, temps, raw)"
+                " VALUES(?,?,?,?,?,?)", (ts, veh, None, "[]", "[]", raw))
+        conn.commit()
+
+        def _stamps(lines):
+            return [ln for ln in lines if ln.startswith("[") and ln.endswith("]")]
+
+        # 10 秒桶（H1）：0/5→取 A5；12/18→取 B18；25→C25；30→自带戳；40→D40
+        r10 = rx_store.history_rows(10, "H1")
+        marks10 = [ln for ln in r10 if ln.startswith("MARK_")]
+        assert marks10 == ["MARK_A5", "MARK_B18", "MARK_C25",
+                           "MARK_STAMPED", "MARK_D40"], marks10
+        assert "MARK_A0" not in r10 and "MARK_B12" not in r10, r10  # 每桶末帧
+        assert len(_stamps(r10)) == 5, r10                          # 每桶补一行戳
+        assert _stamps(r10)[0] == "[2026-11-20 21:00:05]", r10      # 戳用末帧 ts
+        # raw 自带戳 → 不重复补（那一组只有一行戳）
+        assert _stamps(r10).count("[2026-11-20 21:00:30]") == 1, r10
+
+        # 车号过滤：H2 只在传它的车号时出现；不传车号 = 全部
+        r2 = rx_store.history_rows(10, "H2")
+        assert any("MARK_OTHER" in ln for ln in r2), r2
+        assert not any(ln.startswith("MARK_") and "OTHER" not in ln for ln in r2), r2
+        assert len(_stamps(r2)) == 1, r2                # 3/8 同桶，取末帧 8
+        assert "MARK_OTHER8" in r2 and "MARK_OTHER3" not in r2, r2
+        assert len(_stamps(rx_store.history_rows(10))) >= len(_stamps(r10))
+        assert rx_store.history_rows(10, "NO_SUCH_VEHICLE") == []
+
+        # 改间隔 20 秒 → 桶数变少；0/5/12/18 同桶取 B18
+        r20 = rx_store.history_rows(20, "H1")
+        assert len(_stamps(r20)) < len(_stamps(r10)), \
+            (len(_stamps(r20)), len(_stamps(r10)))
+        marks20 = [ln for ln in r20 if ln.startswith("MARK_")]
+        assert marks20[0] == "MARK_B18", marks20
+
+        # limit：只留最近 N 个采样点
+        rlim = rx_store.history_rows(10, "H1", limit=2)
+        assert len(_stamps(rlim)) == 2 and "MARK_D40" in rlim, rlim
+
+        # 7) history_page 分页（绝对桶号 + 每桶末帧 + before_ts 往更早翻）：
+        #    ⛔ 桶口径改成"时间轴绝对对齐"后，前后两页才拼得起来、不重不漏。
+        page1, earliest1, more1 = rx_store.history_page(10, "H1", limit=2)
+        assert _stamps(page1) == ["[2026-11-20 21:00:30]",
+                                  "[2026-11-20 21:00:40]"], page1
+        assert more1 is True, "还有更早的桶，has_more 应为 True"
+        assert earliest1 == "2026-11-20T21:00:30.000", earliest1
+        page2, earliest2, more2 = rx_store.history_page(
+            10, "H1", limit=2, before_ts=earliest1)
+        marks2 = [ln for ln in page2 if ln.startswith("MARK_")]
+        assert marks2 == ["MARK_B18", "MARK_C25"], marks2
+        assert earliest2 == "2026-11-20T21:00:18.000", earliest2
+        assert more2 is True
+        assert not (set(_stamps(page1)) & set(_stamps(page2))), "两页重复了"
+        # 与 history_rows 同一份结果（limit=1 各取最新一个点）
+        assert rx_store.history_page(10, "H1", limit=1)[0] == \
+            rx_store.history_rows(10, "H1", limit=1)
+        # 不传车号 = 全部车号归并成一条时间轴（本用例覆盖生效，只有一本库）
+        assert len(_stamps(rx_store.history_page(10, None, limit=1)[0])) == 1
+
+        # 7b) 分页重复桶回归（BUG-1）：before_ts 是上一页最老桶的**末帧 ts**，
+        #     不是桶边界。若不在桶级跳过，同一桶里更早的帧会在下一页被重新吐出
+        #     （桶去重集合是每次扫描新建的，跨页失效）。造 3 个桶、每桶 3 帧，
+        #     连翻 3 页，断言每页最老帧的桶号严格递减（同桶绝不重复）。
+        _pd_interval = 10                       # 与上面的 10s 桶口径一致
+        _pd_base = datetime(2026, 11, 22, 8, 0, 0)
+        _pd_vehicle = "PAGEDUP"
+        for _bucket in range(3):
+            for _k in range(3):
+                _off = _bucket * _pd_interval + _k + 1   # 每桶 3 帧，ts 各差 1s
+                _ts = (_pd_base + timedelta(seconds=_off)).isoformat(
+                    timespec="milliseconds")
+                conn.execute(
+                    "INSERT INTO frames(ts, vehicle, module, cells, temps, raw)"
+                    " VALUES(?,?,?,?,?,?)",
+                    (_ts, _pd_vehicle, None, "[]", "[]", f"PD_{_bucket}_{_k}"))
+        conn.commit()
+        _pd_seen: list[int] = []
+        _pd_before = None
+        for _page_no in range(3):
+            _pd_rows, _pd_earliest, _pd_more = rx_store.history_page(
+                _pd_interval, _pd_vehicle, limit=1, before_ts=_pd_before)
+            _pd_marks = [ln for ln in _pd_rows if ln.startswith("PD_")]
+            assert len(_pd_marks) == 1, _pd_rows
+            # 每页只有一帧，其标记 PD_<bucket>_<k> 里的 bucket 即该页最老桶号
+            _pd_seen.append(int(_pd_marks[0].split("_")[1]))
+            assert _pd_earliest, "还有更早的桶时 earliest 不应为空"
+            assert _pd_more == (_page_no < 2), \
+                "还有更早的桶时 has_more 才为 True：page {0}".format(_page_no)
+            _pd_before = _pd_earliest
+        assert _pd_seen == [2, 1, 0], \
+            "3 个桶各含多帧时，每页最老桶号应严格递减、同桶不重复：{0}".format(_pd_seen)
+
+        # 8) 老库一次性迁移：<基准>/sessions.db → 历史数据/<车号>.db
+        #    ⛔ 全程在临时目录里造，绝不碰用户真实的 sessions.db（_base_override
+        #       先把基准目录指走，再清掉库覆盖 —— 顺序反了就可能写到真实目录）。
+        migrate_root = tempfile.mkdtemp(prefix="rxmig_")
+        try:
+            legacy_db = os.path.join(migrate_root, "sessions.db")
+            conn2 = sqlite3.connect(legacy_db)
+            conn2.executescript(rx_store.SCHEMA)
+            legacy_rows = [
+                ("2026-11-19T08:00:00.000", "E74-2026", "LEG_E74_1"),
+                ("2026-11-19T08:00:10.000", "E74-2026", "LEG_E74_2"),
+                ("2026-11-19T08:01:00.000", "", "LEG_NONE_1"),
+                ("2026-11-19T08:01:10.000", "", "LEG_NONE_2"),
+            ]
+            conn2.executemany(
+                "INSERT INTO frames(ts, vehicle, module, cells, temps, raw)"
+                " VALUES(?,?,1,'[]','[]',?)",
+                [(ts, veh, raw) for ts, veh, raw in legacy_rows])
+            conn2.commit()
+            conn2.close()
+
+            _saved_base = rx_store._base_override
+            rx_store._base_override = migrate_root
+            rx_store.set_db_path(None)
+            try:
+                assert rx_store.migrate_legacy(30.0) is True, "老库迁移没成功"
+            finally:
+                rx_store.set_db_path(db_file)      # 先回覆盖库，再还原基准目录
+                rx_store._base_override = _saved_base
+
+            hist_dir = os.path.join(migrate_root, "历史数据")
+            tgt_e74 = os.path.join(hist_dir, "E74-2026.db")
+            tgt_none = os.path.join(hist_dir, "未选择车号.db")
+            assert os.path.exists(tgt_e74) and os.path.exists(tgt_none), \
+                os.listdir(hist_dir) if os.path.isdir(hist_dir) else "历史数据 没建出来"
+            assert os.path.exists(os.path.join(hist_dir, rx_store.MIGRATED_MARK)), \
+                "迁移完成标记没写"
+            assert os.path.exists(legacy_db + ".migrated"), "老库没改名留证据"
+            assert not os.path.exists(legacy_db), "老库不该还占着原名"
+            for path, want in ((tgt_e74, 2), (tgt_none, 2)):
+                conn3 = sqlite3.connect(path)
+                try:
+                    got_n = conn3.execute("SELECT COUNT(*) FROM frames").fetchone()[0]
+                    assert got_n == want, f"{os.path.basename(path)} 应 {want} 帧：{got_n}"
+                finally:
+                    conn3.close()
+            conn3 = sqlite3.connect(tgt_e74)
+            try:
+                got = conn3.execute(
+                    "SELECT vehicle, raw FROM frames ORDER BY ts").fetchall()
+            finally:
+                conn3.close()
+            assert [row[1] for row in got] == ["LEG_E74_1", "LEG_E74_2"], got
+            assert got[0][0] == "E74-2026", got
+        finally:
+            shutil.rmtree(migrate_root, ignore_errors=True)
     finally:
         if conn is not None:
             try:
@@ -6255,6 +6813,237 @@ def check_protocol_rules(app: QApplication) -> None:
         ui_highlight.set_protocol(rx_protocol.active())   # 与真实配置对齐
 
 
+def check_rows_hint(app: QApplication) -> None:
+    """「电压/温度数据显示行数」= **每个模组各显示成 N 排**（用户 2026-11-21 定案）。
+
+    这条用例为什么必须存在：同一个毛病用户报过**三次**，三次根因各不相同 ——
+
+      ① 分组单位是**设备行**（`25 点` 被固件拆成 `12 + 13` 两条），设 2 只把
+         半截模组分 2 行，屏幕上跟"自动"一模一样；
+      ② `per_rows = round(r_hint × len(toks) / total_pts)` 里 `toks` 是**循环变量
+         泄漏**（拿到最后一组的 13 点），设 25 得 30 行；
+      ③ `section_points` 是**整篇**点数，回放时被轮数除 → 塌成 1。
+
+    第四次（同日第二次点名「如果不止一排请将偶数位数据对齐」）：那一版在
+    `rows_hint > 0` 时**完全不看视口宽度** —— 25 点设 2 行推出 13 点/排 = 127 字符，
+    而真机视口只有 79 字符（1134 宽窗口实测），控件软换行把它劈成 `8 + 5`，相邻那排
+    12 点劈成 `8 + 4`，屏上一堆长短不齐的排；设 3 行更糟（87 字符那排剩一个孤零零的
+    `25.4283`）。
+
+    所以钉**两层**：
+      ① `max_row_chars=0`（不设视口上限）→ N **严格**等于每模组排数，各排相差 ≤1；
+      ② `max_row_chars=79`（用户真机视口容量）→ **任何一排都不许超视口**
+         （超了控件就会软换行，孤单元格和各排长短不齐全从这个口子进来）。
+
+    第五次（2026-11-21 用户又说"显示行数格式还是有问题"，根因已实测确认）：
+    「每排几个点」原来是拿**本块收到的点数**算的，而串口分包会把**一个模组**劈到
+    两个 `_emit_block` 块里 —— 温度模组（档案 8 点、设 2 排）被劈成 4+4，两块
+    各自 `ceil(4/2)=2` → 屏上出现 `2+2+2+2`；电压（25 点、设 2 排）劈成 12+13
+    则是 `6+6` 和 `7+7`。真实日志 `E74-2026.log` 的 480 个温度段里有 14 段是
+    `2+2+2+2`。改法是让每排点数由**档案点数 ÷ 行数**定（`module_group_plans`
+    给每堆带上档案点数，`_grid_rows(expect_points=...)` 用它算）—— 见下面 ③。
+
+    ⛔ ② 里**不能**断言"排数 == N"：25 个点 × 10 字符 = 247 字符，79 字符的视口
+       物理上放不下 2 排，此时按视口多分几排是**设计如此**（用户的原话是"如果不止
+       一排请将偶数位数据对齐"——接受多排，只要各排点数一致）。
+    ⛔ 断言里的 25 / 8 是**设备协议常量**（E74 每模组 25 电芯、8 路 NTC），
+       79 是**真机实测视口容量**，都不是"用户可配置数值"。
+
+    纯函数、不碰 QSettings、不建主窗口 —— 接线那一层（车辆档案 → `_rx_grid_hints`
+    → 重排）由 `devtools/_probe_rows_hint_live.py` 在真机上验。
+    """
+    from ui_highlight import SECTION_TEMP, SECTION_VOLT, SAMPLE_RE, align_indexes
+
+    lines = ["[2026-11-21 12:00:00]"]
+    for _m in range(5):
+        _base = _m * 25 + 1
+        lines.append("Voltage{0}:".format(_m + 1))
+        lines.append(" ".join("{0}.3800".format(_i)
+                              for _i in range(_base, _base + 12)))
+        lines.append(" ".join("{0}.3800".format(_i)
+                              for _i in range(_base + 12, _base + 25)))
+    for _m in range(5):
+        _base = _m * 8 + 1
+        lines.append("Temperature{0}:".format(_m + 1))
+        lines.append(" ".join("{0}.25".format(_i)
+                              for _i in range(_base, _base + 4)))
+        lines.append(" ".join("{0}.25".format(_i)
+                              for _i in range(_base + 4, _base + 8)))
+    lines.append("BMS OK")
+    block = "\n".join(lines)
+
+    def _rows_under(text: str, head: str, nxt: str | None) -> list[int]:
+        """标题行下面每一排有几个采样点（空行跳过）。"""
+        rows = text.split("\n")
+        start = rows.index(head)
+        stop = rows.index(nxt) if nxt and nxt in rows else len(rows)
+        return [len(SAMPLE_RE.findall(row)) for row in rows[start + 1:stop]
+                if row.strip()]
+
+    volt_segs = [("Voltage{0}:".format(_i),
+                  "Voltage{0}:".format(_i + 1) if _i < 5 else "Temperature1:")
+                 for _i in range(1, 6)]
+    temp_segs = [("Temperature{0}:".format(_i),
+                  "Temperature{0}:".format(_i + 1) if _i < 5 else "BMS OK")
+                 for _i in range(1, 6)]
+
+    # ---- ① 不设视口上限：行数严格等于设置值 ----
+    # 期望值按 `grid_row_sizes` 的"各排相差 ≤1、末排只多不少"算出来：
+    # 25 点分 3 排 → 8/8/9；分 5 排 → 5×5；分 25 排 → 1×25。
+    # 温度模组只有 8 点，设 25 排时 rows 被 min(rows, count) 压到 8 → 8 排各 1 点。
+    for _n, _v_want, _t_want in (
+            (0, [12, 13], [4, 4]),              # 0 = 自动：照设备原样（电压 12+13、温度 4+4）
+            (1, [25], [8]),
+            (3, [8, 8, 9], [2, 3, 3]),
+            (5, [5, 5, 5, 5, 5], [1, 1, 2, 2, 2]),
+            (25, [1] * 25, [1] * 8)):
+        _out = align_indexes(block, max_row_chars=0,
+                             volt_rows_hint=_n, temp_rows_hint=_n)
+        for _head, _nxt in volt_segs:
+            _got = _rows_under(_out, _head, _nxt)
+            assert _got == _v_want, \
+                "H={0} → {1} 应当是 {2}：{3}".format(_n, _head, _v_want, _got)
+            assert sum(_got) == 25, \
+                "H={0} → {1} 点数不守恒（应 25）：{2}".format(_n, _head, _got)
+        for _head, _nxt in temp_segs:
+            _got = _rows_under(_out, _head, _nxt)
+            assert _got == _t_want, \
+                "H={0} → {1} 应当是 {2}：{3}".format(_n, _head, _t_want, _got)
+            assert sum(_got) == 8, \
+                "H={0} → {1} 点数不守恒（应 8）：{2}".format(_n, _head, _got)
+
+    # ---- ② 视口上限 79：任何一排都不许超，各排点数一致 ----
+    # 79 字符 = 用户真机 1134 宽窗口的 `_rx_max_row_chars()`（视口 672px / 8.2px 每字符）。
+    # 一排挤不下时正确行为是**多分几排**（[6,6,6,7]），绝不能硬塞出去让控件软换行。
+    _out = align_indexes(block, max_row_chars=79,
+                         volt_rows_hint=2, temp_rows_hint=2)
+    _longest = max(len(_row) for _row in _out.split("\n"))
+    assert _longest <= 79, \
+        "有排超出视口 {0} 字符（最长 {1} 字符）—— 会被控件软换行劈开".format(
+            79, _longest)
+    for _head, _nxt in volt_segs:
+        _got = _rows_under(_out, _head, _nxt)
+        assert sum(_got) == 25, \
+            "视口封顶后 {0} 点数不守恒（应 25）：{1}".format(_head, _got)
+        assert max(_got) - min(_got) <= 1, \
+            "视口封顶后 {0} 各排点数差超过 1（偶数排没和奇数排对齐）：{1}".format(
+                _head, _got)
+        assert _got == [6, 6, 6, 7], \
+            "视口 79 字符下 {0} 应当是 6/6/6/7（而不是让控件自己折行）：{1}".format(
+                _head, _got)
+    for _head, _nxt in temp_segs:
+        _got = _rows_under(_out, _head, _nxt)
+        assert _got == [4, 4], \
+            "视口 79 字符下 {0} 应当是 4/4：{1}".format(_head, _got)
+
+    # ---- ③ 串口分包把**一个模组**劈成两块：每排点数必须按**档案点数**算 ----
+    # 用户设置（E74-2026）：volt_row_sizes=[25]*5、temp_row_sizes=[8]*5、
+    # volt_rows_hint=2、temp_rows_hint=2，真机视口 136 字符（`_rx_max_row_chars()`）。
+    #
+    # 改前的实际数字（2026-11-21 用户报"显示行数格式还是有问题"的根因）：
+    #   · 温度前半截（4 点，档案 8）→ ceil(4/2)=2 → `[2, 2]`
+    #   · 温度后半截（4 点，档案 8）→ `[2, 2]`
+    #   · 电压前半截（12 点，档案 25）→ ceil(12/2)=6 → `[6, 6]`
+    #   两块各自都按"本块点数"算，于是屏上同一帧出现 `2+2+2+2`，而完整模组是
+    #   `4+4` —— 用户看到的"格式还是不对"就是这个（真实日志 E74-2026.log 的
+    #   480 个温度段里有 14 段是 `2+2+2+2`）。
+    # 改后：每排几个点由**档案点数 ÷ 行数**定，两半各自都按整模组算：
+    #   `[4]` / `[4]` 拼起来是 `4+4`，`[12]` 拼上 13 点那半就是 `12+13`。
+    #
+    # ⛔ 这里的 8 / 25 是设备协议常量（E74 每模组 8 路 NTC、25 电芯）、136 是
+    #    真机实测视口容量，都不是"用户可配置数值"。
+    _car = {"volt_row_sizes": [25] * 5, "temp_row_sizes": [8] * 5,
+            "volt_rows_hint": 2, "temp_rows_hint": 2}
+    _view = 136
+
+    def _split_row_counts(text: str) -> list[int]:
+        """纯采样行各有几个点（标题行、空行跳过）—— 只数"整行都是采样点"的行。
+
+        ⛔ 不能用"含采样点就算"那种宽口径：段标题 `Temperature4:` 那行要是被数
+        成 0 点，`[0, 4, 4]` 会让"4+4"这条断言失去意义。
+        """
+        counts = []
+        for _row in text.split("\n"):
+            _toks = _row.split()
+            if _toks and len(SAMPLE_RE.findall(_row)) == len(_toks):
+                counts.append(len(_toks))
+        return counts
+
+    # ① 完整温度模组（档案 8 点、设 2 排）→ 4/4（改前后都不变）
+    _out = align_indexes("Temperature4:\n1.14 2.14 3.20 4.17\n5.16 6.17 7.14 8.14",
+                         max_row_chars=_view, **_car)
+    assert _split_row_counts(_out) == [4, 4], \
+        "完整温度模组（8 点设 2 排）应当是 4/4：{0}".format(_split_row_counts(_out))
+
+    # ② 温度**前半截**（只有 4 点，标题在）→ 一排 4 点（改前 [2, 2]）
+    _out = align_indexes("Temperature4:\n1.14 2.14 3.20 4.17",
+                         max_row_chars=_view, **_car)
+    assert _split_row_counts(_out) == [4], \
+        "温度前半截（4 点、档案 8 点）应当是 [4]，不是把半截再拆开：{0}".format(
+            _split_row_counts(_out))
+
+    # ③ 温度**后半截**（4 点，无标题，段状态由调用方带进来）→ 一排 4 点（改前 [2, 2]）
+    _out = align_indexes("5.16 6.17 7.14 8.14", section=SECTION_TEMP,
+                         max_row_chars=_view, **_car)
+    assert _split_row_counts(_out) == [4], \
+        "温度后半截（4 点、档案 8 点、无标题）应当是 [4]：{0}".format(
+            _split_row_counts(_out))
+
+    # ④ 完整电压模组（25 点设 2 排）→ 12/13（改前后都不变）
+    _volt_full = "Voltage4:\n" + " ".join(
+        "{0}.4330".format(_i) for _i in range(1, 13)) + "\n" + " ".join(
+        "{0}.4330".format(_i) for _i in range(13, 26))
+    _out = align_indexes(_volt_full, max_row_chars=_view, **_car)
+    assert _split_row_counts(_out) == [12, 13], \
+        "完整电压模组（25 点设 2 排）应当是 12/13：{0}".format(
+            _split_row_counts(_out))
+
+    # ⑤ 电压**前半截**（12 点，档案 25）→ 一排 12 点（改前 [6, 6]）
+    _out = align_indexes("Voltage4:\n" + " ".join(
+        "{0}.4330".format(_i) for _i in range(1, 13)), max_row_chars=_view, **_car)
+    assert _split_row_counts(_out) == [12], \
+        "电压前半截（12 点、档案 25 点）应当是 [12]，不是 6/6：{0}".format(
+            _split_row_counts(_out))
+
+    # ⑥ 视口 79 字符下完整电压模组 → 6/6/6/7（改前后都不变：视口封顶优先）
+    _out = align_indexes(_volt_full, max_row_chars=79, **_car)
+    assert _split_row_counts(_out) == [6, 6, 6, 7], \
+        "视口 79 字符下完整电压模组应当是 6/6/6/7：{0}".format(
+            _split_row_counts(_out))
+    assert max(len(_row) for _row in _out.split("\n")) <= 79, \
+        "半截模组那条路把排宽顶出视口了 —— 控件会软换行"
+
+    # ⑦ **完整模组**时用户的 N 必须一字不差地兑现（选车之后也不许打折）。
+    # 这条钉的是"半截模组"那条路的边界：如果拿"arch 点数 ÷ N"算出的每排点数
+    # 直接换算排数（ceil(8 / 2) = 4），温度 8 点设 5 排就只剩 4 排 —— 用户设
+    # 5 排看见 4 排，正是他反复报的那类"没生效"。完整模组必须仍然是 1/1/2/2/2。
+    _out = align_indexes("Temperature4:\n" + " ".join(
+        "{0}.25".format(_i) for _i in range(1, 9)),
+        max_row_chars=_view, temp_row_sizes=[8] * 5, temp_rows_hint=5)
+    assert _split_row_counts(_out) == [1, 1, 2, 2, 2], \
+        "完整温度模组（8 点设 5 排）应当是 1/1/2/2/2：{0}".format(
+            _split_row_counts(_out))
+
+    # ⑧ BUG-2 回归：显式行数 N>2 时，被串口劈开的模组按点数比例分配排数。
+    # 25 点设 5 排 → 前半截 12 点 round(5×12/25)=2 排、后半截 13 点
+    # round(5×13/25)=3 排，两帧拼起来仍是 5 排（改前的 ceil(12/5)+ceil(13/5)=6）。
+    # 8 / 25 是设备协议常量、136 是真机视口容量，只有 _n 是这条用例自己设的行数。
+    _n = 5
+    _volts5 = {"volt_row_sizes": [25] * 5, "volt_rows_hint": _n}
+    _out_a = align_indexes("Voltage4:\n" + " ".join(
+        "{0}.4330".format(_i) for _i in range(1, 13)),
+        max_row_chars=_view, **_volts5)
+    _out_b = align_indexes(" ".join(
+        "{0}.4330".format(_i) for _i in range(13, 26)),
+        section=SECTION_VOLT, max_row_chars=_view, **_volts5)
+    _counts_a, _counts_b = _split_row_counts(_out_a), _split_row_counts(_out_b)
+    assert (len(_counts_a), len(_counts_b)) == (2, 3), \
+        "25 点劈 12+13 设 5 排应得 2+3：{0} / {1}".format(_counts_a, _counts_b)
+    assert len(_counts_a) + len(_counts_b) == _n, \
+        "两帧排数之和应等于用户设的行数：{0}".format(
+            len(_counts_a) + len(_counts_b))
+
+
 CHECKS = [
     ("HEX 编解码", check_hex_codec),
     ("增量文本解码", check_stream_decoder),
@@ -6284,6 +7073,7 @@ CHECKS = [
     ("安装包脚本", check_installer_script),
     ("历史接收数据", check_rx_history),
     ("历史数据回放", check_history_replay),
+    ("回放分页按需加载", check_replay_paging),
     ("收包合并与暂停继续", check_rx_merge_and_pause),
     ("动画引擎 120fps 与非线性", check_animation_engine),
     ("提示字号与按钮显隐", check_tooltip_and_buttons),
@@ -6292,6 +7082,7 @@ CHECKS = [
     ("默认折叠发送区开关", check_send_collapsed_startup),
     ("定位最近异常按钮", check_alert_locate),
     ("车辆与逐模组配置", check_vehicle_profiles),
+    ("显示行数（每模组 N 排）", check_rows_hint),
 ]
 
 
@@ -6320,6 +7111,52 @@ _POLLUTION_GUARDS = {
     # 时自愈（用户真设 5000 或其它值都不动）；若这确是你手动改的，请到「设置」重设一次。
     ("rx_blocks", "500", "5000"),
 }
+
+# 自测钉住的键 —— 进程序那一刻的**原始值**会先写进下面这个旁路前缀，全部跑完且
+# 还原成功后才删掉。留着这份"写前日志"是为了扛**进程被硬杀**（Ctrl-C / 超时 /
+# SIGPIPE / 断言里 sys.exit）：那种情况下 `main()` 收尾的 global_snapshot 还原
+# 根本跑不到，测试值就永久留在用户真实配置里。
+# ⛔ 真机上已经被咬过两次：一次是车号被清空（2026-11-21 §9.5），一次是
+#    `custom/highlight_errors` 被 check_highlight 拨成 true 之后没还原（用户亲手
+#    把它关成了 false）。后者正是加这段的直接原因。
+_UNDO_PREFIX = "selftest_undo/"
+
+
+def _mark_undo(settings: QSettings, keys) -> None:
+    """把即将被钉住的键的原始值写进旁路键（写前日志），并 ``sync`` 落盘。"""
+    for key in keys:
+        settings.setValue(_UNDO_PREFIX + key, settings.value(key))
+    settings.sync()
+
+
+def _apply_undo_markers(settings: QSettings) -> None:
+    """上一次自测被硬杀 → 这里把用户原值写回，然后清掉日志。
+
+    必须在取 ``global_snapshot`` **之前**调用：否则快照会把上次留下的测试值
+    当成"用户原值"记下来，还原时又原样写回去（污染会自固化）。
+    """
+    pending = {k: settings.value(k) for k in settings.allKeys()
+               if k.startswith(_UNDO_PREFIX)}
+    if not pending:
+        return
+    for key, value in pending.items():
+        real = key[len(_UNDO_PREFIX):]
+        if value is None:
+            settings.remove(real)
+        else:
+            settings.setValue(real, value)
+        settings.remove(key)
+    settings.sync()
+    print(f"  ⚠ 上次自测被中断，已把 {len(pending)} 个配置项还原为用户原值：")
+    for key in sorted(pending):
+        print(f"      {key[len(_UNDO_PREFIX):]} = {pending[key]!r}")
+
+
+def _clear_undo_markers(settings: QSettings) -> None:
+    """全部还原成功之后清掉写前日志（留着会在下次启动被当成"被中断"）。"""
+    for key in [k for k in settings.allKeys() if k.startswith(_UNDO_PREFIX)]:
+        settings.remove(key)
+    settings.sync()
 
 
 # 自测在 check_tooltip_and_buttons 里把 hidden_buttons 写成了这个签名值
@@ -6392,7 +7229,14 @@ def main() -> int:
     global_settings = QSettings("MimoWorks", "SerialAssistant")
     _heal_polluted_keys(global_settings)
     _heal_hidden_buttons(global_settings)
+    _apply_undo_markers(global_settings)
     global_snapshot = {k: global_settings.value(k) for k in global_settings.allKeys()}
+    # 写前日志：下面这一段会把若干键钉成测试值，先把用户原值记到旁路键，
+    # 进程被硬杀时靠它在**下次**运行开头还原（见 `_mark_undo` 的注释）。
+    _mark_undo(global_settings, (
+        "custom/module_count", "custom/cells_per_module", "custom/temps_per_module",
+        "custom/volt_rows", "custom/temp_rows", "custom/pad_zero",
+        "rx_blocks", "custom/highlight_errors"))
     # 自测全程用**默认网格排版**（module_count / cells_per_module / temps_per_module
     # 全 0）：收发/时间戳/定位这几条用例都假设"一段数据在一行里"。若机器上残留了
     # 非零网格配置（例如 module_count=5），电压/温度点会被拆成每行一个 → "整行"
@@ -6421,6 +7265,15 @@ def main() -> int:
     from main_window import DEFAULT_RX_BLOCKS as _DEFAULT_RX_BLOCKS
     global_settings.setValue("custom/pad_zero", True)
     global_settings.setValue("rx_blocks", _DEFAULT_RX_BLOCKS)
+    # ⚠️ 2026-11-21 补的第三条前提（真机实测三条用例同时假挂）：
+    #   · custom/highlight_errors：用户把「高亮异常数据」开关**关掉**了（注册表里
+    #     明确是 false，且 highlight_errors_chosen=true = 用户在界面上亲手选的）。
+    #     开关一关，电压越界红/绿、温度越界黄、BMS 错误橙全部不上色，只剩时间戳紫
+    #     + 序号蓝 —— 于是「历史数据回放」（欠压标绿）、「收包合并与暂停继续」
+    #     （BMS ERROR 上色）、「回车发送/时间戳轮首/序号染蓝」（超上限整条标红）
+    #     三条全部假挂：产品行为完全正确，是用例前提没钉。
+    #     钉成 True，收尾无条件还原（global_snapshot），绝不污染用户配置。
+    global_settings.setValue("custom/highlight_errors", True)
     # ⛔ 取消选车必须走 select_vehicle("")：只写 custom/vehicle 镜像键没用
     #    （_load_store 优先认 vehicles JSON 里的 current，见 pin_rx_grid_defaults 的说明）。
     import customization as _cu_main
@@ -6503,6 +7356,13 @@ def main() -> int:
     # QSettings 还原之后**，否则镜像键又被覆盖回去。
     if _saved_vehicle:
         _cu_main.select_vehicle(_saved_vehicle)
+
+    # 全都还原干净了才清写前日志 —— 顺序不能反（先清日志再还原，中途被杀就
+    # 既没有备份也没有还原来兜底）。这一步失败不影响自测结论，只影响下次自愈。
+    try:
+        _clear_undo_markers(global_settings)
+    except Exception:                     # noqa: BLE001 - 清日志失败不许影响退出码
+        pass
 
     print(f"\n{len(CHECKS) - failed}/{len(CHECKS)} 项通过")
     return 1 if failed else 0

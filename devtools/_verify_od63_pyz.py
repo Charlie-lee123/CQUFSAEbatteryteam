@@ -5,7 +5,7 @@
 
   A. od62 交叉溶解（末段淡出覆盖层 = 还原方向闪）必须已撤销；
   B. 保留 _CoverLabel 的「保源图比例 + 对称裁边」（od58 拉伸根治）；
-  C. 保留 ui_settings 车号残影基础修复（透明底 + swap 当拍 clear）；
+  C. 保留 ui_settings 车号残影基础修复（覆盖层显式关掉半透明底 + 不透明子控件）；
   D. 保留进全屏压 DWM 原生动画（_land）；
   E. od64 起：S2 单窗内交叉溶解（set_blend / painter.setOpacity / 陈旧退路）；
   F. 车号过渡（现行设计）：先落数据 → 落位 → 抓图 → 盖 → 淡出前重对齐；
@@ -20,12 +20,31 @@
 ⛔ 断言一律用「任一 code object 命中」而不是 by.get(name)：项目里同名
    paintEvent / __init__ 有多个类，setdefault 取到的第一个未必是目标类。
 """
+import dis
 import os
 import sys
 import types
 
 from PyInstaller.archive.readers import CArchiveReader
 from PyInstaller.loader.pyimod01_archive import ZlibArchiveReader
+
+
+def attr_arg_is(code, attr_name, want) -> bool:
+    """`setAttribute(<attr_name>, want)` 的**实参**是不是 want。
+
+    ⛔ 只查 ``co_names`` 分不出 True/False —— `setAttribute(WA_TranslucentBackground,
+    True)` 的名字集合与 `False` 完全一样。要真值必须看紧跟其后的 ``LOAD_CONST``。
+    找不到该属性引用时返回 False（宁红不假绿）。
+    """
+    ins = list(dis.get_instructions(code))
+    for i, op in enumerate(ins):
+        if op.opname in ("LOAD_ATTR", "LOAD_METHOD") and op.argval == attr_name:
+            for nxt in ins[i + 1:i + 4]:
+                if nxt.opname in ("LOAD_CONST", "LOAD_SMALL_INT"):
+                    return nxt.argval is want
+                if nxt.opname == "LOAD_ATTR":
+                    break
+    return False
 
 
 def collect_codes(co, out):
@@ -88,20 +107,26 @@ def run_checks(mw_codes, mw_by, us_codes, us_by, extra=None,
             "KeepAspectRatio" in set(stretch[0].co_names))
 
     # ---- C：车号残影基础修复 ----
-    # ⛔⛔ 2026-11-15 改口径：`_FadeOverlay` **不能**再带 WA_TranslucentBackground。
+    # ⛔⛔ 2026-11-15 改口径：覆盖层类**不能**带 WA_TranslucentBackground。
     #    带半透明属性的子控件内容会被合成两遍（正确位置 + 再偏移一个自身坐标），
     #    屏幕上就是「一套模糊 + 一套清晰」两套模组行 —— 用户报的那个叠影。
     #    这条断言以前写反了（要求必须有 WA_TranslucentBackground），现在翻过来。
+    # 2026-11-21：类名已从 `_FadeOverlay` 换成极简 `_VehFade`（同一 `__init__` 契约）。
+    #    定位方式仍是「唯一引用 WA_TranslucentBackground 的 __init__」，但额外用
+    #    `attr_arg_is` 看 LOAD_CONST，确认那个实参真是 False —— 只查 co_names 的话
+    #    `setAttribute(..., True)` 也能过，等于安全网放空。
     print("\n[C] ui_settings 车号选择残影基础修复")
     ov_inits = [c for c in us_codes
                 if c.co_name == "__init__"
                 and "WA_TranslucentBackground" in set(c.co_names)]
-    chk("_FadeOverlay.__init__ 可定位（唯一引用 WA_TranslucentBackground 的 __init__）",
+    chk("_VehFade.__init__ 可定位（唯一引用 WA_TranslucentBackground 的 __init__）",
         len(ov_inits) == 1)
     if ov_inits:
         n = set(ov_inits[0].co_names)
-        chk("_FadeOverlay 是不透明子控件（WA_NoSystemBackground + WA_OpaquePaintEvent）",
+        chk("_VehFade 是不透明子控件（WA_NoSystemBackground + WA_OpaquePaintEvent）",
             {"WA_NoSystemBackground", "WA_OpaquePaintEvent"}.issubset(n))
+        chk("WA_TranslucentBackground 实参是 False（不是只写了名字）",
+            attr_arg_is(ov_inits[0], "WA_TranslucentBackground", False))
 
     # ---- D：进全屏压 DWM ----
     print("\n[D] startup_fullscreen._land 压系统原生动画")
@@ -131,10 +156,16 @@ def run_checks(mw_codes, mw_by, us_codes, us_by, extra=None,
     #    旧断言还留在这里的话，本脚本会**永远 FAIL**，等于安全网自己喊狼来了
     #    （2026-11-14 就被它误导过一次）。所以整段换成「现行设计」的断言，
     #    并把"旧函数不许复活"显式写成检查项。
-    print("\n[F] 车号过渡（现行设计：先落数据 → 落位 → 抓图 → 盖 → 淡出前重对齐）")
-    for name in ("_veh_start", "_veh_settle_layout", "_veh_resync",
-                 "_veh_pix_close", "_veh_ensure_updates", "_veh_fade_out",
-                 "_veh_stop", "_veh_repaint_all"):
+    #
+    #    v2.9.5（2026-11-19）：用户报"选中车号后车辆数据区半透明多层残影"，
+    #    根因是 _veh_resync（淡出前 hide→重抓图→异步 update 的竞态窗口）。
+    #    按用户"高斯模糊要保留、屎山优化掉"的要求，把整套补丁推倒重写成极简版：
+    #    保留高斯模糊 + 不透明快照+模糊图淡出（观感不变），删掉 resync/seq 代数/
+    #    HOLD 两段定时器/调试遥测/三层重绘。下面断言同步换成现行极简契约。
+    print("\n[F] 车号过渡（现行极简：先落数据 → 落位 → 抓图 → 盖 → 单段淡出，零重抓图）")
+    for name in ("_veh_start", "_veh_settle_layout", "_veh_ensure_updates",
+                 "_veh_blur_pixmap", "_below_vehicle_rect", "_veh_fade_tick",
+                 "_veh_stop", "_veh_repaint_all", "_veh_apply_rows"):
         chk(f"ui_settings.{name} 存在", us_by.get(name) is not None)
 
     start = us_by.get("_veh_start")
@@ -143,24 +174,25 @@ def run_checks(mw_codes, mw_by, us_codes, us_by, extra=None,
         chk("_veh_start 先落数据再抓图", "_veh_apply_rows" in sn and "grab" in sn)
         chk("_veh_start 抓图前先落位", "_veh_settle_layout" in sn)
         chk("_veh_start 贴糊层前确保更新开着", "_veh_ensure_updates" in sn)
-        chk("_veh_start 收尾整块重绘面板", "repaint" in sn)
+        chk("_veh_start 收尾整块重绘面板", "_veh_repaint_all" in sn)
         chk("_veh_start 不再用 setUpdatesEnabled（已实测否决）",
             "setUpdatesEnabled" not in sn)
+        chk("_veh_start 不再 resync 重抓图（叠影竞态已删）",
+            "_veh_resync" not in sn)
 
-    fade = us_by.get("_veh_fade_out")
-    if fade:
-        chk("_veh_fade_out 淡出前重新对齐快照",
-            "_veh_resync" in set(fade.co_names))
+    tick = us_by.get("_veh_fade_tick")
+    if tick:
+        tn = set(tick.co_names)
+        chk("_veh_fade_tick 零重抓图（不调 grab/blur/resync）",
+            not ({"grab", "_veh_blur_pixmap", "_veh_resync"} & tn))
+        chk("_veh_fade_tick 到点走 _veh_stop 清场", "_veh_stop" in tn)
 
-    rs = us_by.get("_veh_resync")
-    if rs:
-        rn = set(rs.co_names)
-        chk("_veh_resync 抓图前 hide 覆盖层（别把糊层烤进新图）", "hide" in rn)
-        chk("_veh_resync 用同一条模糊流水线", "_veh_blur_pixmap" in rn)
-        chk("_veh_resync 用 _veh_pix_close 判等", "_veh_pix_close" in rn)
-
-    for dead in ("_veh_tick", "_veh_paint", "_veh_swap", "_veh_finish",
-                 "_veh_grab_new", "_veh_visible_h", "_veh_jobs", "_veh_veil_rect"):
+    # 旧补丁一律不许复活（复活 = 叠影回归）。
+    for dead in ("_veh_resync", "_veh_pix_close", "_veh_fade_out",
+                 "_veh_state", "_veh_dbg", "_veh_next_seq", "_veh_hold_done",
+                 "_FadeOverlay", "_veh_tick", "_veh_paint", "_veh_swap",
+                 "_veh_finish", "_veh_grab_new", "_veh_visible_h",
+                 "_veh_jobs", "_veh_veil_rect"):
         chk(f"旧设计 {dead} 已删除（⛔ 别复活）", us_by.get(dead) is None)
 
     # od119：覆盖层改成「不透明清晰图垫底 + 模糊图按 α 叠上去」。

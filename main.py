@@ -48,27 +48,16 @@ from ui_theme import apply_scheme, detect_system_scheme, ui_font
 def _prewarm_font_engine() -> None:
     """后台线程预热 Qt 字体引擎：把主窗构造的 ~600ms 冷启动从播放期搬走。
 
-    ⛔⛔ od47c（用户「我选择不要那个阻塞，不想有任何观感上的影响」）：
-    真机遥测 ``big_gaps=[(0.0,109),(2.0,635),(2.67,272),(2.94,103)]`` ——
-    落点段 2.10~3.10 被合计 1010ms 阻塞**完整覆盖**，动画几乎一帧跳到终点。
-    根因不是逻辑慢，而是主窗构造里**第一次 QFontMetrics 测量**触发 Windows
-    字体引擎冷启动（实测首次 550~680ms，之后同进程第二次构造只要 137~217ms），
-    而 ``still_delay_ms`` 把构造排在墙钟 2.0s，正好压在落点段。
-
-    实测解法：后台线程用界面**实际**字体（mono_font/num_font/默认）各做一次
-    ``height()`` + ``horizontalAdvance()``（595ms），主线程并行工作完全不被
-    阻塞（Qt 字体库初始化会释放 GIL）；预热后 ``MainWindow()`` 741ms → 137ms。
-    把这 595ms 与开屏的预热/播放重叠 = **双击响应零增加、落点段零阻塞**。
-
-    ⚠️ 线程里只做 QFontMetrics 查询（reentrant、不建 QWidget、不改全局状态）；
-       开屏播放期主线程只 fillRect/drawPixmap，不用字体，无竞态。daemon +
-       全量 try/except 兜底：失败就静默降级为原行为，绝不让预热拖垮启动。
+    ⚠️ v2.10 分段实测：这根线程与 splash_anim 的 import / 主窗预加载**重叠**，
+       总就绪时间 2.2s。曾试图挪到「开屏首帧之后」以早点看见画面，结果那 1s
+       不再被重叠、总就绪恶化到 3.9s —— 已回滚。主线程另有一遍预热，见
+       splash_anim._warm_font_on_main()，两遍缺一不可。
     """
     import threading
 
     def _run() -> None:
         try:
-            from PySide6.QtGui import QFont, QFontMetrics
+            from PySide6.QtGui import QFont, QFontMetrics, QImage, QPainter
 
             import ui_theme
             for f in (ui_theme.mono_font(12.0), ui_theme.num_font(11.5),
@@ -76,16 +65,9 @@ def _prewarm_font_engine() -> None:
                 fm = QFontMetrics(f)
                 fm.height()
                 fm.horizontalAdvance("0000-00-00 00:00:00")
-            # od53：**真正 drawText 一次**。上面只做 QFontMetrics 查询，而主窗构造
-            #   里 `_combo_label_ink_offset` 是 `combo.grab()` → 自绘 paintEvent →
-            #   `drawText` 字形栅格化，那是另一套冷启动（实测首次 272ms，之后
-            #   每条下拉框还要 30~60ms）。在后台线程先把这条路径走通一次，
-            #   真机复测首次 272ms → 个位数 ms。
-            #   ⚠️ QImage + QPainter 在非 GUI 线程是允许的（QPixmap 不行）；
-            #      这里不建任何 QWidget、不改全局状态，失败照样静默降级。
+            # 字形栅格化（下拉框自绘 drawText）是另一套冷启动，也走通一次。
+            # QImage + QPainter 在非 GUI 线程允许（QPixmap 不行），不建 QWidget。
             try:
-                from PySide6.QtGui import QImage, QPainter
-
                 img = QImage(160, 32, QImage.Format.Format_ARGB32_Premultiplied)
                 img.fill(0)
                 p = QPainter(img)
@@ -436,10 +418,9 @@ def main() -> int:
         _fps = ui_anim.display_max_hz()
     ui_anim.set_frame_hz(_fps)
 
-    # 字体引擎冷启动要 ~600ms，放在后台线程与开屏预热/播放并行 —— 否则它会
-    # 在主窗构造时爆发，把「向左上角落点」整段动画吃掉（见函数注释）。
-    # ⚠️ --check-* 验证入口不建主窗、不播完整动画，且进程退出时 Qt 清理字体库
-    #    会额外等这根线程（实测 --check-splash 虚增 ~1.1s），故只在正常启动开。
+    # 后台字体预热**必须在这里**（与 splash_anim import / 主窗预加载重叠）：
+    # 移到开屏首帧之后会让总就绪时间 2.2s → 3.9s（v2.10 A/B 实测，已回滚过一次）。
+    # ⚠️ --check-* 入口不建主窗，进程退出时 Qt 清理字体库会多等这根线程（~1.1s）。
     if not any(a.startswith("--check-") for a in sys.argv[1:]):
         _prewarm_font_engine()
 
@@ -510,6 +491,28 @@ def main() -> int:
                          % ("整窗全屏" if customization.get("startup_maximized")
                             else "普通窗口"))))
 
+    # ⛔⛔ 2026-11-19：把「main_window 全家桶 import」从「事件循环第一拍」提前到
+    #    「开屏底图已上屏、动画时钟尚未启动」的窗口内。
+    #    以前用 ``QTimer.singleShot(0, _preload_main_module)``，本意是"此时画面
+    #    还是纯底 lead"，但几何分支的时钟在 start() 里就起播了 —— 真机遥测
+    #    ``splash_perf.log big_gaps=[(0.0,104),(0.17,238),(0.41,123)]`` 实锤：
+    #    这笔 ≈238ms 正好砸在动画第 0.17s，用户感受就是「开屏动一下突然顿住」。
+    #    现在改由 splash_anim 的预热钩子在 ``_warm_font_on_main()`` 之后同步调，
+    #    此时底图已经 show()+repaint() 上屏 —— 同一笔钱花在静止画面上，一帧动画
+    #    都不占，且不增加双击到出现画面的时间。
+    def _preload_main_module() -> None:
+        """把 main_window 全家的 import 预热掉（开屏底图期付，不占动画帧）。
+
+        ⛔ 2026-11-04（用户：「开屏动画会在两个 logo 变换的时候卡一两秒」）：
+        ``from main_window import MainWindow`` 是一次 ≈312ms 的同步阻塞，
+        原先在 _build_window（定版静止段的定时器回调）里才付——和构造叠在
+        一起 ~1.2s，静止段吞不下就溢出到运动段 = 肉眼卡顿。
+        """
+        try:
+            import main_window  # noqa: F401 - 只预热模块 import，构造仍走 _build_window
+        except Exception as exc:          # noqa: BLE001 - 预热失败不影响启动
+            app_log.warning(f"main_window 预加载失败：{exc}")
+
     # 开屏动画（接口层 splash_anim）：**先起开屏，主窗在后面初始化** ——
     # 点开就有画面，不用干等 MainWindow 构造（玻璃字体布局约 1s）。
     # 没配置/文件坏了/缺 QtMultimedia 都返回 None → 直接建主窗显示，绝不挡启动。
@@ -523,27 +526,12 @@ def main() -> int:
             splash_anim.prewarm_async(16)
         except Exception:                 # noqa: BLE001 - 预热失败不影响启动
             pass
-        _splash = splash_anim.play_configured()
+        # 注册「动画时钟启动前」的钩子（见 splash_anim.set_prewarm_hook / _run_prewarm_hook）
+        splash_anim.set_prewarm_hook(_preload_main_module)
+        # defer_start：几何分支先出底图、暂不起播（见下方构造主窗后 start_clock）
+        _splash = splash_anim.play_configured(defer_start=True)
     except Exception as exc:              # noqa: BLE001 - 开屏失败不能挡住启动
         app_log.warning(f"开屏动画启动失败：{exc}")
-
-    def _preload_main_module() -> None:
-        """在开屏的 0.3s 纯底/淡入段把 main_window 全家的 import 预热掉。
-
-        ⛔ 2026-11-04（用户：「开屏动画会在两个 logo 变换的时候卡一两秒」）：
-        ``from main_window import MainWindow`` 是一次 ≈312ms 的同步阻塞，
-        原先在 _build_window（定版静止段的定时器回调）里才付——和构造叠在
-        一起 ~1.2s，静止段吞不下就溢出到运动段 = 肉眼卡顿。import 提前到
-        事件循环第一拍（此时画面还是纯底 lead），阻塞不可见；构造主窗时
-        只剩 MainWindow() 本体的开销。
-        """
-        try:
-            import main_window  # noqa: F401 - 只预热模块 import，构造仍走 _build_window
-        except Exception as exc:          # noqa: BLE001 - 预热失败不影响启动
-            app_log.warning(f"main_window 预加载失败：{exc}")
-
-    if _splash is not None:
-        QTimer.singleShot(0, _preload_main_module)
 
     def _build_window() -> None:
         """构造主界面并显示（幂等）。
@@ -689,20 +677,37 @@ def main() -> int:
         #    devtools/_probe_b2_early_activate.py）。只挂一次，⛔ 不再挂第二个
         #    set_on_finished；_on_splash_done 的 raise/activate 保留作兜底。
         _splash.set_on_fade_start(_on_fade_start)
-        # 到「天然静止段」再构造（delay=None 表示没帧序列/没静止段 → 立即构造）：
-        # od46：几何分支不再 pause_clock / 200ms 后 resume。构造期靠
-        # _motion_tick 的 dt-clamp 消化（每次最多推进 DT_MAX=2.5/hz），构造的
-        # ~1.2s 里 _mt 缓慢连续爬升：既不出现 Δt=0 长游程、也不跳帧缺帧，
-        # 构造完注入真实落点、播完才放行淡出。帧序列路径的 pause_clock /
-        # resume_clock 方法本身保留在 splash_anim（custom 仍可能用），只是几何
-        # 分支不再调用 —— 只改几何分支、风险隔离。
-        _delay = splash_anim.still_delay_ms(_splash)
-        if _delay is None:
+        # ⛔⛔ 2026-11-19：几何分支改成「先构造主窗、再起播开屏动画」。
+        #    旧路是 still_delay_ms 返回 0 → QTimer.singleShot(0) 构造，注释以为
+        #    「空白段 0~0.30s 画面纯背景、放进去完全不可见」，但真机遥测
+        #    ``splash_perf.log big_gaps=[(0.09,238),(0.32,153)]`` 实锤：主窗构造
+        #    （≈270ms）正好压在动画开头 → 用户说的「开屏动一下就顿住」。
+        #    几何动画几乎没有长静止段（落点段 2.1~3.1s 是运动），所以正确位置是
+        #    **动画开始之前**：此刻底图已 show()+repaint() 上屏（用户看得见画面），
+        #    主窗构造 + 全屏落地这笔钱花在静止底图上，动画第一帧起全程流畅。
+        #    ⚠️ 只对 defer_start 生效（几何分支）；视频/帧序列仍走原来的
+        #    still_delay_ms 路径，一行不改（风险隔离）。
+        if (getattr(_splash, "_defer_start", False)
+                and getattr(_splash, "_motion", None) is not None):
             _build_window()
+            try:
+                _splash.start_clock()
+            except Exception as exc:      # noqa: BLE001 - 起播失败别把开屏卡住
+                app_log.warning(f"开屏动画起播失败：{exc}")
         else:
-            def _build_at_still() -> None:
+            # 到「天然静止段」再构造（delay=None 表示没帧序列/没静止段 → 立即构造）：
+            # od46：几何分支不再 pause_clock / 200ms 后 resume。构造期靠
+            # _motion_tick 的 dt-clamp 消化（每次最多推进 DT_MAX=2.5/hz），构造的
+            # ~1.2s 里 _mt 缓慢连续爬升：既不出现 Δt=0 长游程、也不跳帧缺帧，
+            # 构造完注入真实落点、播完才放行淡出。帧序列路径的 pause_clock /
+            # resume_clock 方法本身保留在 splash_anim（custom 仍可能用）。
+            _delay = splash_anim.still_delay_ms(_splash)
+            if _delay is None:
                 _build_window()
-            QTimer.singleShot(max(0, int(_delay)), _build_at_still)
+            else:
+                def _build_at_still() -> None:
+                    _build_window()
+                QTimer.singleShot(max(0, int(_delay)), _build_at_still)
     else:
         _build_window()
     return app.exec()

@@ -719,22 +719,31 @@ class MotionRenderer:
         threading.Thread(target=_run, name="splash-blur-preheat",
                          daemon=True).start()
 
-    def _absorb_pending(self) -> bool:
+    def _absorb_pending(self, limit: int = 0) -> bool:
         """主线程把后台预热的 QImage 转成 QPixmap 填入缓存（QPixmap 只能在
-        GUI 线程构造）。每帧由 ``_motion_tick`` 调用；返回后台是否全部完成。
+        GUI 线程构造）。每帧由 ``_motion_tick`` 调用；返回「是否已全部就绪」。
+
+        ``limit`` > 0 时**本拍最多转这么多档**。⛔⛔ 2026-11-19：13 档 4K 图
+        一次性转换实测 **123ms**（`splash_perf.log` 的 ``big_gaps (0.41, 123)``
+        实锤），正好砸在动画开头。摊到多拍后单拍开销落进一帧以内；未就绪的档
+        由 ``_paint`` 退回清晰档（原设计就是"后台预热、播放期逐帧补满"）。
+        0 = 不限（构造期等需要一次性转完的调用）。
         """
         pend = getattr(self, "_preheat_pending", None)
         if not pend:
             return getattr(self, "_preheat_done", False)
-        for _k, _q in list(pend.items()):
+        items = list(pend.items())
+        if limit > 0:
+            items = items[:limit]
+        for _k, _q in items:
             _p = QPixmap.fromImage(_q)
             _p.setDevicePixelRatio(self._dpr)
             if _k == "fade":
                 self._fade_pix = _p
             else:
                 self._blur_cache[_k] = _p
-        pend.clear()
-        return getattr(self, "_preheat_done", False)
+            pend.pop(_k, None)
+        return getattr(self, "_preheat_done", False) and not pend
 
     def release_blur_cache(self) -> None:
         """淡入结束后释放模糊档表（约 244MB @1080p@200%），幂等。

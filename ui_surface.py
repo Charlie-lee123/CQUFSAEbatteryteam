@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import time
+
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QBrush, QColor, QCursor, QFontMetricsF, QImage, QLinearGradient, QPainter,
@@ -83,11 +85,11 @@ def paint_glass(painter: QPainter, box: QRectF, radius: float, *,
     path.addRoundedRect(box, radius, radius)
     if fill_override is not None:
         painter.fillPath(path, fill_override)
-        _paint_glass_overlay(painter, box, radius, path, name, dpr)
+        _paint_glass_overlay(painter, box, path, name)
     elif name == MATERIAL_LIQUID:
-        _paint_liquid(painter, box, radius, path, dpr)
+        _paint_liquid(painter, box, radius, path)
     else:
-        _paint_frosted(painter, box, radius, path, dpr)
+        _paint_frosted(painter, box, path, dpr)
 
     # 描边（数据闪一下）。指定了 border_override 就用它，否则按材质算。
     if border_override is not None:
@@ -107,7 +109,7 @@ def paint_glass(painter: QPainter, box: QRectF, radius: float, *,
     return path
 
 
-def _paint_frosted(painter: QPainter, box: QRectF, radius: float,
+def _paint_frosted(painter: QPainter, box: QRectF,
                    path: QPainterPath, dpr: float) -> None:
     """毛玻璃：半透明面色 + 糊过的散射颗粒 + 上缘兜到的光。
 
@@ -151,7 +153,7 @@ def _paint_frost_rim(painter: QPainter, box: QRectF, path: QPainterPath) -> None
 
 
 def _paint_liquid(painter: QPainter, box: QRectF, radius: float,
-                  path: QPainterPath, dpr: float) -> None:
+                  path: QPainterPath) -> None:
     """液态玻璃（Apple Liquid Glass 的桌面近似）—— 苹果 §12「Materials & depth」。
 
     四件套，从下往上叠：
@@ -193,8 +195,8 @@ def _paint_liquid(painter: QPainter, box: QRectF, radius: float,
         painter.strokePath(inner_path, QPen(QBrush(top_glow), 1.0))
 
 
-def _paint_glass_overlay(painter: QPainter, box: QRectF, radius: float,
-                         path: QPainterPath, name: str, dpr: float) -> None:
+def _paint_glass_overlay(painter: QPainter, box: QRectF,
+                         path: QPainterPath, name: str) -> None:
     """``fill_override`` 时的轻量叠加（回放条这种次要面）：只补材质特征，不铺主体色。"""
     if name != MATERIAL_LIQUID:
         return
@@ -357,6 +359,30 @@ def fade_in(widget: QWidget, delay_ms: int = 0, duration_ms: int = 240) -> None:
 
 # ---------------------------------------------------------------- 卡片
 
+# 「描边闪一下」允许的**最小重启间隔**（毫秒）。
+#
+# 为什么要节流：接收热路径（``main_window._on_received``）**每收到一个字节块**就
+# 调一次 ``Card.flash()``，而一段闪烁补间本身就是 380ms —— 不节流时数据一流动就是
+# "边衰减边重启"，``_on_flash`` 每帧都 ``update()``，于是整张卡（含接收区的
+# QPlainTextEdit 视口）跟着 165Hz 屏幕一路重绘：每帧一次 ``fillPath`` +
+# ``drawTiledPixmap``（整卡颗粒纹理）+ 两次 ``strokePath``。读取数据时的耗电大头
+# 就在这里，不在文本处理上。
+#
+# 取 320ms（略短于 380ms 的补间）：满速数据流下起闪频率从"跟着刷新率"降到 ~3Hz，
+# 肉眼仍然是"亮着起伏"，但重绘次数少了两个数量级。
+#
+# ⚠️ 节流**只在连续高速流下**生效，低于 ~3Hz 的采样率行为一点没变。实测边界
+#    （``_check/power_impl_probe.py``，offscreen）：
+#    · 1Hz × 3 帧、每帧一个字节块 → 起闪 3 次 = **每帧都闪**（0.99 次/秒，
+#      与改前一致）—— 1000ms 远大于 320ms 的节流窗，所以"一秒一帧"的设备照旧
+#      每帧亮一下；
+#    · 1Hz × 3 帧、每帧被串口拆成 3 块（共 9 次 flash()，块间 4ms）→ 起闪仍是
+#      3 次：同一帧的第 2、3 块落进 320ms 窗口里被吞掉，所以是"一帧闪一次"，
+#      不会闪三次（这也是改前的观感，用户看不到差别）；
+#    · 165 次/秒的满速流 → 起闪 4 次/秒（改前 150~165 次/秒）。
+FLASH_MIN_INTERVAL_MS = 320
+
+
 class Card(QFrame):
     """平面卡片：柔和阴影 + 圆角实底 + 标题行细线。
 
@@ -368,6 +394,10 @@ class Card(QFrame):
         super().__init__(parent)
         self._title = title
         self._flash = 0.0
+        # 上一次**真正**起闪的时刻（``time.perf_counter() * 1000``，毫秒）。
+        # 初值 0.0 就是"还从没闪过"：perf_counter 是开机以来的单调秒数，
+        # 任何真实时刻减 0 都远大于 FLASH_MIN_INTERVAL_MS → 首次调用照常起闪。
+        self._flash_at_ms = 0.0
         # 悬停微抬升（0~1）。苹果 §1「即时反馈」的延伸：鼠标进到卡面上，卡片自己
         # 抬一下，说明"这块能交互"。只挪**绘制的 box**，不动几何（布局一个字节不碰）。
         self._lift = 0.0
@@ -447,9 +477,28 @@ class Card(QFrame):
     def flash(self, strength: float = 0.7) -> None:
         """收到/发出数据时描边亮一下。黑白主题下只有明暗可变化，所以做得很轻。
 
-        起点取当前亮度而不是固定值：数据来得密时是"接着亮"而不是"重新亮一下"，
-        连续推 125Hz，看着是一条平滑的明暗起伏。
+        起点取当前亮度而不是固定值：数据来得密时是"接着亮"而不是"重新亮一下"。
+
+        ⚠️ 两道闸都在这**一个**入口上（调用方一行都不用改，发送侧走同一个方法）：
+        1. 卡片不可见 / 窗口最小化 → 直接返回。看不见的卡片闪给谁看？整卡重绘
+           白白烧电（后台收数据、窗口被别的东西盖住是最常见的耗电场景）。
+           注意**最小化要问窗口**：窗口最小化时它的子控件仍然算 ``isVisible()``，
+           光看卡片自己会一路闪到底。
+        2. 距上次起闪不足 ``FLASH_MIN_INTERVAL_MS`` → 直接返回，**不重启补间**。
+           数据不停时 flash() 会被每块数据调一次，不节流的话补间一直在重启、
+           每帧 update()，整张卡跟着屏幕刷新率持续重绘（详见该常量的说明）。
+           返回而不是重启，意味着这段时间里闪烁按原本的 out_expo 继续衰减 ——
+           观感是"亮起来、散掉、再亮一下"，不是被钉在一个不动的亮度上。
         """
+        if not self.isVisible() or self.isMinimized():
+            return
+        window = self.window()
+        if window is not None and window.isMinimized():
+            return
+        now_ms = time.perf_counter() * 1000.0
+        if now_ms - self._flash_at_ms < FLASH_MIN_INTERVAL_MS:
+            return
+        self._flash_at_ms = now_ms
         self._flash_anim.start(min(1.0, strength), 0.0)
 
     def start_intro(self, delay_ms: int) -> None:

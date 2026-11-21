@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
-"""只读验证 od120 exe 里 `_FadeOverlay.__init__` 的 setAttribute 实参值。
+"""只读验证 exe 里覆盖层 `__init__` 的 setAttribute 实参值。
 
 不靠源码、不靠属性名存在与否 —— 直接解 PYZ → marshal code object → dis，
 看每次 `setAttribute(Qt.WidgetAttribute.WA_*, X)` 前面那条 LOAD_CONST 的 X。
 
     .venv\\Scripts\\python.exe devtools/_verify_exe_overlay_attr.py
+
+覆盖层类名：2026-11-21 起是 ``_VehFade``（极简版），旧包是 ``_FadeOverlay``；
+两个都认，优先新名 —— 否则脚本会在新包上假红（od120 那会儿就踩过）。
 
 ⛔ 只读；不改产品源码、不打包、不动 发布/ 与 dist*。
 """
@@ -20,7 +23,9 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 EXE = os.path.join(ROOT, "发布", "SerialAssistant.exe")
-EXPECT_SHA = "120aa36000b90c8a391492bb990075bf43d526188527473b1bee72a246f664ec"
+# 历史哈希（od120）只作对照，不参与判定；要校验就设 SA_EXPECT_SHA。
+EXPECT_SHA = os.environ.get("SA_EXPECT_SHA", "")
+CLASS_NAMES = ("_VehFade", "_FadeOverlay")
 WANT = ("WA_TranslucentBackground", "WA_NoSystemBackground", "WA_OpaquePaintEvent")
 
 
@@ -104,18 +109,26 @@ def main() -> int:
             h.update(chunk)
     sha = h.hexdigest()
     print(f"[verify] SHA256 = {sha}")
-    print(f"[verify] 期望   = {EXPECT_SHA}")
-    print(f"[verify] 哈希一致 = {sha == EXPECT_SHA}")
+    if EXPECT_SHA:
+        print(f"[verify] 期望   = {EXPECT_SHA}")
+        print(f"[verify] 哈希一致 = {sha == EXPECT_SHA}")
+    else:
+        print("[verify] 未设 SA_EXPECT_SHA，跳过哈希对照")
 
     mod = extract_module(EXE)
     print(f"[verify] PYZ ui_settings code = {mod.co_name} "
           f"consts={len(mod.co_consts)}")
 
-    init = find_class_init(mod, "_FadeOverlay")
+    cls, init = "", None
+    for name in CLASS_NAMES:
+        init = find_class_init(mod, name)
+        if init is not None:
+            cls = name
+            break
     if init is None:
-        print("FAIL 找不到 _FadeOverlay 类体里的 __init__")
+        print(f"FAIL 找不到覆盖层类体里的 __init__（找过 {CLASS_NAMES}）")
         return 1
-    print(f"[verify] _FadeOverlay.__init__ code = {init!r}")
+    print(f"[verify] {cls}.__init__ code = {init!r}")
     print(f"[verify] co_consts = {init.co_consts!r}")
 
     found, ins = analyze_init(init)
@@ -124,7 +137,7 @@ def main() -> int:
         val, i, j = found.get(attr, (None, None, None))
         print(f"  {attr:<28} = {val!r}  (LOAD_ATTR@{i}, LOAD_CONST@{j})")
 
-    print("\n[verify] _FadeOverlay.__init__ 反汇编（原始证据）：")
+    print(f"\n[verify] {cls}.__init__ 反汇编（原始证据）：")
     txt = dis_text(init)
     print(txt)
 
@@ -133,9 +146,9 @@ def main() -> int:
         and found.get("WA_NoSystemBackground", (None,))[0] is True
         and found.get("WA_OpaquePaintEvent", (None,))[0] is True
     )
-    print("\n[结论] " + ("od120 exe 里 WA_TranslucentBackground=False，"
+    print("\n[结论] " + (f"{cls} 里 WA_TranslucentBackground=False，"
                         "另两个属性=True → 修复确实进包" if ok else
-                        "od120 exe 的属性实参与预期不符 → 修复没有进包"))
+                        f"{cls} 的属性实参与预期不符 → 修复没有进包"))
     # 落一份证据，方便 lead 直接引用
     with open(os.path.join(ROOT, "_check", "verify_exe_overlay_attr.txt"), "w",
               encoding="utf-8") as fh:

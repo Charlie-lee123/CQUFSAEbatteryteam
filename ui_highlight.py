@@ -170,12 +170,22 @@ def stamp_span(text: str) -> tuple[int, int] | None:
     return None
 
 
+def _index_span(match: re.Match) -> tuple[int, int]:
+    """单个采样点里**序号（含小数点）**的染色区间 ``(起点, 长度)``。
+
+    SAMPLE_RE 的组 1 是序号、组 2 是 ".值"，小数点就在组 2 的首位。区间止于
+    ``m.start(2) + 1`` —— 把 "." 一并包含（"01.3820" -> "01."），值数字
+    （3820）绝不染成序号色。⛔ 纯函数与控件染色共用这一个口径，别再各写一遍。
+    """
+    return match.start(1), match.start(2) + 1 - match.start(1)
+
+
 def index_spans(text: str) -> list[tuple[int, int]]:
-    """序号的染色区间 ``[(起点, 长度), ...]``。
+    """序号（含小数点）的染色区间 ``[(起点, 长度), ...]``。
 
     单独拎出来是为了能**脱离控件**推敲边界（自测直接断言它）。
     """
-    return [(m.start(1), m.end(1) - m.start(1)) for m in SAMPLE_RE.finditer(text)]
+    return [_index_span(m) for m in SAMPLE_RE.finditer(text)]
 
 
 # 序号补齐到几位（"1.3820" -> "01.3820"）。用户点名："一位数的数值在前方补零
@@ -291,6 +301,133 @@ def _pad_line(line: str, section: str, widths: dict[str, int],
         return pad_char * pad_w + index + "." + value
 
     return SAMPLE_RE.sub(pad, line)
+
+
+# ⛔⛔ 2026-11-19「没接收完的数据也要排列好」：设备固件 printf(" %d.%d ") 在
+#    串口分包时会把**一个采样点劈成两帧** —— 帧尾是 "9."（序号+小数点，值还没到），
+#    下一帧头是 "3890"（值的前半）。SAMPLE_RE 要求小数点后必须有数字，这两半
+#    都不被认成采样点 → 原样堆在屏幕上（截图里 "…08.3891     9." / "3890  10.3897"）。
+#    这里在排版**之前**把这类跨行断裂拼回 "9.3890"，align_indexes 就能照常补零
+#    分栏（→ 09.3890），与其它点对齐。
+_HALF_SAMPLE_RE = re.compile(r"^(.*?)(\d+)\.\s*$")   # 行尾：序号 + 小数点，无值
+_LEAD_VALUE_RE = re.compile(r"^(\d+)(\s+.*)?$")      # 行首：纯数字（值的开头）
+
+
+def repair_split_samples(lines) -> list[str]:
+    """把串口分包劈成两行的采样点拼回一行（供电压/温度数据行用）。
+
+    规则（只拼"行尾 `序号.`" + "下一行行首纯数字"这一种确定形态）：
+      · 上一行 ``… 9.`` 末尾是「序号+小数点、点后无数字」；
+      · 下一行 ``3890  10.3897`` 开头是**纯数字 token**（后面可以跟别的点）；
+      · 拼成 ``… 9.3890`` 并把下一行剩下的 ``10.3897`` 留下 —— 两行仍各一行，
+        点数守恒、不伪造任何数字，只是把被帧边界切开的那一个点接回去。
+      · 值可能是负数（霍尔电流断了读 -250，但那是 I= 行不在这里）、可能带 X
+        断线标记，都按原样拼，后续 align_indexes 照常处理。
+
+    ⛔ 只拼**相邻两行**，不跨第三行；⛔ 只在本行以半截点结尾、下行以纯数字
+    开头时才动手 —— 正常数据行（"09.3891"）和 BMS 明细行都不匹配，零误伤。
+    ⚠️ 跨块（帧尾在上一块、帧头在下一块）的情形由主窗口的 ``_rx_half_sample``
+    暂存序号后在下一块拼；本函数处理的是**同一块内**的跨行断裂（历史回放整篇
+    文本就是这种）。
+    """
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        m = _HALF_SAMPLE_RE.match(line) if line.strip() else None
+        if m and i + 1 < n:
+            nxt = lines[i + 1]
+            v = _LEAD_VALUE_RE.match(nxt.strip())
+            if v:
+                head, index = m.group(1).rstrip(), m.group(2)
+                # 上一行去掉半截 "9."，下一行去掉被吃掉的值 "3890"
+                out.append(head + " " + index + "." + v.group(1))
+                rest = (v.group(2) or "").strip()
+                out.append(rest if rest else "")
+                i += 2
+                continue
+        out.append(line)
+        i += 1
+    return out
+
+
+def split_module_groups(group_tokens: list[list[tuple[str, str]]],
+                        sizes: list[int] | None) -> list[list[tuple[str, str]]]:
+    """把**连续的设备数据行**按模组尺寸合并成「一个模组一堆 token」。
+
+    为什么需要它（用户 2026-11-21 第 N 次报「行数没生效」的根因）：
+    BMS 把 25 个电芯分包成 `12 + 13` 两条设备行发出来，``align_indexes`` 一直是
+    "一条设备行各成一组"。于是用户设「每模组 N 行」时，N 被套到**半截模组**上：
+    设 2 只会把 12 点分 2 行、13 点分 3 行 —— 屏幕上跟自动（12+13）几乎没差别，
+    用户当然说"没生效"；设 25 则得到 30 行。分组单位必须是**模组**，不是设备行。
+
+    ``sizes`` 是车辆档案里的逐模组点数（如 ``[25,25,25,25,25]``）。数据比列表多
+    时多出来的整块并进最后一块（绝不丢点）；``sizes`` 为空（没选车）→ 整段算
+    一个组（此时"一行一个模组"无从谈起，用户设的 N 就是整段几行）。
+    """
+    flat = [tok for toks in group_tokens for tok in toks]
+    if not flat:
+        return []
+    if not sizes:
+        return [flat]
+    out: list[list[tuple[str, str]]] = []
+    pos = 0
+    for raw in sizes:
+        try:
+            size = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if size <= 0 or pos >= len(flat):
+            continue
+        out.append(flat[pos:pos + size])
+        pos += size
+    if pos < len(flat):
+        out.append(flat[pos:])
+    return [group for group in out if group]
+
+
+def module_group_plans(
+        group_tokens: list[list[tuple[str, str]]],
+        sizes: list[int] | None) -> list[tuple[list[tuple[str, str]], int]]:
+    """把连续设备数据行按模组尺寸聚堆，并带上**档案声明的点数**。
+
+    返回 ``[(该模组的 token 列表, 档案点数)]``；档案点数 0 = 未知（用该堆实际
+    点数）。数据比档案多出来的那部分并成最后一堆，其档案点数按实际点数算（= 0）。
+
+    为什么光有 ``split_module_groups`` 不够（2026-11-21 用户第 N 次报"显示行数
+    格式还是有问题"的根因）：**排版每排该放几个点，取决于模组本身有几个点，
+    而不是这一块收到了几个点**。串口分包会把一个模组劈到两个 ``_emit_block``
+    块里 —— 温度模组（档案 8 点、设 2 排）被劈成 ``4 + 4``，两块各自只拿到 4 个
+    点，用"本块点数"算每排几个就得到 ``ceil(4/2) = 2`` → 每块排成 ``2 + 2``，
+    屏上同一帧出现 ``2+2+2+2``，而完整模组是 ``4+4``（真实日志 E74-2026.log 的
+    480 个温度段里 14 段是 ``2+2+2+2``）。带上档案点数，两半各自都按 8 点算
+    → 每排 4 个 → 前半截一行 4 点、后半截一行 4 点，拼起来就是 ``4+4``。
+
+    分组边界**完全**由 ``split_module_groups`` 决定（那里已经处理了"数据比档案
+    多 / 少 / 坏值"三种兜底，不在这里重写一遍）；本函数只负责给每一堆配上
+    "这一堆按档案应该是几个点"。
+
+    ``sizes`` 为空（没选车）→ ``[(flat, 0)]``：整段一堆、点数未知，调用方按实际
+    点数排（与加这个函数之前一字不差）。
+    """
+    groups = split_module_groups(group_tokens, sizes)
+    if not groups:
+        return []
+    if not sizes:
+        return [(groups[0], 0)]
+    declared: list[int] = []
+    for raw in sizes:
+        try:
+            size = int(raw)
+        except (TypeError, ValueError):
+            continue                        # 坏值：split_module_groups 同样跳过
+        if size > 0:
+            declared.append(size)
+    # 第 k 堆的边界就是第 k 个有效尺寸（见 split_module_groups 的切片顺序）；
+    # 超出有效尺寸的那些堆（末尾多出来的点）档案点数未知 → 0。
+    return [(group, declared[k] if k < len(declared) else 0)
+            for k, group in enumerate(groups)]
 
 
 def grid_row_sizes(count: int, rows_hint: int = 0, cols_hint: int = 0,
@@ -451,7 +588,8 @@ def _grid_rows(tokens: list[tuple[str, str]], section: str,
                max_row_chars: int = 0, rows_hint: int = 0,
                cols_hint: int = 0, row_sizes: list[int] | None = None,
                wire_breaks: set[int] | None = None, wire_base: int = 0,
-               wire_lead: bool = False, pad_char: str = "0") -> list[str]:
+               wire_lead: bool = False, pad_char: str = "0",
+               expect_points: int = 0) -> list[str]:
     """把一组采样点排成等宽网格：值补零到段内最宽；电压段序号补零到
     index_width（0 号点、温度段都不补）；单元格补空格到等宽后以 CELL_GAP 拼接。
 
@@ -474,6 +612,15 @@ def _grid_rows(tokens: list[tuple[str, str]], section: str,
     - 给了 ``row_sizes``（选了车）→ **先按模组切**（``grid_row_sizes`` 的显式尺寸
       分支），**再按视口在模组内部均衡拆**（``_cap_rows``）：模组还是那个模组，
       只是它长到装不下一行时，由我们决定断在第几个电芯，而不是让控件软换行。
+
+    ``expect_points``：这一堆点**按车辆档案应该是几个**（0 = 未知 → 按本堆实际
+    点数）。只在 ``rows_hint > 0`` 那条路上说话 —— 每排几个点由**模组点数**除
+    行数得到，这样被串口分包劈成两半的模组（4+4 / 12+13）两半各按整模组算，
+    排出来拼回去仍是 ``4+4`` / ``12+13``，而不是 ``2+2`` 和 ``6+6``。
+    ⚠️ 模组**完整**时（本块点数 ≥ ``expect_points``）排数仍是用户设的 N
+    （8 点设 5 排 → 1/1/2/2/2，与按本块点数算的老结果一字不差）—— 只有**半截**
+    模组走"用模组点数推每排几个、整块不拆"那条路。
+    ⛔ ``expect_points == 0`` 时该分支与加这个参数之前**逐字节相同**。
     """
     cells: list[str] = []
     for index, value in tokens:
@@ -505,12 +652,63 @@ def _grid_rows(tokens: list[tuple[str, str]], section: str,
             cols = min(cols, fit)
             if cols_hint > 0:
                 cols_hint = min(cols_hint, fit)
-        # ⛔ 显式行数（rows_hint > 0）时**列数必须传 0**，让 grid_row_sizes 按
-        #    ceil(count / rows) 自己推：否则它会拿"设备每行点数"当目标列数，
-        #    rows×cols 装不下 count 时又按列数把行数顶回去 —— 实测 125 点设成
-        #    3 行会被顶成 5 行（每行 25），"显示成几行"直接失效。
-        cols_target = 0 if rows_hint > 0 else (cols_hint if cols_hint > 0 else cols)
-        sizes = grid_row_sizes(len(cells), rows_hint, cols_target)
+        if rows_hint > 0:
+            # ⛔⛔ 显式行数（``rows_hint`` > 0）= **至少这么多排**，且每一排都必须
+            #    装得进视口。2026-11-21 用户第二次点名「如果不止一排请将偶数位
+            #    数据对齐」就是这条：之前这里把列数传 0 让 grid_row_sizes 按
+            #    ceil(n/rows) 自己推，25 点设 2 行 → 每排 13 个点 = 127 个字符，
+            #    而真机视口只放得下 79 个字符 → **控件自己软换行**把它劈成
+            #    "8 个点 + 5 个点"；相邻那排只有 12 个点 → 劈成 "8 个点 + 4 个
+            #    点"。屏上于是出现 8/4/8/5 这种长短不齐的排（设 3 行更糟：87 字符
+            #    那排被劈成 8 个点 + 孤零零一个 "25.4283"，正是用户 2026-10-11
+            #    截图点名的"行尾孤单元格"）。
+            #    现在**视口说了算**：先算"这个行数每排要几个点"，装不下就把排数
+            #    加到装得下为止；多出来的点由 grid_row_sizes 均分（各排相差 ≤1，
+            #    末排只多不少 —— 用户 2026-10-11 定的规则）。任何一排都不超视口，
+            #    软换行再也插不上手，"偶数位"（第 2、4… 排）自然与奇数排等长。
+            #
+            # ⛔⛔ 2026-11-21「模组计划」：每排几个点必须按**模组的档案点数**
+            #    （``expect_points``）算，不能按「本块实际收到的点数」算。串口分包
+            #    会把一个模组劈成两块（温度 8 点 → 4+4、电压 25 点 → 12+13），
+            #    各块只拿到半截点数，按块算就得出 ceil(4/2)=2 → 每块排 2+2，
+            #    屏上一帧出现 2+2+2+2 而不是 4+4（用户报的"显示行数格式还是
+            #    有问题"）。按档案点数算 → 前半截一行 4 点、后半截一行 4 点。
+            #    ``expect_points == 0``（没选车 / 档案点数未知）→ 与改前一字不差。
+            #
+            #    两条子情形（都以"每排几个点"为中间量，再换算成本块几排）：
+            #    · **完整模组**（本块点数 ≥ 档案点数）→ 排数就是用户设的 N
+            #      （``grid_row_sizes`` 再按"各排相差 ≤1、末排只多不少"均分），
+            #      视口装不下才加排 —— 与"按本块点数算"的整模组结果完全一致，
+            #      ⛔ 不能只写 ``ceil(点数 / 每排点数)``：温度 8 点设 5 排会算出
+            #      每排 2 点 → 只有 4 排，用户要的 5 排凭空少了 1 排（老代码给的是
+            #      1/1/2/2/2）。模组完整时用户的 N 必须一字不差地兑现。
+            #    · **半截模组**（本块点数 < 档案点数，被分包劈开）→ 按本块点数
+            #      占档案点数的**比例**分配排数（round(N × 本块点数 / 档案点数)），
+            #      两半各自排完仍凑得出 N 排（25 点劈 12+13 设 5 排 → 2+3=5）。
+            #      ⛔ 不能用 ceil(本块点数 / ceil(档案/N))：N=5、12+13 会排成
+            #      3+3=6 行（多一行）。视口装不下才加排。
+            if expect_points > 0:
+                if len(cells) >= expect_points:
+                    rows_eff = rows_hint                         # 整模组：兑现 N 排
+                    if fit:                                      # 视口装不下就加排
+                        rows_eff = max(rows_eff, -(-len(cells) // fit))
+                else:
+                    # 比例分配：Python round 是银行家舍入（2.5→2），等分半截 +
+                    # 奇数 N 得到相邻整数分配（8 点 4+4 设 5 排 → 2+2=4）；无法
+                    # 只用块内点数精确凑 N 属已知边界，不引入跨块状态去硬凑。
+                    rows_eff = max(1, min(rows_hint,
+                                         round(rows_hint * len(cells) / expect_points)))
+                    if fit:
+                        rows_eff = max(rows_eff, -(-len(cells) // fit))
+            else:
+                need = max(1, -(-len(cells) // rows_hint))      # ceil(点数 / 排数)
+                rows_eff = rows_hint
+                if fit and need > fit:
+                    rows_eff = max(1, -(-len(cells) // fit))    # 视口要几排就给几排
+            sizes = grid_row_sizes(len(cells), rows_eff, 0)
+        else:
+            cols_target = cols_hint if cols_hint > 0 else cols
+            sizes = grid_row_sizes(len(cells), 0, cols_target)
     rows: list[str] = []
     start = 0
     base = wire_base
@@ -580,6 +778,12 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
     是用户**直接指定显示成几行**，比"一排一个模组"更明确，所以它压过
     ``*_row_sizes``（按行数均分，不再按模组切）；0 = 自动，仍走逐模组尺寸。
 
+    ⛔ 显式行数这条路上，**每排几个点由"模组的档案点数"除行数得到**（不是由本块
+    收到的点数）：串口分包会把一个模组劈成两块，按块算会把温度 ``4+4`` 排成
+    ``2+2+2+2``、电压 ``12+13`` 排成 ``6+6`` 和 ``7+7``（见 module_group_plans）。
+    档案点数未知（``*_row_sizes`` 为空且没给 ``*_cols_hint``）时退回按本块点数算
+    —— 与加这条规则之前一字不差。
+
     列表为 None → 与加这个参数之前一字不差。
 
     ⚠️ 数字本身一个都不动：只在前导位置补数字 0（用户："在前方补零"）、重排
@@ -629,15 +833,17 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
             for match in SAMPLE_RE.finditer(line):
                 widths[sec] = max(widths.get(sec, 0), len(match.group(2)) - 1)
 
-    # 第二遍：**每条设备数据行各自成组**（2026-10-24 用户点名"不要篡改接收的
-    # 数据内容"）：以前把连续的几条数据行并成一组再重排，于是设备发 "4+4" 两行
-    # 温度会被合并成一行 8 个 —— 那是把收到的内容改了个样。现在一行进一行出，
-    # 只做"补零 + 等宽对齐"，行宽超视口时也**只拆这一行**（软换行会甩出孤零零
-    # 的单元格，见 _grid_rows）。
+    # 第二遍：默认**每条设备数据行各自成组**（2026-10-24 用户点名"不要篡改接收的
+    # 数据内容"）：设备发 "4+4" 两行温度不许合并成一行 8 个 —— 一行进一行出，
+    # 只做"补零 + 等宽对齐"。
+    #
+    # ⚠️ 例外是**显式行数**（``r_hint > 0``，用户 2026-11-21 定案「每个模组各显示
+    #    N 行」）：这时分组单位必须是**模组**，先把同一模组的 12+13 两条设备行并
+    #    回来再按 N 拆（见 `split_module_groups`）。按设备行拆的后果是设 2 只把
+    #    半截模组分 2 行、跟自动没差别 = 用户反复报的"没生效"。
     #
     # ⚠️ 断线标记要按**整个模组**算（平均值、以及"一号电芯拿平均值当参照"），
-    #    所以先把属于同一模组的连续数据行收在一起求 marks（横跨多行），
-    #    输出仍然是一行进一行出（只是把边界集合按全局下标喂给 _grid_rows）。
+    #    所以边界集合按全局下标喂给 _grid_rows（横跨多行也对）。
     out: list[str] = []
     current = section
     i = 0
@@ -669,15 +875,81 @@ def align_indexes(text: str, index_width: int = INDEX_PAD_WIDTH,
         sizes = volt_row_sizes if sec == SECTION_VOLT else temp_row_sizes
         # 电压/温度区**独立**显示行数（功能 1）：没设就退回通用的 rows_hint。
         r_hint = (volt_rows_hint if sec == SECTION_VOLT else temp_rows_hint) or rows_hint
+        # ⛔⛔ 2026-11-21 定案：``r_hint`` 的语义是**每个模组显示成几行**
+        #    （用户当面选的那一条，见 customization 的 tip）。
+        #    历史包袱：2026-11-18 曾按"整块区域几行"做过一次比例折算
+        #    （per_rows = round(r_hint × 本组点数 / 整段点数)），那条路有两个坑：
+        #      ① 分母是**设备行**点数（12/13）而不是模组点数（25）——
+        #         设 2 只把半截模组分 2 行，屏幕上跟自动没差别 = 用户报的"没生效"；
+        #      ② 循环变量 `toks` 在折算时泄漏成**最后一组**的点数，于是每一组都
+        #         按 13 点算：设 25 得到 5×6=30 行。
+        #    现在直接喂 r_hint，分组单位换成模组（`split_module_groups`），
+        #    设 N 就是每模组 N 行；r_hint=0 仍走老路（一行进一行出，一字不差）。
+        #    ⛔ 2026-11-21 再修：每堆还要带上**档案点数**（`module_group_plans`），
+        #    否则被分包劈成两半的模组会按"本块点数"排（温度 4+4 变成 2+2+2+2）。
         base = 0
-        for toks in group_tokens:
-            out.extend(_grid_rows(toks, sec, widths, index_width, len(toks),
-                                  max_row_chars, r_hint, hint, sizes,
-                                  breaks, base, lead and base == 0,
-                                  pad_char=pad))
-            base += len(toks)
+        if r_hint > 0:
+            # 分组单位必须是**模组**；档案没给逐模组尺寸时，用设置里的
+            # 「每模组电芯数 / 温度采集数」（``hint``）兜底，否则整块会被当成
+            # 一个超大模组，设 N 就变成"整块 N 排"（老语义，用户已否决）。
+            # 兜底出来的每一堆，"档案点数"就是 ``hint`` 本身（见 module_group_plans）。
+            mod_sizes = sizes
+            if not mod_sizes and hint > 0:
+                n_pts = sum(len(toks) for toks in group_tokens)
+                mod_sizes = [hint] * max(1, -(-n_pts // hint))
+            for module, expect in module_group_plans(group_tokens, mod_sizes):
+                out.extend(_grid_rows(module, sec, widths, index_width,
+                                      len(module), max_row_chars, r_hint, 0,
+                                      None, breaks, base,
+                                      lead and base == 0, pad_char=pad,
+                                      expect_points=expect))
+                base += len(module)
+        else:
+            for toks in group_tokens:
+                out.extend(_grid_rows(toks, sec, widths, index_width, len(toks),
+                                      max_row_chars, 0, hint, sizes,
+                                      breaks, base, lead and base == 0,
+                                      pad_char=pad))
+                base += len(toks)
         i = j
     return "\n".join(out)
+
+
+def align_text_by_round(text: str, **kwargs) -> str:
+    """按轮（时间戳行）切段、逐轮独立 ``align_indexes``，再按原顺序拼回。
+
+    为什么整篇一次 align 会出事（2026-11-21）：整篇里**跨轮**的连续数据行会被
+    ``align_indexes`` 当成"同一段连续数据行"（`while marks[j][1]` 只看"是不是
+    数据行、段号是否相同"，不看中间有没有时间戳——时间戳行不是数据行，会把
+    循环切断，但**模组切分**依赖 `sizes` 从段首开始数，段一长、起点一偏，
+    模组边界就跟着错位）。按轮切段后每轮各自从头数模组，边界稳定。
+
+    ⚠️ 2026-11-21 起 ``r_hint`` 的语义改成"每个模组显示成几行"，不再按
+    "整块点数"折算，所以**行数本身**已经不依赖切不切段了；这里保留切段只为了
+    上面那条模组边界稳定性（实时链路一轮一次 align，行为一致）。
+
+    - 切段：以 ``stamp_span`` 命中的时间戳行为轮起点；第一个时间戳之前的行
+      （若有）单独成一段。每段保留自己的全部行（含段内空行），段间原有空行
+      / 顺序原样不动。
+    - 每段都从 ``section=SECTION_OTHER`` 起排（调用方经 kwargs 传入），每轮首行
+      是时间戳，``section_of`` 会把它翻回电压段，段状态自洽。
+    - 没有时间戳（单轮 / 无戳文本）→ 退化为直接一次 ``align_indexes``，行为与
+      加这个函数之前一字不差。
+
+    ``kwargs`` 原样透传给 ``align_indexes``（section / max_row_chars /
+    *_rows_hint / *_row_sizes / wire_mv 等）。
+    """
+    lines = text.split("\n")
+    starts = [i for i, line in enumerate(lines) if stamp_span(line)]
+    if not starts:
+        return align_indexes(text, **kwargs)
+    segments: list[str] = []
+    if starts[0] > 0:
+        segments.append("\n".join(lines[:starts[0]]))
+    for k, start in enumerate(starts):
+        end = starts[k + 1] if k + 1 < len(starts) else len(lines)
+        segments.append("\n".join(lines[start:end]))
+    return "\n".join(align_indexes(seg, **kwargs) for seg in segments)
 
 
 def gap_lines(lines, prev: str = "") -> list[str]:
@@ -705,6 +977,75 @@ def gap_lines(lines, prev: str = "") -> list[str]:
             out.append("")
         out.append(line)
         last = line
+    return out
+
+
+# 历史回放摊平：历史文件存的是"当时排版固化"的文本（E74 一个模组 25 点被存成
+# 12+13 两行、温度 8 点存成 4+4 两行）；整行都是采样点（可夹断线 X）的行在这里
+# 合并成"一个模组一行"，随后交给 align_indexes 按**当前**行数设置重新分栏。
+# ⚠️ 与 _is_data_line 不同，这里**允许 X**：历史里的 X 是已经固化进文本的标记。
+_HIST_SAMPLE_LINE_RE = re.compile(
+    r"^\s*(?:\d+\.\d+|X)(?:\s+(?:\d+\.\d+|X))*\s*$")
+
+
+def collapse_history_rows(lines) -> list[str]:
+    """历史回放专用：把"排版固化"的采样行摊平成「一个模组一行」。
+
+    ⛔ **仅供历史回放摊平排版固化的行，实时接收不走这里**（实时链路是
+    ``_emit_block → align_indexes → gap_lines``，设备发几行就显示几行，
+    2026-10-24 起绝不合并）。历史文件里存的是当时那一版的排版结果：
+    E74 每模组 25 点电压被存成 2 行（12+13）、温度 8 点被存成 2 行（4+4）。
+    ``align_indexes`` 自 2026-10-24 起是"一条数据行独立排、一行进一行出"，
+    不会把已固化成 2 行的模组再拆/合，所以光改行数设置回放纹丝不动。本函数
+    先把这些固化行还原成"一个模组一行"，后面的 align_indexes 才能按当前设置
+    重新分栏。
+
+    规则（段识别复用 ``stamp_span`` / ``VOLT_HEADER_RE`` / ``TEMP_HEADER_RE`` /
+    ``BMS_LINE_RE`` / ``OTHER_HEADER_RE``）：
+      · 时间戳 / ``VoltageN:`` / ``TemperatureN:`` / BMS / 其它标题行 →
+        先 flush 当前模组缓冲，再**原样**输出该行；
+      · 电压/温度段内的连续采样行（整行都是 ``序号.值``，可含独立成词的 ``X``）
+        → 累积进缓冲，遇到下一个标题/非采样行时用 ``CELL_GAP`` 合并成一行输出；
+      · 原有空行**一律丢弃** —— 回放链路里 ``gap_lines`` 会按规则重建空行，别重复。
+
+    纯函数、无 Qt 依赖，selftest 可直接 import。两条不变式：
+      · **token 守恒**：合并只动空白，采样点/断线 X 一个不多一个不少；
+      · **幂等**：对已摊平的文本再跑一次输出不变（每个模组间都有标题隔开；
+        没有标题的裸数据本来也就只有一行），可安全重复调用。
+    """
+    out: list[str] = []
+    buffer: list[str] = []
+
+    def flush() -> None:
+        if buffer:
+            out.append(CELL_GAP.join(buffer))
+            buffer.clear()
+
+    section = SECTION_OTHER
+    for line in lines:
+        if not line.strip():
+            continue                       # 原空行丢掉，空行由 gap_lines 重建
+        stamp = stamp_span(line)
+        header = (stamp or VOLT_HEADER_RE.match(line)
+                  or TEMP_HEADER_RE.match(line) or BMS_LINE_RE.match(line)
+                  or OTHER_HEADER_RE.match(line))
+        if header:
+            flush()
+            out.append(line)
+            if stamp or VOLT_HEADER_RE.match(line):
+                section = SECTION_VOLT
+            elif TEMP_HEADER_RE.match(line):
+                section = SECTION_TEMP
+            else:
+                section = SECTION_OTHER
+            continue
+        if (section in (SECTION_VOLT, SECTION_TEMP)
+                and _HIST_SAMPLE_LINE_RE.match(line)):
+            buffer.extend(line.split())
+            continue
+        flush()
+        out.append(line)
+    flush()
     return out
 
 
@@ -924,9 +1265,11 @@ class RxHighlighter(QSyntaxHighlighter):
         # 值（坏电芯 425 mV 发成 "02.425"）只有在这种情况下才按 mV 判。
         volt_row = _volt_block(text)
         for match in SAMPLE_RE.finditer(text):
-            # 序号一律染蓝（"错误明细整行橙"那套已按用户要求删掉，见上）
-            self.setFormat(match.start(1), match.end(1) - match.start(1),
-                           self._index_fmt)
+            # 序号一律染蓝（"错误明细整行橙"那套已按用户要求删掉，见上）。
+            # 序号**含小数点**（"01."），口径与 index_spans 共用 _index_span ——
+            # 用户点名电池箱序号带 "."，小数点也得跟序号一支蓝；值数字不染。
+            idx_start, idx_len = _index_span(match)
+            self.setFormat(idx_start, idx_len, self._index_fmt)
             if not self._errors_on:
                 continue
             # 有问题的那一条：把**序号 + 值**整条覆盖成异常色（用户点名

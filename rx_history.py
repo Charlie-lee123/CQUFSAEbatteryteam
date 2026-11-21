@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """历史接收数据：自动保存最近的接收内容（含时间戳行）。
 
-- **存哪**：默认与日志文件同一目录（``app_log`` 的 logs 目录，跟着软件走）；
-  用户在设置面板选了别的目录就用那个（``set_directory`` 持久化到
-  ``custom/rx_history_dir``，``directory()`` 是唯一读入口）。
+- **存哪**：``<基准目录>\\近期数据\\<车号>.log``（用户 2026-11-21："把近期数据和
+  历史数据分成不同的文件夹，也要按照车号分"）。基准目录默认与日志文件同一目录
+  （``app_log`` 的 logs 目录，跟着软件走）；用户在设置面板选了别的目录就用那个
+  （``set_directory`` 持久化到 ``custom/rx_history_dir``，``directory()`` 是唯一
+  读入口）。未选车 = ``未选择车号.log``；老版本的 ``接收历史-<车号>.log`` 会在
+  首次定位时**自动搬进**子目录（见 ``_claim_legacy``），搬一次就完。
 - **存什么**：接收区实际显示的行——已含时间戳行、段重排后的数据行；
   HEX 视图存的就是 HEX 文本。逐帧喂 ``feed()``，尾部换行由这里统一收口。
 - **存多少**：**跟随接收区的「保留行数」**（用户 2026-10-13 点名："本地留存行数
@@ -30,7 +33,9 @@ from pathlib import Path
 DEFAULT_MAX_LINES = 5000
 COMPACT_EXTRA = 500      # 文件比上限多出这么多行才整体重写一次
 FLUSH_MS = 1000          # 批量刷盘周期
-FILE_NAME = "接收历史.log"
+SUB_DIR = "近期数据"      # 近期数据独占的子目录（与历史数据平级分开）
+FILE_NAME = "未选择车号.log"   # 未选车时的那本
+LEGACY_PREFIX = "接收历史"     # 老版本的单文件前缀（只用于迁移/兼容扫描）
 
 _ORG, _APP = "MimoWorks", "SerialAssistant"
 DIR_KEY = "custom/rx_history_dir"      # 用户手动指定的历史目录（空 = 跟日志同目录）
@@ -125,6 +130,23 @@ def directory() -> str | None:
         return None
 
 
+def _data_dir() -> Path | None:
+    """近期数据目录 ``<基准目录>\\近期数据``（建不出来返回 None → 功能静默降级）。
+
+    ⛔ 只做"子目录"这一层：基准目录本身仍由 ``directory()`` 决定（自定义目录
+    优先、默认跟日志同目录），语义一个字没改。
+    """
+    folder = directory()
+    if not folder:
+        return None
+    try:
+        sub = Path(folder) / SUB_DIR
+        sub.mkdir(parents=True, exist_ok=True)
+        return sub
+    except (OSError, TypeError):
+        return None
+
+
 def set_directory(path: str) -> bool:
     """切换历史目录并持久化。返回 True = 成功；不可写 / 存不下 → False（一个字不改）。
 
@@ -157,40 +179,61 @@ def set_directory(path: str) -> bool:
 
 
 def labels_of(folder: str | Path | None) -> list[tuple[str, str]]:
-    """某个目录下的历史文件 → ``[(标签, 绝对路径)]``（**新的在前**）。
+    """某个目录下的近期历史文件 → ``[(标签, 绝对路径)]``（**新的在前**）。
 
-    标签取自文件名：``接收历史-E74-2026.log`` → ``E74-2026``；没有后缀的
-    ``接收历史.log``（未选车那本）→ ``默认``。
+    新的布局是按文件夹分车号，所以标签就是文件名去掉 ``.log``
+    （``E74-2026.log`` → ``E74-2026``、``未选择车号.log`` → ``未选择车号``）。
+
+    ⛔ **两处都要扫**：``<folder>/近期数据/*.log`` 是新家；``<folder>/接收历史*.log``
+    是还没搬家的老文件（`load()` 只搬**当前车号**那一本，别的车的要等切过去才搬）。
+    只扫子目录的话，升级之后"接收历史"下拉里会突然只剩当前这台车 —— 用户会以为
+    别的车数据丢了。老文件的标签剥掉 ``接收历史`` 前缀；同标签时新家优先。
     """
     if not folder:
         return []
     base = Path(folder)
     found: list[tuple[str, str, float]] = []
-    try:
-        entries = list(base.glob("接收历史*.log"))
-    except OSError:
-        return []
-    for entry in entries:
-        try:
-            if not entry.is_file():
+    seen: set[str] = set()
+
+    def _scan(entries, legacy: bool) -> None:
+        for entry in entries:
+            try:
+                if not entry.is_file():
+                    continue
+                stamp = entry.stat().st_mtime
+                full = str(entry.resolve())
+            except OSError:
                 continue
-            stamp = entry.stat().st_mtime
-            full = str(entry.resolve())
-        except OSError:
-            continue
-        found.append((label_of(entry.name), full, stamp))
+            name = entry.name
+            if legacy and name.startswith(LEGACY_PREFIX):
+                name = name[len(LEGACY_PREFIX):].lstrip("-")
+            label = label_of(name)
+            if label in seen:            # 新家已经有一份同标签的 → 老的忽略
+                continue
+            seen.add(label)
+            found.append((label, full, stamp))
+
+    try:
+        _scan(list((base / SUB_DIR).glob("*.log")), legacy=False)
+    except OSError:
+        pass
+    try:
+        _scan(list(base.glob(f"{LEGACY_PREFIX}*.log")), legacy=True)
+    except OSError:
+        pass
     found.sort(key=lambda item: (-item[2], item[0]))
     return [(label, full) for label, full, _stamp in found]
 
 
 def label_of(filename: str) -> str:
-    """历史文件名 → 显示标签（``接收历史-X.log`` → ``X``；通用文件 → ``默认``）。"""
+    """历史文件名 → 显示标签（``X.log`` → ``X``；通用文件 → ``默认``）。
+
+    不再剥 ``接收历史`` 前缀 —— 新布局靠文件夹区分，文件名本身就是车号。
+    """
     stem = Path(str(filename)).name
     if stem.endswith(".log"):
         stem = stem[: -len(".log")]
-    if stem.startswith("接收历史"):
-        stem = stem[len("接收历史"):]
-    stem = stem.lstrip("-").strip(" .")
+    stem = stem.strip(" .")
     return stem or "默认"
 
 
@@ -219,17 +262,54 @@ def _safe_key(key: str | None) -> str:
 
 
 def file_for(key: str | None) -> str:
-    """车辆名 → 历史文件名；key 为空 = 未选车，落到通用文件。"""
+    """车辆名 → 近期数据文件名；key 为空 = 未选车，落到 ``未选择车号.log``。
+
+    ⛔ 文件名**不再带** ``接收历史-`` 前缀（用户 2026-11-21）：已经按
+    ``近期数据`` 文件夹分了，前缀纯属重复。
+    """
     safe = _safe_key(key)
-    return f"接收历史-{safe}.log" if safe else FILE_NAME
+    return f"{safe}.log" if safe else FILE_NAME
+
+
+def _legacy_name_for(key: str | None) -> str:
+    """老版本的文件名（只在迁移/兼容扫描时用，新文件不再这么命名）。"""
+    safe = _safe_key(key)
+    return f"{LEGACY_PREFIX}-{safe}.log" if safe else f"{LEGACY_PREFIX}.log"
+
+
+def _claim_legacy(base: Path, key: str | None, target: Path) -> None:
+    """把老位置的单文件搬进 ``近期数据``（目标已存在就不动，绝不覆盖新数据）。
+
+    跨盘 / 文件被占用时 ``os.replace`` 会失败，退化成"读+写+删"。任何一步失败都
+    静默 —— 老文件留着还能用（下次 load 再试），不能因为搬家把数据搞丢。
+    """
+    try:
+        if target.exists():
+            return
+        legacy = base / _legacy_name_for(key)
+        if not legacy.is_file():
+            return
+    except OSError:
+        return
+    try:
+        os.replace(legacy, target)
+    except OSError:
+        try:
+            target.write_bytes(legacy.read_bytes())
+            legacy.unlink()
+        except OSError:
+            return
+    import app_log
+    app_log.info(f"接收历史迁移：{legacy.name} → {SUB_DIR}/{target.name}")
 
 
 def switch_target(key: str | None) -> str | None:
     """把历史记录**切到某台车**（key=None = 未选车，用通用文件）。
 
-    不同电池箱的历史数据**分开放**（用户 2026-10-23 要求）：每台车一个
-    「接收历史-<车名>.log」，切车前先把当前文件的尾巴落盘，内存里换上新
-    文件的最近 _max_lines 行。删车**不删文件** —— 已接收的数据不受影响。
+    不同电池箱的历史数据**分开放**（用户 2026-10-23 要求，2026-11-21 升级成
+    「按文件夹 + 车号」）：每台车一个 ``近期数据/<车名>.log``，切车前先把当前
+    文件的尾巴落盘，内存里换上新文件的最近 _max_lines 行。删车**不删文件**
+    —— 已接收的数据不受影响。
     """
     flush()
     return load(key)
@@ -238,21 +318,20 @@ def switch_target(key: str | None) -> str | None:
 def load(key: str | None = None) -> str | None:
     """启动/切车时调用：定位文件、把已有尾巴读回内存。返回路径（可能没建成）。
 
-    ``key`` = 当前车辆名（"E74-2026" 这种）或 None（未选车 → 通用文件）。
+    ``key`` = 当前车辆名（"E74-2026" 这种）或 None（未选车 → 未选择车号.log）。
+    定位前先把老位置的 ``接收历史*.log`` 搬进子目录（只搬一次）。
     """
     global _path, _file_lines, _timer, _current_key
     _pending.clear()
     _lines.clear()
     _file_lines = 0
     _current_key = key
-    folder = directory()                 # 自定义目录优先，默认仍是"跟日志同目录"
-    try:
-        base = Path(folder) if folder else _resolve_dir()
-        base.mkdir(parents=True, exist_ok=True)
-        _path = base / file_for(key)
-    except (OSError, TypeError):
+    folder = _data_dir()                 # 自定义目录优先，默认仍是"跟日志同目录"
+    if folder is None:
         _path = None
         return None
+    _path = folder / file_for(key)
+    _claim_legacy(folder.parent, key, _path)
     try:
         if _path.exists():
             text = _path.read_text(encoding="utf-8", errors="replace")
@@ -353,15 +432,26 @@ def _resume_timer() -> None:
 
 
 def all_lines() -> tuple[str, ...]:
-    """回放用：优先读整个文件（可能比内存 deque 更长/更全）。
+    """回放用：整个文件 + **未落盘的尾巴**，读不到文件才退回内存副本。
 
-    读不到就退回内存副本。文件里的行才是"本地留存"的真实快照。
+    文件可能比内存 deque 更长/更全（没 compact 时文件留着上限+COMPACT_EXTRA
+    行，deque 只留上限行），所以以文件为底。但落盘是 1 秒批量 flush
+    （``FLUSH_MS``），最近一次 flush 之后 ``feed()`` 进来的行只在 ``_pending``
+    里、还没写进文件 —— 只读文件会**永远少掉最新 1 秒的帧**（用户 2026-11-21
+    报"近期数据没有最新的"）。
+
+    不变式：``_pending`` 恰好是"上次 flush 之后新喂的行"，是文件内容的**严格
+    后缀**（flush 先清空 pending 再整批 append，写失败也是丢批不回填，不会和
+    文件重复）。所以文件行 + pending 就是当下完整的本地留存。
     """
     if _path is not None:
         try:
             if _path.exists():
                 text = _path.read_text(encoding="utf-8", errors="replace")
-                return tuple(text.splitlines())
+                rows = text.splitlines()
+                if _pending:
+                    rows.extend(_pending)
+                return tuple(rows)
         except OSError:
             pass
     return tuple(_lines)

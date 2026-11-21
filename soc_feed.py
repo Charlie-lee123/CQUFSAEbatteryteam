@@ -52,6 +52,19 @@ CVI_RE = re.compile(r"V\s*=\s*(-?\d+(?:\.\d+)?)\s*,\s*I\s*=\s*(-?\d+(?:\.\d+)?)"
 #: ``CVMax=5446, Min=0`` —— 一轮的收尾行
 END_RE = re.compile(r"^CVMax\s*=")
 
+#: ``SOC=80.40%`` —— **车端 BMS 自己上报**的 SOC（用户要的就是这个数）。
+#: 前后要卡住，否则 ``SOCAdjusted=79.58%`` 里的 ``SOC`` 也会被认成命中。
+SOC_RE = re.compile(r"^\s*SOC\s*=\s*(-?\d+(?:\.\d+)?)\s*%?\s*$")
+
+#: ``SOCAdjusted=79.58%`` —— 车端按别的口径修过的值。**只记录不显示**：
+#: 用户点名要 ``SOC=`` 那一行，混着显示反而说不清是哪个口径。
+SOC_ADJ_RE = re.compile(r"^\s*SOCAdjusted\s*=\s*(-?\d+(?:\.\d+)?)\s*%?\s*$")
+
+#: 车端上报 SOC 的合法区间（%）。上限给 0.5 的余量：实测报文里出现过
+#: ``100.05%`` 这种越界一点点的采样。区间外一律**丢弃**（不更新、不显示）——
+#: E74 曾刷过一版恒报 ``100.00%`` 的坏固件，把明显非法的值当真比显示 ``--`` 更误导。
+SOC_READ_RANGE = (0.0, 100.5)
+
 _TEMP_PER_MODULE = 8
 
 #: 接触器状态最多继承几轮。真实报文里 ``AIR+=…`` 那行不是每块都发（实测会话库
@@ -62,10 +75,27 @@ _TEMP_PER_MODULE = 8
 STICKY_ROUNDS = 10
 
 
+def _soc_pct(text: str) -> float | None:
+    """把报文里的百分比文本转成 float；**超出合法区间的值一律丢弃**。
+
+    为什么必须挡：车端固件出过恒报 ``100.00%`` 的版本，也出现过 ``150.00`` 这类
+    明显非法的行。把这种值当真会让「读取到的」那枚读数长期骗人 —— 宁可返回
+    ``None``（上层显示 ``车端 SOC --``），也不显示一个明知不可能是真的数。
+    """
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    lo, hi = SOC_READ_RANGE
+    if not lo <= value <= hi:
+        return None
+    return value
+
+
 class RoundData:
     """一轮完整的采样。字段名与 :meth:`soc_est.SocEstimator.update` 对齐。"""
 
-    __slots__ = ("cells", "bad", "temps", "i_meas",
+    __slots__ = ("cells", "bad", "temps", "i_meas", "soc_read",
                  "contactor_open", "bms_ok", "complete", "n_samples")
 
     def __init__(self):
@@ -73,6 +103,7 @@ class RoundData:
         self.bad: list = []            # 设备打 X 的位置
         self.temps: list = []          # 温度（°C）
         self.i_meas = None             # 设备上报电流（A）
+        self.soc_read: float | None = None   # 车端 BMS 上报的 SOC（%，无则 None）
         self.contactor_open = None     # 接触器是否全断（True/False/None=没这行）
         self.bms_ok = True
         self.complete = False          # 是否收到了 CVMax 收尾行
@@ -81,11 +112,22 @@ class RoundData:
     def __repr__(self) -> str:
         return (f"RoundData(cells={self.n_samples}/{len(self.cells)}, "
                 f"bad={sum(1 for b in self.bad if b)}, I={self.i_meas}, "
+                f"soc_read={self.soc_read}, "
                 f"open={self.contactor_open}, done={self.complete})")
 
 
 class RoundCollector:
-    """把流式文本拼成整轮。``feed()`` 一个块可能吐出 0 个、1 个或多个整轮。"""
+    """把流式文本拼成整轮。``feed()`` 一个块可能吐出 0 个、1 个或多个整轮。
+
+    车端上报的 SOC 为什么是**粘滞**的（``last_soc_read``）
+    -----------------------------------------------------
+    报文里 ``SOC=80.40%`` 紧跟在 ``CVMax=`` **之后**，而 ``CVMax=`` 已经触发本轮
+    收尾并把整轮 emit 出去了 —— 想把它塞进"被 emit 的那一轮"必然慢一轮。也
+    **不能**因此挪 ``CVMax=`` 的收尾时机：那是整条轮边界契约的锚点（见模块注释
+    的段状态判据），动一下会把每轮的电芯数拆坏。
+    所以这里额外维护一个**粘滞**状态：``SOC=`` 行一到就更新，``reset()`` 才清
+    回 None（``_finish()`` **不清**，否则每轮都会忘掉）。
+    """
 
     def __init__(self, n_modules: int = N_MODULES,
                  cells_per_module: int = CELLS_PER_MODULE,
@@ -103,6 +145,9 @@ class RoundCollector:
         # 接触器状态的粘滞继承（见 STICKY_ROUNDS）
         self._last_open = None
         self._open_misses = 0
+        # 车端上报 SOC 的**粘滞状态**（见下面 last_soc_read 的说明）
+        self.last_soc_read: float | None = None
+        self.last_soc_adj: float | None = None   # SOCAdjusted，仅记录，不上界面
 
     # -- 对外 ---------------------------------------------------------
 
@@ -115,6 +160,8 @@ class RoundCollector:
         self._round = RoundData()
         self._last_open = None
         self._open_misses = 0
+        self.last_soc_read = None
+        self.last_soc_adj = None
 
     def feed(self, text: str) -> list[RoundData]:
         """喂一个文本块，返回这个块里**收尾完成**的整轮列表。"""
@@ -125,7 +172,7 @@ class RoundCollector:
             line = raw.strip()
             if not line:
                 continue
-            done = self._feed_line(line, out)
+            done = self._feed_line(line)
             if done:
                 out.append(done)
         return out
@@ -141,7 +188,32 @@ class RoundCollector:
 
     # -- 内部 ---------------------------------------------------------
 
-    def _feed_line(self, line: str, out: list[RoundData]) -> RoundData | None:
+    def _feed_line(self, line: str) -> RoundData | None:
+        # ⚠️ 这两条必须排在**所有分支之前**：``SOC=80.40%`` 里的 ``80.40`` 会被
+        #    ``SAMPLE`` 正则认成一个采样点（seq=80 > cells_per_module=25，恰好被
+        #    丢掉，纯属巧合），而 ``SOCAdjusted=`` 更会被认成 ``Adjusted`` 的邻居。
+        #    命中就 return，绝不让它们继续走 _take_cells / _take_temps。
+        soc = SOC_RE.match(line)
+        if soc:
+            value = _soc_pct(soc.group(1))
+            if value is not None:
+                # 粘滞：UI 那边会把它当作"车端最近一次上报"（见类注释）
+                self.last_soc_read = value
+                if self._started and self._round.cells:
+                    # 顺序相反（同一块里 SOC 行先于 CVMax）时，本轮自己带上它
+                    self._round.soc_read = value
+            return None
+
+        adj = SOC_ADJ_RE.match(line)
+        if adj:
+            # 只记录：用户点名要的是 SOC= 那一行，SOCAdjusted 不进任何显示。
+            # ⚠️ 只在值**变了**才写：这个槽位目前没有消费者（留给"两个都显示"
+            #    那一步），顺手也把"每轮都无意义地重写一次"省掉。
+            value = _soc_pct(adj.group(1))
+            if value is not None and value != self.last_soc_adj:
+                self.last_soc_adj = value
+            return None
+
         head = VOLT_HEADER.match(line)
         if head:
             module = int(head.group(1)) - 1
