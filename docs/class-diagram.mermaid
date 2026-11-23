@@ -1,0 +1,126 @@
+classDiagram
+    %% ==================== 需求1：电压来源可选 + 去掉「车端」 ====================
+    class RoundData {
+        +list cells
+        +list bad
+        +list temps
+        +float i_meas
+        +float soc_read
+        +str v_read
+        +bool contactor_open
+        +bool bms_ok
+        +bool complete
+        +int n_samples
+    }
+
+    class RoundCollector {
+        +int n_modules
+        +float last_soc_read
+        +float last_v_read
+        +reset() None
+        +feed(text) list~RoundData~
+        +flush() RoundData
+        -_feed_line(line) RoundData
+    }
+    RoundCollector "1" o-- "N" RoundData : feed 产出
+
+    class customization {
+        +register_choice(key, label, default, options, tip)
+        +register_bool(key, label, default, tip)
+        +get(key)
+        +set(key, value)
+    }
+    note for customization "soc_source: calc/read (措辞去车端)\nvolt_source: calc/read 新增\nkeep_awake_on_rx: bool 新增\n标记不持久化 → 不进 QSettings"
+
+    class MainWindow_SOC {
+        +str _soc_source
+        +str _volt_source
+        +float _soc_read_last
+        +float _volt_read_last
+        +tuple _soc_calc_last
+        +_load_soc_source() str
+        +_set_soc_source(value) None
+        +_load_volt_source() str
+        +_set_volt_source(value) None
+        +_feed_soc(text) None
+        +_apply_soc(res) None
+        +_render_soc(parts, state, emphasis) None
+        +_soc_read_parts(parts) tuple
+        +_soc_placeholder() tuple
+        +_refresh_soc_now() None
+    }
+    MainWindow_SOC --> customization : get/set volt_source
+    MainWindow_SOC --> RoundCollector : _soc_feed.feed
+    MainWindow_SOC --> soc_est : format_soc_parts
+
+    class soc_est {
+        +format_soc_parts(res, cfg) tuple
+        +pack_mv property
+    }
+
+    %% ==================== 需求2：工况电流符号为主 + 死区 ====================
+    class WorkModeClassifier {
+        +str mode
+        +float _hold_until
+        +reset() None
+        +_set(new, ts, force) str
+        +classify(ts, mean_mv, i_eff, i_valid, contactor_open, bms_ok) str
+    }
+    note for WorkModeClassifier "去掉 _hist/_trend/_hist\n死区复用 MODE_I_MIN_A\nopen 硬约束 + MODE_HOLD_S 滞回不变\nP1 判序在 _effective_current，不动"
+    soc_est "1" *-- "1" WorkModeClassifier : SocEstimator._mode
+
+    class SocEstimator {
+        +WorkModeClassifier _mode
+        +update(cells, temps, i_meas, ts, bad_mask, contactor_open, bms_ok) SocResult
+        -_effective_current(i_meas, contactor_open, bms_ok) tuple
+    }
+    SocEstimator --> WorkModeClassifier : classify()
+
+    %% ==================== 需求3：读串口期间不息屏 ====================
+    class WakeLock {
+        +bool ENABLED
+        +bool HELD
+        +bool enabled
+        +bool receiving
+        +bool _active
+        +configure(enabled) None
+        +set_receiving(active) None
+        -_sync() None
+        -_acquire() None
+        -_release() None
+        +release() None
+    }
+    note for WakeLock "新模块 wake_lock.py\nctypes.windll.kernel32.SetThreadExecutionState\n0x80000000|1|2 acquire / 0x80000000 release\n非 Windows 降级 no-op；无定时器轮询"
+    MainWindow_SOC "1" o-- "1" WakeLock : self._wake_lock
+
+    %% ==================== 需求4：标记（整轮） ====================
+    class RoundMark {
+        +int seq
+        +str key
+        +int start_block
+        +str stamp
+        +str summary
+    }
+    note for RoundMark "纯内存 list 不持久化\nkey = 轮首时间戳 + seq\nstart_block 被裁剪 → 靠 stamp 重定位"
+    class MarkStore {
+        +list~RoundMark~ marks
+        +int _seq
+        +current int
+        +add(start, stamp, summary) RoundMark
+        +clear() None
+        +nearest_key(block) str
+        +by_key(key) RoundMark
+    }
+    MarkStore "1" o-- "N" RoundMark
+    MainWindow_SOC "1" o-- "1" MarkStore : self._marks
+
+    class RxDocument {
+        # 复用既有设施
+        +_round_span(from_block) tuple
+        +_viewed_block_number() int
+        +_make_selection(cursor, color) ExtraSelection
+        +_apply_extra_selections() None
+        +_visual_line_index(block, row_h) int
+    }
+    note for RxDocument "main_window.py 既有方法：\n_round_span :7330 / _viewed_block_number :7441\n_make_selection :2909 / _apply_extra_selections :7804\nstamp_span (ui_highlight.py:165)"
+    MainWindow_SOC --> RxDocument : 跳转/高亮复用

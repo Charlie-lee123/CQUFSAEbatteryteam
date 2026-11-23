@@ -35,8 +35,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication, QBoxLayout, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLayout,
-    QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QSizePolicy, QSplitter,
-    QTextEdit, QVBoxLayout, QWidget,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
+    QSizePolicy, QSplitter, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from serial_io import (
@@ -56,6 +56,8 @@ import soc_est
 import soc_feed
 import soc_profiles
 from soc_display import SocDisplayGate
+import wake_lock
+from marks_model import MarkStore
 import customization
 from ui_anim import (EASE, STANDARD, Reveal, Tween, animations_enabled,
                      in_out_cubic, in_out_quint, out_cubic)
@@ -78,8 +80,8 @@ from ui_perf_mode import PerfModeOverlay
 from ui_theme import (
     CARD_PAD, CARD_RADIUS,
     DEFAULT_GLASS, GAP, GLYPH_CHEVRON_DOWN, GLYPH_CHEVRON_UP, GLYPH_CLEAR,
-    GLYPH_CLOSE, GLYPH_COLLAPSE, GLYPH_COPY, GLYPH_EXPAND, GLYPH_EXPAND_CHEVRON,
-    GLYPH_PAUSE,
+    GLYPH_ADD, GLYPH_CLOSE, GLYPH_COLLAPSE, GLYPH_COPY, GLYPH_EXPAND,
+    GLYPH_EXPAND_CHEVRON, GLYPH_PAUSE,
     GLYPH_PLAY, GLYPH_REFRESH, GLYPH_RESTORE, GLYPH_SAVE, GLYPH_SEARCH,
     GLYPH_SEND, GLYPH_SETTINGS, LEGACY_GLASS, SHADOW_PAD, TITLE_H, apply_scheme,
     apply_titlebar_theme,
@@ -873,6 +875,8 @@ class MainWindow(QMainWindow):
         # 要还回去。单独一个属性而不是塞进 _settings_previous：那个元组的解包点
         # 在别处（_apply_settings_result），加字段容易漏一处就 ValueError。
         self._settings_soc_source_prev = "calc"
+        # 「总电压来源」同样是实时预览项，取消要还回去；独立字段，理由同上。
+        self._settings_volt_source_prev = "calc"
         # 设置面板"整块放大/缩小"动画里的那张内容快照（见 _SettingsShot）
         self._settings_shot = _SettingsShot(self)
         # 入场落定时"同一拍真面板上屏、撤快照"的临时目标。硬切是**同步**的
@@ -963,6 +967,15 @@ class MainWindow(QMainWindow):
         # 历史回放模式：为真时接收区显示的是本地留存数据，实时帧不写进画面
         # （但照常进 rx_history 与计数）。见 _open_history / _exit_replay。
         self._replay_active = False
+        # 整轮标记（v2.11 需求 4）：纯内存、不持久化。回放态禁用，清屏/换车即空。
+        self._marks = MarkStore()
+        self._mark_selection: QTextEdit.ExtraSelection | None = None
+        # 防息屏状态机（v2.11 需求 3）：默认关，按设置初值 configure，不主动 acquire。
+        self._wake_lock = wake_lock.WakeLock()
+        try:
+            self._wake_lock.configure(bool(customization.get("keep_awake_on_rx")))
+        except Exception:                    # noqa: BLE001 - 配置读坏当默认关
+            pass
         # 回放的是哪一路数据：""=非回放、"recent"=近期数据（_open_history）、
         # "long"=历史数据（_open_long_history）。两颗回放按钮共用 _replay_active
         # 互斥，但**文案各管各的** —— 点哪颗进回放，哪颗就变「关闭 XX 数据」，
@@ -1595,7 +1608,10 @@ class MainWindow(QMainWindow):
             "SOC min：由正常电压区间内最低单体电压估算（放电时看它）")
         self.lbl_soc_max.setToolTip(
             "SOC max：由正常电压区间内最高单体电压估算（充电时看它）")
-        self.lbl_soc_volt.setToolTip("总电压按清洗后电芯平均值 × 串数估算")
+        self.lbl_soc_volt.setToolTip(
+            "总电压来源见设置：「本地估算」= 清洗后电芯平均值 × 串数；"
+            "「BMS 上报」= 报文 V= 行的原文（本机该传感器恒为 0.00，"
+            "界面照实显示，不自动回退；要可用值请切本地估算）")
         # 兼容别名：旧代码 / 自测用 lbl_soc 指主读数
         self.lbl_soc = self.lbl_soc_min
         self._soc_labels = (self.lbl_soc_mode, self.lbl_soc_min,
@@ -1644,12 +1660,17 @@ class MainWindow(QMainWindow):
 
         # SOC：按当前车辆取参数（没配参数的车显示 --，功能对它完全惰性）
         # ⚠️ 这两行必须排在 _init_soc() **之前**：那里的占位文本要按数据来源选措辞
-        #    （"SOC --" 还是 "车端 SOC --"），见 _soc_placeholder。
+        #    （"SOC --" 还是 "BMS SOC --"），见 _soc_placeholder。
         self._soc_source = self._load_soc_source()   # "calc" / "read"
         self._soc_read_last: float | None = None     # 车端最近一次上报的 SOC(%)
         # 已经画到过底栏的车端值：SOC= 单独成一个串口块时（rounds 为空）靠它
         # 决定要不要补刷一次，避免每块都重绘。
         self._soc_read_last_shown: float | None = None
+        # 总电压来源（v2.11 需求 1，与 _soc_source 各自独立）：calc=清洗均值×串数；
+        # read=报文 V= 原文（本机恒 0.00，照实显示）。
+        self._volt_source = self._load_volt_source()  # "calc" / "read"
+        self._volt_read_last: str | None = None       # 报文 V= 行原文（粘滞）
+        self._volt_read_last_shown: str | None = None  # 已画到过底栏的 V= 原文（补刷判据）
         self._init_soc()
 
         # USB 转串口驱动体检：新机器插上 STLink / CH340 却没串口，用户会以为
@@ -2317,6 +2338,11 @@ class MainWindow(QMainWindow):
         self.btn_expand = IconButton(GLYPH_EXPAND, "接收区全屏显示（Esc 退出）",
                                      size=30, glyph_size=15)
         self.btn_expand.clicked.connect(self._toggle_expand)
+        # 整轮标记（v2.11 需求 4）：点一下给「当前正在看的一轮」打标。
+        # ⛔ 不进 BUTTON_SPECS —— 那是"可隐藏按钮"清单，标记是核心操作不允许隐藏。
+        self.btn_mark = IconButton(GLYPH_ADD, "标记当前轮（Alt+M）",
+                                   size=30, glyph_size=15)
+        self.btn_mark.clicked.connect(self._mark_current)
         rail = QVBoxLayout()
         rail.setSpacing(10)
         # 分屏接管时亮出的串口开关：常驻竖栏顶部（普通态隐藏），见 _apply_snap_zoom。
@@ -2328,9 +2354,16 @@ class MainWindow(QMainWindow):
         #    列被撑宽到开关宽度，图标跟着列的**左边**走（左边距不变），离卡片右缘
         #    自然变远。别再改回 AlignRight。
         for button in (self.btn_search, self.btn_alert, self.btn_pause,
-                       self.btn_copy_all, self.btn_clear, self.btn_save,
-                       self.btn_expand):
+                       self.btn_copy_all, self.btn_mark, self.btn_clear,
+                       self.btn_save, self.btn_expand):
             rail.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft)
+        rail.addStretch(1)
+        # 标记列表：点击某项跳回对应整轮。回放态禁用（见 _refresh_replay_ui 的调用点）。
+        self._mark_list = QListWidget()
+        self._mark_list.setMaximumHeight(120)
+        self._mark_list.setToolTip("整轮标记（仅本次会话，重启清空）：点击跳回该轮")
+        self._mark_list.itemClicked.connect(self._on_mark_item_clicked)
+        rail.addWidget(self._mark_list)
         rail.addStretch(1)
         # 包一层容器，把整列当成一个控件交给布局（间距、对齐都只算一次）
         self._rx_rail = QWidget()
@@ -2501,6 +2534,11 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+F"), self, self._toggle_search)
         QShortcut(QKeySequence("Escape"), self, self._on_escape)
         QShortcut(QKeySequence("F11"), self, self._toggle_expand)
+        # 整轮标记（v2.11 需求 4）：Alt+M 打标、Alt+↑/↓ 跳上/下一个标记。
+        # ⛔ 避开已有的 Ctrl+F / Ctrl+L / Ctrl+Return / F11 / Escape。
+        QShortcut(QKeySequence("Alt+M"), self, self._mark_current)
+        QShortcut(QKeySequence("Alt+Up"), self, lambda: self._goto_mark(-1))
+        QShortcut(QKeySequence("Alt+Down"), self, lambda: self._goto_mark(1))
 
     # ------------------------------------------------------------ 滚动暂停
 
@@ -6409,6 +6447,8 @@ class MainWindow(QMainWindow):
             # 建链期间被取消 / 又换了口：这次结果作废（worker 会自己收尾退出）
             return
         self._port_connected = True
+        # 防息屏：串口开成功即置 receiving=True（⛔ 必须在这行之后、BLE 早退之前）。
+        self._wake_lock.set_receiving(True)
         if isinstance(worker, _ble_worker_cls()):
             # 广播模式没有波特率/校验位这回事，状态栏按"正在接收广播"来写
             self._ble_target = worker.port
@@ -6471,6 +6511,7 @@ class MainWindow(QMainWindow):
         port = worker.port
         self._worker = None
         self._port_connected = False
+        self._wake_lock.set_receiving(False)   # 打开失败：不算在收，撤销防息屏
         worker.deleteLater()
         app_log.error(f"串口打开失败 {port}: {message}")
         self.btn_open.setChecked(False)
@@ -6513,6 +6554,7 @@ class MainWindow(QMainWindow):
         self._flush_rx(force=True)
         worker, self._worker = self._worker, None
         self._port_connected = False
+        self._wake_lock.set_receiving(False)   # 关串口：停止接收，撤销防息屏
         self._send_timer.stop()
         self.chk_timer_send.setChecked(False)
         if worker is not None:
@@ -7507,6 +7549,105 @@ class MainWindow(QMainWindow):
             return
         self._toast(f"已复制本轮 {text.count(chr(10)) + 1} 行（含时间戳）", 2000)
 
+    # ------------------------------------------------------------ 整轮标记
+    # ⛔ 复用既有的 _round_span / _viewed_block_number / _make_selection /
+    #    _apply_extra_selections / _visual_line_index / stamp_span，不另起高亮机制。
+    #    标记只活内存（MarkStore），不写 QSettings / 不写盘。
+
+    def _mark_current(self) -> None:
+        """给「当前正在看的一轮」打标（按钮 / Alt+M）。回放态禁用。"""
+        if getattr(self, "_replay_active", False):
+            self._toast("回放中不支持标记，返回实时后可用", 2500)
+            return
+        span = self._round_span(self._viewed_block_number())
+        if span is None:
+            self._toast("当前没有可标记的轮次（没有时间戳）", 2500)
+            return
+        doc = self.txt_rx.document()
+        stamp = doc.findBlockByNumber(span[0]).text()
+        summary = ""
+        for b in range(span[0] + 1, span[1]):
+            text = doc.findBlockByNumber(b).text().strip()
+            if text:
+                summary = text[:24]
+                break
+        self._marks.add(span[0], stamp, summary)
+        self._refresh_mark_list()
+        self._search_pinned = True
+
+    def _refresh_mark_list(self) -> None:
+        """按 MarkStore 重建列表项（不框选文本，只列 stamp + summary）。"""
+        lst = getattr(self, "_mark_list", None)
+        if lst is None:
+            return
+        lst.clear()
+        for mark in self._marks.marks:
+            item = QListWidgetItem(f"{mark.stamp} {mark.summary}".strip())
+            item.setData(0x0100, mark.key)      # Qt.UserRole
+            lst.addItem(item)
+
+    def _on_mark_item_clicked(self, item) -> None:
+        if item is None:
+            return
+        self._jump_to_mark(str(item.data(0x0100) or ""))
+
+    def _goto_mark(self, step: int) -> None:
+        """上/下一个标记（Alt+↑/↓，循环）。回放态禁用。"""
+        if getattr(self, "_replay_active", False):
+            return
+        mark = self._marks.next() if step > 0 else self._marks.prev()
+        if mark is None:
+            self._toast("还没有标记，先按 Alt+M 打一个", 2000)
+            return
+        self._jump_to_mark(mark.key)
+
+    def _jump_to_mark(self, key: str) -> None:
+        """跳到标记对应整轮并高亮；块号漂移就按 stamp 全文重定位，找不到只提示。"""
+        mark = self._marks.by_key(key)
+        if mark is None:
+            return
+        doc = self.txt_rx.document()
+        round_start = None
+        block = doc.findBlockByNumber(mark.start_block)
+        if block.isValid() and block.text() == mark.stamp:
+            round_start = mark.start_block
+        else:
+            # setMaximumBlockCount 从头裁导致块号漂移：全文按 stamp 文本重定位
+            for b in range(doc.blockCount()):
+                if doc.findBlockByNumber(b).text() == mark.stamp:
+                    round_start = b
+                    break
+        if round_start is None:
+            self._toast("该标记对应的数据已被裁剪，无法跳回", 3000)
+            return
+        span = self._round_span(round_start)
+        if span is None:
+            self._toast("该标记所在轮已不完整，无法跳回", 3000)
+            return
+        row_height = self._single_line_height()
+        bar = self.txt_rx.verticalScrollBar()
+        bar.setValue(max(0, self._visual_line_index(span[0], row_height)
+                         - ALERT_TOP_LINES))
+        self._search_pinned = True
+        # 高亮整轮 [span0, span1)：ExtraSelection 背景色，⛔ 不是文本选区
+        cursor = QTextCursor(doc)
+        first = doc.findBlockByNumber(span[0])
+        last = doc.findBlockByNumber(span[1] - 1)
+        cursor.setPosition(first.position())
+        cursor.setPosition(last.position() + last.length(),
+                           QTextCursor.MoveMode.KeepAnchor)
+        fill = QColor(qcolor("temp_warn"))
+        fill.setAlpha(ALERT_FILL_ALPHA)
+        self._mark_selection = self._make_selection(cursor, fill)
+        self._apply_extra_selections()
+
+    def _clear_mark_highlight(self) -> None:
+        """清掉整轮标记高亮（仿 _clear_alert_highlight）。"""
+        if self._mark_selection is None:
+            return
+        self._mark_selection = None
+        self._apply_extra_selections()
+
     def _clear_receive(self) -> None:
         self.txt_rx.clear()
         self._rx_bytes = 0
@@ -7516,6 +7657,10 @@ class MainWindow(QMainWindow):
         self._rx_pending.clear()
         self._reset_matches()
         self._clear_alert_highlight()
+        self._marks.clear()                     # 标记不持久化：清屏即空
+        self._clear_mark_highlight()
+        if getattr(self, "_mark_list", None) is not None:
+            self._mark_list.clear()
         self._align_section = SECTION_OTHER      # 画面清空 = 段状态归零
         # 空行规则要跨帧判断"上一行空不空"（见 _emit_block 的 gap_lines）
         self._rx_prev_line = ""
@@ -7810,6 +7955,8 @@ class MainWindow(QMainWindow):
         merged = list(self._search_selections)
         if self._alert_selection is not None:
             merged.append(self._alert_selection)
+        if self._mark_selection is not None:
+            merged.append(self._mark_selection)
         self.txt_rx.setExtraSelections(merged)
 
     def _save_log(self) -> None:
@@ -8055,6 +8202,10 @@ class MainWindow(QMainWindow):
         self.txt_rx.clear()
         self._reset_matches()
         self._clear_alert_highlight()
+        self._marks.clear()                     # 回放态不支持标记：进入即清空
+        self._clear_mark_highlight()
+        if getattr(self, "_mark_list", None) is not None:
+            self._mark_list.clear()
         # 回放内容走与实时相同的着色/排版管线：_align_section 从头推（历史文件
         # 里每轮都带时间戳，段状态自洽），着色的段状态由 QSyntaxHighlighter
         # 自己按块序推，这里只需要把文本塞进去。
@@ -8217,6 +8368,12 @@ class MainWindow(QMainWindow):
         if not self._replay_active:
             self.btn_open_history.setText("打开近期数据")
             self.btn_open_long_history.setText("打开历史数据")
+            # 标记：实时态可用（回放态在下面置灰）
+            if getattr(self, "btn_mark", None) is not None:
+                self.btn_mark.setEnabled(True)
+                self.btn_mark.setToolTip("标记当前轮（Alt+M）")
+            if getattr(self, "_mark_list", None) is not None:
+                self._mark_list.setEnabled(True)
             self._replay_bar_anim(False)
             # 与 __init__ 一致：**不设**占位提示（Qt 只按"正文色×≈0.5"画它，
             # 永远比别处暗一半；详见 __init__ 里那段说明）。
@@ -8230,6 +8387,12 @@ class MainWindow(QMainWindow):
             self.btn_open_history.setText("关闭近期数据")
             self.btn_open_long_history.setText("打开历史数据")
         self._replay_bar_anim(True)
+        # 标记在回放态禁用（分页前插块号剧烈漂移，锚点不可靠）—— tooltip 说明原因
+        if getattr(self, "btn_mark", None) is not None:
+            self.btn_mark.setEnabled(False)
+            self.btn_mark.setToolTip("回放中不支持标记，返回实时后可用")
+        if getattr(self, "_mark_list", None) is not None:
+            self._mark_list.setEnabled(False)
         self.txt_rx.setPlaceholderText("正在查看本地留存数据（点右上角返回实时）")
 
     def _replay_bar_height(self) -> int:
@@ -8605,6 +8768,7 @@ class MainWindow(QMainWindow):
         # 带到新上下文里比不显示更糟。车端上报值同理 —— 它属于旧车的 BMS。
         self._soc_read_last = None
         self._soc_read_last_shown = None
+        self._volt_read_last = None          # 总压 V= 原文属于旧车，换车作废
         self._soc_calc_last = None
         # 显示门控是纯状态机；换车 / 切 EKF 开关时重建基准（不带旧车读数）
         self._soc_display_gate = SocDisplayGate()
@@ -8664,17 +8828,24 @@ class MainWindow(QMainWindow):
             #    必须赶在 _apply_soc **之前**同步，「读取到的」模式才不会永远慢一轮。
             if self._soc_feed.last_soc_read is not None:
                 self._soc_read_last = self._soc_feed.last_soc_read
-            if (not rounds and self._soc_source == "read"
-                    and self._soc_read_last is not None
-                    and self._soc_read_last != self._soc_read_last_shown):
-                # 报文里 SOC= 本来就在 CVMax= 之后；被串口缓冲切成单独一块时
-                # rounds 为空，下面那个循环一次都不跑 —— 不在这里补刷就要等到
-                # 下一整轮才看得见新车端读数（用户点名的"慢一轮"）。
+            # 总压 V= 原文同样粘滞同步（v2.11 需求 1）：read 模式照实显示。
+            if self._soc_feed.last_v_read is not None:
+                self._volt_read_last = self._soc_feed.last_v_read
+            if (not rounds and (
+                    (self._soc_source == "read" and self._soc_read_last is not None
+                     and self._soc_read_last != self._soc_read_last_shown)
+                    or (self._volt_source == "read" and self._volt_read_last is not None
+                        and self._volt_read_last != self._volt_read_last_shown))):
+                # 报文里 SOC=/V= 被串口缓冲切成单独一块时 rounds 为空，下面那个
+                # 循环一次都不跑 —— 不在这里补刷就要等到下一整轮才看得见新读数
+                # （SOC= 用户点名的"慢一轮"；电压同理）。
                 self._refresh_soc_now()
             for data in rounds:
                 if data.soc_read is not None:
                     # 同一块里 SOC 行先于 CVMax 时本轮自带读数（比粘滞值更贴合本轮）
                     self._soc_read_last = data.soc_read
+                if data.v_read is not None:
+                    self._volt_read_last = data.v_read
                 res = self._soc_est.update(
                     data.cells, data.temps, data.i_meas, ts=now,
                     bad_mask=data.bad,
@@ -8726,14 +8897,32 @@ class MainWindow(QMainWindow):
 
         两种来源共用同一组四枚标签，差别只在这里：
           · ``calc``：算出来的（min / max / 总压 + 焦点语义），原样下发；
-          · ``read``：车端上报（工况 / 车端 SOC / 空 / 总压），见 _soc_read_parts。
+          · ``read``：车端上报（工况 / BMS SOC / 空 / 总压），见 _soc_read_parts。
+        ⛔ 顺序铁律：先按 SOC 来源定四槽，再**无条件**套电压来源（_volt_part）。
+           电压来源与 SOC 来源互相独立，不能因为 SOC 是 calc 就跳过电压套用。
         """
         if self._soc_source == "read":
             parts, state = self._soc_read_parts(parts)
             # min/max 的 focus/dim 焦点语义在读取模式下不成立（只剩一枚读数）
             emphasis = ""
             self._soc_read_last_shown = self._soc_read_last
+        parts = self._volt_part(parts)       # ⛔ 必须在 SOC 来源之后，顺序不可反
+        if self._volt_source == "read":
+            self._volt_read_last_shown = self._volt_read_last
         self._set_soc_parts(parts, state, emphasis)
+
+    def _volt_part(self, parts) -> tuple[str, str, str, str]:
+        """按「总电压来源」替换第 4 槽（总电压）；其余三槽原样返回。
+
+        ``read`` = 报文 ``V=`` 行原文（本机恒 ``0.00``）—— ⛔ **照实显示**，
+        绝不回退到 calc 的清洗均值（用户知情后坚持要看到 BMS 到底报了多少）。
+        无读数 → ``总电压 -- V``；``calc`` → 原样。
+        """
+        if self._volt_source != "read" or len(parts) < 4:
+            return parts
+        volt = (f"总电压 {self._volt_read_last} V" if self._volt_read_last is not None
+                else "总电压 -- V")
+        return parts[0], parts[1], parts[2], volt
 
     def _soc_read_parts(self, parts) -> tuple[tuple[str, str, str, str], str]:
         """「读取到的」模式下的四槽文本 + 状态。
@@ -8743,23 +8932,46 @@ class MainWindow(QMainWindow):
         一个空串 —— ``_place_soc`` 会跳过空标签，所以这一组仍然是"精确居中"的
         两枚（工况 / 读数 / 总压共三枚）。
 
-        ⛔ 车端从没报过 SOC 就显示 ``车端 SOC --``，**不许**拿本地估算值顶上：
-           用户要看的是"车端到底报了多少"，糊上去反而误导（宁可空着说不知道）。
+        ⛔ 车端从没报过 SOC 就显示 ``BMS SOC --``，**不许**拿本地估算值顶上：
+           用户要看的是"BMS 到底报了多少"，糊上去反而误导（宁可空着说不知道）。
         ⛔ 读取模式下不因为本地估算的 residual / module_offset 转橙：那些是**本地
            算法**的健康度，与车端读数一点关系都没有。
         """
         mode_text = parts[0] if parts else ""
         volt_text = parts[3] if len(parts) > 3 else ""
         if self._soc_read_last is None:
-            return (mode_text, "车端 SOC --", "", volt_text), "off"
-        return (mode_text, f"车端 SOC {self._soc_read_last:.2f}%", "",
+            return (mode_text, "BMS SOC --", "", volt_text), "off"
+        return (mode_text, f"BMS SOC {self._soc_read_last:.2f}%", "",
                 volt_text), "ok"
 
     def _soc_placeholder(self) -> tuple[str, str, str, str]:
         """还没有任何一轮读数时的占位文本（按当前来源选措辞）。"""
         if self._soc_source == "read":
-            return "", "车端 SOC --", "", ""
+            # read 模式的第 4 槽按总电压来源（设计 §1.1）：volt=read → 占位
+            # "总电压 -- V"，volt=calc → 空串。⛔ 占位路径没有可计算的结果，
+            # 别在这里给计算值。
+            volt_slot = "总电压 -- V" if self._volt_source == "read" else ""
+            return "", "BMS SOC --", "", volt_slot
         return "", "SOC --", "", ""
+
+    def _load_volt_source(self) -> str:
+        """读设置里的「总电压来源」，只会是 ``"calc"`` / ``"read"``。
+
+        ⛔ 独立读 ``custom/volt_source``，不复用 ``soc_source``。
+        """
+        try:
+            value = str(customization.get("volt_source") or "calc")
+        except Exception:                    # noqa: BLE001 - 配置读坏就当默认
+            return "calc"
+        return "read" if value == "read" else "calc"
+
+    def _set_volt_source(self, value) -> None:
+        """落地「总电压来源」并立刻重绘底栏（估算链路不动，同 _set_soc_source）。"""
+        source = "read" if str(value) == "read" else "calc"
+        if source == self._volt_source:
+            return
+        self._volt_source = source
+        self._refresh_soc_now()
 
     def _load_soc_source(self) -> str:
         """读设置里的「SOC 数据来源」，只会是 ``"calc"`` / ``"read"``。"""
@@ -8981,8 +9193,9 @@ class MainWindow(QMainWindow):
         previous_fps = ui_anim.frame_hz()
         self._settings_previous = (previous_glass, previous_material,
                                    previous_hidden, previous_font, previous_fps)
-        # 「SOC 数据来源」的预览起点（取消时要还回这个值）
+        # 「SOC 数据来源」「总电压来源」的预览起点（取消时要还回这两个值）
         self._settings_soc_source_prev = self._soc_source
+        self._settings_volt_source_prev = self._volt_source
         dialog = SettingsDialog(self._theme_mode, previous_glass,
                                 BUTTON_SPECS, sorted(self._hidden_buttons),
                                 on_glass=self._apply_glass,
@@ -9515,8 +9728,10 @@ class MainWindow(QMainWindow):
             self._apply_button_visibility()
             self._apply_rx_font_size(previous_font)
             ui_anim.set_frame_hz(previous_fps)
-            # 「SOC 数据来源」也是预览项：换回来并重绘底栏（估算状态不动）
+            # 「SOC 数据来源」「总电压来源」也是预览项：换回来并重绘底栏
+            # （估算状态不动）。⛔ 两者独立字段，别塞进 _settings_previous 元组。
             self._set_soc_source(self._settings_soc_source_prev)
+            self._set_volt_source(self._settings_volt_source_prev)
             return
         theme_mode, glass = self._settings_values
         # 「定制功能」由注册表统一管理：面板按 specs() 生成控件，这里统一落盘。
@@ -9586,7 +9801,16 @@ class MainWindow(QMainWindow):
             # 只换「读哪个数」：估算 / 积分 / 零漂一行没动（见 _refresh_soc_now）
             self._set_soc_source(customization.get("soc_source"))
             app_log.info("SOC 数据来源已切换为 " +
-                         ("车端上报" if self._soc_source == "read" else "本地估算"))
+                         ("BMS 上报" if self._soc_source == "read" else "本地估算"))
+        if "volt_source" in custom_changes:
+            self._set_volt_source(customization.get("volt_source"))
+            app_log.info("总电压来源已切换为 " +
+                         ("BMS 上报" if self._volt_source == "read" else "本地估算"))
+        if "keep_awake_on_rx" in custom_changes:
+            # 防息屏开关：立即 configure（当前是否在收由 WakeLock 自己记得）
+            self._wake_lock.configure(bool(customization.get("keep_awake_on_rx")))
+            app_log.info("读串口保持唤醒已" +
+                         ("打开" if self._wake_lock.enabled else "关闭"))
         if any(k in custom_changes for k in ("module_count", "cells_per_module",
                                              "temps_per_module", "broken_wire_mv",
                                              "volt_rows", "temp_rows")):
@@ -9637,6 +9861,9 @@ class MainWindow(QMainWindow):
         elif key == "soc_source":
             # 下拉框选中即预览：底栏那组读数当场换成另一种来源（不落盘）
             self._set_soc_source(value)
+        elif key == "volt_source":
+            # 总电压来源同样实时预览（不落盘）
+            self._set_volt_source(value)
         elif key == "vehicle":
             self._refresh_vehicle_badge()
             import rx_history
@@ -10208,6 +10435,8 @@ class MainWindow(QMainWindow):
         # 插件可能开着 BLE 线程，必须在真正关窗这一拍停掉（幂等）。
         self._shutdown_dlc()
         self._save_settings()
+        # 防息屏：退出强制恢复系统默认电源策略（即使 receiving 仍为真）。
+        self._wake_lock.release()
         # 会话库收尾：把批量窗口里还没提交的帧（≤50 帧 / 500ms）落盘再退出。
         # 超时短一点：关窗是自己触发的，不能为了尾巴卡住退出。
         try:

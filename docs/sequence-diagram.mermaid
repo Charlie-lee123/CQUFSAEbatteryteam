@@ -1,0 +1,96 @@
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant SW as SerialWorker
+    participant W as MainWindow
+    participant FC as RoundCollector(soc_feed)
+    participant SE as SocEstimator(soc_est)
+    participant WC as WorkModeClassifier
+    participant WL as WakeLock
+    participant MS as MarkStore
+    participant QS as QSettings(customization)
+
+    %% ========== 启动：读三个新设置 ==========
+    rect rgb(235,240,248)
+    Note over W,QS: 启动 / 设置确定
+    W->>QS: get("soc_source") / get("volt_source") / get("keep_awake_on_rx")
+    QS-->>W: "calc"/"read" / "calc"/"read" / False
+    W->>WL: configure(enabled=keep_awake_on_rx)
+    WL->>WL: _sync()：enabled=True 且 receiving → acquire
+    end
+
+    %% ========== 打开串口（防息屏钩子） ==========
+    rect rgb(235,248,240)
+    U->>W: 拨「串口开关」→ _on_power_toggled(True)
+    W->>SW: _open_port() → worker.open()
+    SW-->>W: opened 信号 → _on_port_opened()
+    W->>WL: set_receiving(True)
+    WL->>WL: _sync()：enabled and receiving → SetThreadExecutionState(0x80000000|1|2)
+    end
+
+    %% ========== 收一帧：SOC + 电压 + 工况 ==========
+    rect rgb(248,245,235)
+    SW-->>W: received → _on_received → _flush_rx → _emit_block(raw)
+    W->>W: perf 整流 / 半截点拼接 / _feed_export（均拿原始文本）
+    W->>FC: _feed_soc(raw) → feed(raw)
+    FC->>FC: CVI_RE 命中 → 存 i_meas 与 v_read(原始 V= 文本)
+    FC->>FC: SOC_RE 命中 → 粘滞 last_soc_read
+    FC->>FC: END_RE → _finish → emit RoundData
+    FC-->>W: rounds[]
+    W->>W: _volt_read_last = last_v_read；_soc_read_last = last_soc_read
+    loop 每个 round
+        W->>SE: update(cells, temps, i_meas, ..., contactor_open, bms_ok)
+        SE->>SE: _effective_current()（⛔ P1 判序不动）
+        SE->>WC: classify(ts, mean_mv, i_eff, i_valid, contactor_open, bms_ok)
+        WC->>WC: open(force) → 死区符号 → idle；电压趋势已删；滞回 _hold_until
+        WC-->>SE: mode ("discharge"/"charge"/"idle"/"open")
+        SE-->>W: SocResult(mode, pack_v, ...)
+    end
+    W->>W: _apply_soc → _render_soc
+    alt _soc_source == "read"
+        W->>W: _soc_read_parts()：min 槽=BMS SOC x%（去车端）
+    else _soc_source == "calc"
+        W->>W: 保留 format_soc_parts 的 min/max
+    end
+    alt _volt_source == "read"
+        W->>W: 总压槽 = 原始 V= 文本（如实显示 0.00）
+    else _volt_source == "calc"
+        W->>W: 总压槽 = format_soc_parts 的 清洗均值×串数
+    end
+    W->>W: _set_soc_parts → _place_soc
+    end
+
+    %% ========== 标记当前轮 ==========
+    rect rgb(240,235,248)
+    U->>W: 点右侧栏「标记」按钮 / Ctrl+M
+    W->>W: span = _round_span(_viewed_block_number())
+    alt span is None（无时间戳）
+        W-->>U: toast「没有可标记的轮次」
+    else 有整轮
+        W->>W: stamp = 轮首块文本；summary = 轮首后首个非空行(截断)
+        W->>MS: add(start_block, stamp, summary) → RoundMark(key=stamp#seq)
+        W->>W: 重建标记列表 UI；_search_pinned=True
+    end
+    end
+
+    %% ========== 跳到标记（上/下一个） ==========
+    rect rgb(240,235,248)
+    U->>W: 点列表项 / Ctrl+PgDn / Ctrl+PgUp
+    W->>MS: by_key / nearest_key → RoundMark
+    W->>W: 校验 start_block 块文本 == stamp，否则全篇扫 stamp 重定位
+    alt stamp 找不到（被 setMaximumBlockCount 裁剪）
+        W-->>U: toast「该标记已被裁剪，无法跳转」（保留条目，不崩）
+    else 找到
+        W->>W: span=_round_span(round_start)；_visual_line_index 算滚动值
+        W->>W: scrollbar.setValue(...-ALERT_TOP_LINES)；_search_pinned=True
+        W->>W: cursor 选整轮 → _make_selection(淡色) → _apply_extra_selections
+    end
+    end
+
+    %% ========== 关闭串口 / 退出：恢复电源策略 ==========
+    rect rgb(248,240,235)
+    U->>W: 关串口 _close_port() / 退出 closeEvent()
+    W->>WL: set_receiving(False) / release()
+    WL->>WL: _sync()：SetThreadExecutionState(0x80000000) 恢复系统默认
+    Note over WL: 异常退出 OS 自动释放线程执行状态；无定时器轮询
+    end

@@ -80,7 +80,7 @@ def _soc_pct(text: str) -> float | None:
 
     为什么必须挡：车端固件出过恒报 ``100.00%`` 的版本，也出现过 ``150.00`` 这类
     明显非法的行。把这种值当真会让「读取到的」那枚读数长期骗人 —— 宁可返回
-    ``None``（上层显示 ``车端 SOC --``），也不显示一个明知不可能是真的数。
+    ``None``（上层显示 ``BMS SOC --``），也不显示一个明知不可能是真的数。
     """
     try:
         value = float(text)
@@ -95,7 +95,7 @@ def _soc_pct(text: str) -> float | None:
 class RoundData:
     """一轮完整的采样。字段名与 :meth:`soc_est.SocEstimator.update` 对齐。"""
 
-    __slots__ = ("cells", "bad", "temps", "i_meas", "soc_read",
+    __slots__ = ("cells", "bad", "temps", "i_meas", "soc_read", "v_read",
                  "contactor_open", "bms_ok", "complete", "n_samples")
 
     def __init__(self):
@@ -104,6 +104,7 @@ class RoundData:
         self.temps: list = []          # 温度（°C）
         self.i_meas = None             # 设备上报电流（A）
         self.soc_read: float | None = None   # 车端 BMS 上报的 SOC（%，无则 None）
+        self.v_read: str | None = None       # 报文 V= 行原文（含 "0.00" 写法，界面照实显示）
         self.contactor_open = None     # 接触器是否全断（True/False/None=没这行）
         self.bms_ok = True
         self.complete = False          # 是否收到了 CVMax 收尾行
@@ -148,6 +149,10 @@ class RoundCollector:
         # 车端上报 SOC 的**粘滞状态**（见下面 last_soc_read 的说明）
         self.last_soc_read: float | None = None
         self.last_soc_adj: float | None = None   # SOCAdjusted，仅记录，不上界面
+        # 报文 V= 行原文的**粘滞状态**：与 SOC= 同样做一份兜底（分包可能把它切到
+        # 下一块）。存原文字符串 —— 电压来源=read 时界面照实显示（含 "0.00"），
+        # ⛔ 不转 float、不回退到清洗均值。
+        self.last_v_read: str | None = None
 
     # -- 对外 ---------------------------------------------------------
 
@@ -162,6 +167,7 @@ class RoundCollector:
         self._open_misses = 0
         self.last_soc_read = None
         self.last_soc_adj = None
+        self.last_v_read = None
 
     def feed(self, text: str) -> list[RoundData]:
         """喂一个文本块，返回这个块里**收尾完成**的整轮列表。"""
@@ -261,9 +267,13 @@ class RoundCollector:
         cvi = CVI_RE.search(line)
         if cvi:
             try:
-                # 设备上报总压（group 1）传感器已坏、无人消费，但保留解析作
-                # 格式校验：坏行仍走 ValueError 分支，不污染 i_meas。
+                # 设备上报总压（group 1）：本机该传感器恒报 0.00，但用户要求
+                # 「读取到的电压」照实显示原文 —— 存**原始字符串**，⛔ 不转 float
+                # 也不回退到清洗均值（float() 仅作格式校验，坏行不污染 i_meas）。
                 float(cvi.group(1))
+                v_text = cvi.group(1).strip()
+                self._round.v_read = v_text
+                self.last_v_read = v_text        # 粘滞：与 SOC= 同口径，分包兜底
                 self._round.i_meas = float(cvi.group(2))
             except ValueError:
                 pass

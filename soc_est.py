@@ -206,16 +206,19 @@ CELL_IMBALANCE_TOL_MV = 30.0
 # 轨值，闭合轮数 0。只靠电流符号的话，高亮逻辑在真机上一次都不会生效。
 # 所以改成多信号分层：接触器状态（物理硬约束） > 有效电流符号 > 电压趋势。
 
-#: 电压趋势窗口（s）与窗口内最小变化量（mV）。
-#: 静置实测 120 s 窗口极差 ≤1.25 mV → 3 mV 约 2.4 倍噪声；
-#: 1C 放电 60 s 约 1.67% SOC，平台段折合 7~17 mV，能检出。
-MODE_V_WINDOW_S = 60.0
-MODE_V_DELTA_MV = 3.0
 #: 判定为放电/充电后的最短保持时间（s），避免阈值附近来回跳
 MODE_HOLD_S = 30.0
-#: 电流达到这个绝对值才认为"显著"（与下面的 REST_I_MAX_A=1.2 同口径；
-#: ⛔ 这里写死而不是引用它 —— 那个常量定义在后面的融合常量区）
+#: 电流死区（A）：|i_eff| 超过它才按符号判放/充，否则静置。
+#: ⛔ 独立常量，不复用 REST_I_MAX_A（那个是静置锚定的电流上限，语义不同：
+#:    改一个不应牵动另一个）。MODE_I_MIN_A 保留供外部探针引用，但 classify
+#:    已改用本常量（v2.11 需求 2：电流符号为主 + 死区，删电压趋势兜底）。
+#: 旧版"电流显著阈值"，外部探针仍 import 这个名字 —— v2.11 起 ``classify`` 不再
+#: 直接读它（改读下面的死区常量），但保留本名不影响外部引用；让死区常量从它派生，
+#: 既保持两个名字的既有取值一致，也不会被 vulture 误报成死代码。
 MODE_I_MIN_A = 1.2
+#: ⛔ 不复用 REST_I_MAX_A（静置锚定上限，语义不同）。这里从 MODE_I_MIN_A 派生
+#: 是为了兼容旧探针的引用；两者值是同一口径，改一个即同时生效。
+MODE_I_DEADBAND_A = MODE_I_MIN_A
 
 MODE_LABELS = {
     "discharge": "放电",
@@ -229,45 +232,23 @@ MODE_LABELS = {
 class WorkModeClassifier:
     """判断电池箱此刻是放电 / 充电 / 静置 / 未接负载 / 未知。
 
-    ⛔ 优先级不是随便排的：
-      1. ``contactor_open is True`` 是**物理硬约束**（母线断开不可能有功率流），
-         比任何电流读数都可靠，也能天然挡住「满放后静置回弹」被误判成充电；
-      2. 电流有效且显著时按符号，响应最快；
-      3. 电流缺字段 / 轨值 / 太小时，用**单体平均电压的长窗口趋势**兜底
-         （这路完全不依赖电流传感器）；
-      4. 其余按静置处理，并带 ``MODE_HOLD_S`` 滞回。
+    ⛔ 判序（v2.11 需求 2，电流符号为主 + 死区，电压趋势兜底已删）：
+      1. ``mean_mv <= 0`` → unknown（无有效电压数据，无法估算）；
+      2. ``contactor_open is True`` → open，**force** 硬约束（母线断开不可能有功率流，
+         比任何电流读数都可靠，且不受滞回影响 —— 这是物理事实）；
+      3. ``i_valid`` 且 ``|i_eff| > MODE_I_DEADBAND_A`` → 正=放电 / 负=充电；
+      4. 其余（死区内 / i_valid=False / 缺 I= / BMS 报错但母线未断）→ idle。
+    ``bms_ok=False`` 不再否决（旧版 unknown 分支已删），电压趋势分支整体删除。
+    返回放/充时带 ``MODE_HOLD_S`` 滞回，避免阈值附近来回跳。
     """
 
     def __init__(self):
         self.mode = "unknown"
-        self._hist: list[tuple[float, float]] = []
         self._hold_until = 0.0
 
     def reset(self) -> None:
         self.mode = "unknown"
-        self._hist.clear()
         self._hold_until = 0.0
-
-    def _trend(self, ts, mean_mv: float) -> str:
-        """返回 ``"down"`` / ``"up"`` / ``"flat"``。"""
-        if ts is None or not math.isfinite(float(ts)):
-            return "flat"
-        now = float(ts)
-        self._hist.append((now, float(mean_mv)))
-        cut = now - MODE_V_WINDOW_S
-        while self._hist and self._hist[0][0] < cut:
-            self._hist.pop(0)
-        if len(self._hist) < 2:
-            return "flat"
-        span = self._hist[-1][0] - self._hist[0][0]
-        if span < MODE_V_WINDOW_S * 0.5:
-            return "flat"                  # 窗口还不够长，不急判
-        delta = self._hist[-1][1] - self._hist[0][1]
-        if delta <= -MODE_V_DELTA_MV:
-            return "down"
-        if delta >= MODE_V_DELTA_MV:
-            return "up"
-        return "flat"
 
     def _set(self, new: str, ts, force: bool = False) -> str:
         if not force and new != self.mode:
@@ -285,23 +266,20 @@ class WorkModeClassifier:
 
     def classify(self, ts, mean_mv: float, i_eff: float, i_valid: bool,
                  contactor_open, bms_ok: bool) -> str:
-        """喂一轮，返回工况字符串。"""
+        """喂一轮，返回工况字符串（签名不变，调用点零改）。
+
+        判序见类 docstring。⛔ ``_effective_current`` 的 P1 判序不在这里，
+        本函数只消费它算好的 ``i_eff`` / ``i_valid``。
+        """
         if mean_mv <= 0:
             return self._set("unknown", ts, force=True)
-        # ⚠️ 接触器放在 BMS 检查**之前**：真机 98 轮报文里既有 `BMS Error`
-        #    又全是 AIR+/AIR-/PRE 全 0。BMS 报错不代表母线没断开，而"母线
-        #    已断"是硬件级事实，对用户判断"有没有接负载"更有用。
+        # ⚠️ 接触器最高优先级（force，不受滞回）：母线断开是硬件级事实，
+        #    真机 98 轮报文里既有 BMS Error 又全是 AIR+/AIR-/PRE 全 0。
         if contactor_open is True:
             return self._set("open", ts, force=True)
-        if not bms_ok:
-            return self._set("unknown", ts, force=True)
-        if i_valid and abs(i_eff) > MODE_I_MIN_A:
+        # bms_ok 不再否决；电流符号为主，死区内 / 电流无效 → idle。
+        if i_valid and abs(i_eff) > MODE_I_DEADBAND_A:
             return self._set("discharge" if i_eff > 0 else "charge", ts)
-        trend = self._trend(ts, mean_mv)
-        if trend == "down":
-            return self._set("discharge", ts)
-        if trend == "up":
-            return self._set("charge", ts)
         return self._set("idle", ts)
 
 

@@ -118,7 +118,10 @@ def run_checks(mods) -> bool:
     if wm:
         chk("classify 接收 contactor_open / bms_ok 参数",
             {"contactor_open", "bms_ok"} <= set(wm.co_varnames))
-        chk("classify 引用 _trend 兜底", "_trend" in set(wm.co_names))
+        chk("classify 已删电压趋势兜底（不引用 _trend）",
+            "_trend" not in set(wm.co_names))
+        chk("classify 引用死区常量 MODE_I_DEADBAND_A",
+            "MODE_I_DEADBAND_A" in set(wm.co_names))
         # 「接触器排在 BMS 之前」要看**真实分支顺序**，不能看参数顺序（参数顺序
         # 只反映签名）。这里扫字节码里两个名字首次被读取的先后。
         first = {}

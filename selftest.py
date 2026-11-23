@@ -3494,7 +3494,7 @@ def check_customization(app: QApplication) -> None:
                          __import__("customization").specs()
                          if spec["key"] == "soc_source"
                          for lab, _v in spec["options"]]
-            assert _soc_opts == ["本地估算", "车端 BMS"], f"SOC 来源文案：{_soc_opts}"
+            assert _soc_opts == ["本地估算", "BMS 上报"], f"SOC 来源文案：{_soc_opts}"
 
             # 6a-1c) 弹层高度必须封顶到 _POPUP_MAX_ROWS 行（用户 2026-11-21：
             #     「这个太长太宽了」—— 30 档撑到 864px、跑出屏幕下缘）。
@@ -7044,7 +7044,81 @@ def check_rows_hint(app: QApplication) -> None:
             len(_counts_a) + len(_counts_b))
 
 
+def check_v211_features() -> None:
+    """v2.11 四项增量：电压来源 / 工况死区 / 防息屏 / 整轮标记（纯逻辑，不碰真 OS）。"""
+    import customization
+    import soc_est
+    import soc_feed
+    import wake_lock
+    import marks_model
+
+    # --- 需求 1：两组来源文案统一、无「车端」；volt_source 是独立新键 ---
+    def _opts(key: str) -> list[str]:
+        return [lab for spec in customization.specs() if spec["key"] == key
+                for lab, _v in spec["options"]]
+    assert _opts("soc_source") == ["本地估算", "BMS 上报"], _opts("soc_source")
+    assert _opts("volt_source") == ["本地估算", "BMS 上报"], _opts("volt_source")
+    _all_labels = " ".join(_opts("soc_source") + _opts("volt_source"))
+    assert "车端" not in _all_labels, _all_labels
+    assert customization.get("volt_source") in ("calc", "read")
+    assert customization.get("keep_awake_on_rx") in (True, False)
+
+    # --- RoundData.v_read 拿到报文 V= 原文（含 "0.00"，不转 float） ---
+    rc = soc_feed.RoundCollector(n_modules=1, cells_per_module=2)
+    rc.feed("Voltage1:\n 1.3700 2.3800\nV=0.00,I=-1.50\n"
+            "CVMax=3800, Min=0\n")
+    assert rc.last_v_read == "0.00", rc.last_v_read
+    rc.reset()
+    assert rc.last_v_read is None
+
+    # --- 需求 2：电流符号 + 死区，电压趋势已删，bms_ok 不再否决 ---
+    dead = soc_est.MODE_I_DEADBAND_A
+    assert not hasattr(soc_est, "MODE_V_WINDOW_S")
+    assert not hasattr(soc_est, "MODE_V_DELTA_MV")
+    assert not hasattr(soc_est.WorkModeClassifier, "_trend")
+    c = soc_est.WorkModeClassifier()
+    assert c.classify(0, 3800, dead, True, False, True) == "idle"
+    c = soc_est.WorkModeClassifier()
+    assert c.classify(0, 3800, dead + 0.1, True, False, True) == "discharge"
+    c = soc_est.WorkModeClassifier()
+    assert c.classify(0, 3800, -5, False, False, True) == "idle"       # i 无效
+    c = soc_est.WorkModeClassifier()
+    assert c.classify(0, 3800, -5, True, False, False) == "charge"     # bms 错但母线未断
+    c = soc_est.WorkModeClassifier()
+    assert c.classify(0, 3800, 99, True, True, True) == "open"          # 母线硬约束
+
+    # --- 需求 3：wake_lock 用 fake setter，绝不真改测试机电源策略 ---
+    calls: list[int] = []
+    wl = wake_lock.WakeLock(os_setter=calls.append)
+    wl.configure(True)
+    assert calls == []                                    # 只开开关未收数据 → 不 acquire
+    wl.set_receiving(True)
+    assert calls == [wake_lock.ACQUIRE_FLAGS]
+    wl.set_receiving(True)                                # 幂等
+    assert calls == [wake_lock.ACQUIRE_FLAGS]
+    wl.set_receiving(False)
+    assert calls == [wake_lock.ACQUIRE_FLAGS, wake_lock.RELEASE_FLAGS]
+    wl.set_receiving(True)
+    wl.release()                                          # 退出强制恢复
+    assert calls[-1] == wake_lock.RELEASE_FLAGS and wl.held is False
+    assert wake_lock.ACQUIRE_FLAGS == (wake_lock.ES_CONTINUOUS
+                                       | wake_lock.ES_DISPLAY_REQUIRED
+                                       | wake_lock.ES_SYSTEM_REQUIRED)
+
+    # --- 需求 4：MarkStore 纯内存 add/clear/nearest/by_key/next/prev ---
+    ms = marks_model.MarkStore()
+    a = ms.add(10, "[t1]", "Voltage1: 01.3700")
+    b = ms.add(20, "[t2]", "Voltage1: 02.3800")
+    assert a.seq == 1 and b.seq == 2 and a.key != b.key
+    assert ms.nearest_key(15) == a.key and ms.nearest_key(25) == b.key
+    assert ms.by_key(b.key) == b
+    assert ms.next().key == a.key and ms.prev().key == b.key  # 循环
+    ms.clear()
+    assert ms.marks == [] and ms.next() is None
+
+
 CHECKS = [
+    ("v2.11 四功能（电压来源/工况/防息屏/标记）", check_v211_features),
     ("HEX 编解码", check_hex_codec),
     ("增量文本解码", check_stream_decoder),
     ("串口枚举", check_port_enumeration),
@@ -7127,6 +7201,44 @@ def _mark_undo(settings: QSettings, keys) -> None:
     for key in keys:
         settings.setValue(_UNDO_PREFIX + key, settings.value(key))
     settings.sync()
+
+
+# 车辆库索引不在 QSettings 里：`select_vehicle("")` 改的是 vehicles/index.json
+# 的 current 字段，只靠 _mark_undo 的键快照盖不到它（2026-11-23 实测：QA 探针
+# 被 SIGTERM 中断后，用户车号 E74-2026 被清空、索引只剩 {"schema":1}）。
+_VEH_UNDO_KEY = _UNDO_PREFIX + "vehicles/index.json"
+
+
+def _veh_index_path() -> Path:
+    return Path(__file__).resolve().parent / "vehicles" / "index.json"
+
+
+def _mark_undo_vehicles(settings: QSettings) -> None:
+    """写前日志：把车辆库索引原文旁路保存（车号.current 就在里面）。"""
+    try:
+        text = _veh_index_path().read_text(encoding="utf-8")
+    except OSError:
+        text = None
+    settings.setValue(_VEH_UNDO_KEY, text)
+    settings.sync()
+
+
+def _apply_undo_vehicles(settings: QSettings) -> None:
+    """上次自测被中断 → 把车辆库索引原文写回，然后清掉这条旁路键。"""
+    if _VEH_UNDO_KEY not in settings.allKeys():
+        return
+    text = settings.value(_VEH_UNDO_KEY)
+    settings.remove(_VEH_UNDO_KEY)
+    settings.sync()
+    if text is None:
+        return
+    path = _veh_index_path()
+    try:
+        if path.read_text(encoding="utf-8") != text:
+            path.write_text(str(text), encoding="utf-8")
+            print("  ⚠ 上次自测被中断，已还原车辆库索引 vehicles/index.json")
+    except OSError:
+        pass
 
 
 def _apply_undo_markers(settings: QSettings) -> None:
@@ -7229,6 +7341,7 @@ def main() -> int:
     global_settings = QSettings("MimoWorks", "SerialAssistant")
     _heal_polluted_keys(global_settings)
     _heal_hidden_buttons(global_settings)
+    _apply_undo_vehicles(global_settings)
     _apply_undo_markers(global_settings)
     global_snapshot = {k: global_settings.value(k) for k in global_settings.allKeys()}
     # 写前日志：下面这一段会把若干键钉成测试值，先把用户原值记到旁路键，
@@ -7236,7 +7349,8 @@ def main() -> int:
     _mark_undo(global_settings, (
         "custom/module_count", "custom/cells_per_module", "custom/temps_per_module",
         "custom/volt_rows", "custom/temp_rows", "custom/pad_zero",
-        "rx_blocks", "custom/highlight_errors"))
+        "rx_blocks", "custom/highlight_errors", "custom/vehicle"))
+    _mark_undo_vehicles(global_settings)
     # 自测全程用**默认网格排版**（module_count / cells_per_module / temps_per_module
     # 全 0）：收发/时间戳/定位这几条用例都假设"一段数据在一行里"。若机器上残留了
     # 非零网格配置（例如 module_count=5），电压/温度点会被拆成每行一个 → "整行"

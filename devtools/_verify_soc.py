@@ -629,6 +629,17 @@ def test_ui() -> None:
     qsettings = QSettings("MimoWorks", "SerialAssistant")
     snap = {key: qsettings.value(key) for key in qsettings.allKeys()}
 
+    # ⛔⛔ 必须隔离 SOC 数据来源：E 系列测的是**估算链路**的 min/max/总压，
+    #   只有 calc 来源才显示 "SOC min xx% / max xx%"。用户真实 QSettings 里
+    #   曾残留 custom/soc_source=read（历史遗留值），read 模式下底栏显示
+    #   "BMS SOC xx%" 是**正确行为**，导致 E2/E6/E8/E10/E15/E16/E17/E23
+    #   八条写死 "SOC min/max" 文案的用例稳定假红（2026-11-23 真实事故：
+    #   被误判成产品 bug，实际是探针没隔离开关）。
+    #   ⚠️ 这里**临时**设成 calc，finally 的 snap 还原会把原值（含 read、
+    #   含"原本不存在"→ remove）一字不差写回 —— 不动用户持久化的值。
+    qsettings.setValue("custom/soc_source", "calc")
+    qsettings.sync()
+
     rx_history._resolve_dir = lambda: __import__("pathlib").Path(tmp)
     # ⛔ 只读打补丁：不调 select_vehicle（那会写用户配置）
     customization.current_vehicle = lambda: "E74-2026"
@@ -855,7 +866,9 @@ def test_ui() -> None:
         customization.current_vehicle = real_pin
         if real_db is not None:
             rx_store.set_db_path(real_db)
-        # 还原 QSettings：删掉探针新增的键，其余按快照写回（geometry 尤其关键）
+        # 还原 QSettings：删掉探针新增的键，其余按快照写回（geometry 尤其关键）。
+        # ⚠️ 上面临时设的 custom/soc_source 也在这里原样还原：原本是 read → 写回
+        #    read；原本不存在（None）→ 因不在 snap 里而被 remove（不会留下空串）。
         for key in list(qsettings.allKeys()):
             if key not in snap:
                 qsettings.remove(key)
@@ -1132,10 +1145,11 @@ def test_color() -> None:
 
 
 def test_mode() -> None:
-    """工况判别：多信号分层 + 电压趋势兜底 + 滞回（2026-11-11 新增）。
+    """工况判别：电流符号为主 + 死区 + 母线硬约束 + 滞回（v2.11 需求 2）。
 
-    真机 98 轮报文里接触器**全部全断**、`I=` 全是 -250 A 轨值，所以
-    「没接负载」和「电流传感器不可信」才是常态，这里必须逐条锁住。
+    2026-11 起电压趋势兜底（`_hist`/`_trend`/`MODE_V_*`）与 `bms_ok=False→unknown`
+    否决分支已删：`i_valid=False` / 死区内一律 idle，`bms_ok=False` 但母线未断
+    仍按电流符号判。接触器全断仍是 force 硬约束且不受滞回影响。
     """
     import soc_est as S
 
@@ -1159,25 +1173,38 @@ def test_mode() -> None:
     c = new()
     m = c.classify(ts=0.0, mean_mv=3200.0, i_eff=-12.0, i_valid=True,
                    contactor_open=False, bms_ok=False)
-    check("M4 BMS ERROR 且母线状态未知 → 未知", m == "unknown", m)
+    check("M4 BMS ERROR 但母线未断 → 仍按电流符号判充电", m == "charge", m)
     c = new()
     m = c.classify(ts=0.0, mean_mv=3200.0, i_eff=-12.0, i_valid=True,
                    contactor_open=True, bms_ok=False)
     check("M4b BMS ERROR 但母线全断仍判未接负载", m == "open", m)
 
-    # 电流无效（轨值 / 缺字段）时靠电压长窗口趋势
+    # 电流无效（轨值 / 缺字段）→ idle；电压趋势兜底已删，不再跟着电压升降走
     c = new()
     for k in range(8):
         m = c.classify(ts=k * 10.0, mean_mv=3300.0 - k * 2.0,
                        i_eff=0.0, i_valid=False,
                        contactor_open=False, bms_ok=True)
-    check("M5 电流无效 + 电压持续下降判放电", m == "discharge", m)
+    check("M5 电流无效 + 电压持续下降仍判静置", m == "idle", m)
     c = new()
     for k in range(8):
         m = c.classify(ts=k * 10.0, mean_mv=3300.0 + k * 2.0,
                        i_eff=0.0, i_valid=False,
                        contactor_open=False, bms_ok=True)
-    check("M6 电流无效 + 电压持续上升判充电", m == "charge", m)
+    check("M6 电流无效 + 电压持续上升仍判静置", m == "idle", m)
+
+    # 死区边界：|I| == 死区 → 静置；略大 → 按符号
+    dead = S.MODE_I_DEADBAND_A
+    c = new()
+    check("M6a 死区边界 |I|=死区 → idle",
+          c.classify(ts=0, mean_mv=3200, i_eff=dead, i_valid=True,
+                     contactor_open=False, bms_ok=True) == "idle",
+          str(c.mode))
+    c = new()
+    check("M6b 略超死区 → 按符号放电",
+          c.classify(ts=0, mean_mv=3200, i_eff=dead + 0.1, i_valid=True,
+                     contactor_open=False, bms_ok=True) == "discharge",
+          str(c.mode))
 
     # 满放后静置回弹 348 mV 也不能被误判成充电（母线断开了）
     c = new()
@@ -1207,8 +1234,12 @@ def test_mode() -> None:
     c.classify(ts=0.0, mean_mv=3200.0, i_eff=12.0, i_valid=True,
                contactor_open=False, bms_ok=True)
     c.reset()
-    check("M11 reset 清空趋势与滞回", c.mode == "unknown" and not c._hist,
-          f"mode={c.mode} hist={len(c._hist)}")
+    check("M11 reset 清空工况与滞回（无 _hist 可查）",
+          c.mode == "unknown" and c._hold_until == 0.0 and not hasattr(c, "_hist"),
+          f"mode={c.mode} hold={c._hold_until}")
+    check("M11b 电压趋势设施已彻底删除",
+          not hasattr(S, "MODE_V_WINDOW_S") and not hasattr(S, "MODE_V_DELTA_MV")
+          and not hasattr(S.WorkModeClassifier, "_trend"))
 
     check("M12 工况文案齐全",
           set(S.MODE_LABELS) == {"discharge", "charge", "idle", "open", "unknown"},
