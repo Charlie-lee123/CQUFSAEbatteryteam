@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
 import re
 import sys
@@ -7568,6 +7569,25 @@ class MainWindow(QMainWindow):
     #    _apply_extra_selections / _visual_line_index / stamp_span，不另起高亮机制。
     #    标记只活内存（MarkStore），不写 QSettings / 不写盘。
 
+    def _round_content_sig(self, span) -> str:
+        """一轮 ``[span0, span1)`` 的内容签名：各块文本用 ``\\n`` 拼起来 → blake2b 8 字节。
+
+        这是**主锚点**：整轮内容在块号/序号漂移前后都不变（内容不因裁剪/前插而改），
+        所以签名相同 ⇒ 就是同一轮。用它定位对「裁剪位移恰好等于一整轮行数」「顶部
+        前插」这类会让 start_block / 正序对不上的漂移天然免疫。
+
+        ⚠️ 必须 ``.strip("\\n")`` 去掉首尾空行：**末轮**的 ``_round_span`` 右端是
+        **文档末尾**，下一轮到达时 ``gap_lines`` 会在新时间戳前插一行空行，这行空行
+        会落进末轮 span 范围 → 打标时签名含尾空行、之后又不含，blake2b 全变 →
+        跳回落到相邻轮、再去重也失效（用户打标基本都在最新一轮，是主路径缺陷）。
+        非末轮两端被时间戳卡住本来稳定，strip 对它无影响。
+        """
+        doc = self.txt_rx.document()
+        joined = "\n".join(doc.findBlockByNumber(b).text()
+                           for b in range(span[0], span[1])).strip("\n")
+        return hashlib.blake2b(joined.encode("utf-8", "replace"),
+                               digest_size=8).hexdigest()
+
     def _mark_current(self) -> None:
         """给「当前正在看的一轮」打标（按钮 / Alt+M）。实时与回放态共用同一套。"""
         span = self._round_span(self._viewed_block_number())
@@ -7576,13 +7596,29 @@ class MainWindow(QMainWindow):
             return
         doc = self.txt_rx.document()
         stamp = doc.findBlockByNumber(span[0]).text()
+        # 主锚点：整轮内容签名（精确、免疫两个漂移方向）。
+        content_sig = self._round_content_sig(span)
+        # 兜底锚点（反向组内序号）：这一轮之后还有几条同 stamp 块（0=最后一处）。
+        # 仅当文档被换成"只加载一页的回放"、该轮内容已不在时作退化定位用。
+        stamp_rev = sum(1 for b in range(span[0] + 1, doc.blockCount())
+                        if doc.findBlockByNumber(b).text() == stamp)
         summary = ""
         for b in range(span[0] + 1, span[1]):
             text = doc.findBlockByNumber(b).text().strip()
             if text:
                 summary = text[:24]
                 break
-        self._marks.add(span[0], stamp, summary)
+        _mark, created = self._marks.add_unique(
+            span[0], stamp, summary, stamp_rev, content_sig)
+        if not created:
+            # 同一轮已标过（连按 Alt+M）：不新增、不清已有高亮，只提示并选中已有条目
+            self._toast("这一轮已经标记过", 2000)
+            self._refresh_mark_list()
+            # 列表游标定位到已有那条（add_unique 已把 current 指到它的下标）
+            lst = getattr(self, "_mark_list", None)
+            if lst is not None and 0 <= self._marks.current < lst.count():
+                lst.setCurrentRow(self._marks.current)
+            return
         self._refresh_mark_list()
         self._search_pinned = True
 
@@ -7617,16 +7653,30 @@ class MainWindow(QMainWindow):
         if mark is None:
             return
         doc = self.txt_rx.document()
+        # ⛔ 不再有"直接信 start_block"的快速路径：块号漂移若恰等于一整轮行数，
+        #    start_block 新位置仍是同文本时间戳块 → 会误命中同秒相邻轮（QA 实测
+        #    got=R3 期望=R2，fast_path 根本没进 rev 分支）。定位改为内容签名主锚。
+        # start_block 仅作展示/调试用。
         round_start = None
-        block = doc.findBlockByNumber(mark.start_block)
-        if block.isValid() and block.text() == mark.stamp:
-            round_start = mark.start_block
-        else:
-            # setMaximumBlockCount 从头裁导致块号漂移：全文按 stamp 文本重定位
-            for b in range(doc.blockCount()):
-                if doc.findBlockByNumber(b).text() == mark.stamp:
-                    round_start = b
+        hits = [b for b in range(doc.blockCount())
+                if doc.findBlockByNumber(b).text() == mark.stamp]
+        # ① 主锚点：内容签名。对每个同 stamp 候选算整轮签名，与 mark.content_sig
+        #    完全相同即精确命中 —— 内容不随裁剪/前插而变，两个漂移方向都免疫。
+        #    有签名才走这条（老对象/无签名的 content_sig=="" 跳过，交给 rev 兜底）。
+        if mark.content_sig:
+            for cand in hits:
+                cand_span = self._round_span(cand)
+                if cand_span is None:
+                    continue
+                if self._round_content_sig(cand_span) == mark.content_sig:
+                    round_start = cand
                     break
+        # ② 兜底：文档被换成"只加载一页的回放"、该轮内容已不在 → 退回反向组内序号
+        #    （从尾部倒数）。rev >= len(hits) 会 clamp 到最早那条（数据没加载的退化）。
+        if round_start is None and hits:
+            idx = len(hits) - 1 - min(mark.stamp_rev, len(hits) - 1)
+            if self._round_span(hits[idx]) is not None:
+                round_start = hits[idx]
         if round_start is None:
             # 实时态是从头裁剪；回放只加载一页，更早的页可能还没加载 —— 两种情况
             # 都覆盖（找不到只提示，不误跳别的轮）。

@@ -7161,6 +7161,53 @@ def check_v211_features() -> None:
     live.clear()
     assert live.marks == [] and live.next() is None
 
+    # --- 同轮去重 + 三层锚点（stamp→content_sig 主锚→stamp_rev 兜底）---
+    ms = marks_model.MarkStore()
+    m0, created0 = ms.add_unique(10, "[t]", "a", 0, "SIG_A")
+    assert created0 and len(ms.marks) == 1
+    # ① 同 (stamp, content_sig) 重复 add_unique 不新增
+    m0b, created0b = ms.add_unique(10, "[t]", "a", 0, "SIG_A")
+    assert not created0b and m0b is m0 and len(ms.marks) == 1, \
+        "同一轮（同签名）重复打标应不新增"
+    assert ms.current == 0, "命中重复时游标应定位到已有那条"
+    # ② 同 stamp 不同签名 = 两条不同标记（同一秒两轮，内容不同）
+    m1, created1 = ms.add_unique(30, "[t]", "b", 1, "SIG_B")
+    assert created1 and len(ms.marks) == 2, "同 stamp 不同签名应是两条"
+    assert ms.find_round("[t]", "SIG_A") is m0 and ms.find_round("[t]", "SIG_B") is m1
+    assert ms.find_round("[t]", "SIG_C") is None
+    assert m0.content_sig == "SIG_A" and m1.content_sig == "SIG_B"
+    # ③ 签名缺失（老对象默认 ""）时不自崩，且 stamp_rev 兜底字段仍可读
+    ms2 = marks_model.MarkStore()
+    legacy = ms2.add(5, "[x]", "legacy")
+    assert legacy.content_sig == "" and legacy.stamp_rev == 0
+    lg2, created_lg = ms2.add_unique(5, "[x]", "legacy")   # 同 "" 签名 → 去重
+    assert not created_lg and lg2 is legacy and len(ms2.marks) == 1
+
+    # ④ 末轮签名：尾部追加空行后仍相等（末轮右端=文档末尾，新轮前插的空行会进范围）
+    #    纯函数级：真 QPlainTextEdit 上跑真实 _round_content_sig，取末轮 span 签名，
+    #    再在文档尾部补一个空行、重取末轮签名，两者必须一致（strip("\n") 生效）。
+    from PySide6.QtWidgets import QPlainTextEdit as _QPTE
+    from main_window import MainWindow as _MW
+    _pte = _QPTE()
+    _pte.setPlainText("[2026-11-24 12:00:00]\nVoltage1:\n 1.3800\nTOKEN_R1\nBMS OK")
+    # 用一个只暴露 txt_rx 的 shim 调真实方法（不构造整个主窗）
+    class _SigShim:                      # noqa: D401 - 测试用最小 shim
+        pass
+    _shim = _SigShim()
+    _shim.txt_rx = _pte
+    _sig_fn = _MW._round_content_sig.__get__(_shim, _SigShim)
+    _doc = _pte.document()
+    _span = (0, _doc.blockCount())
+    _sig_before = _sig_fn(_span)
+    # 尾部追加一个空行（模拟下一轮前插的 gap 空行落进末轮 span）
+    _cur = _pte.textCursor()
+    _cur.movePosition(_cur.MoveOperation.End)
+    _cur.insertText("\n")
+    _doc = _pte.document()
+    _sig_after = _sig_fn((0, _doc.blockCount()))
+    assert _sig_before == _sig_after, \
+        "末轮签名被尾部空行污染（strip(\"\\n\") 失效）"
+
 
 CHECKS = [
     ("v2.11 四功能（电压来源/工况/防息屏/标记）", check_v211_features),
