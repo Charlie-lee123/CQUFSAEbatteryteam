@@ -1483,37 +1483,41 @@ def check_history_replay(app: QApplication) -> None:
             f"近期回放的 _replay_kind 不对：{window._replay_kind!r}"
 
         # ---- 单套共享标记（新增：历史/近期数据也支持标记）----
-        # 进回放前先放 1 条（模拟"实时打标"），进回放后列表仍应是这同一条。
+        # 进回放前先放 1 条（模拟"实时打标"），进回放后仍是这同一条。
+        # ⚠️ 列表现在活在「查看标记」弹窗里（_mark_list 平时 None）——计数用
+        #    _marks.marks 这一份数据真值；要看列表项文字时临时开一下弹窗再关。
         window._marks.clear()
         window._marks.add(0, "[live-stamp]", "live")
         window._refresh_mark_list()
-        _before = [window._mark_list.item(i).text()
-                   for i in range(window._mark_list.count())]
-        assert len(_before) == 1 and _before[0].startswith("[live-stamp]"), \
-            f"进回放前列表应为实时那 1 条：{_before}"
-        assert window.btn_mark.isEnabled() and window._mark_list.isEnabled(), \
-            "回放态标记按钮/列表不该禁用"
-        # 回放文档里有时间戳轮，打标应落进同一套 → 列表变 2 条
+        assert len(window._marks.marks) == 1, "进回放前应有 1 条标记"
+        assert window.btn_mark.isEnabled(), "回放态打标按钮不该禁用"
+        # 回放文档里有时间戳轮，打标应落进同一套 → 数据变 2 条
         window._mark_current()
         app.processEvents()
         assert len(window._marks.marks) == 2, \
             f"回放打标后同一套应有 2 条，实际 {len(window._marks.marks)}"
-        assert window._mark_list.count() == 2, "回放打标后列表应同步为 2 条"
-        _items = [window._mark_list.item(i).text()
-                  for i in range(window._mark_list.count())]
-        assert not any(t.startswith(("近期 · ", "历史 · ")) for t in _items), \
-            f"单套共享不该有来源前缀：{_items}"
+        # 开弹窗核对列表项（无来源前缀 + 条数一致），核对完关掉
+        window._show_marks_dialog()
+        app.processEvents()
+        try:
+            assert window._mark_list is not None and window._mark_list.count() == 2, \
+                "弹窗列表应与数据同步为 2 条"
+            _items = [window._mark_list.item(i).text()
+                      for i in range(window._mark_list.count())]
+            assert not any(t.startswith(("近期 · ", "历史 · ")) for t in _items), \
+                f"单套共享不该有来源前缀：{_items}"
+        finally:
+            window._marks_dialog.accept()
+            app.processEvents()
         # 退回实时仍 2 条（进/出回放都不清）
         window._exit_replay()
         app.processEvents()
         assert len(window._marks.marks) == 2, \
             f"退回实时标记被清空了（应仍 2 条）：{len(window._marks.marks)}"
-        assert window._mark_list.count() == 2, "退回实时列表应仍 2 条"
         # 只有主动清空接收区才清零
         window._clear_receive()
         app.processEvents()
-        assert len(window._marks.marks) == 0 and window._mark_list.count() == 0, \
-            "主动清空接收区后标记应清零"
+        assert len(window._marks.marks) == 0, "主动清空接收区后标记应清零"
         # 恢复现场：回到近期回放继续原有断言
         window._open_history()
         app.processEvents()

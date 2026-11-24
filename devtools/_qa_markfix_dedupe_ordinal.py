@@ -41,9 +41,12 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 os.chdir(_ROOT)
 
-from PySide6.QtCore import QEvent, QSettings
+from PySide6.QtCore import QEvent, QPoint, QSettings, Qt
 from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import QApplication
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QDialog, QListWidget
+
+from ui_highlight import stamp_span
 
 _CHECK = Path(_ROOT) / "_check"
 _RESULTS: list[tuple[str, bool, str]] = []
@@ -106,9 +109,16 @@ def round_sig(win, start: int) -> str:
     return "" if span is None else win._round_content_sig(span)
 
 
+def all_stamp_blocks(win) -> list[int]:
+    """**所有**时间戳块的块号（不限定文本 —— 探针里会出现多个不同 stamp 的轮）。"""
+    d = doc_of(win)
+    return [b for b in range(d.blockCount())
+            if stamp_span(d.findBlockByNumber(b).text())]
+
+
 def stamp_block_with_token(win, token: str) -> int:
     """某个 token 所在那一轮的**时间戳块号**（块号会因裁剪/前插漂移，别写死）。"""
-    for b in stamp_blocks(win):
+    for b in all_stamp_blocks(win):
         if token in round_text(win, b):
             return b
     return -1
@@ -141,7 +151,33 @@ def hl_signature(win):
 
 
 def list_texts(win) -> list[str]:
-    return [win._mark_list.item(i).text() for i in range(win._mark_list.count())]
+    """列表项文字。⚠️ 列表现在活在「查看标记」弹窗里（平时 `_mark_list is None`）——
+    弹窗没开时退化成按 `_marks.marks` 真值拼（同 `_refresh_mark_list` 的口径）。"""
+    lst = getattr(win, "_mark_list", None)
+    if lst is None:
+        return [f"{m.stamp} {m.summary}".strip() for m in win._marks.marks]
+    return [lst.item(i).text() for i in range(lst.count())]
+
+
+def click_mark_item(win, app, idx: int) -> str:
+    """点弹窗列表第 idx 项：优先真实鼠标点击，点不到（不在视口内）退回 itemClicked。"""
+    dlg = getattr(win, "_marks_dialog", None)
+    if win._mark_list is None or dlg is None or not dlg.isVisible():
+        win._show_marks_dialog()           # 弹窗被 accept 过只是 hide，_mark_list 不再为 None
+        app.processEvents()
+    lst = win._mark_list
+    item = lst.item(idx)
+    lst.scrollToItem(item)
+    app.processEvents()
+    rect = lst.visualItemRect(item)
+    if lst.viewport().rect().contains(rect.center()):
+        QTest.mouseClick(lst.viewport(), Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier, rect.center())
+        app.processEvents()
+        return "mouse"
+    lst.itemClicked.emit(item)
+    app.processEvents()
+    return "signal"
 
 
 def revs(win) -> list[int]:
@@ -317,8 +353,9 @@ def main() -> int:                                     # noqa: C901 - 探针
         n_after2 = len(win._marks.marks)
         m1 = win._marks.marks[-1] if n_after2 > 1 else None
         check("1f 第 2 轮（同 stamp、内容不同）打标 → 共 2 条",
-              n_after2 == 2 and win._mark_list.count() == 2,
-              f"marks={n_after2} list={list_texts(win)}")
+              n_after2 == 2 and len(win._marks.marks) == 2,
+              f"marks={n_after2} list={list_texts(win)} "
+              f"btn_tip={win.btn_marks.toolTip()!r}")
         check("1g 第 2 条 rev=0、start_block 指向第 2 处、签名与第 1 条不同",
               m1 is not None and m1.stamp_rev == 0 and m1.start_block == st[1]
               and m1.content_sig and m1.content_sig != m0.content_sig,
@@ -370,13 +407,14 @@ def main() -> int:                                     # noqa: C901 - 探针
         toasts.clear()
         win._mark_current()                            # 同一轮再按一次（Alt+M 等价）
         app.processEvents()
-        check("2a 同一轮再按一次 → 列表仍 1 条、不新增",
-              len(win._marks.marks) == n_before == 1 and win._mark_list.count() == 1,
+        check("2a 同一轮再按一次 → 仍 1 条、不新增",
+              len(win._marks.marks) == n_before == 1,
               f"marks={len(win._marks.marks)} list={list_texts(win)}")
         check("2b 弹出「这一轮已经标记过」", any("已经标记过" in t for t in toasts),
               str(toasts))
-        check("2c 列表当前行指向已有那条（index=0）",
-              win._mark_list.currentRow() == 0, f"currentRow={win._mark_list.currentRow()}")
+        check("2c 弹窗未开时 _mark_list 为 None，且「查看标记」tooltip 同步条数",
+              win._mark_list is None and "1 条" in win.btn_marks.toolTip(),
+              f"_mark_list={win._mark_list} tooltip={win.btn_marks.toolTip()!r}")
         check("2d 已有整轮高亮没有被清掉",
               hl_signature(win) is not None and hl_signature(win) == sig_before,
               f"{sig_before} -> {hl_signature(win)}")
@@ -681,15 +719,17 @@ def main() -> int:                                     # noqa: C901 - 探针
         # 关注：标记那轮的签名是否仍然算得出来（末轮的 span 右端 = 文档末尾），
         #      以及一旦签名失配，rev=0 的兜底会落到"新的最后一处"= 跳错一轮。
         win._clear_receive()
-        feed_round(win, "TOKEN_R1", base=1, filler=6)
+        feed_round(win, "TOKEN_R1", base=1, filler=30)     # 轮要够高才能把视口中点放进去
         app.processEvents()
-        center_on_block(win, app, stamp_block_with_token(win, "TOKEN_R1"))
+        _c6a, _ = center_on_block(win, app, stamp_block_with_token(win, "TOKEN_R1"))
         win._mark_current()
         app.processEvents()
+        check("6a-0 视口中点已落在被标的末轮（前提）", _c6a,
+              f"viewed={win._viewed_block_number()} marks={len(win._marks.marks)}")
         mark_10 = win._marks.marks[-1]
         sig_at_mark = mark_10.content_sig
         text_at_mark = round_text(win, stamp_block_with_token(win, "TOKEN_R1"))
-        feed_round(win, "TOKEN_R2", base=4, filler=6)      # 同 stamp 的下一轮到达
+        feed_round(win, "TOKEN_R2", base=4, filler=30)     # 同 stamp 的下一轮到达
         app.processEvents()
         hits10 = stamp_blocks(win)
         sig_now = round_sig(win, stamp_block_with_token(win, "TOKEN_R1"))
@@ -727,7 +767,7 @@ def main() -> int:                                     # noqa: C901 - 探针
         # 只差"中间来了一轮"，没有同秒重复戳。判重键是 (stamp, content_sig)，
         # 若末轮的签名随"下一轮到达"而变，去重就会失效、出重复条目。
         win._clear_receive()
-        feed_round(win, "TOKEN_R1", base=1, filler=6)
+        feed_round(win, "TOKEN_R1", base=1, filler=30)
         app.processEvents()
         r1b = stamp_block_with_token(win, "TOKEN_R1")
         center_on_block(win, app, r1b)
@@ -737,30 +777,30 @@ def main() -> int:                                     # noqa: C901 - 探针
         check("6c-0 末轮打一次 → 1 条（前提）",
               len(win._marks.marks) == 1 and bool(mark_12.content_sig),
               f"n={len(win._marks.marks)} sig={mark_12.content_sig}")
-        feed_round(win, "TOKEN_R2", base=4, filler=6,
+        feed_round(win, "TOKEN_R2", base=4, filler=30,
                    stamp_line="[2026-11-24 12:00:05]")     # 下一秒的下一轮（stamp 不同）
         app.processEvents()
-        center_on_block(win, app, stamp_block_with_token(win, "TOKEN_R1"))
+        _c6c, _ = center_on_block(win, app, stamp_block_with_token(win, "TOKEN_R1"))
         toasts.clear()
         win._mark_current()                                # 对**同一轮**再打一次
         app.processEvents()
         check("6c-1 中间来了一轮后再对同一轮打标 → 不应新增重复条目",
-              len(win._marks.marks) == 1
+              _c6c and len(win._marks.marks) == 1
               and any("已经标记过" in t for t in toasts),
-              f"marks={len(win._marks.marks)} sig={sigs(win)} list={list_texts(win)} "
-              f"toasts={toasts}")
+              f"centered={_c6c} marks={len(win._marks.marks)} sig={sigs(win)} "
+              f"list={list_texts(win)} toasts={toasts}")
 
         # ============ 7a 本 QA 自设：标末轮 → **连续来 3 轮（其中 2 轮同秒）** → 跳回 ============
         win._clear_receive()
-        feed_round(win, "TOKEN_R1", base=1, filler=6)              # 此刻的末轮 → 打标
+        feed_round(win, "TOKEN_R1", base=1, filler=30)             # 此刻的末轮 → 打标
         app.processEvents()
         center_on_block(win, app, stamp_block_with_token(win, "TOKEN_R1"))
         win._mark_current()
         app.processEvents()
         mark_13 = win._marks.marks[-1]
-        feed_round(win, "TOKEN_R2", base=4, filler=6)              # 同 stamp（同秒）
-        feed_round(win, "TOKEN_R3", base=7, filler=6)              # 同 stamp（同秒）
-        feed_round(win, "TOKEN_R4", base=10, filler=6,
+        feed_round(win, "TOKEN_R2", base=4, filler=30)             # 同 stamp（同秒）
+        feed_round(win, "TOKEN_R3", base=7, filler=30)             # 同 stamp（同秒）
+        feed_round(win, "TOKEN_R4", base=10, filler=30,
                    stamp_line="[2026-11-24 12:00:05]")            # 另一秒
         app.processEvents()
         hits13 = stamp_blocks(win)
@@ -773,28 +813,29 @@ def main() -> int:                                     # noqa: C901 - 探针
         g13 = hl_probe(win)
         check("7a-1 标末轮后连续来 3 轮（2 轮同秒）→ 跳回仍落 TOKEN_R1",
               g13["token"] == "TOKEN_R1", f"got={g13['token'] or g13}")
-        center_on_block(win, app, stamp_block_with_token(win, "TOKEN_R1"))
+        _c7a, _ = center_on_block(win, app, stamp_block_with_token(win, "TOKEN_R1"))
         n13 = len(win._marks.marks)
         toasts.clear()
         win._mark_current()
         app.processEvents()
         check("7a-2 此时对同一轮再打标 → 不新增（判重键未被后续轮冲掉）",
-              len(win._marks.marks) == n13,
-              f"{n13} -> {len(win._marks.marks)} sig={sigs(win)} toasts={toasts}")
+              _c7a and len(win._marks.marks) == n13,
+              f"centered={_c7a} {n13} -> {len(win._marks.marks)} "
+              f"sig={sigs(win)} toasts={toasts}")
 
         # ============ 7b 本 QA 自设：标末轮 → 又来一轮（同秒）→ **头裁** → 跳回 ============
         # R0/R1/R2 同 stamp；标 R1（当时末轮，rev=0）→ R2 到达（rev=0 就过期了）
         # → 头裁掉 R0 → 此时 hits=[R1,R2]：rev=0 会指到 R2，只有签名能指回 R1。
         win._clear_receive()
         prepend_lines(win, app, 12)
-        feed_round(win, "TOKEN_R0", base=1, filler=8)
-        feed_round(win, "TOKEN_R1", base=4, filler=8)              # 此刻的末轮 → 打标
+        feed_round(win, "TOKEN_R0", base=1, filler=30)
+        feed_round(win, "TOKEN_R1", base=4, filler=30)             # 此刻的末轮 → 打标
         app.processEvents()
         center_on_block(win, app, stamp_block_with_token(win, "TOKEN_R1"))
         win._mark_current()
         app.processEvents()
         mark_14 = win._marks.marks[-1]
-        feed_round(win, "TOKEN_R2", base=7, filler=8)              # 同秒再来一轮
+        feed_round(win, "TOKEN_R2", base=7, filler=30)             # 同秒再来一轮
         app.processEvents()
         before14 = doc_of(win).blockCount()
         force_crop(win, app, stamp_block_with_token(win, "TOKEN_R0") + 1)  # 头裁掉垫料+R0轮首
@@ -812,13 +853,13 @@ def main() -> int:                                     # noqa: C901 - 探针
               g14["token"] == "TOKEN_R1",
               f"got={g14['token'] or g14}（rev=0 兜底会指到 R2，说明签名未命中）")
         win.txt_rx.setMaximumBlockCount(win._rx_blocks)
-        center_on_block(win, app, stamp_block_with_token(win, "TOKEN_R1"))
+        _c7b, _ = center_on_block(win, app, stamp_block_with_token(win, "TOKEN_R1"))
         n14 = len(win._marks.marks)
         toasts.clear()
         win._mark_current()
         app.processEvents()
-        check("7b-2 头裁后再打标 → 不新增", len(win._marks.marks) == n14,
-              f"{n14} -> {len(win._marks.marks)} toasts={toasts}")
+        check("7b-2 头裁后再打标 → 不新增", _c7b and len(win._marks.marks) == n14,
+              f"centered={_c7b} {n14} -> {len(win._marks.marks)} toasts={toasts}")
 
         # ============ 6b 本 QA 自设：标记后该轮**继续增长** ============
         win._clear_receive()
@@ -841,6 +882,187 @@ def main() -> int:                                     # noqa: C901 - 探针
         check("6b 标记后同一轮继续增长 → 跳回仍落在这一轮（签名失配时 rev 兜底）",
               g6b["token"] == "TOKEN_R1", f"got={g6b['token'] or g6b}")
 
+        # ============ U 「查看标记」按钮 + 弹窗（列表不再常驻配置卡）============
+        win._clear_receive()
+        win._marks.clear()
+        win._refresh_mark_list()
+        app.processEvents()
+
+        # ---- U1 卡片里没有常驻列表；按钮归属/文案/enabled ----
+        lists_in_card = win._config_content.findChildren(QListWidget)
+        check("U1a 未开弹窗时 _mark_list 为 None（卡片里没有常驻列表）",
+              win._mark_list is None, f"_mark_list={win._mark_list!r}")
+        check("U1b _config_content 里没有 QListWidget",
+              not lists_in_card,
+              f"found={[type(w).__name__ for w in lists_in_card]}")
+        in_card = win._config_content.isAncestorOf(win.btn_marks)
+        _card_vis = win._config_card.isVisible()      # 开局接收区可能是展开态 → 卡被收起
+        if not _card_vis:
+            win._config_card.show()                  # 只为看按钮是否真的能显示（探针侧动作）
+            app.processEvents()
+        check("U1c 「查看标记」按钮在 _config_content 内、文案正确、enabled，卡展开后可见",
+              in_card and win.btn_marks.text() == "查看标记"
+              and win.btn_marks.isEnabled() and not win.btn_marks.isHidden()
+              and win.btn_marks.isVisible(),
+              f"ancestor={in_card} text={win.btn_marks.text()!r} "
+              f"enabled={win.btn_marks.isEnabled()} card_visible@start={_card_vis} "
+              f"visible_now={win.btn_marks.isVisible()}")
+        _fields_w = [w for w, _min in getattr(win, "_config_fields", [])]
+        check("U1f 「查看标记」按钮不进 _config_fields（不会被窄档压到 66px）",
+              win.btn_marks not in _fields_w,
+              f"in_fields={win.btn_marks in _fields_w} n_fields={len(_fields_w)}")
+        _need = win.btn_marks.fontMetrics().horizontalAdvance("查看标记")
+        check("U1d 按钮宽度装得下六个字（不会戳出圆角底板）",
+              win.btn_marks.width() >= _need + 8,
+              f"width={win.btn_marks.width()} need={_need}")
+        _tl = win.btn_marks.mapTo(win, QPoint(0, 0))
+        _cc = win._config_content.mapTo(win, QPoint(0, 0))
+        check("U1e 按钮完整落在配置卡内容区内（没被裁）",
+              _cc.x() <= _tl.x()
+              and _tl.x() + win.btn_marks.width() <= _cc.x() + win._config_content.width()
+              and _cc.y() <= _tl.y()
+              and _tl.y() + win.btn_marks.height() <= _cc.y() + win._config_content.height(),
+              f"btn@({_tl.x()},{_tl.y()},{win.btn_marks.width()}x{win.btn_marks.height()}) "
+              f"card@({_cc.x()},{_cc.y()},{win._config_content.width()}x"
+              f"{win._config_content.height()})")
+
+        # ---- U2 空标记：只 toast，不弹窗 ----
+        toasts.clear()
+        win.btn_marks.click()
+        app.processEvents()
+        check("U2a 空标记点按钮 → 只 toast「还没有标记…」，不建弹窗",
+              any("还没有标记" in t for t in toasts) and win._marks_dialog is None,
+              f"toasts={toasts} dlg={win._marks_dialog!r}")
+        check("U2b 没有任何可见 QDialog，_mark_list 仍为 None",
+              not [w for w in win.findChildren(QDialog) if w.isVisible()]
+              and win._mark_list is None,
+              f"visible_dialogs={[w.windowTitle() for w in win.findChildren(QDialog) if w.isVisible()]}")
+
+        # ---- U3 打 3 条（含同秒两条）→ 查看 → 点第 2 条跳转 ----
+        win._clear_receive()
+        feed_round(win, "TOKEN_R1", base=1)
+        feed_round(win, "TOKEN_R2", base=4)
+        feed_round(win, "TOKEN_R3", base=7, stamp_line="[2026-11-24 12:00:05]")
+        feed_round(win, "TOKEN_R4", base=10, filler=30,
+                   stamp_line="[2026-11-24 12:00:09]")   # 垫一轮，让 R3 也能居中
+        app.processEvents()
+        _centered = {}
+        for _tok in ("TOKEN_R1", "TOKEN_R2", "TOKEN_R3"):
+            _ok, _ = center_on_block(win, app, stamp_block_with_token(win, _tok))
+            _centered[_tok] = _ok
+            win._mark_current()
+            app.processEvents()
+        check("U3a 三条标记（含同秒两条：stamp A ×2 + stamp B ×1）",
+              len(win._marks.marks) == 3 and all(_centered.values()),
+              f"marks={len(win._marks.marks)} centered={_centered}")
+        win.btn_marks.click()
+        app.processEvents()
+        _dlg = win._marks_dialog
+        _want = [f"{m.stamp} {m.summary}".strip() for m in win._marks.marks]
+        _got = ([win._mark_list.item(i).text() for i in range(win._mark_list.count())]
+                if win._mark_list is not None else None)
+        check("U3b 点按钮 → 弹窗可见、列表 3 条、顺序与 _marks.marks 一致",
+              _dlg is not None and _dlg.isVisible() and _got == _want,
+              f"visible={getattr(_dlg, 'isVisible', lambda: None)()} got={_got}")
+        _how = click_mark_item(win, app, 1)
+        _g = hl_probe(win)
+        check("U3c 点第 2 条 → 主窗整轮高亮落到第 2 条对应轮（_mark_selection.cursor）",
+              _g["token"] == "TOKEN_R2", f"got={_g} 期望=TOKEN_R2 click={_how}")
+        check("U3d 跳完弹窗自动关闭（accept，不析构）",
+              _dlg is not None and not _dlg.isVisible(),
+              f"visible={getattr(_dlg, 'isVisible', lambda: None)()} "
+              f"same_obj={win._marks_dialog is _dlg}")
+        win.btn_marks.click()
+        app.processEvents()
+        _got2 = ([win._mark_list.item(i).text() for i in range(win._mark_list.count())]
+                 if win._mark_list is not None else None)
+        check("U3e 再开仍 3 条且复用同一实例",
+              win._marks_dialog is _dlg and _got2 == _want,
+              f"same_obj={win._marks_dialog is _dlg} got={_got2}")
+
+        # ---- U4 清屏：弹窗开着列表变空；清屏后点按钮只 toast ----
+        win._clear_receive()
+        app.processEvents()
+        check("U4a 弹窗开着时清屏 → 列表变空、不崩",
+              win._mark_list is not None and win._mark_list.count() == 0
+              and len(win._marks.marks) == 0,
+              f"list={None if win._mark_list is None else win._mark_list.count()} "
+              f"marks={len(win._marks.marks)}")
+        _dlg.accept()
+        app.processEvents()
+        toasts.clear()
+        win.btn_marks.click()
+        app.processEvents()
+        check("U4b 清屏后再点按钮 → 不弹窗，只 toast",
+              any("还没有标记" in t for t in toasts) and not _dlg.isVisible(),
+              f"toasts={toasts} dlg_visible={_dlg.isVisible()}")
+
+        # ---- U5 回放态：可开、列同一套、点项能跳；退出后仍可开 ----
+        win._clear_receive()
+        feed_round(win, "TOKEN_R1", base=1)
+        center_on_block(win, app, stamp_block_with_token(win, "TOKEN_R1"))
+        win._mark_current()
+        app.processEvents()
+        n_live = len(win._marks.marks)
+        import rx_history
+        rx_history.flush()
+        rx_history._pending.clear()
+        _rows: list[str] = []
+        for i, st in enumerate(("2026-12-01 08:00:00", "2026-12-01 08:00:10")):
+            _rows += [f"[{st}]", "", "Voltage1:", f"{i + 1:02d}.3800 {i + 2:02d}.3820",
+                      "", "Temperature1:", "1.25 2.25", "", "BMS OK"]
+        if rx_history._path is not None:
+            rx_history._path.write_text("\n".join(_rows) + "\n", encoding="utf-8")
+            rx_history._lines.clear()
+            rx_history._lines.extend(_rows)
+            rx_history._file_lines = len(_rows)
+        win._open_history()
+        settle(app)
+        check("U5a 已进入近期回放（前提）",
+              win._replay_active and win._replay_kind == "recent",
+              f"active={win._replay_active} kind={win._replay_kind!r}")
+        check("U5b 回放态「查看标记」按钮 enabled（未禁用）；原标记条数不变",
+              win.btn_marks.isEnabled() and not win.btn_marks.isHidden()
+              and len(win._marks.marks) == n_live,
+              f"enabled={win.btn_marks.isEnabled()} hidden={win.btn_marks.isHidden()} "
+              f"card_visible={win._config_card.isVisible()} "
+              f"marks={len(win._marks.marks)} 期望={n_live}")
+        n_before_replay_mark = len(win._marks.marks)
+        win._mark_current()                     # 回放文档里再打一条（同一套）
+        app.processEvents()
+        check("U5c 回放态 Alt+M 打标进同一套（+1）",
+              len(win._marks.marks) == n_before_replay_mark + 1,
+              f"{n_before_replay_mark} -> {len(win._marks.marks)}")
+        win.btn_marks.click()
+        app.processEvents()
+        _got5 = ([win._mark_list.item(i).text() for i in range(win._mark_list.count())]
+                 if win._mark_list is not None else None)
+        _want5 = [f"{m.stamp} {m.summary}".strip() for m in win._marks.marks]
+        check("U5d 回放态点按钮 → 弹窗可见、列同一套（无来源前缀）",
+              _got5 == _want5
+              and not any((t or "").startswith(("近期 ·", "历史 ·")) for t in (_got5 or [])),
+              f"got={_got5}")
+        # 点最后一条（= 刚在回放文档里打的那条）→ 应跳到回放文档里对应轮
+        click_mark_item(win, app, len(win._marks.marks) - 1)
+        _g5 = hl_probe(win)
+        _hl_stamp = (doc_of(win).findBlockByNumber(_g5["block"]).text()
+                     if _g5["block"] >= 0 else "")
+        check("U5e 回放态点项 → 高亮轮的轮首文本 == 该标记的 stamp（不是空/旧位置）",
+              _g5["block"] >= 0 and _hl_stamp == win._marks.marks[-1].stamp,
+              f"{_g5} hl_stamp={_hl_stamp!r} mark_stamp={win._marks.marks[-1].stamp!r}")
+        win._exit_replay()
+        app.processEvents()
+        check("U5f 退出回放后按钮仍 enabled",
+              win.btn_marks.isEnabled(), f"enabled={win.btn_marks.isEnabled()}")
+        win.btn_marks.click()
+        app.processEvents()
+        check("U5g 退出回放后仍能打开弹窗",
+              win._marks_dialog is not None and win._marks_dialog.isVisible(),
+              f"visible={getattr(win._marks_dialog, 'isVisible', lambda: None)()}")
+        if win._marks_dialog is not None:
+            win._marks_dialog.accept()
+            app.processEvents()
+
         # ============ 收尾：清屏才清零（语义回归）============
         n_sem = len(win._marks.marks)
         win._clear_receive(clear_marks=False)
@@ -850,9 +1072,9 @@ def main() -> int:                                     # noqa: C901 - 探针
               f"{n_sem} -> {len(win._marks.marks)}")
         win._clear_receive()
         app.processEvents()
-        check("7-2 主动清空接收区才清零标记",
-              len(win._marks.marks) == 0 and win._mark_list.count() == 0,
-              f"marks={len(win._marks.marks)} list={win._mark_list.count()}")
+        check("7-2 主动清空接收区才清零标记（tooltip 同步 0 条）",
+              len(win._marks.marks) == 0 and "0 条" in win.btn_marks.toolTip(),
+              f"marks={len(win._marks.marks)} tooltip={win.btn_marks.toolTip()!r}")
 
     except Exception:                                 # noqa: BLE001 - 探针留证据
         print("EXCEPTION:\n" + traceback.format_exc(), flush=True)

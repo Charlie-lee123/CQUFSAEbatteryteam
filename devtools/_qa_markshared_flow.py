@@ -89,7 +89,25 @@ def round_text(win, span: tuple[int, int]) -> str:
 
 
 def list_texts(win) -> list[str]:
-    return [win._mark_list.item(i).text() for i in range(win._mark_list.count())]
+    """列表项文字。⚠️ 列表活在「查看标记」弹窗里（平时 `_mark_list is None`）。"""
+    lst = getattr(win, "_mark_list", None)
+    if lst is None:
+        return [f"{m.stamp} {m.summary}".strip() for m in win._marks.marks]
+    return [lst.item(i).text() for i in range(lst.count())]
+
+
+def open_marks(win, app) -> None:
+    """确保弹窗**可见**（列表在弹窗里）。
+
+    ⚠️ `_mark_list` 一旦建过就不再是 None（弹窗 accept 只是 hide），所以判据必须是
+    "弹窗是否可见"，否则第二次点击会落在隐藏控件上、静默无效。
+    """
+    if not win._marks.marks:
+        return
+    dlg = getattr(win, "_marks_dialog", None)
+    if dlg is None or not dlg.isVisible():
+        win._show_marks_dialog()
+        app.processEvents()
 
 
 def store_snapshot(win) -> list[tuple]:
@@ -141,6 +159,7 @@ def feed_round(win, stamp: str, base: int) -> None:
 
 def click_mark_item(win, app, idx: int) -> str:
     """点列表项：优先真实鼠标点击，点不到（不在视口内）就退回 itemClicked 信号。"""
+    open_marks(win, app)
     item = win._mark_list.item(idx)
     win._mark_list.scrollToItem(item)
     app.processEvents()
@@ -217,10 +236,10 @@ def main() -> int:                                    # noqa: C901 - 探针
 
         store_id0 = id(win._marks)
         art("store_id", store_id0)
-        check("0e 实例属性里只有一套 MarkStore（无 _marks_* 兄弟属性）",
-              not [a for a in vars(win)
-                   if a.startswith("_marks_") and a != "_marks_model"],
-              str([a for a in vars(win) if a.startswith("_marks_")]))
+        _sib = [a for a in vars(win)
+                if a.startswith("_marks_") and a not in ("_marks_model", "_marks_dialog")]
+        check("0e 实例属性里只有一套 MarkStore（只允许 _marks_dialog 这个弹窗句柄）",
+              not _sib, str(_sib))
 
         # ================= 1 实时：灌数 + 打 1 标 =================
         live_stamps = [f"2026-11-24 10:00:0{i}" for i in range(4)]
@@ -231,16 +250,16 @@ def main() -> int:                                    # noqa: C901 - 探针
         art("live_rounds", len(round_spans(win)))
         check("1a 实时灌进 4 轮", len(round_spans(win)) == 4,
               f"rounds={len(round_spans(win))} blocks={doc(win).blockCount()}")
-        check("1b 新窗标记为空", win._mark_list.count() == 0
-              and len(win._marks.marks) == 0)
+        check("1b 新窗标记为空", len(win._marks.marks) == 0
+              and win._mark_list is None)
         check("1c 实时态 btn_mark / _mark_list 可用",
-              win.btn_mark.isEnabled() and win._mark_list.isEnabled())
+              win.btn_mark.isEnabled() and win.btn_marks.isEnabled())
 
         win.btn_mark.click()                       # 真实按钮信号（clicked(bool)）
         app.processEvents()
         live_mark = win._marks.marks[-1] if win._marks.marks else None
         check("1d 实时打 1 标（点按钮）→ 列表 1 条",
-              live_mark is not None and win._mark_list.count() == 1,
+              live_mark is not None and len(win._marks.marks) == 1,
               f"list={list_texts(win)}")
         check("1e 标记锚点是文档里真实的时间戳行",
               live_mark is not None
@@ -255,8 +274,10 @@ def main() -> int:                                    # noqa: C901 - 探针
         rx_history._pending.clear()
         # 把近期留存换成**另一批时间戳**（模拟"更早/另一段"留存）：
         # 实时那 1 条标记的轮在回放文档里**不存在** → 同时能验"跳到不存在的标"。
-        replay_stamps = ["2026-12-01 08:00:00", "2026-12-01 08:00:10",
-                         "2026-12-01 08:00:20"]
+        # ⚠️ 10 轮（≈90 行）而不是 3 轮：配置卡里的常驻列表改成按钮后接收视口高了
+        #    ~120px，3 轮的文档装得下 → 滚动条 maximum=0，"滚动前后像素必须变化"
+        #    的自检会恒 0（探针侧假红，不是产品问题）。
+        replay_stamps = [f"2026-12-01 08:00:{10 * i:02d}" for i in range(10)]
         rows: list[str] = []
         for i, st in enumerate(replay_stamps):
             rows += [f"[{st}]", "",
@@ -282,15 +303,16 @@ def main() -> int:                                    # noqa: C901 - 探针
               list_texts(win) == before_texts and len(win._marks.marks) == 1,
               f"{before_texts} -> {list_texts(win)}")
         check("2d 还是同一个 MarkStore 对象", id(win._marks) == store_id0)
-        check("2e 回放态 btn_mark.isEnabled() / _mark_list.isEnabled() 均为 True",
-              win.btn_mark.isEnabled() and win._mark_list.isEnabled(),
-              f"btn={win.btn_mark.isEnabled()} list={win._mark_list.isEnabled()}")
+        check("2e 回放态 btn_mark / btn_marks（查看标记）isEnabled() 均为 True",
+              win.btn_mark.isEnabled() and win.btn_marks.isEnabled(),
+              f"btn={win.btn_mark.isEnabled()} btn_marks={win.btn_marks.isEnabled()}")
         check("2f 回放态 tooltip 不再写「回放中不支持标记」",
               "不支持标记" not in win.btn_mark.toolTip(), win.btn_mark.toolTip())
-        check("2f-2 回放态标记按钮/列表在**屏幕上真实可见**（不是只 enabled）",
-              win.btn_mark.isVisible() and win._mark_list.isVisible(),
+        check("2f-2 回放态打标按钮可见、「查看标记」按钮未被隐藏",
+              win.btn_mark.isVisible() and not win.btn_marks.isHidden(),
               f"btn_visible={win.btn_mark.isVisible()} "
-              f"list_visible={win._mark_list.isVisible()}")
+              f"btn_marks_hidden={win.btn_marks.isHidden()} "
+              f"config_card_visible={win._config_card.isVisible()}")
         check("2f-3 列表项无来源前缀（不是「近期 · / 历史 ·」各一套）",
               not any(t.startswith(("近期 ·", "历史 ·", "近期·", "历史·"))
                       for t in list_texts(win)),
@@ -304,7 +326,7 @@ def main() -> int:                                    # noqa: C901 - 探针
                 art("altm_target", label)
                 break
         check("2g 回放态 Alt+M 打上第 2 标（真实按键）",
-              len(win._marks.marks) == 2 and win._mark_list.count() == 2,
+              len(win._marks.marks) == 2,
               f"marks={len(win._marks.marks)} list={list_texts(win)}")
         replay_mark = win._marks.marks[-1] if len(win._marks.marks) >= 2 else None
         art("replay_mark_stamp", getattr(replay_mark, "stamp", ""))
@@ -316,7 +338,7 @@ def main() -> int:                                    # noqa: C901 - 探针
 
         # 观察项：同一轮连按两次 Alt+M 会得到两条文案相同的条目（MarkStore 不去重，
         # 这是改动前就有的行为，不属本次需求判据）。
-        _dup_before = win._mark_list.count()
+        _dup_before = len(win._marks.marks)
         win._mark_current()
         app.processEvents()
         win._mark_current()
@@ -416,12 +438,12 @@ def main() -> int:                                    # noqa: C901 - 探针
         settle(app)
         exit_text = win.txt_rx.toPlainText().strip()
         check("4a 退出回放后标记仍 2 条（_exit_replay 不清）",
-              len(win._marks.marks) == 2 and win._mark_list.count() == 2,
+              len(win._marks.marks) == 2,
               f"marks={len(win._marks.marks)} list={list_texts(win)}")
         check("4b 退出回放确实清了画面（_clear_receive(clear_marks=False) 生效）",
               exit_text == "", f"text_len_after_exit={len(exit_text)}")
         check("4c 退出回放后 btn_mark / _mark_list 仍可用",
-              win.btn_mark.isEnabled() and win._mark_list.isEnabled())
+              win.btn_mark.isEnabled() and win.btn_marks.isEnabled())
         for i in range(2):                        # 退出回放后在实时画面灌新数据
             feed_round(win, f"2026-11-24 23:00:0{i}", 20 + i * 3)
         settle(app)
@@ -456,12 +478,12 @@ def main() -> int:                                    # noqa: C901 - 探针
               list_texts(win) == before_texts and len(win._marks.marks) == 2,
               f"{before_texts} -> {list_texts(win)}")
         check("5c 历史回放态 btn_mark / _mark_list 可用",
-              win.btn_mark.isEnabled() and win._mark_list.isEnabled())
+              win.btn_mark.isEnabled() and win.btn_marks.isEnabled())
         win.btn_mark.click()
         app.processEvents()
         long_mark = win._marks.marks[-1] if win._marks.marks else None
         check("5d 历史回放里打第 3 标 → 同一套 3 条",
-              len(win._marks.marks) == 3 and win._mark_list.count() == 3,
+              len(win._marks.marks) == 3,
               f"list={list_texts(win)}")
         check("5e 第 3 条锚在历史回放文档里的轮上",
               long_mark is not None
@@ -470,7 +492,7 @@ def main() -> int:                                    # noqa: C901 - 探针
         win._exit_replay()
         app.processEvents()
         check("5f 退出历史回放仍 3 条",
-              len(win._marks.marks) == 3 and win._mark_list.count() == 3,
+              len(win._marks.marks) == 3,
               f"list={list_texts(win)}")
         check("5g 全程同一个 MarkStore 对象", id(win._marks) == store_id0)
 
@@ -478,7 +500,7 @@ def main() -> int:                                    # noqa: C901 - 探针
         win.btn_clear.click()                     # ⚠️ clicked(bool) 真实路径
         app.processEvents()
         check("6a 点「清空接收区」（clicked(bool) 路径）→ 标记清零",
-              len(win._marks.marks) == 0 and win._mark_list.count() == 0,
+              len(win._marks.marks) == 0,
               f"marks={len(win._marks.marks)} list={list_texts(win)}")
         # 6b Ctrl+L 快捷路径
         feed_round(win, "2026-11-25 09:00:00", 30)
@@ -533,6 +555,7 @@ def main() -> int:                                    # noqa: C901 - 探针
             win._refresh_mark_list()
             win._mark_selection = None
             win._apply_extra_selections()
+            open_marks(win, app)
             win._on_mark_item_clicked(win._mark_list.item(0))
             app.processEvents()
             _fast_ok = (win._mark_selection is not None
@@ -541,6 +564,7 @@ def main() -> int:                                    # noqa: C901 - 探针
                         == _b2[0])
             win._marks.marks[0] = dataclasses.replace(win._marks.marks[0],
                                                      start_block=0)   # 模拟块号漂移
+            open_marks(win, app)
             win._on_mark_item_clicked(win._mark_list.item(0))
             app.processEvents()
             _got = (doc(win).findBlock(

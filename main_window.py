@@ -973,6 +973,10 @@ class MainWindow(QMainWindow):
         # 别处也仍列在同一张表里；进/出回放都不清空（用户纠正：不是各一套）。
         self._marks = MarkStore()
         self._mark_selection: QTextEdit.ExtraSelection | None = None
+        # 标记列表现在活在「查看标记」弹窗里（不再常驻配置卡）。这里置 None，
+        # _refresh_mark_list / _clear_receive 等调用点都有 getattr 判空，弹窗未开时安全。
+        self._mark_list: QListWidget | None = None
+        self._marks_dialog = None              # 复用的弹窗实例（懒建，见 _show_marks_dialog）
         # 防息屏状态机（v2.11 需求 3）：默认关，按设置初值 configure，不主动 acquire。
         self._wake_lock = wake_lock.WakeLock()
         try:
@@ -2115,21 +2119,23 @@ class MainWindow(QMainWindow):
         line_row.addWidget(self.cmb_rx_lines, 1)
         col.addLayout(line_row)
 
-        # 整轮标记列表（用户 2026-11-24「查看标记在串口设置卡片里面」）：打标按钮
-        # 仍在接收区右侧竖栏（Alt+M），列表挪进这张定宽配置卡，样式与卡片其它行一致。
-        # ⛔ 必须放进 col（它是 panel 的布局，panel 挂在 _config_content 定宽容器上），
-        #    别绕过 _config_content 直接挂 card —— 转场只裁切不重排，直接挂会重排弹一下。
+        # 整轮标记（用户 2026-11-24「查看标记还是做成按钮吧」）：卡片里只留一颗
+        # 「查看标记」按钮，点它弹窗看列表（列表在弹窗里，见 _show_marks_dialog）。
+        # 打标按钮仍在接收区右侧竖栏（Alt+M）。⛔ 必须放进 col（panel 布局、挂
+        # _config_content 定宽容器），别绕过它直接挂 card —— 转场只裁切不重排。
         mark_tag = self._field_label("标记")
         mark_tag.setFixedWidth(64)
-        mark_tag.setToolTip("整轮标记：点右侧栏小旗子（Alt+M）给当前轮打标，点这里某项跳回")
+        mark_tag.setToolTip("整轮标记：点右侧栏小旗子（Alt+M）打标；"
+                            "点「查看标记」查看并跳回")
         mark_head = QHBoxLayout()
         mark_head.setSpacing(10)
         mark_head.addWidget(mark_tag)
-        self._mark_list = QListWidget()
-        self._mark_list.setMaximumHeight(120)
-        self._mark_list.setToolTip("整轮标记（仅本次会话，重启清空）：点击跳回该轮")
-        self._mark_list.itemClicked.connect(self._on_mark_item_clicked)
-        mark_head.addWidget(self._mark_list, 1)
+        # 与「打开近期数据」同款 ghost 按钮。⛔ 不进 _config_fields（那是窄档会被
+        # 压到 66px 的清单，六个字会戳出圆角底板）—— 与打开近期数据同一条口径。
+        self.btn_marks = InkButton("查看标记", variant="ghost")
+        self.btn_marks.setToolTip("查看整轮标记（仅本次会话）")
+        self.btn_marks.clicked.connect(self._show_marks_dialog)
+        mark_head.addWidget(self.btn_marks, 1)
         col.addLayout(mark_head)
 
         # 「打开近期数据」（用户 2026-10-13 点名，2026-11-21 改名）：在软件内打开
@@ -7623,7 +7629,15 @@ class MainWindow(QMainWindow):
         self._search_pinned = True
 
     def _refresh_mark_list(self) -> None:
-        """按 MarkStore 重建列表项（不框选文本，只列 stamp + summary）。"""
+        """按 MarkStore 重建列表项（不框选文本，只列 stamp + summary）。
+
+        同时把「查看标记」按钮 tooltip 同步条数（不改按钮文字，避免宽度抖动）。
+        列表可能在弹窗未打开时为 None —— 那条分支只更新 tooltip 即返回。
+        """
+        n = len(self._marks.marks)
+        btn = getattr(self, "btn_marks", None)
+        if btn is not None:
+            btn.setToolTip(f"查看整轮标记（{n} 条，仅本次会话）")
         lst = getattr(self, "_mark_list", None)
         if lst is None:
             return
@@ -7638,6 +7652,51 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         self._jump_to_mark(str(item.data(0x0100) or ""))
+        # 跳完即关弹窗（用户立刻看到结果）。复用实例只 hide，不析构。
+        dlg = getattr(self, "_marks_dialog", None)
+        if dlg is not None:
+            dlg.accept()
+
+    def _show_marks_dialog(self) -> None:
+        """「查看标记」按钮：弹窗列出全部整轮标记，点某项跳回该轮并关闭。
+
+        ⛔ 标记数据/打标/去重/锚点/清屏语义全不动 —— 这里只是把列表从常驻卡片
+        搬进一个非阻塞、窗口模态的弹窗（用户：「查看标记还是做成按钮吧」）。
+        复用同一个 dlg 实例（懒建）：父对象是主窗，生命周期绑定，关闭只 hide、
+        不 deleteLater → ``self._mark_list`` 永不悬空；每次打开前 ``_refresh_mark_list``
+        按当前 MarkStore 重建条目。
+        """
+        if not self._marks.marks:
+            self._toast("还没有标记，先按 Alt+M 打一个", 2000)
+            return
+        from PySide6.QtWidgets import QDialog
+        dlg = getattr(self, "_marks_dialog", None)
+        if dlg is None:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("标记")
+            dlg.setWindowModality(Qt.WindowModality.WindowModal)
+            dlg.resize(420, 360)
+            root = QVBoxLayout(dlg)
+            root.setSpacing(10)
+            root.setContentsMargins(14, 14, 14, 14)
+            hint = QLabel("仅本次会话，重启清空；点某项跳回该轮")
+            hint.setObjectName("hint")
+            hint.setWordWrap(True)
+            root.addWidget(hint)
+            self._mark_list = QListWidget()
+            self._mark_list.itemClicked.connect(self._on_mark_item_clicked)
+            root.addWidget(self._mark_list, 1)
+            btn_row = QHBoxLayout()
+            btn_row.addStretch(1)
+            close_btn = InkButton("关闭", variant="ghost")
+            close_btn.clicked.connect(dlg.accept)
+            btn_row.addWidget(close_btn)
+            root.addLayout(btn_row)
+            self._marks_dialog = dlg
+        self._refresh_mark_list()               # 每次打开按当前 MarkStore 重建
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _goto_mark(self, step: int) -> None:
         """上/下一个标记（Alt+↑/↓，循环）。三种数据源都可用。"""
@@ -7732,8 +7791,8 @@ class MainWindow(QMainWindow):
         if clear_marks and getattr(self, "_marks", None) is not None:
             self._marks.clear()
             self._clear_mark_highlight()
-            if getattr(self, "_mark_list", None) is not None:
-                self._mark_list.clear()
+            # 同步「查看标记」按钮 tooltip（清空后 0 条）；列表同理（弹窗开着则变空）。
+            self._refresh_mark_list()
         self._align_section = SECTION_OTHER      # 画面清空 = 段状态归零
         # 空行规则要跨帧判断"上一行空不空"（见 _emit_block 的 gap_lines）
         self._rx_prev_line = ""
