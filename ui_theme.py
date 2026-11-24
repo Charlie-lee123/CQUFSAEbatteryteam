@@ -353,6 +353,11 @@ GLYPH_CHEVRON_UP = GLYPH_EXPAND_CHEVRON
 GLYPH_SEARCH = "\uE721"           # 放大镜
 GLYPH_CLOSE = "\uE711"            # 关闭（叉）
 GLYPH_ADD = "\uE710"              # 加号（新增）
+# 小旗子（整轮标记按钮）。Segoe MDL2 Assets / Fluent Icons 的 U+E7C1 是
+# 「旗杆上一面三角旗」，真平台 QPainter 渲染确认过（_check/icon_flag_candidates.png，
+# glyph inFont=True、非缺字方框）；E81B 也是旗但带缺口的矩形旗，选 E7C1 更简洁。
+# ⛔ 记错一个码位出来的就是毫不相干的符号，别凭记忆改。
+GLYPH_FLAG = "\uE7C1"             # 小旗子（标记当前轮）
 GLYPH_PAUSE = "\uE769"            # 暂停（两竖）
 GLYPH_PLAY = "\uE768"             # 播放（三角）
 GLYPH_COPY = "\uE8C8"             # 复制（两张纸）

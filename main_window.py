@@ -80,8 +80,8 @@ from ui_perf_mode import PerfModeOverlay
 from ui_theme import (
     CARD_PAD, CARD_RADIUS,
     DEFAULT_GLASS, GAP, GLYPH_CHEVRON_DOWN, GLYPH_CHEVRON_UP, GLYPH_CLEAR,
-    GLYPH_ADD, GLYPH_CLOSE, GLYPH_COLLAPSE, GLYPH_COPY, GLYPH_EXPAND,
-    GLYPH_EXPAND_CHEVRON, GLYPH_PAUSE,
+    GLYPH_CLOSE, GLYPH_COLLAPSE, GLYPH_COPY, GLYPH_EXPAND,
+    GLYPH_EXPAND_CHEVRON, GLYPH_FLAG, GLYPH_PAUSE,
     GLYPH_PLAY, GLYPH_REFRESH, GLYPH_RESTORE, GLYPH_SAVE, GLYPH_SEARCH,
     GLYPH_SEND, GLYPH_SETTINGS, LEGACY_GLASS, SHADOW_PAD, TITLE_H, apply_scheme,
     apply_titlebar_theme,
@@ -2112,6 +2112,23 @@ class MainWindow(QMainWindow):
         line_row.addWidget(self.cmb_rx_lines, 1)
         col.addLayout(line_row)
 
+        # 整轮标记列表（用户 2026-11-24「查看标记在串口设置卡片里面」）：打标按钮
+        # 仍在接收区右侧竖栏（Alt+M），列表挪进这张定宽配置卡，样式与卡片其它行一致。
+        # ⛔ 必须放进 col（它是 panel 的布局，panel 挂在 _config_content 定宽容器上），
+        #    别绕过 _config_content 直接挂 card —— 转场只裁切不重排，直接挂会重排弹一下。
+        mark_tag = self._field_label("标记")
+        mark_tag.setFixedWidth(64)
+        mark_tag.setToolTip("整轮标记：点右侧栏小旗子（Alt+M）给当前轮打标，点这里某项跳回")
+        mark_head = QHBoxLayout()
+        mark_head.setSpacing(10)
+        mark_head.addWidget(mark_tag)
+        self._mark_list = QListWidget()
+        self._mark_list.setMaximumHeight(120)
+        self._mark_list.setToolTip("整轮标记（仅本次会话，重启清空）：点击跳回该轮")
+        self._mark_list.itemClicked.connect(self._on_mark_item_clicked)
+        mark_head.addWidget(self._mark_list, 1)
+        col.addLayout(mark_head)
+
         # 「打开近期数据」（用户 2026-10-13 点名，2026-11-21 改名）：在软件内打开
         # 本地留存的接收数据，格式/风格/功能与实时接收一致。放在参数栏最下面 ——
         # 它读的正是上面"保留行数"落在本地的那份备份（接收历史-{车号}.log），挨着最顺。
@@ -2340,7 +2357,7 @@ class MainWindow(QMainWindow):
         self.btn_expand.clicked.connect(self._toggle_expand)
         # 整轮标记（v2.11 需求 4）：点一下给「当前正在看的一轮」打标。
         # ⛔ 不进 BUTTON_SPECS —— 那是"可隐藏按钮"清单，标记是核心操作不允许隐藏。
-        self.btn_mark = IconButton(GLYPH_ADD, "标记当前轮（Alt+M）",
+        self.btn_mark = IconButton(GLYPH_FLAG, "标记当前轮（Alt+M）",
                                    size=30, glyph_size=15)
         self.btn_mark.clicked.connect(self._mark_current)
         rail = QVBoxLayout()
@@ -2358,13 +2375,8 @@ class MainWindow(QMainWindow):
                        self.btn_save, self.btn_expand):
             rail.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft)
         rail.addStretch(1)
-        # 标记列表：点击某项跳回对应整轮。回放态禁用（见 _refresh_replay_ui 的调用点）。
-        self._mark_list = QListWidget()
-        self._mark_list.setMaximumHeight(120)
-        self._mark_list.setToolTip("整轮标记（仅本次会话，重启清空）：点击跳回该轮")
-        self._mark_list.itemClicked.connect(self._on_mark_item_clicked)
-        rail.addWidget(self._mark_list)
-        rail.addStretch(1)
+        # 标记列表已挪进串口配置卡（见 _build_config_panel），这里不再占位 ——
+        # 用户极在意右边距/间距，多一个 stretch 会在图标列下方留一段空档。
         # 包一层容器，把整列当成一个控件交给布局（间距、对齐都只算一次）
         self._rx_rail = QWidget()
         self._rx_rail.setLayout(rail)
