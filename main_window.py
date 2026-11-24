@@ -967,7 +967,9 @@ class MainWindow(QMainWindow):
         # 历史回放模式：为真时接收区显示的是本地留存数据，实时帧不写进画面
         # （但照常进 rx_history 与计数）。见 _open_history / _exit_replay。
         self._replay_active = False
-        # 整轮标记（v2.11 需求 4）：纯内存、不持久化。回放态禁用，清屏/换车即空。
+        # 整轮标记（v2.11 需求 4）：纯内存、不持久化。**全程只有一套**：实时 /
+        # 近期回放 / 历史回放共用这一个 MarkStore —— 在哪个数据源打的标，切到
+        # 别处也仍列在同一张表里；进/出回放都不清空（用户纠正：不是各一套）。
         self._marks = MarkStore()
         self._mark_selection: QTextEdit.ExtraSelection | None = None
         # 防息屏状态机（v2.11 需求 3）：默认关，按设置初值 configure，不主动 acquire。
@@ -7567,10 +7569,7 @@ class MainWindow(QMainWindow):
     #    标记只活内存（MarkStore），不写 QSettings / 不写盘。
 
     def _mark_current(self) -> None:
-        """给「当前正在看的一轮」打标（按钮 / Alt+M）。回放态禁用。"""
-        if getattr(self, "_replay_active", False):
-            self._toast("回放中不支持标记，返回实时后可用", 2500)
-            return
+        """给「当前正在看的一轮」打标（按钮 / Alt+M）。实时与回放态共用同一套。"""
         span = self._round_span(self._viewed_block_number())
         if span is None:
             self._toast("当前没有可标记的轮次（没有时间戳）", 2500)
@@ -7593,6 +7592,7 @@ class MainWindow(QMainWindow):
         if lst is None:
             return
         lst.clear()
+        # 全程同一套、无来源前缀（用户纠正：不是各一套，切数据源列表始终同一批）
         for mark in self._marks.marks:
             item = QListWidgetItem(f"{mark.stamp} {mark.summary}".strip())
             item.setData(0x0100, mark.key)      # Qt.UserRole
@@ -7604,9 +7604,7 @@ class MainWindow(QMainWindow):
         self._jump_to_mark(str(item.data(0x0100) or ""))
 
     def _goto_mark(self, step: int) -> None:
-        """上/下一个标记（Alt+↑/↓，循环）。回放态禁用。"""
-        if getattr(self, "_replay_active", False):
-            return
+        """上/下一个标记（Alt+↑/↓，循环）。三种数据源都可用。"""
         mark = self._marks.next() if step > 0 else self._marks.prev()
         if mark is None:
             self._toast("还没有标记，先按 Alt+M 打一个", 2000)
@@ -7630,7 +7628,9 @@ class MainWindow(QMainWindow):
                     round_start = b
                     break
         if round_start is None:
-            self._toast("该标记对应的数据已被裁剪，无法跳回", 3000)
+            # 实时态是从头裁剪；回放只加载一页，更早的页可能还没加载 —— 两种情况
+            # 都覆盖（找不到只提示，不误跳别的轮）。
+            self._toast("该标记的数据尚未加载或已被裁剪", 3000)
             return
         span = self._round_span(round_start)
         if span is None:
@@ -7660,7 +7660,13 @@ class MainWindow(QMainWindow):
         self._mark_selection = None
         self._apply_extra_selections()
 
-    def _clear_receive(self) -> None:
+    def _clear_receive(self, *, clear_marks: bool = True) -> None:
+        """清空接收区。``clear_marks=False`` 供 _exit_replay 只清画面、保留实时标记。
+
+        ⚠️ ``clear_marks`` 必须是 **keyword-only**：btn_clear.clicked 会带一个
+        ``bool checked`` 位置参数进来，若为普通参数会被它绑成 False（清空按钮
+        反而不清标记）。QShortcut.activated 不传参，走默认 True。
+        """
         self.txt_rx.clear()
         self._rx_bytes = 0
         self._decoder.reset()
@@ -7669,10 +7675,15 @@ class MainWindow(QMainWindow):
         self._rx_pending.clear()
         self._reset_matches()
         self._clear_alert_highlight()
-        self._marks.clear()                     # 标记不持久化：清屏即空
-        self._clear_mark_highlight()
-        if getattr(self, "_mark_list", None) is not None:
-            self._mark_list.clear()
+        # 标记全程同一套，只有用户主动"清空接收区"才清（既定行为）。
+        # ⚠️ clear_marks 是 keyword-only：_exit_replay 调 _clear_receive 时传 False，
+        #    只清画面、保留标记（进/出回放都不清空）；清空按钮/QShortcut 走默认 True。
+        #    PySide6 会把 btn_clear.clicked(bool) 的位置 bool 截断，不会误绑此参数。
+        if clear_marks and getattr(self, "_marks", None) is not None:
+            self._marks.clear()
+            self._clear_mark_highlight()
+            if getattr(self, "_mark_list", None) is not None:
+                self._mark_list.clear()
         self._align_section = SECTION_OTHER      # 画面清空 = 段状态归零
         # 空行规则要跨帧判断"上一行空不空"（见 _emit_block 的 gap_lines）
         self._rx_prev_line = ""
@@ -8196,6 +8207,8 @@ class MainWindow(QMainWindow):
     def _enter_replay(self, rows) -> None:
         """把给定行灌进接收区并进入回放模式。
 
+        ⛔ 标记全程同一套：进回放**不清空**（用户纠正，不是各数据源一套）。
+
         三步的顺序都是刻意排的：
           1. 先抓"当前画面"并**立刻铺上去**（见 ``_show_rx_shot``）——
              必须在改文本**之前**，否则后面那次同步重绘会把新内容直接亮出来，
@@ -8214,10 +8227,6 @@ class MainWindow(QMainWindow):
         self.txt_rx.clear()
         self._reset_matches()
         self._clear_alert_highlight()
-        self._marks.clear()                     # 回放态不支持标记：进入即清空
-        self._clear_mark_highlight()
-        if getattr(self, "_mark_list", None) is not None:
-            self._mark_list.clear()
         # 回放内容走与实时相同的着色/排版管线：_align_section 从头推（历史文件
         # 里每轮都带时间戳，段状态自洽），着色的段状态由 QSyntaxHighlighter
         # 自己按块序推，这里只需要把文本塞进去。
@@ -8254,7 +8263,9 @@ class MainWindow(QMainWindow):
         # 分页状态一起清：返回实时之后就不该再有"往前翻一页"这种事。
         self._replay_page = None
         self._refresh_replay_ui()
-        self._clear_receive()
+        # ⛔ 标记全程同一套：退回放**不清空**。_clear_receive 传 False 只清画面，
+        #    标记保留（原样那条 self._marks.clear() 只在用户主动清接收区时生效）。
+        self._clear_receive(clear_marks=False)
         # 块数上限收回实时口径（回放态放宽过，见 _enter_replay）。
         self.txt_rx.setMaximumBlockCount(self._rx_blocks)
         self._settle_rx_layout()
@@ -8380,7 +8391,7 @@ class MainWindow(QMainWindow):
         if not self._replay_active:
             self.btn_open_history.setText("打开近期数据")
             self.btn_open_long_history.setText("打开历史数据")
-            # 标记：实时态可用（回放态在下面置灰）
+            # 标记：全程同一套，tooltip 保持简单（不写数据源相关说明）
             if getattr(self, "btn_mark", None) is not None:
                 self.btn_mark.setEnabled(True)
                 self.btn_mark.setToolTip("标记当前轮（Alt+M）")
@@ -8399,12 +8410,12 @@ class MainWindow(QMainWindow):
             self.btn_open_history.setText("关闭近期数据")
             self.btn_open_long_history.setText("打开历史数据")
         self._replay_bar_anim(True)
-        # 标记在回放态禁用（分页前插块号剧烈漂移，锚点不可靠）—— tooltip 说明原因
+        # 回放态标记照常可用（与实时共用同一套）：tooltip 保持简单，不写数据源说明。
         if getattr(self, "btn_mark", None) is not None:
-            self.btn_mark.setEnabled(False)
-            self.btn_mark.setToolTip("回放中不支持标记，返回实时后可用")
+            self.btn_mark.setEnabled(True)
+            self.btn_mark.setToolTip("标记当前轮（Alt+M）")
         if getattr(self, "_mark_list", None) is not None:
-            self._mark_list.setEnabled(False)
+            self._mark_list.setEnabled(True)
         self.txt_rx.setPlaceholderText("正在查看本地留存数据（点右上角返回实时）")
 
     def _replay_bar_height(self) -> int:

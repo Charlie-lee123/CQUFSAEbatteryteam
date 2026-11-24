@@ -1481,6 +1481,44 @@ def check_history_replay(app: QApplication) -> None:
              f"{window.btn_open_long_history.text()!r}")
         assert window._replay_kind == "recent", \
             f"近期回放的 _replay_kind 不对：{window._replay_kind!r}"
+
+        # ---- 单套共享标记（新增：历史/近期数据也支持标记）----
+        # 进回放前先放 1 条（模拟"实时打标"），进回放后列表仍应是这同一条。
+        window._marks.clear()
+        window._marks.add(0, "[live-stamp]", "live")
+        window._refresh_mark_list()
+        _before = [window._mark_list.item(i).text()
+                   for i in range(window._mark_list.count())]
+        assert len(_before) == 1 and _before[0].startswith("[live-stamp]"), \
+            f"进回放前列表应为实时那 1 条：{_before}"
+        assert window.btn_mark.isEnabled() and window._mark_list.isEnabled(), \
+            "回放态标记按钮/列表不该禁用"
+        # 回放文档里有时间戳轮，打标应落进同一套 → 列表变 2 条
+        window._mark_current()
+        app.processEvents()
+        assert len(window._marks.marks) == 2, \
+            f"回放打标后同一套应有 2 条，实际 {len(window._marks.marks)}"
+        assert window._mark_list.count() == 2, "回放打标后列表应同步为 2 条"
+        _items = [window._mark_list.item(i).text()
+                  for i in range(window._mark_list.count())]
+        assert not any(t.startswith(("近期 · ", "历史 · ")) for t in _items), \
+            f"单套共享不该有来源前缀：{_items}"
+        # 退回实时仍 2 条（进/出回放都不清）
+        window._exit_replay()
+        app.processEvents()
+        assert len(window._marks.marks) == 2, \
+            f"退回实时标记被清空了（应仍 2 条）：{len(window._marks.marks)}"
+        assert window._mark_list.count() == 2, "退回实时列表应仍 2 条"
+        # 只有主动清空接收区才清零
+        window._clear_receive()
+        app.processEvents()
+        assert len(window._marks.marks) == 0 and window._mark_list.count() == 0, \
+            "主动清空接收区后标记应清零"
+        # 恢复现场：回到近期回放继续原有断言
+        window._open_history()
+        app.processEvents()
+        assert window._replay_kind == "recent", "恢复近期回放失败"
+
         # 窗口没 show()，子控件 isVisible() 恒为 False —— 断言"要求显示"
         # （isHidden 为 False）而不是可见性。
         assert not window._replay_bar.isHidden(), "回放提示条没有显示"
@@ -1593,10 +1631,10 @@ def check_history_replay(app: QApplication) -> None:
         assert any("9.9999" in ln for ln in rx_history._pending), \
             "回放期间实时数据没有进历史"
 
-        # 返回实时：回放标记清掉、提示条收起
+        # 返回实时：标记共享保留、提示条收起
         window._exit_replay()
         app.processEvents()
-        assert not window._replay_active, "返回实时后回放标记没清"
+        assert not window._replay_active, "返回实时后仍在回放态"
         assert window.btn_open_history.text() == "打开近期数据", \
             "返回实时后按钮文案没变回「打开近期数据」"
         assert window.btn_open_long_history.text() == "打开历史数据", \
@@ -7115,6 +7153,13 @@ def check_v211_features() -> None:
     assert ms.next().key == a.key and ms.prev().key == b.key  # 循环
     ms.clear()
     assert ms.marks == [] and ms.next() is None
+
+    # --- 单套共享：MarkStore 本身即一份（历史/近期/实时共用，不建多套）---
+    live = marks_model.MarkStore()
+    live.add(1, "[t]", "one shared store")
+    assert len(live.marks) == 1
+    live.clear()
+    assert live.marks == [] and live.next() is None
 
 
 CHECKS = [
