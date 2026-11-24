@@ -8940,8 +8940,8 @@ class MainWindow(QMainWindow):
         mode_text = parts[0] if parts else ""
         volt_text = parts[3] if len(parts) > 3 else ""
         if self._soc_read_last is None:
-            return (mode_text, "BMS SOC --", "", volt_text), "off"
-        return (mode_text, f"BMS SOC {self._soc_read_last:.2f}%", "",
+            return (mode_text, "SOC --", "", volt_text), "off"
+        return (mode_text, f"SOC {self._soc_read_last:.2f}%", "",
                 volt_text), "ok"
 
     def _soc_placeholder(self) -> tuple[str, str, str, str]:
@@ -8951,7 +8951,7 @@ class MainWindow(QMainWindow):
             # "总电压 -- V"，volt=calc → 空串。⛔ 占位路径没有可计算的结果，
             # 别在这里给计算值。
             volt_slot = "总电压 -- V" if self._volt_source == "read" else ""
-            return "", "BMS SOC --", "", volt_slot
+            return "", "SOC --", "", volt_slot
         return "", "SOC --", "", ""
 
     def _load_volt_source(self) -> str:
@@ -9801,7 +9801,7 @@ class MainWindow(QMainWindow):
             # 只换「读哪个数」：估算 / 积分 / 零漂一行没动（见 _refresh_soc_now）
             self._set_soc_source(customization.get("soc_source"))
             app_log.info("SOC 数据来源已切换为 " +
-                         ("BMS 上报" if self._soc_source == "read" else "本地估算"))
+                         ("报文读取" if self._soc_source == "read" else "本地估算"))
         if "volt_source" in custom_changes:
             self._set_volt_source(customization.get("volt_source"))
             app_log.info("总电压来源已切换为 " +

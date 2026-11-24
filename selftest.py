@@ -3494,7 +3494,7 @@ def check_customization(app: QApplication) -> None:
                          __import__("customization").specs()
                          if spec["key"] == "soc_source"
                          for lab, _v in spec["options"]]
-            assert _soc_opts == ["本地估算", "BMS 上报"], f"SOC 来源文案：{_soc_opts}"
+            assert _soc_opts == ["本地估算", "报文读取"], f"SOC 来源文案：{_soc_opts}"
 
             # 6a-1c) 弹层高度必须封顶到 _POPUP_MAX_ROWS 行（用户 2026-11-21：
             #     「这个太长太宽了」—— 30 档撑到 864px、跑出屏幕下缘）。
@@ -7052,14 +7052,14 @@ def check_v211_features() -> None:
     import wake_lock
     import marks_model
 
-    # --- 需求 1：两组来源文案统一、无「车端」；volt_source 是独立新键 ---
+    # --- 需求 1：SOC 那组不许出现「BMS」「车端」；电压那组保持「BMS 上报」不变 ---
     def _opts(key: str) -> list[str]:
         return [lab for spec in customization.specs() if spec["key"] == key
                 for lab, _v in spec["options"]]
-    assert _opts("soc_source") == ["本地估算", "BMS 上报"], _opts("soc_source")
+    assert _opts("soc_source") == ["本地估算", "报文读取"], _opts("soc_source")
     assert _opts("volt_source") == ["本地估算", "BMS 上报"], _opts("volt_source")
-    _all_labels = " ".join(_opts("soc_source") + _opts("volt_source"))
-    assert "车端" not in _all_labels, _all_labels
+    _soc_labels = " ".join(_opts("soc_source"))
+    assert "BMS" not in _soc_labels and "车端" not in _soc_labels, _soc_labels
     assert customization.get("volt_source") in ("calc", "read")
     assert customization.get("keep_awake_on_rx") in (True, False)
 

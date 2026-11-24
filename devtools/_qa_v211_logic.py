@@ -69,7 +69,7 @@ def probe_customization():
         labels = [lab for lab, _v in soc["options"]]
         values = [v for _lab, v in soc["options"]]
         emit(f"    soc_source labels={labels} values={values} default={soc['default']!r}")
-        check("soc_source 文案=本地估算/BMS 上报", labels == ["本地估算", "BMS 上报"], str(labels))
+        check("soc_source 文案=本地估算/报文读取", labels == ["本地估算", "报文读取"], str(labels))
         check("soc_source 存储值不变=calc/read", values == ["calc", "read"], str(values))
         check("soc_source 默认值不变=calc", soc["default"] == "calc", str(soc["default"]))
         check("soc_source 文案无「车端」", all("车端" not in lab for lab in labels))
