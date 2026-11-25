@@ -2192,7 +2192,7 @@ class MainWindow(QMainWindow):
         self.btn_marks = RowButton("查看标记", outlined=True)
         self.btn_marks.setToolTip("查看整轮标记（仅本次会话）")
         self.btn_marks.clicked.connect(self._show_marks_dialog)
-        actions.addWidget(self.btn_marks, alignment=Qt.AlignmentFlag.AlignLeft)
+        actions.addWidget(self.btn_marks, alignment=Qt.AlignmentFlag.AlignHCenter)
         actions.addSpacing(4)   # 四颗都是描边胶囊，彼此留一点呼吸
 
         # 「打开近期数据」（用户 2026-10-13 点名，2026-11-21 改名）：在软件内打开
@@ -2205,7 +2205,7 @@ class MainWindow(QMainWindow):
             "用来看瞬时报错；回放中再点一次返回实时"
             "（格式与实时一致，可搜索 / 定位异常 / 复制）")
         self.btn_open_history.clicked.connect(self._open_history)
-        actions.addWidget(self.btn_open_history, alignment=Qt.AlignmentFlag.AlignLeft)
+        actions.addWidget(self.btn_open_history, alignment=Qt.AlignmentFlag.AlignHCenter)
 
         # 「打开历史数据」（用户 2026-11-21 明确需求）：读会话库 sessions.db
         # （append-only、永不删除），按采样间隔抽帧回放，看长期电压变化。与近期回放
@@ -2215,7 +2215,7 @@ class MainWindow(QMainWindow):
             "查看永不删除的历史数据，按设置里的采样间隔显示，用来看长期电压变化；"
             "回放中再点一次返回实时")
         self.btn_open_long_history.clicked.connect(self._open_long_history)
-        actions.addWidget(self.btn_open_long_history, alignment=Qt.AlignmentFlag.AlignLeft)
+        actions.addWidget(self.btn_open_long_history, alignment=Qt.AlignmentFlag.AlignHCenter)
         actions.addSpacing(4)   # 回放两颗之间留一点呼吸
 
         # 「历史报错数据」（用户 2026-11-13 点名）：扫一遍本地留存的接收数据，
@@ -2224,7 +2224,7 @@ class MainWindow(QMainWindow):
         self.btn_error_history.setToolTip(
             "查看历史接收数据里出现过的超温 / 超压 / 欠压 / BMS 报错，每条都带时间戳")
         self.btn_error_history.clicked.connect(self._open_error_history)
-        actions.addWidget(self.btn_error_history, alignment=Qt.AlignmentFlag.AlignLeft)
+        actions.addWidget(self.btn_error_history, alignment=Qt.AlignmentFlag.AlignHCenter)
         actions.addSpacing(4)   # 主操作收尾，再接次要（但同款描边）的 DLC
 
         actions_box_col.addLayout(actions)
@@ -2242,7 +2242,7 @@ class MainWindow(QMainWindow):
         self.btn_dlc = RowButton("DLC", muted=True, outlined=True)
         self.btn_dlc.setToolTip("心率广播 DLC：未安装时提示安装，已安装直接打开")
         self.btn_dlc.clicked.connect(self._on_dlc_clicked)
-        dlc_row.addWidget(self.btn_dlc, alignment=Qt.AlignmentFlag.AlignLeft)
+        dlc_row.addWidget(self.btn_dlc, alignment=Qt.AlignmentFlag.AlignHCenter)
         actions_box_col.addLayout(dlc_row)
 
         col.addWidget(self.actions_box)

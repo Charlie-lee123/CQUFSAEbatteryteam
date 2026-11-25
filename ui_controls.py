@@ -351,7 +351,7 @@ class RowButton(QPushButton):
         self.setFont(ui_font(12.5))
         # 绕开全局 QPushButton 规则（自绘，别在行外再描一圈框）
         self.setObjectName("rowButton")
-        # 描边按钮按文字取自然宽度、左对齐；普通动作行仍吃满整行。
+        # 描边按钮按文字取自然宽度，由调用方在竖排布局里居中放；普通动作行吃满整行。
         self.setSizePolicy(
             QSizePolicy.Policy.Preferred if outlined else QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed)

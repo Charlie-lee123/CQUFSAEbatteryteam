@@ -7,7 +7,7 @@ r"""一次性真平台探针：配置卡底部动作行改版的功能等价性 
   C clicked 连接的目标方法存在且可调用（handler 未丢）
   D 回放态文案切换与改前一致（打开/关闭 近期/历史）
   E 禁用逻辑：btn_dlc / btn_error_history 等 setEnabled(False) 生效
-  F 行高=32、DLC 是 muted；五颗像素上有浅底+描边，且宽度按文字取、不撑满整行
+  F 行高=32、DLC 是 muted；五颗像素上有浅底+描边，宽度按文字取、不撑满整行且水平居中
   G 布局仍在 _config_content 内、不在 _config_fields；无 64px 占位残留
   H 窄档（把 config 收窄到 1/4）不抛异常、卡片最小宽不异常
   I QSettings 前后零变化
@@ -172,20 +172,43 @@ def main() -> int:
             img = pm.toImage()
             return img, img.pixelColor(lx, ly).getRgb()
 
+        app.processEvents()   # 居中对齐改完先让布局落定，别量到中间态尺寸
         for attr in btns:
             b = getattr(win, attr)
-            r = b.rect()
-            img, inside = _render_px(b, r.center().x(), 5)
+            # 串口模式下 DLC 按设计隐藏；隐藏控件 render() 出来的图尺寸会失真
+            # （实测 widget=88x32 但 pixmap=640x32，取样全透明）。临时显示再收回去。
+            dlc_hidden = (attr == "btn_dlc" and b.isHidden())
+            if dlc_hidden:
+                b.show()
+                app.processEvents()
+            # 只 render 一次：DLC 在两次 render 之间尺寸可能还没落定，
+            # 先前分别取样会出现 inside 透明 / border 有色的假红。
+            img, _ = _render_px(b, 0, 0)
             img.save(str(Path(_ROOT) / "_check" / f"ui_actions_{attr}.png"))
-            _, border = _render_px(b, r.center().x(), 0)   # 胶囊上边缘中点=描边
+            cx = img.width() // 2
+            inside = img.pixelColor(cx, 5).getRgb()
+            border = img.pixelColor(cx, 0).getRgb()   # 胶囊上边缘中点=描边
             check(f"F4 {attr} 浅底/描边在像素上可见",
                   inside[3] == 255 and border[3] == 255 and inside[:3] != border[:3],
-                  f"inside={inside} border={border}")
+                  f"inside={inside} border={border} size={img.width()}x{img.height()} "
+                  f"widget={b.width()}x{b.height()} visible={b.isVisible()}")
+            if dlc_hidden:
+                b.hide()
+                app.processEvents()
         widths = {a: getattr(win, a).width() for a in btns}
         check("F5 按钮宽度按文字取合适尺寸（不撑满配置栏）",
               all(88 <= w <= 180 for w in widths.values())
               and max(widths.values()) < win._config_content.width() - 20,
               f"widths={widths} content={win._config_content.width()}")
+        # F6 用户「将这几个按钮居中放置」：每颗按钮中心 x 必须落在配置栏中线。
+        center = win._config_content.width() / 2.0
+        offsets = {}
+        for attr in btns:
+            b = getattr(win, attr)
+            p = b.mapTo(win._config_content, QPoint(b.rect().center().x(), 0))
+            offsets[attr] = round(p.x() - center, 1)
+        check("F6 五颗按钮水平居中", all(abs(v) <= 2 for v in offsets.values()),
+              f"offsets={offsets} center={center}")
 
         # G 在 _config_content 内、不在 _config_fields、无 64px 占位残留
         check("G1 五颗都在 _config_content 内",
