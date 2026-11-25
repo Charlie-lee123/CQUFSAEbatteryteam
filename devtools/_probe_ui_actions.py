@@ -2,12 +2,12 @@
 r"""一次性真平台探针：配置卡底部动作行改版的功能等价性 + 窄档不崩。
 
 证明（写 _check/ui_actions_probe.txt）：
-  A 五颗按钮都存在、是 RowButton、文案与改前一致；标记/近期/历史/历史报错四颗是 outlined
+  A 五颗按钮都存在、是 RowButton、文案与改前一致；五颗全是 outlined 描边态
   B tooltip 非空且关键子串在（文案/提示未丢）
   C clicked 连接的目标方法存在且可调用（handler 未丢）
   D 回放态文案切换与改前一致（打开/关闭 近期/历史）
   E 禁用逻辑：btn_dlc / btn_error_history 等 setEnabled(False) 生效
-  F 行高=32、DLC 是 muted 且无边框；四颗主操作像素上有浅底+描边
+  F 行高=32、DLC 是 muted；五颗像素上有浅底+描边，且宽度按文字取、不撑满整行
   G 布局仍在 _config_content 内、不在 _config_fields；无 64px 占位残留
   H 窄档（把 config 收窄到 1/4）不抛异常、卡片最小宽不异常
   I QSettings 前后零变化
@@ -88,12 +88,9 @@ def main() -> int:
             ok_all = ok_all and is_row and same_text
         check("A 五颗全部符合", ok_all)
         _outlined = {a: getattr(getattr(win, a, None), "_outlined", False)
-                     for a in ("btn_marks", "btn_open_history",
-                               "btn_open_long_history", "btn_error_history")}
-        _plain = {"btn_dlc": getattr(win.btn_dlc, "_outlined", False)}
-        check("A2 标记/近期/历史/历史报错是 outlined，DLC 仍是普通动作行",
-              all(_outlined.values()) and not any(_plain.values()),
-              f"outlined={_outlined} plain={_plain}")
+                     for a in btns}
+        check("A2 五颗全是 outlined 描边按钮", all(_outlined.values()),
+              str(_outlined))
 
         # B tooltip 关键子串
         tips = {
@@ -175,12 +172,7 @@ def main() -> int:
             img = pm.toImage()
             return img, img.pixelColor(lx, ly).getRgb()
 
-        plain_img, plain_px = _render_px(win.btn_dlc,
-                                         win.btn_dlc.rect().center().x(), 5)
-        check("F4a DLC 动作行静止态透明（无底板）", plain_px[3] == 0,
-              f"px={plain_px}")
-        for attr in ("btn_marks", "btn_open_history",
-                     "btn_open_long_history", "btn_error_history"):
+        for attr in btns:
             b = getattr(win, attr)
             r = b.rect()
             img, inside = _render_px(b, r.center().x(), 5)
@@ -189,6 +181,11 @@ def main() -> int:
             check(f"F4 {attr} 浅底/描边在像素上可见",
                   inside[3] == 255 and border[3] == 255 and inside[:3] != border[:3],
                   f"inside={inside} border={border}")
+        widths = {a: getattr(win, a).width() for a in btns}
+        check("F5 按钮宽度按文字取合适尺寸（不撑满配置栏）",
+              all(88 <= w <= 180 for w in widths.values())
+              and max(widths.values()) < win._config_content.width() - 20,
+              f"widths={widths} content={win._config_content.width()}")
 
         # G 在 _config_content 内、不在 _config_fields、无 64px 占位残留
         check("G1 五颗都在 _config_content 内",

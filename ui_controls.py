@@ -328,11 +328,10 @@ class RowButton(QPushButton):
     ``setText`` 只影响文字、不改高度（改宽由布局决定）。⛔ 不画图标/箭头 ——
     这几颗里有开关语义（打开=关闭），箭头会误导。
     ``muted=True`` 时文字静止用 ``ink_3``（次要动作，如 DLC），悬停仍转 ``ink``。
-    ``outlined=True`` 时改画**常驻浅底 + 描边的胶囊按钮**、文字居中（其余动作行
-    不受影响）：用户 2026-11-25 先点名「历史记录和近期记录仍需要按钮」，随后补
-    「查看历史报错和标记也要」——四颗主操作都要一眼看出是按钮，不能像一行文字。
-    行高仍锁 32、宽度仍随布局撑满，所以窄档不会被 InkButton 的「文字宽 + 44」
-    下限挤出去。
+    ``outlined=True`` 时改画**常驻浅底 + 描边的胶囊按钮**、文字居中：用户
+    2026-11-25 先点名「历史记录和近期记录仍需要按钮」，随后补「查看历史报错
+    和标记也要」「DLC 也一样」，所以五颗全部描边。⛔ 宽度按文字取合适尺寸
+    （不是撑满整行）——「按钮要大小合适」；行高仍锁 32，窄档可压到 88。
     """
 
     HEIGHT = 32
@@ -352,7 +351,12 @@ class RowButton(QPushButton):
         self.setFont(ui_font(12.5))
         # 绕开全局 QPushButton 规则（自绘，别在行外再描一圈框）
         self.setObjectName("rowButton")
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        # 描边按钮按文字取自然宽度、左对齐；普通动作行仍吃满整行。
+        self.setSizePolicy(
+            QSizePolicy.Policy.Preferred if outlined else QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed)
+        if outlined:
+            self.setMinimumWidth(88)
         self.setFixedHeight(self.HEIGHT)
         # 悬停 120ms 补间（进入即到位），按下/禁用短补间，全部复用 ui_anim Tween。
         self._hover_anim = Tween(120, out_cubic, self._on_hover, parent=self)
@@ -394,10 +398,11 @@ class RowButton(QPushButton):
         super().changeEvent(event)
 
     def sizeHint(self) -> QSize:      # noqa: N802 (Qt 命名)
-        # 高度固定；宽度随文字（布局 Expanding 会撑满），只保证有个合理下限。
+        # 高度固定；描边态文字居中，左右各留 18px 呼吸，按文字取宽度。
+        # 普通动作行左对齐，宽度由 Expanding 布局撑满，这里只给个合理下限。
         metrics = QFontMetrics(self.font())
-        return QSize(metrics.horizontalAdvance(self.text()) + self.PAD_LEFT + 12,
-                     self.HEIGHT)
+        pad = 36 if self._outlined else self.PAD_LEFT + 12
+        return QSize(metrics.horizontalAdvance(self.text()) + pad, self.HEIGHT)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
@@ -418,7 +423,9 @@ class RowButton(QPushButton):
             #   用户说的「看不出是按钮」。
             fill = QColor(mix(qcolor("surface_2"), qcolor("surface_hover"), lit))
             border = QColor(mix(qcolor("line"), qcolor("line_strong"), lit))
-            text_color = QColor(mix(qcolor("ink_2"), qcolor("ink"), lit))
+            # DLC 仍是 muted 的次要动作：同一套描边胶囊，但文字淡一档。
+            base_ink = qcolor("ink_3") if self._muted else qcolor("ink_2")
+            text_color = QColor(mix(base_ink, qcolor("ink"), lit))
             if dim > 0.0:
                 fill.setAlphaF(fill.alphaF() * (1.0 - dim))
                 border.setAlphaF(border.alphaF() * (1.0 - dim))

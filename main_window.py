@@ -325,7 +325,7 @@ BUTTON_SPECS: tuple[tuple[str, str, str], ...] = (
     # key = getattr(self, key) 的属性名 → 必须与 main_window 里的属性**完全一致**。
     ("serial_params",   "串口参数",   "串口设置"),
     ("rx_lines_box",    "保留行数",   "串口设置"),
-    ("actions_box",     "数据与工具", "串口设置"),
+    ("actions_box",     "数据工具",   "串口设置"),
 )
 # ⛔ 「串口开关」「连接方式 / 目标列表」**故意不在表里**：藏了就切不了模式，
 #    等于把用户锁死。DLC 同样不在表里（不许隐藏），它只随连接方式出现/消失。
@@ -2152,7 +2152,7 @@ class MainWindow(QMainWindow):
         rx_lines_col.addLayout(line_row)
         col.addWidget(self.rx_lines_box)
 
-        # ============ 「数据与工具」动作列表（用户 2026-11-26「做好看一些」）============
+        # ============ 「数据工具」动作列表（用户 2026-11-26「做好看一些」）============
         # 原来这里是 5 颗同款描边药丸竖叠（还各带 64px 标签占位），又重又单调。
         # 改成紧凑无边框动作行（ui_controls.RowButton）：分隔线 + 小标题分组，行高 32、
         # 静止无边框无底色、悬停浮浅底。⛔ 文案 / tooltip / clicked / 回放文案切换逻辑
@@ -2172,16 +2172,17 @@ class MainWindow(QMainWindow):
         divider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         actions_box_col.addWidget(divider)
 
-        group_title = QLabel("数据与工具")
+        group_title = QLabel("数据工具")
         group_title.setObjectName("actionsGroupTitle")
         group_title.setFont(ui_font(10.5))
         actions_box_col.addWidget(group_title)
 
         # 动作列表容器：竖排、行间 2px。全部 RowButton，无标签占位、无 64px 空格。
-        # ⚠️ 四颗主操作（查看标记 / 近期 / 历史 / 历史报错）走 RowButton 的 outlined
-        #    态（常驻浅底 + 描边胶囊）：用户 2026-11-25 先点名「历史记录和近期记录
-        #    仍需要按钮」，随后补「查看历史报错和标记也要」。DLC 仍是次要的无边框
-        #    muted 动作行，不抢这四颗的视觉层级。
+        # ⚠️ 五颗（查看标记 / 近期 / 历史 / 历史报错 / DLC）全走 RowButton 的
+        #    outlined 态（常驻浅底 + 描边胶囊）：用户 2026-11-25 先点名「历史记录和
+        #    近期记录仍需要按钮」，随后补「查看历史报错和标记也要」「DLC 也一样」。
+        #    ⛔ 宽度按文字取合适尺寸、不撑满整行（用户「按钮要大小合适」）；DLC
+        #    保留 muted 文字当次要动作，但同样是描边按钮。
         actions = QVBoxLayout()
         actions.setContentsMargins(0, 3, 0, 0)
         actions.setSpacing(2)
@@ -2191,7 +2192,7 @@ class MainWindow(QMainWindow):
         self.btn_marks = RowButton("查看标记", outlined=True)
         self.btn_marks.setToolTip("查看整轮标记（仅本次会话）")
         self.btn_marks.clicked.connect(self._show_marks_dialog)
-        actions.addWidget(self.btn_marks)
+        actions.addWidget(self.btn_marks, alignment=Qt.AlignmentFlag.AlignLeft)
         actions.addSpacing(4)   # 四颗都是描边胶囊，彼此留一点呼吸
 
         # 「打开近期数据」（用户 2026-10-13 点名，2026-11-21 改名）：在软件内打开
@@ -2204,7 +2205,7 @@ class MainWindow(QMainWindow):
             "用来看瞬时报错；回放中再点一次返回实时"
             "（格式与实时一致，可搜索 / 定位异常 / 复制）")
         self.btn_open_history.clicked.connect(self._open_history)
-        actions.addWidget(self.btn_open_history)
+        actions.addWidget(self.btn_open_history, alignment=Qt.AlignmentFlag.AlignLeft)
 
         # 「打开历史数据」（用户 2026-11-21 明确需求）：读会话库 sessions.db
         # （append-only、永不删除），按采样间隔抽帧回放，看长期电压变化。与近期回放
@@ -2214,7 +2215,7 @@ class MainWindow(QMainWindow):
             "查看永不删除的历史数据，按设置里的采样间隔显示，用来看长期电压变化；"
             "回放中再点一次返回实时")
         self.btn_open_long_history.clicked.connect(self._open_long_history)
-        actions.addWidget(self.btn_open_long_history)
+        actions.addWidget(self.btn_open_long_history, alignment=Qt.AlignmentFlag.AlignLeft)
         actions.addSpacing(4)   # 回放两颗之间留一点呼吸
 
         # 「历史报错数据」（用户 2026-11-13 点名）：扫一遍本地留存的接收数据，
@@ -2223,14 +2224,14 @@ class MainWindow(QMainWindow):
         self.btn_error_history.setToolTip(
             "查看历史接收数据里出现过的超温 / 超压 / 欠压 / BMS 报错，每条都带时间戳")
         self.btn_error_history.clicked.connect(self._open_error_history)
-        actions.addWidget(self.btn_error_history)
-        actions.addSpacing(4)   # 描边按钮组收尾，再接次要的 DLC 动作行
+        actions.addWidget(self.btn_error_history, alignment=Qt.AlignmentFlag.AlignLeft)
+        actions.addSpacing(4)   # 主操作收尾，再接次要（但同款描边）的 DLC
 
         actions_box_col.addLayout(actions)
 
         # 「DLC」常驻串口配置栏（用户 2026-11-12："DLC 按钮放串口设置那里"）：
         # 放在动作列表之后再单独一行、文字用 ink_3（muted）当**次要动作**，与上面
-        # 四颗主动作拉开层次。
+        # 四颗主动作拉开层次；按钮本身仍是同款描边胶囊（用户「DLC 也一样」）。
         # 语义仍是单 DLC 直通：没装 → 提示安装，装了 → 直接进心率面板。
         # ⚠️ 不进 BUTTON_SPECS —— 允许隐藏等于让用户把自己锁在 DLC 外面。
         # ⚠️ 只在**蓝牙广播模式**显示（串口模式下心率广播用不上）：显隐由
@@ -2238,10 +2239,10 @@ class MainWindow(QMainWindow):
         dlc_row = QVBoxLayout()
         dlc_row.setContentsMargins(0, 2, 0, 0)
         dlc_row.setSpacing(0)
-        self.btn_dlc = RowButton("DLC", muted=True)
+        self.btn_dlc = RowButton("DLC", muted=True, outlined=True)
         self.btn_dlc.setToolTip("心率广播 DLC：未安装时提示安装，已安装直接打开")
         self.btn_dlc.clicked.connect(self._on_dlc_clicked)
-        dlc_row.addWidget(self.btn_dlc)
+        dlc_row.addWidget(self.btn_dlc, alignment=Qt.AlignmentFlag.AlignLeft)
         actions_box_col.addLayout(dlc_row)
 
         col.addWidget(self.actions_box)
@@ -4471,9 +4472,9 @@ class MainWindow(QMainWindow):
         # 「一发」两个字，看不出这是个历史列表（1/4 屏截图里量到过）。
         if field_w > 0:
             self.cmb_history.setMinimumWidth(90)
-        # 底部「数据与工具」都是 RowButton：四颗 outlined 主操作（常驻浅底描边）
-        # + 一颗无边框 muted 的 DLC。⛔ 它们都不再需要老药丸的 146/104 下限，也不
-        # 再需要 64px 标签占位 —— 那些 spacer 已随布局改版删除，这里不触碰。
+        # 底部「数据工具」五颗都是 outlined RowButton（常驻浅底描边）；宽度按文字
+        # 自然取、不撑满整行，窄档由 minimumWidth(88) 兜底。⛔ 不再需要老药丸的
+        # 146/104 下限，也不需要 64px 标签占位 —— spacer 已删，这里不触碰。
 
         # 工具栏横/竖排。切换会改变内容自然高度，把"量过的高度"和"钉住的高度"一起
         # 作废 —— 否则下一次全屏转场会按旧行高插值（展开那一帧工具栏会被裁）。
@@ -10083,9 +10084,9 @@ class MainWindow(QMainWindow):
         规则：
           · 串口参数（波特率/停止位/数据位/校验位）：蓝牙广播模式没有这些概念
             → 整体隐藏；再叠加用户是否隐藏了「串口参数」。
-          · 保留行数 / 数据与工具：两种模式都要，只看用户隐藏状态。
+          · 保留行数 / 数据工具：两种模式都要，只看用户隐藏状态。
           · DLC：**只在蓝牙广播模式**出现（串口模式心率广播用不上）。它住在
-            「数据与工具」组里，所以隐藏该组时自然跟着没 —— 但它**不受**「串口
+            「数据工具」组里，所以隐藏该组时自然跟着没 —— 但它**不受**「串口
             参数」隐藏影响（两者是兄弟容器，不是父子）。
 
         ⛔ 蓝牙广播模式下别让 DLC 跟着串口参数一起没了 —— 它在 actions_box 里。
@@ -10115,7 +10116,7 @@ class MainWindow(QMainWindow):
         # 串口参数：蓝牙广播模式没有这些概念 → 整体隐藏；再叠加用户是否隐藏了它。
         _show(getattr(self, "serial_params", None),
               (not ble) and ("serial_params" not in hidden))
-        # 保留行数 / 数据与工具：两种模式都要，只看用户隐藏状态。
+        # 保留行数 / 数据工具：两种模式都要，只看用户隐藏状态。
         for key in ("rx_lines_box", "actions_box"):
             _show(getattr(self, key, None), key not in hidden)
         # DLC：只在蓝牙广播模式出现（串口模式心率广播用不上）。

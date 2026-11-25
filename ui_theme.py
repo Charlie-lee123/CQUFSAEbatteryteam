@@ -1007,7 +1007,7 @@ QLabel#groupCaption {
     color: @ink_2@;
 }
 
-/* 串口配置卡底部「数据与工具」动作列表的分组小标题 / 分隔线。
+/* 串口配置卡底部「数据工具」动作列表的分组小标题 / 分隔线。
    用小标题 + 1px line 分隔，与上方表单行明确分组（用户「做好看一些」）。
    走 QSS token 而非内联色，换主题时随 unpolish/polish 一起更新。 */
 QLabel#actionsGroupTitle {

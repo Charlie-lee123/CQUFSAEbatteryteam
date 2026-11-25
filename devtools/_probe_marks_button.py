@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -202,6 +203,11 @@ def main() -> int:
             if getattr(win, "_marks_dialog", None) is not None:
                 win._marks_dialog.accept()
             win.close()
+            # close() 只起 160ms 淡出；立刻 deleteLater() 会在扫描线程还活着时
+            # 析构主窗 → 退出码 127、stdout 缓冲全丢（报告虽然写了但门禁看退出码）。
+            for _ in range(80):
+                app.processEvents()
+                time.sleep(0.006)
             win.deleteLater()
         app.processEvents()
         app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
