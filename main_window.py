@@ -2178,20 +2178,21 @@ class MainWindow(QMainWindow):
         actions_box_col.addWidget(group_title)
 
         # 动作列表容器：竖排、行间 2px。全部 RowButton，无标签占位、无 64px 空格。
-        # ⚠️ 「打开近期数据 / 打开历史数据」走 RowButton 的 outlined 态（常驻浅底
-        #    + 描边胶囊）：用户 2026-11-25 点名「历史记录和近期记录仍需要按钮」——
-        #    进出回放的主操作要一眼看出是按钮；其余三颗仍是无边框紧凑动作行。
+        # ⚠️ 四颗主操作（查看标记 / 近期 / 历史 / 历史报错）走 RowButton 的 outlined
+        #    态（常驻浅底 + 描边胶囊）：用户 2026-11-25 先点名「历史记录和近期记录
+        #    仍需要按钮」，随后补「查看历史报错和标记也要」。DLC 仍是次要的无边框
+        #    muted 动作行，不抢这四颗的视觉层级。
         actions = QVBoxLayout()
         actions.setContentsMargins(0, 3, 0, 0)
         actions.setSpacing(2)
 
         # 「查看标记」（用户 2026-11-24「查看标记还是做成按钮吧」）：点它弹窗看列表
         # （见 _show_marks_dialog）。打标按钮仍在接收区右侧竖栏（Alt+M）。
-        self.btn_marks = RowButton("查看标记")
+        self.btn_marks = RowButton("查看标记", outlined=True)
         self.btn_marks.setToolTip("查看整轮标记（仅本次会话）")
         self.btn_marks.clicked.connect(self._show_marks_dialog)
         actions.addWidget(self.btn_marks)
-        actions.addSpacing(4)   # 与两颗回放按钮拉开层次（它们是描边胶囊）
+        actions.addSpacing(4)   # 四颗都是描边胶囊，彼此留一点呼吸
 
         # 「打开近期数据」（用户 2026-10-13 点名，2026-11-21 改名）：在软件内打开
         # 本地留存的接收数据，格式/风格/功能与实时接收一致。
@@ -2214,15 +2215,16 @@ class MainWindow(QMainWindow):
             "回放中再点一次返回实时")
         self.btn_open_long_history.clicked.connect(self._open_long_history)
         actions.addWidget(self.btn_open_long_history)
-        actions.addSpacing(4)   # 描边按钮收尾，再接无边框动作行
+        actions.addSpacing(4)   # 回放两颗之间留一点呼吸
 
         # 「历史报错数据」（用户 2026-11-13 点名）：扫一遍本地留存的接收数据，
         # 把出现过的超温 / 超压 / 欠压 / BMS 报错逐条带时间戳列出来。
-        self.btn_error_history = RowButton("历史报错数据")
+        self.btn_error_history = RowButton("历史报错数据", outlined=True)
         self.btn_error_history.setToolTip(
             "查看历史接收数据里出现过的超温 / 超压 / 欠压 / BMS 报错，每条都带时间戳")
         self.btn_error_history.clicked.connect(self._open_error_history)
         actions.addWidget(self.btn_error_history)
+        actions.addSpacing(4)   # 描边按钮组收尾，再接次要的 DLC 动作行
 
         actions_box_col.addLayout(actions)
 
@@ -4469,9 +4471,9 @@ class MainWindow(QMainWindow):
         # 「一发」两个字，看不出这是个历史列表（1/4 屏截图里量到过）。
         if field_w > 0:
             self.cmb_history.setMinimumWidth(90)
-        # 底部「数据与工具」都是 RowButton：三颗无边框动作行 + 两颗 outlined 回放
-        # 按钮（常驻浅底描边）。⛔ 两者都不再需要老药丸的 146/104 下限，也不再需要
-        # 64px 标签占位 —— 那些 spacer 已随布局改版删除，这里不触碰（⛔ 不留悬空属性）。
+        # 底部「数据与工具」都是 RowButton：四颗 outlined 主操作（常驻浅底描边）
+        # + 一颗无边框 muted 的 DLC。⛔ 它们都不再需要老药丸的 146/104 下限，也不
+        # 再需要 64px 标签占位 —— 那些 spacer 已随布局改版删除，这里不触碰。
 
         # 工具栏横/竖排。切换会改变内容自然高度，把"量过的高度"和"钉住的高度"一起
         # 作废 —— 否则下一次全屏转场会按旧行高插值（展开那一帧工具栏会被裁）。

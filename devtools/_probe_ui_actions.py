@@ -2,12 +2,12 @@
 r"""一次性真平台探针：配置卡底部动作行改版的功能等价性 + 窄档不崩。
 
 证明（写 _check/ui_actions_probe.txt）：
-  A 五颗按钮都存在、是 RowButton、文案与改前一致；近期/历史两颗是 outlined 描边态
+  A 五颗按钮都存在、是 RowButton、文案与改前一致；标记/近期/历史/历史报错四颗是 outlined
   B tooltip 非空且关键子串在（文案/提示未丢）
   C clicked 连接的目标方法存在且可调用（handler 未丢）
   D 回放态文案切换与改前一致（打开/关闭 近期/历史）
   E 禁用逻辑：btn_dlc / btn_error_history 等 setEnabled(False) 生效
-  F 行高=32、其余三颗无边框、DLC 是 muted；两颗回放按钮像素上有浅底+描边
+  F 行高=32、DLC 是 muted 且无边框；四颗主操作像素上有浅底+描边
   G 布局仍在 _config_content 内、不在 _config_fields；无 64px 占位残留
   H 窄档（把 config 收窄到 1/4）不抛异常、卡片最小宽不异常
   I QSettings 前后零变化
@@ -88,10 +88,10 @@ def main() -> int:
             ok_all = ok_all and is_row and same_text
         check("A 五颗全部符合", ok_all)
         _outlined = {a: getattr(getattr(win, a, None), "_outlined", False)
-                     for a in ("btn_open_history", "btn_open_long_history")}
-        _plain = {a: getattr(getattr(win, a, None), "_outlined", False)
-                  for a in ("btn_marks", "btn_error_history", "btn_dlc")}
-        check("A2 近期/历史是 outlined 描边按钮，其余三颗仍是普通动作行",
+                     for a in ("btn_marks", "btn_open_history",
+                               "btn_open_long_history", "btn_error_history")}
+        _plain = {"btn_dlc": getattr(win.btn_dlc, "_outlined", False)}
+        check("A2 标记/近期/历史/历史报错是 outlined，DLC 仍是普通动作行",
               all(_outlined.values()) and not any(_plain.values()),
               f"outlined={_outlined} plain={_plain}")
 
@@ -175,11 +175,12 @@ def main() -> int:
             img = pm.toImage()
             return img, img.pixelColor(lx, ly).getRgb()
 
-        plain_img, plain_px = _render_px(win.btn_marks,
-                                         win.btn_marks.rect().center().x(), 5)
-        check("F4a 普通动作行静止态透明（无底板）", plain_px[3] == 0,
+        plain_img, plain_px = _render_px(win.btn_dlc,
+                                         win.btn_dlc.rect().center().x(), 5)
+        check("F4a DLC 动作行静止态透明（无底板）", plain_px[3] == 0,
               f"px={plain_px}")
-        for attr in ("btn_open_history", "btn_open_long_history"):
+        for attr in ("btn_marks", "btn_open_history",
+                     "btn_open_long_history", "btn_error_history"):
             b = getattr(win, attr)
             r = b.rect()
             img, inside = _render_px(b, r.center().x(), 5)
