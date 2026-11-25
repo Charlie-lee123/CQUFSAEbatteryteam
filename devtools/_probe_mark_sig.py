@@ -67,6 +67,26 @@ def build_round(stamp: str, token: str, pad: int = 28) -> str:
     return "\n".join(body) + "\n"
 
 
+def list_state(win, app) -> tuple[int, list[str]]:
+    """读标记列表（条数 + 各条文案）。
+
+    ⚠️ 列表现在活在「查看标记」弹窗里（UI 改版后从配置卡挪进了弹窗，平时
+    ``_mark_list`` 是 None）→ 读之前开一下弹窗，读完关掉。
+    """
+    win._show_marks_dialog()
+    app.processEvents()
+    try:
+        lst = win._mark_list
+        if lst is None:
+            return 0, []
+        return lst.count(), [lst.item(i).text() for i in range(lst.count())]
+    finally:
+        dlg = getattr(win, "_marks_dialog", None)
+        if dlg is not None:
+            dlg.accept()
+        app.processEvents()
+
+
 def main() -> int:
     import shutil
     import tempfile
@@ -153,8 +173,8 @@ def main() -> int:
         _m, created = win._marks.add_unique(b2, STAMP, token_of(win, sp2), revb, sigb)
         check("B1 再打标不新增(created=False)", created is False,
               f"created={created} count={len(win._marks.marks)}")
-        check("B2 列表仍 1 条", win._mark_list.count() == 1,
-              str([win._mark_list.item(i).text() for i in range(win._mark_list.count())]))
+        _nB, _itemsB = list_state(win, app)
+        check("B2 列表仍 1 条", _nB == 1, str(_itemsB))
 
         # ---- C start_block 改成 99999（纯漂移）仍落 R2 ----
         import dataclasses
@@ -273,8 +293,8 @@ def main() -> int:
         _mI, createdI = win._marks.add_unique(blkI, STAMP, token_of(win, spI), rvI, sgI)
         check("I1 标最新轮→来不同stamp轮→再打标不新增(created=False)",
               createdI is False, f"created={createdI} count={len(win._marks.marks)}")
-        check("I2 列表仍 1 条（无重复）", win._mark_list.count() == 1,
-              str([win._mark_list.item(i).text() for i in range(win._mark_list.count())]))
+        _nI, _itemsI = list_state(win, app)
+        check("I2 列表仍 1 条（无重复）", _nI == 1, str(_itemsI))
 
         # ---- J 标最新轮 → 来两轮(其中一轮同秒) → 跳回仍落原轮 ----
         win._clear_receive()
@@ -294,8 +314,9 @@ def main() -> int:
         # ---- F 清屏清零 ----
         win._clear_receive()
         app.processEvents()
-        check("F1 清屏后标记清零", len(win._marks.marks) == 0
-              and win._mark_list.count() == 0)
+        _nF, _itemsF = list_state(win, app)
+        check("F1 清屏后标记清零", len(win._marks.marks) == 0 and _nF == 0,
+              str(_itemsF))
 
     finally:
         if win is not None:

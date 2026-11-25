@@ -73,7 +73,7 @@ from ui_highlight import (
 )
 from ui_controls import (
     AlertButton, ChevronComboBox, ChevronSpinBox, FlashLabel, IconButton,
-    IconLabel, InkButton, LabeledField, PulseDot, SearchEdit, Switch,
+    IconLabel, InkButton, LabeledField, PulseDot, RowButton, SearchEdit, Switch,
 )
 from ui_settings import SettingsDialog
 from ui_surface import Card, fade_in, paint_glass
@@ -321,7 +321,19 @@ BUTTON_SPECS: tuple[tuple[str, str, str], ...] = (
     ("chk_append_crlf", "换行",       "发送区"),
     ("chk_timer_send",  "定时发送",   "发送区"),
     ("history_box",     "历史",       "发送区"),
+    # ---- 串口设置卡（用户 2026-11-26「串口设置卡片里也能开关」）----
+    # key = getattr(self, key) 的属性名 → 必须与 main_window 里的属性**完全一致**。
+    ("serial_params",   "串口参数",   "串口设置"),
+    ("rx_lines_box",    "保留行数",   "串口设置"),
+    ("actions_box",     "数据与工具", "串口设置"),
 )
+# ⛔ 「串口开关」「连接方式 / 目标列表」**故意不在表里**：藏了就切不了模式，
+#    等于把用户锁死。DLC 同样不在表里（不许隐藏），它只随连接方式出现/消失。
+
+# 串口设置卡里由 _refresh_config_visibility 统一管显隐的三个 key —— 它们的显隐
+# 要**叠加模式规则**（串口参数在蓝牙广播下整体隐藏），不能走 _apply_button_visibility
+# 那条"只按隐藏开关"的通用路径，否则两处各写一套必然打架。
+_CONFIG_VIS_KEYS = ("serial_params", "rx_lines_box", "actions_box")
 
 
 # 抓设置面板快照时把它挪到这里的坐标：屏幕外，用户看不见，但窗口对 DWM 仍是
@@ -826,6 +838,9 @@ class MainWindow(QMainWindow):
         self._retiring: list[SerialWorker] = []
         # 蓝牙广播：列表扫描器（只在"点刷新"时活几秒）、扫到的设备、上次选的目标
         self._ble_scanner: object | None = None      # BleBroadcastWorker（惰性导入，见 _ble_worker_cls）
+        # 扫到一半被取消的蓝牙扫描线程（还没跑完就走了）—— 留强引用保住它，
+        # 见 _finish_ble_scan 里那段说明（QThread 还在跑时被析构 = 进程静默死掉）。
+        self._ble_retiring: list[object] = []
         self._ble_seen: dict[str, dict] = {}
         self._ble_target = ""
         # 可选 DLC（见 dlc_host）：当前只有「心率广播 DLC」一个。主界面只保留一颗
@@ -1129,6 +1144,7 @@ class MainWindow(QMainWindow):
         # 显示器矩形，状态切换无跳变。这是用户要的"位置/尺寸连续变化"。
         self._fs_animating = False
         self._closing = False            # 关闭淡出的重入闸
+        self._settings_saved_once = False   # 落盘只做一次（见 _save_settings_once）
         self._snap_zoom = False          # 分屏窄档自动"最大化接收区"是否由我们接管
         self._snap_pending = False       # 已预约一次延迟重算（防 resizeEvent 自激）
         self._in_snap_apply = False      # 正在切显隐（重入闸）
@@ -1539,6 +1555,13 @@ class MainWindow(QMainWindow):
         panel.setContentsMargins(0, 0, 0, 0)
         self._config_card.body.addWidget(self._config_content, 1)
         body.addWidget(self._config_card)
+
+        # 串口设置卡的初始显隐：按**当前**连接方式落一次（DLC 只在蓝牙广播模式出现；
+        # 串口参数在广播模式下整体隐藏）。⛔ 必须在配置卡**组装完成**之后才落 ——
+        # 放在 _build_config_panel 里时控件还没进布局（setLayout(panel) 尚未跑），
+        # show/hide 会走另一条 polish/layout 路径，把下拉框弹层的展开动画吃掉
+        # （自测「弹层没有展开动画：起始高 24 / 完整高 24」恒挂，实测 3/3）。
+        self._refresh_config_visibility()
 
         inner.addLayout(body, 1)
 
@@ -2094,8 +2117,10 @@ class MainWindow(QMainWindow):
         # 64px 放得下「保留行数」四字，三字标签也因此对齐。
         # ⚠️ 前四行是**串口专有**的（蓝牙广播下没有波特率/校验位可言），包成一个
         #    容器整体显隐；「保留行数」是显示侧的事，两种模式都要，留在外面。
-        self._serial_params = QWidget()
-        params_col = QVBoxLayout(self._serial_params)
+        # ⚠️ 属性名**不带下划线**：BUTTON_SPECS 的 key 就是 getattr(self, key)，
+        #    所以「串口参数」这一组的 key = serial_params（见 BUTTON_SPECS）。
+        self.serial_params = QWidget()
+        params_col = QVBoxLayout(self.serial_params)
         params_col.setContentsMargins(0, 0, 0, 0)
         params_col.setSpacing(12)
         for label, widget in (("波特率", self.cmb_baud), ("停止位", self.cmb_stopbits),
@@ -2108,8 +2133,15 @@ class MainWindow(QMainWindow):
             row.addWidget(tag)
             row.addWidget(widget, 1)
             params_col.addLayout(row)
-        col.addWidget(self._serial_params)
+        col.addWidget(self.serial_params)
 
+        # 「保留行数」整行（标签 + 下拉框）包进容器 rx_lines_box：要让"界面按钮"
+        # 开关能**连标签一起收**，不能只藏下拉框剩个光秃秃的标签（与 encoding_box
+        # 同理）。key = rx_lines_box（属性名不带下划线，BUTTON_SPECS 直接取属性）。
+        self.rx_lines_box = QWidget()
+        rx_lines_col = QVBoxLayout(self.rx_lines_box)
+        rx_lines_col.setContentsMargins(0, 0, 0, 0)
+        rx_lines_col.setSpacing(0)
         line_row = QHBoxLayout()
         line_row.setSpacing(10)
         line_tag = self._field_label("保留行数")
@@ -2117,112 +2149,103 @@ class MainWindow(QMainWindow):
         line_tag.setBuddy(self.cmb_rx_lines)
         line_row.addWidget(line_tag)
         line_row.addWidget(self.cmb_rx_lines, 1)
-        col.addLayout(line_row)
+        rx_lines_col.addLayout(line_row)
+        col.addWidget(self.rx_lines_box)
 
-        # 整轮标记（用户 2026-11-24「查看标记还是做成按钮吧」）：卡片里只留一颗
-        # 「查看标记」按钮，点它弹窗看列表（列表在弹窗里，见 _show_marks_dialog）。
-        # 打标按钮仍在接收区右侧竖栏（Alt+M）。⛔ 必须放进 col（panel 布局、挂
-        # _config_content 定宽容器），别绕过它直接挂 card —— 转场只裁切不重排。
-        mark_tag = self._field_label("标记")
-        mark_tag.setFixedWidth(64)
-        mark_tag.setToolTip("整轮标记：点右侧栏小旗子（Alt+M）打标；"
-                            "点「查看标记」查看并跳回")
-        mark_head = QHBoxLayout()
-        mark_head.setSpacing(10)
-        mark_head.addWidget(mark_tag)
-        # 与「打开近期数据」同款 ghost 按钮。⛔ 不进 _config_fields（那是窄档会被
-        # 压到 66px 的清单，六个字会戳出圆角底板）—— 与打开近期数据同一条口径。
-        self.btn_marks = InkButton("查看标记", variant="ghost")
+        # ============ 「数据与工具」动作列表（用户 2026-11-26「做好看一些」）============
+        # 原来这里是 5 颗同款描边药丸竖叠（还各带 64px 标签占位），又重又单调。
+        # 改成紧凑无边框动作行（ui_controls.RowButton）：分隔线 + 小标题分组，行高 32、
+        # 静止无边框无底色、悬停浮浅底。⛔ 文案 / tooltip / clicked / 回放文案切换逻辑
+        # 全部一字不动；⛔ 仍走 col（panel 布局、挂 _config_content 定宽容器），
+        # 新按钮也不进 _config_fields（窄档会被压到 66px、六字戳出底板）。
+        # 组标题上方一条 1px line 分隔线，与上面的表单行明确分组。
+        # ⚠️ 整块（分隔线 + 小标题 + 5 行按钮）包进 actions_box：让"界面按钮"开关
+        #    能把这一整组一起收起（key = actions_box，属性名不带下划线）。
+        self.actions_box = QWidget()
+        actions_box_col = QVBoxLayout(self.actions_box)
+        actions_box_col.setContentsMargins(0, 0, 0, 0)
+        actions_box_col.setSpacing(0)
+
+        divider = QWidget()
+        divider.setObjectName("actionsGroupDivider")
+        divider.setFixedHeight(1)
+        divider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        actions_box_col.addWidget(divider)
+
+        group_title = QLabel("数据与工具")
+        group_title.setObjectName("actionsGroupTitle")
+        group_title.setFont(ui_font(10.5))
+        actions_box_col.addWidget(group_title)
+
+        # 动作列表容器：竖排、行间 2px。全部 RowButton，无标签占位、无 64px 空格。
+        actions = QVBoxLayout()
+        actions.setContentsMargins(0, 3, 0, 0)
+        actions.setSpacing(2)
+
+        # 「查看标记」（用户 2026-11-24「查看标记还是做成按钮吧」）：点它弹窗看列表
+        # （见 _show_marks_dialog）。打标按钮仍在接收区右侧竖栏（Alt+M）。
+        self.btn_marks = RowButton("查看标记")
         self.btn_marks.setToolTip("查看整轮标记（仅本次会话）")
         self.btn_marks.clicked.connect(self._show_marks_dialog)
-        mark_head.addWidget(self.btn_marks, 1)
-        col.addLayout(mark_head)
+        actions.addWidget(self.btn_marks)
 
         # 「打开近期数据」（用户 2026-10-13 点名，2026-11-21 改名）：在软件内打开
-        # 本地留存的接收数据，格式/风格/功能与实时接收一致。放在参数栏最下面 ——
-        # 它读的正是上面"保留行数"落在本地的那份备份（接收历史-{车号}.log），挨着最顺。
-        # ⚠️ 它与新增的「打开历史数据」严格分层：近期数据**每个时间戳记一行**、按
-        #    保留行数裁剪、用来看瞬时报错；历史数据来自会话库、永不删除、按采样
-        #    间隔显示、用来看长期电压变化。**文件名保持不变**，老用户数据自然
-        #    成为近期数据。
+        # 本地留存的接收数据，格式/风格/功能与实时接收一致。
         # ⚠️ 它是**开关**（回放态下再点 = 返回实时），文案随状态在「打开近期数据」
-        #    /「关闭近期数据」之间切（见 _refresh_replay_ui）。两个文案都是 6 个字，
-        #    切换时按钮宽度不变，布局不会抖。
-        self.btn_open_history = InkButton("打开近期数据", variant="ghost")
-        # ⚠️ 这一颗**不进** _config_fields：它的最小宽度（102）来自文字，压到 66
-        #    会让"打开近期数据"六个字戳出按钮的圆角底板（1/4 屏截图里量到过）。
-        #    窄档的表单内容有 172px，56+10+102=168 放得下。
+        #    /「关闭近期数据」之间切（见 _refresh_replay_ui）。
+        self.btn_open_history = RowButton("打开近期数据")
         self.btn_open_history.setToolTip(
             "在接收区打开本地留存的近期数据：受保留行数上限、每个时间戳记一次，"
             "用来看瞬时报错；回放中再点一次返回实时"
             "（格式与实时一致，可搜索 / 定位异常 / 复制）")
         self.btn_open_history.clicked.connect(self._open_history)
-        hist_row = QHBoxLayout()
-        hist_row.setSpacing(10)
-        spacer = QWidget()
-        spacer.setFixedWidth(64)
-        # 这一格是"标签列"的占位（按钮左对齐到字段那一列）。窄档标签列收起时
-        # 它也要跟着收，否则 64px 白占着，「打开近期数据」被挤成「打开近…」。
-        self._hist_spacer = spacer
-        hist_row.addWidget(spacer)
-        hist_row.addWidget(self.btn_open_history, 1)
-        col.addLayout(hist_row)
+        actions.addWidget(self.btn_open_history)
 
-        # 「打开历史数据」（用户 2026-11-21 明确需求）：与上面的近期数据严格分层。
-        # 读的是会话库 sessions.db（append-only、永不删除），按设置里的「历史数据
-        # 采样间隔」抽帧回放，用来看长期电压变化。与近期回放共用 _replay_active、
-        # 两者互斥（任一回放态下点它都先返回实时）。同一套 64px 占位排法。
-        self.btn_open_long_history = InkButton("打开历史数据", variant="ghost")
+        # 「打开历史数据」（用户 2026-11-21 明确需求）：读会话库 sessions.db
+        # （append-only、永不删除），按采样间隔抽帧回放，看长期电压变化。与近期回放
+        # 共用 _replay_active、两者互斥。
+        self.btn_open_long_history = RowButton("打开历史数据")
         self.btn_open_long_history.setToolTip(
             "查看永不删除的历史数据，按设置里的采样间隔显示，用来看长期电压变化；"
             "回放中再点一次返回实时")
         self.btn_open_long_history.clicked.connect(self._open_long_history)
-        long_hist_row = QHBoxLayout()
-        long_hist_row.setSpacing(10)
-        long_spacer = QWidget()
-        long_spacer.setFixedWidth(64)
-        self._long_hist_spacer = long_spacer
-        long_hist_row.addWidget(long_spacer)
-        long_hist_row.addWidget(self.btn_open_long_history, 1)
-        col.addLayout(long_hist_row)
+        actions.addWidget(self.btn_open_long_history)
 
         # 「历史报错数据」（用户 2026-11-13 点名）：扫一遍本地留存的接收数据，
-        # 把出现过的超温 / 超压 / 欠压 / BMS 报错逐条带时间戳列出来。和「打开历史
-        # 数据」同一套排法（标签列占位 + 按钮吃满字段列），挨在它下面。
-        self.btn_error_history = InkButton("历史报错数据", variant="ghost")
+        # 把出现过的超温 / 超压 / 欠压 / BMS 报错逐条带时间戳列出来。
+        self.btn_error_history = RowButton("历史报错数据")
         self.btn_error_history.setToolTip(
             "查看历史接收数据里出现过的超温 / 超压 / 欠压 / BMS 报错，每条都带时间戳")
         self.btn_error_history.clicked.connect(self._open_error_history)
-        err_row = QHBoxLayout()
-        err_row.setSpacing(10)
-        err_spacer = QWidget()
-        err_spacer.setFixedWidth(64)
-        # 窄档标签列收起时它跟着收（理由同 _hist_spacer）
-        self._err_spacer = err_spacer
-        err_row.addWidget(err_spacer)
-        err_row.addWidget(self.btn_error_history, 1)
-        col.addLayout(err_row)
+        actions.addWidget(self.btn_error_history)
+
+        actions_box_col.addLayout(actions)
 
         # 「DLC」常驻串口配置栏（用户 2026-11-12："DLC 按钮放串口设置那里"）：
-        # 和「打开近期数据 / 打开历史数据」同一套排法（标签列占位 + 按钮吃满字段列），挨在它下面。
-        # 语义仍是单 DLC 直通：没装 → 提示安装，装了 → 直接进心率面板；
-        # 卸载在面板里的「卸载 DLC」。
-        # ⚠️ 不进 BUTTON_SPECS —— 那是「界面按钮」隐藏清单，允许隐藏等于让用户
-        #    把自己锁在 DLC 外面（和左下角设置按钮同一个理由）。
-        self.btn_dlc = InkButton("DLC", variant="ghost")
+        # 放在动作列表之后再单独一行、文字用 ink_3（muted）当**次要动作**，与上面
+        # 四颗主动作拉开层次。
+        # 语义仍是单 DLC 直通：没装 → 提示安装，装了 → 直接进心率面板。
+        # ⚠️ 不进 BUTTON_SPECS —— 允许隐藏等于让用户把自己锁在 DLC 外面。
+        # ⚠️ 只在**蓝牙广播模式**显示（串口模式下心率广播用不上）：显隐由
+        #    _refresh_config_visibility 统一管（见 _on_link_mode_changed）。
+        dlc_row = QVBoxLayout()
+        dlc_row.setContentsMargins(0, 2, 0, 0)
+        dlc_row.setSpacing(0)
+        self.btn_dlc = RowButton("DLC", muted=True)
         self.btn_dlc.setToolTip("心率广播 DLC：未安装时提示安装，已安装直接打开")
         self.btn_dlc.clicked.connect(self._on_dlc_clicked)
-        dlc_row = QHBoxLayout()
-        dlc_row.setSpacing(10)
-        dlc_spacer = QWidget()
-        dlc_spacer.setFixedWidth(64)
-        # 窄档标签列收起时它跟着收（理由同 _hist_spacer）
-        self._dlc_spacer = dlc_spacer
-        dlc_row.addWidget(dlc_spacer)
-        dlc_row.addWidget(self.btn_dlc, 1)
-        col.addLayout(dlc_row)
+        dlc_row.addWidget(self.btn_dlc)
+        actions_box_col.addLayout(dlc_row)
+
+        col.addWidget(self.actions_box)
 
         col.addStretch(1)
+
+        # 初始显隐：按**当前**连接方式落一次（见 _refresh_config_visibility）。
+        # ⚠️ 这行**不能**放在 _build_config_panel 里 —— 那时 setLayout(panel) 还没
+        #    跑，控件还没进布局，show/hide 会走另一条 polish/layout 路径，把下拉框
+        #    弹层的展开动画吃掉（自测「弹层没有展开动画：起始高 24 / 完整高 24」
+        #    恒挂）。改到配置卡**组装完成**之后再落（见 _build_ui）。
 
         return col
 
@@ -4441,17 +4464,9 @@ class MainWindow(QMainWindow):
         # 「一发」两个字，看不出这是个历史列表（1/4 屏截图里量到过）。
         if field_w > 0:
             self.cmb_history.setMinimumWidth(90)
-        # 「打开历史数据 / 打开近期数据」的下限是 QSS 给的（实测 146px），不是
-        # sizeHint 的 102 —— 窄档压到 104：六个字（84px）+ 圆角底板的左右留白，
-        # 再小就会戳出底板（1/4 屏截图里量到过：文字比底色块还宽）。
-        self.btn_open_history.setMinimumWidth(146 if field_w <= 0 else 104)
-        self.btn_open_long_history.setMinimumWidth(146 if field_w <= 0 else 104)
-        self._hist_spacer.setFixedWidth(spec["label_w"])
-        self._long_hist_spacer.setFixedWidth(spec["label_w"])
-        self._dlc_spacer.setFixedWidth(spec["label_w"])
-        # 「历史报错数据」的占位同理由 _hist_spacer 收起（窄档标签列收起时跟着收，
-        # 否则按钮会被挤成「历史报…」；之前漏了这行，属性从没被读过也触发了死代码告警）。
-        self._err_spacer.setFixedWidth(spec["label_w"])
+        # 底部「数据与工具」动作行现在是无边框 RowButton（文字左对齐、不再有圆角
+        # 底板/描边），窄档不需要再给 146/104 的药丸下限，也不需要 64px 标签占位
+        # —— 那两个 spacer 已随布局改版删除，这里不再触碰它们（⛔ 不留悬空属性）。
 
         # 工具栏横/竖排。切换会改变内容自然高度，把"量过的高度"和"钉住的高度"一起
         # 作废 —— 否则下一次全屏转场会按旧行高插值（展开那一帧工具栏会被裁）。
@@ -6646,7 +6661,10 @@ class MainWindow(QMainWindow):
         self.cmb_port.setToolTip(
             "只被动扫描广播，不需要配对；设备要把数据放进广播包才收得到"
             if ble else "")
-        self._serial_params.setVisible(not ble)
+        # 串口专有参数的显隐 + DLC 的随模式显隐，统一走一个出口（见
+        # _refresh_config_visibility）：串口参数在广播模式下整体隐藏；DLC 反过来，
+        # 只在广播模式下出现。
+        self._refresh_config_visibility()
         # 广播是**单向**的（只能听，没有"发给设备"这条路，见 _on_send 的说明），
         # 所以发送区在广播模式下直接禁用 —— 比"点了才弹报错"友好。
         self.txt_tx.setEnabled(not ble)
@@ -6704,11 +6722,34 @@ class MainWindow(QMainWindow):
             scanner.open_failed.disconnect()
             scanner.stop()
             if scanner.isRunning():
-                scanner.finished.connect(scanner.deleteLater)
+                # ⚠️ 与 _close_port 的串口分支**同一个坑**：扫描线程可能正卡在一次
+                #    WinRT 回调里（stop() 只等 200ms），此刻绝不能撒手 ——
+                #    Python 一旦回收掉这个包装对象，QThread 的 C++ 对象会在**线程
+                #    还在跑**时被析构，Qt 直接 fail-fast：进程静默死掉、退出码 127、
+                #    stdout 缓冲全丢（只剩 stderr 那两行串口报错）。
+                #    触发路径很日常：开机就是蓝牙广播模式 → 用户切到串口 →
+                #    _on_link_mode_changed 调这里 → 扫描还没结束。
+                #    存进 _ble_retiring 保住强引用，等它自己跑完，再由
+                #    _reap_ble_retired 收尸（同串口那边的 _retiring/_reap_retired）。
+                self._ble_retiring.append(scanner)
+                scanner.finished.connect(self._reap_ble_retired)
             else:
                 scanner.deleteLater()
         if fill:
             self._fill_ble_combo()
+
+    def _reap_ble_retired(self) -> None:
+        """给"扫到一半被取消"的蓝牙扫描线程收尸（见 _finish_ble_scan 的说明）。
+
+        留强引用只保证对象不被 Python 提前回收；真正销毁得等线程跑完。finished
+        是从线程内部发出来的，那会儿线程还差最后几步，所以这里以 isRunning() 为准，
+        没退干净就留着，下次 finished 再来收。
+        """
+        for scanner in list(self._ble_retiring):
+            if scanner.isRunning():
+                continue
+            self._ble_retiring.remove(scanner)
+            scanner.deleteLater()
 
     def _fill_ble_combo(self) -> None:
         """把扫到的设备填进下拉框（按信号强度排，强的在前）。"""
@@ -10015,12 +10056,63 @@ class MainWindow(QMainWindow):
         known = {key for key, _label, _group in BUTTON_SPECS}
         self._hidden_buttons &= known          # 旧配置里已删掉的键不要留着
         for key, _label, _group in BUTTON_SPECS:
+            if key in _CONFIG_VIS_KEYS:
+                # 串口设置卡这三组的显隐要**叠加模式规则**（串口参数在蓝牙广播下
+                # 整体隐藏），由 _refresh_config_visibility 统一算，别在这里直接
+                # setVisible —— 两处各写一套必然打架。
+                continue
             widget = getattr(self, key, None)
             if widget is not None:
                 widget.setVisible(key not in self._hidden_buttons)
         # 「定时发送」藏起来时，紧跟其后的间隔时长数字框要一起收 —— 一个孤零零的
         # 「1000 ms」留在选项行里毫无意义，还会让人以为定时发送还开着。
         self.spin_interval.setVisible("chk_timer_send" not in self._hidden_buttons)
+        # 串口设置卡三组 + DLC：统一出口（模式规则 × 用户隐藏开关）。
+        self._refresh_config_visibility()
+
+    def _refresh_config_visibility(self) -> None:
+        """串口设置卡的显隐 —— **唯一出口**（模式规则 × 用户隐藏开关）。
+
+        规则：
+          · 串口参数（波特率/停止位/数据位/校验位）：蓝牙广播模式没有这些概念
+            → 整体隐藏；再叠加用户是否隐藏了「串口参数」。
+          · 保留行数 / 数据与工具：两种模式都要，只看用户隐藏状态。
+          · DLC：**只在蓝牙广播模式**出现（串口模式心率广播用不上）。它住在
+            「数据与工具」组里，所以隐藏该组时自然跟着没 —— 但它**不受**「串口
+            参数」隐藏影响（两者是兄弟容器，不是父子）。
+
+        ⛔ 蓝牙广播模式下别让 DLC 跟着串口参数一起没了 —— 它在 actions_box 里。
+        """
+        hidden = getattr(self, "_hidden_buttons", set())
+        # cmb_link 是配置卡里的控件，理论上这会儿已经建好；但 _refresh_config_visibility
+        # 也可能在更早的时机被调（构造期），取不到就按"串口模式"处理（安全默认）。
+        link = getattr(self, "cmb_link", None)
+        ble = (link is not None and link.currentText() == LINK_BLE)
+
+        def _show(widget, visible: bool) -> None:
+            """只在该改的时候改。
+
+            ⚠️ 构造期就调 setVisible(True) 会给控件打上"显式 show"的旗子，触发一次
+            不必要的 show/layout，**把下拉框弹层的展开动画吃掉**（实测自测里
+            「弹层没有展开动画：起始高 24 / 完整高 24」恒挂）。所以这里只在
+            "显式隐藏状态"与目标不一致时才动（isHidden 才是显式隐藏标志）。
+            """
+            if widget is None:
+                return
+            if visible:
+                if widget.isHidden():
+                    widget.setVisible(True)
+            elif not widget.isHidden():
+                widget.setVisible(False)
+
+        # 串口参数：蓝牙广播模式没有这些概念 → 整体隐藏；再叠加用户是否隐藏了它。
+        _show(getattr(self, "serial_params", None),
+              (not ble) and ("serial_params" not in hidden))
+        # 保留行数 / 数据与工具：两种模式都要，只看用户隐藏状态。
+        for key in ("rx_lines_box", "actions_box"):
+            _show(getattr(self, key, None), key not in hidden)
+        # DLC：只在蓝牙广播模式出现（串口模式心率广播用不上）。
+        _show(getattr(self, "btn_dlc", None), ble)
 
     def _apply_glass(self, value: int) -> None:
         """设置毛玻璃强度并立刻重绘。
@@ -10173,6 +10265,20 @@ class MainWindow(QMainWindow):
             app_log.info(f"[geometry] 夹进屏幕可用区："
                          f"{geo.width()}x{geo.height()}+{geo.x()}+{geo.y()}"
                          f" → {fit.width()}x{fit.height()}+{fit.x()}+{fit.y()}")
+
+    def _save_settings_once(self) -> None:
+        """落盘**只做一次**（幂等）。
+
+        第一次 closeEvent（关窗那一刻）就同步落盘；淡出结束后的 _finish_close 走
+        真正清理时**不再**存第二次 —— 否则那一次延后 165ms 的落盘会：
+          ① 在窗口已被 deleteLater 析构后跑不到（设置丢）；
+          ② 在别的用例构造新窗的途中把自己的旧值写回去，把新值盖掉。
+        见 closeEvent 里那段说明。
+        """
+        if getattr(self, "_settings_saved_once", False):
+            return
+        self._settings_saved_once = True
+        self._save_settings()
 
     def _save_settings(self) -> None:
         settings = self._settings
@@ -10553,6 +10659,17 @@ class MainWindow(QMainWindow):
         if not self._closing and animations_enabled() and self.isVisible():
             event.ignore()
             self._closing = True
+            # ⛔⛔ 落盘必须在这里（**第一次** closeEvent）**同步**做完，不能拖到
+            #    165ms 之后的 _finish_close：
+            #    ① 调用方（自测/探针/外部代码）常在 close() 之后**立刻**
+            #       deleteLater() → 窗口被析构，延迟的落盘根本跑不到；
+            #    ② 更糟：那个旧窗会在**下一条用例构造新窗的途中**把自己的设置写
+            #       回去（hidden_buttons / rx_blocks / 车号…），把新值盖掉 →
+            #       自测偶发假红（QA 实测：「校验位/…/发送区一排」读到 rx_blocks=500、
+            #       「提示字号与按钮显隐」读到上一条留下的 hidden_buttons）。
+            #    淡出这 165ms 里窗口几何不变（只改透明度），所以此刻存的几何
+            #    与淡出结束后存的是同一个值。
+            self._save_settings_once()
             self._fade_window(0.0, 160, out_cubic)
             QTimer.singleShot(165, self._finish_close)
             return
@@ -10566,7 +10683,7 @@ class MainWindow(QMainWindow):
             self._finish_ble_scan(fill=False)
         # 插件可能开着 BLE 线程，必须在真正关窗这一拍停掉（幂等）。
         self._shutdown_dlc()
-        self._save_settings()
+        self._save_settings_once()
         # 防息屏：退出强制恢复系统默认电源策略（即使 receiving 仍为真）。
         self._wake_lock.release()
         # 会话库收尾：把批量窗口里还没提交的帧（≤50 帧 / 500ms）落盘再退出。

@@ -1084,6 +1084,13 @@ def main() -> int:                                     # noqa: C901 - 探针
         if win is not None:
             try:
                 win.close()
+                # ⛔ close() 只启动 160ms 淡出、真正的清理在 165ms 后的 _finish_close；
+                #    立刻 deleteLater() 会在淡出/抓图线程还活着时析构主窗 → 进程
+                #    异常退出（退出码 127、stdout 缓冲丢失）。先让事件循环把这段时间
+                #    跑完，再析构。
+                for _ in range(80):
+                    app.processEvents()
+                    time.sleep(0.006)
                 win.deleteLater()
             except Exception:                          # noqa: BLE001
                 pass

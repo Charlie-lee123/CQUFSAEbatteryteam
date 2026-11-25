@@ -15,6 +15,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
 
@@ -587,6 +588,11 @@ def main() -> int:                                    # noqa: C901 - 探针
         if win is not None:
             try:
                 win.close()
+                # ⛔ close() 只启动淡出、真正清理在 165ms 后；立刻 deleteLater()
+                #    会在抓图线程还活着时析构主窗 → 进程异常退出（127、stdout 丢失）。
+                for _ in range(80):
+                    app.processEvents()
+                    time.sleep(0.006)
                 win.deleteLater()
             except Exception:                     # noqa: BLE001
                 pass

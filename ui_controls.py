@@ -20,8 +20,8 @@ from PySide6.QtGui import (
     QColor, QFontMetrics, QFontMetricsF, QImage, QPainter, QPainterPath, QPen,
 )
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider,
-    QSpinBox, QStyle, QStyledItemDelegate, QWidget,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy,
+    QSlider, QSpinBox, QStyle, QStyledItemDelegate, QWidget,
 )
 
 from ui_anim import (STANDARD, Tween, in_out_quint, linear, out_cubic, out_expo,
@@ -312,6 +312,123 @@ class InkButton(QPushButton):
                                 self.devicePixelRatioF() or 2.0)
         painter.drawText(rect.adjusted(0.0, dy, 0.0, dy),
                          Qt.AlignmentFlag.AlignCenter, self.text())
+
+
+# --------------------------------------------------------- 列表式动作行按钮
+
+class RowButton(QPushButton):
+    """紧凑无边框「动作行」（苹果设置列表 / 现代 monochrome 列表风）。
+
+    与药丸 :class:`InkButton` 的区别：**静止态无边框、无底色**，文字左对齐，
+    只在悬停时浮出一层 ``surface_2`` 浅底、文字转 ``ink``，按下再深一档到
+    ``surface_hover``；禁用时文字转 ``ink_disabled``、无悬停反馈。用途是把串口
+    配置卡底部一叠同款描边药丸换成安静的一列动作行（用户「做好看一些」）。
+
+    行高固定 32、水平 Expanding、圆角 8、左内边距 10；字体 ``ui_font(12.5)``。
+    ``setText`` 只影响文字、不改高度（改宽由布局决定）。⛔ 不画图标/箭头 ——
+    这几颗里有开关语义（打开=关闭），箭头会误导。
+    ``muted=True`` 时文字静止用 ``ink_3``（次要动作，如 DLC），悬停仍转 ``ink``。
+    """
+
+    HEIGHT = 32
+    RADIUS = 8
+    PAD_LEFT = 10
+
+    def __init__(self, text: str = "", muted: bool = False,
+                 parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self._muted = muted
+        self._hover = 0.0
+        self._press = 0.0
+        self._enabled_t = 1.0 if self.isEnabled() else 0.0
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFont(ui_font(12.5))
+        # 绕开全局 QPushButton 规则（自绘，别在行外再描一圈框）
+        self.setObjectName("rowButton")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(self.HEIGHT)
+        # 悬停 120ms 补间（进入即到位），按下/禁用短补间，全部复用 ui_anim Tween。
+        self._hover_anim = Tween(120, out_cubic, self._on_hover, parent=self)
+        self._press_anim = Tween(110, out_cubic, self._on_press, parent=self)
+        self._enabled_anim = Tween(160, out_cubic, self._on_enabled, parent=self)
+
+    def enterEvent(self, event) -> None:
+        self._hover_anim.start(self._hover, 1.0, 120)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover_anim.start(self._hover, 0.0, 160)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        self._press_anim.start(self._press, 1.0, 110)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._press_anim.start(self._press, 0.0, 160)
+        super().mouseReleaseEvent(event)
+
+    def _on_hover(self, value) -> None:
+        self._hover = float(value)
+        self.update()
+
+    def _on_press(self, value) -> None:
+        self._press = float(value)
+        self.update()
+
+    def _on_enabled(self, value) -> None:
+        self._enabled_t = float(value)
+        self.update()
+
+    def changeEvent(self, event) -> None:
+        if event.type() == QEvent.Type.EnabledChange:
+            self._enabled_anim.start(
+                self._enabled_t, 1.0 if self.isEnabled() else 0.0, 160)
+        super().changeEvent(event)
+
+    def sizeHint(self) -> QSize:      # noqa: N802 (Qt 命名)
+        # 高度固定；宽度随文字（布局 Expanding 会撑满），只保证有个合理下限。
+        metrics = QFontMetrics(self.font())
+        return QSize(metrics.horizontalAdvance(self.text()) + self.PAD_LEFT + 12,
+                     self.HEIGHT)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect())
+        path = QPainterPath()
+        path.addRoundedRect(rect, self.RADIUS, self.RADIUS)
+
+        # 静止：透明底、无边框。悬停浮出 surface_2，按下再深到 surface_hover。
+        # ⛔ 只补间**透明度**（0→255），RGB 恒为 surface_2：如果用
+        #    mix(transparent, surface_2, t) 会把 RGB 一起朝黑色插值，半程渲染成
+        #    半透明**发暗**的一层（实测 #0a0b0d，比卡片底还暗），像块脏印而不是浅底。
+        lit = max(self._hover, self._press)
+        hover_c = qcolor("surface_2")
+        press_c = qcolor("surface_hover")
+        fill = QColor(mix(hover_c, press_c, self._press))   # 按下偏深（RGB 层面）
+        fill.setAlphaF(min(1.0, lit))                       # 只让透明度随悬停/按下升
+        # 文字：静止 ink_2（secondary）/ ink_3（muted），悬停转 ink。
+        base_text = qcolor("ink_3") if self._muted else qcolor("ink_2")
+        text_color = mix(base_text, qcolor("ink"), lit)
+        # 禁用：整体淡向 ink_disabled，且不参与悬停补间（外部已 setEnabled(False)
+        # 时 enter/leave 不会触达，这里再按 _enabled_t 混合兜底）。
+        dim = 1.0 - self._enabled_t
+        if dim > 0.0:
+            fill.setAlphaF(fill.alphaF() * (1.0 - dim))
+            text_color = mix(text_color, qcolor("ink_disabled"), dim)
+
+        if fill.alpha() > 0:
+            painter.fillPath(path, fill)
+
+        painter.setPen(text_color)
+        painter.setFont(self.font())
+        # 左对齐 + 左内边距；垂直居中（汉字的行盒居中偏差这里不追 0.5px 级，
+        # 32px 行高下 AlignVCenter 已足够）。
+        text_rect = rect.adjusted(self.PAD_LEFT, 0.0, -8.0, 0.0)
+        painter.drawText(text_rect,
+                         Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                         self.text())
 
 
 # ------------------------------------------------------------------ 图标按钮

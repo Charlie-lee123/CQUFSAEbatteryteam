@@ -143,6 +143,51 @@ def window_click(app: QApplication, window, point: QPoint) -> None:
     app.sendEvent(handle, release)
 
 
+def _reset_pinned_state(settings: QSettings) -> None:
+    """把「保留行数」这个前提重新钉回默认值（每条 check 之后调）。
+
+    为什么只需要这一条：自测里有三处 ``_on_rx_lines_changed(30 / 300)``，而
+    ``_on_rx_lines_changed`` 会把值**夹到 RX_LINES_MIN(500)**（30→500、300→500），
+    之后那句"还原" ``_on_rx_lines_changed(window._rx_blocks)`` 传的是**已经被夹过
+    的 500**，等于什么都没还原 —— 窗口关窗落盘时把 rx_blocks=500 写进注册表，
+    下一条 check（「校验位/保留行数/时钟/发送区一排」断言 currentText()==5000）
+    读到 500 就假红（这条假红在 _POLLUTION_GUARDS 里有记录，起手自愈只能救
+    "下一次运行"，救不了同一轮里的下一条）。
+
+    ⛔ 只重钉这一条：其它前提（高亮开关、车号、隐藏清单）**故意**跨用例留着 ——
+    有用例依赖"上一条把开关关掉/把车号建好"这个状态。一起重钉会让它们假红
+    （试过：重钉 highlight_errors / 车号 → 「回车发送/…」与「车辆与逐模组配置」
+    两条立刻挂）。
+    """
+    from main_window import DEFAULT_RX_BLOCKS
+    settings.setValue("rx_blocks", DEFAULT_RX_BLOCKS)
+    settings.sync()
+
+
+def _close_top_windows(app, wait_ms: int = 220) -> None:
+    """收掉所有顶层窗口并让它们的延迟落盘跑完。
+
+    主窗 ``close()`` 只起 **160ms 淡出**，真清理（``_save_settings`` 把状态写回
+    QSettings）在 165ms 之后 —— 窗口还活着的这段时间里，它会在**别的用例跑到
+    一半**时把自己的状态写回去（hidden_buttons / link_mode），把后者刚写好的值
+    盖掉（实测「提示字号与按钮显隐」偶发读到空 set）。
+
+    顺序：close() 全部 → 事件循环等 wait_ms（跨过 165ms 那道延迟落盘）→
+    deleteLater() → 跑事件循环让析构落地。
+    """
+    from PySide6.QtCore import QEventLoop, QTimer
+    for widget in QApplication.topLevelWidgets():
+        widget.close()
+    loop = QEventLoop()
+    QTimer.singleShot(wait_ms, loop.quit)
+    loop.exec()
+    for widget in QApplication.topLevelWidgets():
+        widget.deleteLater()
+    app.processEvents()
+    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
+
+
 def make_window():
     """建一个主窗口，并**停掉插拔自动扫描**。
 
@@ -159,6 +204,14 @@ def make_window():
     #    用户上次用过蓝牙广播，一片串口用例会同时挂掉、现象还各不相同
     #    （实测 5 条一起挂：状态栏文字不对、假句柄没关、发送路径报没有 write…）。
     window.cmb_link.setCurrentText(LINK_SERIAL)
+    # ⚠️ 掐掉后台抓图线程：产品构造完 1.5s 会起一个 QTimer 去启动抓图 worker
+    #    （main_window._start_snap_worker）。自测里窗口常常在 1.5s 内就被
+    #    close+deleteLater，定时器到点仍会回调 → 访问已析构的 QThread parent，
+    #    进程**静默死掉**（退出码 127、stdout 缓冲全丢，只剩 stderr 那两行）——
+    #    打包门禁看的就是退出码，这条不修会偶发假红（实测 5 跑里挂 2 次）。
+    #    这里直接把幂等旗子立起来：_start_snap_worker 见到已启动就原样返回，
+    #    线程根本不起。自测不依赖抓图缓存（无任何用例引用它）。
+    window._snap_started = True
     return window
 
 
@@ -2180,6 +2233,7 @@ def check_tooltip_and_buttons(app: QApplication) -> None:
     后来又把「编码」「历史」两个带标签的下拉框也加了进来 —— 它们是"整行"级的
     控件（``LabeledField``），所以这里的断言按两档分别检查。
     """
+    from PySide6.QtWidgets import QWidget
     from ui_controls import IconButton, LabeledField, Switch
     from ui_settings import SettingsDialog
     from ui_theme import stylesheet
@@ -2224,16 +2278,23 @@ def check_tooltip_and_buttons(app: QApplication) -> None:
             window._toggle_send_area()
         app.processEvents()
         assert window._hidden_buttons == set(), window._hidden_buttons
-        # 清单里每一项都得是带文字的控件，面板标签与控件显示名一一对应
+        # 清单里每一项都得是"带文字的控件"或"能整体显隐的容器"，面板标签与控件
+        # 显示名一一对应。
+        # ⚠️ 串口设置卡那三组（serial_params / rx_lines_box / actions_box）是
+        #    **容器**：一组里有好几个控件（标签+下拉框 / 标题+5 行按钮），没法用
+        #    一个 LabeledField 表达，所以 key 指向包住整组的 QWidget。面板里那枚
+        #    开关的标题由 BUTTON_SPECS 的 label 提供（ui_settings 按 specs 建
+        #    Switch），这里只校验"它是个能整体显隐的容器"。
         for key, label, _group in BUTTON_SPECS:
             widget = getattr(window, key)
             assert not isinstance(widget, IconButton), f"{key} 是图标按钮"
             if isinstance(widget, Switch):
                 assert widget.text() == label, (key, widget.text(), label)
-            else:
-                assert isinstance(widget, LabeledField), \
-                    f"{key} 不是可显隐的带文字控件: {type(widget)}"
+            elif isinstance(widget, LabeledField):
                 assert widget.label_text() == label, (key, widget.label_text(), label)
+            else:
+                assert isinstance(widget, QWidget), \
+                    f"{key} 不是可显隐的控件或容器: {type(widget)}"
             assert not widget.isHidden(), f"{key} 默认应当是显示的"
 
         # 关掉一枚：它消失，同类别的其它控件不受影响，图标按钮更不该被卷进来
@@ -3717,7 +3778,12 @@ def check_config_parity_clock(app: QApplication) -> None:
         #    标题栏那一档高度、输入框整块藏起来，省下的高度全给接收区。
         #    下面 4)/9) 量的是**展开态**的版式，量之前先展开（顺手也验了能展开）。
         assert window._tx_collapsed, "发送区开局没有折叠"
-        assert window._tx_content.isHidden(), "折叠了但输入框那块还露着"
+        # ⚠️ 启动折叠的 hide() 落在收起动画终态回调里（_finish_send_collapsed），
+        #    蓝牙模式下那几帧可能挤在窗口构造之后才跑完。一次 processEvents()
+        #    不够（实测要 1~6 次），这里泵到真正隐藏再断言；不是放宽条件，
+        #    是把"动画还没落定"exclude 掉。
+        assert wait_for(app, lambda: window._tx_content.isHidden(), timeout=1.5), \
+            "折叠了但输入框那块还露着"
         assert window._tx_card.maximumHeight() == TX_COLLAPSED_H, \
             (f"折叠态没把卡片高度夹住：{window._tx_card.maximumHeight()}"
              f"（应为 {TX_COLLAPSED_H}）")
@@ -5524,7 +5590,10 @@ def check_send_collapsed_startup(app: QApplication) -> None:
             app.processEvents()
             assert window._tx_collapsed is True, \
                 "开关开着，发送区开局却不是折叠的"
-            assert not window._tx_content.isVisible(), "折叠态发送区内容还露着"
+            # 同 check_config_parity_clock：启动折叠的 hide() 在动画终态回调里，
+            # 泵事件等它落定，别拿"还没收到回调"当产品缺陷。
+            assert wait_for(app, lambda: not window._tx_content.isVisible(),
+                            timeout=1.5), "折叠态发送区内容还露着"
         finally:
             window.close()
 
@@ -5537,7 +5606,8 @@ def check_send_collapsed_startup(app: QApplication) -> None:
             app.processEvents()
             assert window._tx_collapsed is False, \
                 "关掉开关后，发送区开局仍然是折叠的（没有按配置初始化）"
-            assert window._tx_content.isVisible(), "展开态发送区内容没显示"
+            assert wait_for(app, lambda: window._tx_content.isVisible(),
+                            timeout=1.5), "展开态发送区内容没显示"
         finally:
             window.close()
 
@@ -7494,6 +7564,14 @@ def main() -> int:
     _saved_vehicle = _cu_main.current_vehicle()
     _cu_main.select_vehicle("")
     global_settings.sync()
+    # ⛔ 连接方式（link_mode）也要还（2026-11-25 QA 抓出）：make_window() 会把
+    #    连接方式钉成串口，而 main_window._on_link_mode_changed 每次切换都会
+    #    setValue("link_mode", ...) 落盘 —— 自测跑完用户的连接方式就被改掉了
+    #    （实测本机 'ble' → 'serial'）。
+    #    这里**在 CHECKS 循环之前**记下原值（含"原本就不存在"这种情况）：
+    #    原本不存在 → 收尾时 remove（而不是写一个空串，那会让"没设过"变成"设成空"）。
+    _saved_link_mode = global_settings.value("link_mode")
+    _had_link_mode = "link_mode" in global_snapshot
     # ⛔ 历史文件也要隔离（2026-10-24 补）：各用例都会构造 MainWindow
     #    （构造里 rx_history.load() 按车辆取文件）、再用 _emit_block/feed 灌
     #    测试数据。上面把车辆清空了 → 落到用户的**无车历史**
@@ -7522,6 +7600,16 @@ def main() -> int:
             print(f"  FAIL  {name}: {type(exc).__name__}: {exc}")
         else:
             print(f"  PASS  {name}")
+        # ⚠️ **每条 check 之后**把顶层窗口收干净：close() 只起 160ms 淡出，真清理
+        #    （_save_settings 落盘）在 165ms 之后 —— 上一条 check 的窗口若还活着，
+        #    它会在**下一条 check 跑到一半**时把自己的状态写回 QSettings，把后者
+        #    刚写好的前提盖掉。顺序：close → 等 220ms（跨过 165ms 那道延迟落盘）
+        #    → deleteLater。代价 ~0.2s/条。
+        #    ⛔ 这里**不**顺手重钉其它前提（试过，会打断依赖前一条 check 状态的用例：
+        #    高亮开关 / 车号那几条会假红）。只把「保留行数」钉回默认值 —— 它被
+        #    夹到 500 后下一条 check 会假红（见 _reset_pinned_state 的说明）。
+        _close_top_windows(app, wait_ms=220)
+        _reset_pinned_state(global_settings)
 
     for key in global_settings.allKeys():
         if key not in global_snapshot:
@@ -7534,12 +7622,14 @@ def main() -> int:
     #    只是隐藏，对象还活着，它们的析构回写会在解释器退出时把测试值重新
     #    写回用户真实配置（hidden_buttons 就这样被永久污染过）。这里显式清掉
     #    所有顶层控件、跑一轮事件循环让析构落地，再无条件还原一次。
-    for widget in QApplication.topLevelWidgets():
-        widget.close()
-        widget.deleteLater()
-    app.processEvents()
-    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-    app.processEvents()
+    #
+    # ⚠️⚠️ close() 只起 **160ms 淡出**，真清理在 165ms 之后的 _finish_close。
+    #    此刻就 deleteLater() 会在抓图线程还活着时析构主窗 → 进程异常终止
+    #    （**退出码 127**），连 stdout 缓冲都丢（只剩 stderr 的两行串口报错）。
+    #    打包门禁看的是**退出码**，这条不修会偶发假红（实测 9 跑里挂 1 次）。
+    #    所以顺序必须是：close() → 事件循环跑 0.5s（等淡出与延迟保存落地）
+    #    → deleteLater() → 跑事件循环让析构落地。⛔ 不用 os._exit()（会绕过还原）。
+    _close_top_windows(app, wait_ms=500)
     # 历史文件路径隔离的还原：放在**窗口全部析构之后**（上面那两次 processEvents
     # 之前都还有对象活着，它们的析构可能触到 rx_history），并且先把内存态清空，
     # 这样任何迟到的 flush 都写不出东西（flush 见到 _path 为 None 直接返回）。
@@ -7560,6 +7650,18 @@ def main() -> int:
             global_settings.remove(key)
     for key, value in global_snapshot.items():
         global_settings.setValue(key, value)
+    global_settings.sync()
+    # ⚠️ 再钉一次「连接方式」：自测里 make_window() 把连接方式切到串口，
+    #    而 _on_link_mode_changed 每次切换都会 setValue("link_mode", ...)；
+    #    窗口的 _save_settings 又在**淡出之后**（165ms）才落盘 —— 那时上面的
+    #    还原已经跑完了，于是用户的连接方式被自测改掉（实测 ble → serial）。
+    #    ⛔ 必须放在**所有窗口析构之后**的那次还原之后：析构回写会盖掉先前的
+    #    还原，这里是最后一次落笔。原本就没有 link_mode 这个键 → remove（别写
+    #    空串，那会把"没设过"变成"设成空"）。
+    if _had_link_mode:
+        global_settings.setValue("link_mode", _saved_link_mode)
+    else:
+        global_settings.remove("link_mode")
     global_settings.sync()
     # 车号：必须走 select_vehicle（只写 custom/vehicle 镜像键没用，
     # _load_store 优先认 vehicles JSON 里的 current）。放在**最后一次
