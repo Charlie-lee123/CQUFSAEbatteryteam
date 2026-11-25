@@ -328,6 +328,10 @@ class RowButton(QPushButton):
     ``setText`` 只影响文字、不改高度（改宽由布局决定）。⛔ 不画图标/箭头 ——
     这几颗里有开关语义（打开=关闭），箭头会误导。
     ``muted=True`` 时文字静止用 ``ink_3``（次要动作，如 DLC），悬停仍转 ``ink``。
+    ``outlined=True`` 时改画**常驻浅底 + 描边的胶囊按钮**、文字居中（其余动作行
+    不受影响）：用户 2026-11-25 点名「历史记录和近期记录仍需要按钮」——这两颗
+    是进出回放的主操作，不能做得像一行文字。行高仍锁 32、宽度仍随布局撑满，
+    所以窄档不会被 InkButton 的「文字宽 + 44」下限挤出去。
     """
 
     HEIGHT = 32
@@ -335,9 +339,11 @@ class RowButton(QPushButton):
     PAD_LEFT = 10
 
     def __init__(self, text: str = "", muted: bool = False,
+                 outlined: bool = False,
                  parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
         self._muted = muted
+        self._outlined = outlined
         self._hover = 0.0
         self._press = 0.0
         self._enabled_t = 1.0 if self.isEnabled() else 0.0
@@ -397,38 +403,57 @@ class RowButton(QPushButton):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(self.rect())
         path = QPainterPath()
-        path.addRoundedRect(rect, self.RADIUS, self.RADIUS)
+        # 描边态画成胶囊（和老 InkButton 同一观感）；普通动作行仍是 8px 圆角。
+        radius = self.HEIGHT / 2.0 if self._outlined else self.RADIUS
+        path.addRoundedRect(rect, radius, radius)
 
-        # 静止：透明底、无边框。悬停浮出 surface_2，按下再深到 surface_hover。
-        # ⛔ 只补间**透明度**（0→255），RGB 恒为 surface_2：如果用
-        #    mix(transparent, surface_2, t) 会把 RGB 一起朝黑色插值，半程渲染成
-        #    半透明**发暗**的一层（实测 #0a0b0d，比卡片底还暗），像块脏印而不是浅底。
         lit = max(self._hover, self._press)
-        hover_c = qcolor("surface_2")
-        press_c = qcolor("surface_hover")
-        fill = QColor(mix(hover_c, press_c, self._press))   # 按下偏深（RGB 层面）
-        fill.setAlphaF(min(1.0, lit))                       # 只让透明度随悬停/按下升
-        # 文字：静止 ink_2（secondary）/ ink_3（muted），悬停转 ink。
-        base_text = qcolor("ink_3") if self._muted else qcolor("ink_2")
-        text_color = mix(base_text, qcolor("ink"), lit)
         # 禁用：整体淡向 ink_disabled，且不参与悬停补间（外部已 setEnabled(False)
         # 时 enter/leave 不会触达，这里再按 _enabled_t 混合兜底）。
         dim = 1.0 - self._enabled_t
-        if dim > 0.0:
-            fill.setAlphaF(fill.alphaF() * (1.0 - dim))
-            text_color = mix(text_color, qcolor("ink_disabled"), dim)
-
-        if fill.alpha() > 0:
+        if self._outlined:
+            # 常驻可见的按钮：浅底 + line 描边，悬停/按下再深一档。
+            # ⛔ 底和边全程不透明，不能像普通动作行那样从透明补上来 —— 那正是
+            #   用户说的「看不出是按钮」。
+            fill = QColor(mix(qcolor("surface_2"), qcolor("surface_hover"), lit))
+            border = QColor(mix(qcolor("line"), qcolor("line_strong"), lit))
+            text_color = QColor(mix(qcolor("ink_2"), qcolor("ink"), lit))
+            if dim > 0.0:
+                fill.setAlphaF(fill.alphaF() * (1.0 - dim))
+                border.setAlphaF(border.alphaF() * (1.0 - dim))
+                text_color = QColor(mix(text_color, qcolor("ink_disabled"), dim))
             painter.fillPath(path, fill)
+            if border.alpha() > 0:
+                pen = QPen(border)
+                pen.setWidthF(1.0)
+                painter.strokePath(path, pen)
+            text_rect = rect
+            align = Qt.AlignmentFlag.AlignCenter
+        else:
+            # 静止：透明底、无边框。悬停浮出 surface_2，按下再深到 surface_hover。
+            # ⛔ 只补间**透明度**（0→255），RGB 恒为 surface_2：如果用
+            #    mix(transparent, surface_2, t) 会把 RGB 一起朝黑色插值，半程渲染成
+            #    半透明**发暗**的一层（实测 #0a0b0d，比卡片底还暗），像块脏印而不是浅底。
+            hover_c = qcolor("surface_2")
+            press_c = qcolor("surface_hover")
+            fill = QColor(mix(hover_c, press_c, self._press))  # 按下偏深（RGB 层面）
+            fill.setAlphaF(min(1.0, lit))                      # 只让透明度随悬停/按下升
+            # 文字：静止 ink_2（secondary）/ ink_3（muted），悬停转 ink。
+            base_text = qcolor("ink_3") if self._muted else qcolor("ink_2")
+            text_color = QColor(mix(base_text, qcolor("ink"), lit))
+            if dim > 0.0:
+                fill.setAlphaF(fill.alphaF() * (1.0 - dim))
+                text_color = QColor(mix(text_color, qcolor("ink_disabled"), dim))
+            if fill.alpha() > 0:
+                painter.fillPath(path, fill)
+            # 左对齐 + 左内边距；垂直居中（汉字的行盒居中偏差这里不追 0.5px 级，
+            # 32px 行高下 AlignVCenter 已足够）。
+            text_rect = rect.adjusted(self.PAD_LEFT, 0.0, -8.0, 0.0)
+            align = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
 
         painter.setPen(text_color)
         painter.setFont(self.font())
-        # 左对齐 + 左内边距；垂直居中（汉字的行盒居中偏差这里不追 0.5px 级，
-        # 32px 行高下 AlignVCenter 已足够）。
-        text_rect = rect.adjusted(self.PAD_LEFT, 0.0, -8.0, 0.0)
-        painter.drawText(text_rect,
-                         Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                         self.text())
+        painter.drawText(text_rect, align, self.text())
 
 
 # ------------------------------------------------------------------ 图标按钮
