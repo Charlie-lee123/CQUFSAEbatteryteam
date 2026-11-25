@@ -57,6 +57,7 @@ import soc_est
 import soc_feed
 import soc_profiles
 from soc_display import SocDisplayGate
+import ui_monitor
 import wake_lock
 from marks_model import MarkStore
 import customization
@@ -992,6 +993,9 @@ class MainWindow(QMainWindow):
         # _refresh_mark_list / _clear_receive 等调用点都有 getattr 判空，弹窗未开时安全。
         self._mark_list: QListWidget | None = None
         self._marks_dialog = None              # 复用的弹窗实例（懒建，见 _show_marks_dialog）
+        # 数据监控面板（独立浮窗）：主窗持强引用、懒建单例，关窗只 hide 不销毁。
+        # ⚠️ 未打开时为 None，接收链路上的 _push_monitor_sample 直接返回（零开销）。
+        self._monitor_panel: ui_monitor.MonitorPanel | None = None
         # 防息屏状态机（v2.11 需求 3）：默认关，按设置初值 configure，不主动 acquire。
         self._wake_lock = wake_lock.WakeLock()
         try:
@@ -2166,7 +2170,7 @@ class MainWindow(QMainWindow):
         # 全部一字不动；⛔ 仍走 col（panel 布局、挂 _config_content 定宽容器），
         # 新按钮也不进 _config_fields（窄档会被压到 66px、六字戳出底板）。
         # 组标题上方一条 1px line 分隔线，与上面的表单行明确分组。
-        # ⚠️ 整块（分隔线 + 小标题 + 5 行按钮）包进 actions_box：让"界面按钮"开关
+        # ⚠️ 整块（分隔线 + 小标题 + 6 行按钮）包进 actions_box：让"界面按钮"开关
         #    能把这一整组一起收起（key = actions_box，属性名不带下划线）。
         self.actions_box = QWidget()
         actions_box_col = QVBoxLayout(self.actions_box)
@@ -2186,14 +2190,23 @@ class MainWindow(QMainWindow):
 
         # 动作列表容器：竖排、行间 12px（用户「间距再大一点，参考上面的按钮」）。全部 RowButton，
         # 无标签占位、无 64px 空格。
-        # ⚠️ 五颗（查看标记 / 近期 / 历史 / 历史报错 / DLC）全走 RowButton 的
+        # ⚠️ 六颗（监控面板 / 查看标记 / 近期 / 历史 / 历史报错 / DLC）全走 RowButton 的
         #    outlined 态（常驻浅底 + 描边胶囊）：用户 2026-11-25 先点名「历史记录和
         #    近期记录仍需要按钮」，随后补「查看历史报错和标记也要」「DLC 也一样」。
         #    ⛔ 宽度按文字取合适尺寸、不撑满整行（用户「按钮要大小合适」）；DLC
         #    保留 muted 文字当次要动作，但同样是描边按钮。
         actions = QVBoxLayout()
         actions.setContentsMargins(0, 3, 0, 0)
-        actions.setSpacing(12)  # 用户「间距再大一点」：五颗统一 12px，与 col/params_col 一致
+        actions.setSpacing(12)  # 用户「间距再大一点」：六颗统一 12px，与 col/params_col 一致
+
+        # 「监控面板」（独立浮窗，排第一颗，用户 2026-11-25 点名）：勾选要显示的
+        # 曲线、支持回看历史。样本来自 SOC 链路的原始 SocResult（显示门控之前那份），
+        # 不碰接收主链路。
+        self.btn_monitor = RowButton("监控面板", outlined=True)
+        self.btn_monitor.setToolTip(
+            "打开数据监控面板：勾选要显示的曲线，支持回看历史")
+        self.btn_monitor.clicked.connect(self._show_monitor)
+        actions.addWidget(self.btn_monitor, alignment=Qt.AlignmentFlag.AlignHCenter)
 
         # 「查看标记」（用户 2026-11-24「查看标记还是做成按钮吧」）：点它弹窗看列表
         # （见 _show_marks_dialog）。打标按钮仍在接收区右侧竖栏（Alt+M）。
@@ -2232,17 +2245,27 @@ class MainWindow(QMainWindow):
         self.btn_error_history.clicked.connect(self._open_error_history)
         actions.addWidget(self.btn_error_history, alignment=Qt.AlignmentFlag.AlignHCenter)
 
+        # 用户 2026-11-25：前两颗（监控面板 / 查看标记）只有四个字，按文字取宽会
+        # 比后面三颗窄。按后三颗里最宽的自然宽统一它们的下限（⛔ 不硬编码像素），
+        # 让五颗 outlined 胶囊视觉等宽；DLC 是次要按钮，不参与。
+        _uniform_action_w = max(
+            self.btn_open_history.sizeHint().width(),
+            self.btn_open_long_history.sizeHint().width(),
+            self.btn_error_history.sizeHint().width())
+        for _btn in (self.btn_monitor, self.btn_marks):
+            _btn.setMinimumWidth(_uniform_action_w)
+
         actions_box_col.addLayout(actions)
 
         # 「DLC」常驻串口配置栏（用户 2026-11-12："DLC 按钮放串口设置那里"）：
         # 放在动作列表之后再单独一行、文字用 ink_3（muted）当**次要动作**，与上面
-        # 四颗主动作拉开层次；按钮本身仍是同款描边胶囊（用户「DLC 也一样」）。
+        # 五颗主动作拉开层次；按钮本身仍是同款描边胶囊（用户「DLC 也一样」）。
         # 语义仍是单 DLC 直通：没装 → 提示安装，装了 → 直接进心率面板。
         # ⚠️ 不进 BUTTON_SPECS —— 允许隐藏等于让用户把自己锁在 DLC 外面。
         # ⚠️ 只在**蓝牙广播模式**显示（串口模式下心率广播用不上）：显隐由
         #    _refresh_config_visibility 统一管（见 _on_link_mode_changed）。
         dlc_row = QVBoxLayout()
-        dlc_row.setContentsMargins(0, 12, 0, 0)  # 与上面四颗统一 12px 间距
+        dlc_row.setContentsMargins(0, 12, 0, 0)  # 与上面五颗统一 12px 间距
         dlc_row.setSpacing(0)
         self.btn_dlc = RowButton("DLC", muted=True, outlined=True)
         self.btn_dlc.setToolTip("心率广播 DLC：未安装时提示安装，已安装直接打开")
@@ -4477,7 +4500,7 @@ class MainWindow(QMainWindow):
         # 「一发」两个字，看不出这是个历史列表（1/4 屏截图里量到过）。
         if field_w > 0:
             self.cmb_history.setMinimumWidth(90)
-        # 底部「数据工具」五颗都是 outlined RowButton（常驻浅底描边）；宽度按文字
+        # 底部「数据工具」六颗都是 outlined RowButton（常驻浅底描边）；宽度按文字
         # 自然取、不撑满整行，窄档由 minimumWidth(88) 兜底。⛔ 不再需要老药丸的
         # 146/104 下限，也不需要 64px 标签占位 —— spacer 已删，这里不触碰。
 
@@ -7752,6 +7775,47 @@ class MainWindow(QMainWindow):
         dlg.raise_()
         dlg.activateWindow()
 
+    def _show_monitor(self) -> None:
+        """「监控面板」：懒建单例独立浮窗，主窗持强引用，关窗只 hide 不销毁。"""
+        try:
+            panel = self._monitor_panel
+            if panel is None:
+                panel = ui_monitor.MonitorPanel(self)
+                self._monitor_panel = panel
+            panel.set_vehicle(customization.current_vehicle())
+            panel.show()
+            panel.raise_()
+            panel.activateWindow()
+        except Exception as exc:                  # noqa: BLE001 - 面板不能拖垮主窗
+            app_log.error(f"数据监控面板打开失败：{exc}")
+
+    def _push_monitor_sample(self, res) -> None:
+        """把原始 SocResult 的一轮结果推给监控面板（面板未建时零开销）。
+
+        ⛔ 必须在 ``_apply_soc`` 的显示门控**之前**取数：门控会用浅拷贝替换
+        min/max 显示值，曲线要的是未经门控改写的原始 res。
+        """
+        panel = getattr(self, "_monitor_panel", None)
+        if panel is None:
+            return
+        try:
+            if res is None or res.clean is None:
+                return
+            values = {
+                "soc": res.soc,
+                "pack_v": res.pack_v,
+                "i_eff": res.i_eff,
+                "temp": res.temp_c,
+                "cell_min": res.clean.min_mv,
+                "cell_max": res.clean.max_mv,
+                "cell_mean": res.clean.mean_mv,
+                # 车端上报 SOC 是粘滞值：主窗没有该属性时留 None（面板不写这一路）
+                "soc_read": getattr(self, "_soc_read_last", None),
+            }
+            panel.push_sample(values, vehicle=customization.current_vehicle())
+        except Exception as exc:                  # noqa: BLE001 - 绝不影响接收主链路
+            app_log.error(f"监控面板采样失败：{exc}")
+
     def _goto_mark(self, step: int) -> None:
         """上/下一个标记（Alt+↑/↓，循环）。三种数据源都可用。"""
         mark = self._marks.next() if step > 0 else self._marks.prev()
@@ -9044,6 +9108,9 @@ class MainWindow(QMainWindow):
 
     def _apply_soc(self, res) -> None:
         """把一轮结果刷到底栏正中的 min / max / 总压三枚标签。"""
+        # ⛔ 曲线取**原始 res**，必须在下面的显示门控（copy.copy 替身）之前：
+        # 门控只改显示用的 min/max，不该污染历史曲线。面板未开时该方法直接返回。
+        self._push_monitor_sample(res)
         state = "ok"
         if res is None or res.clean is None or not res.clean.ok:
             state = "off"
@@ -10655,6 +10722,13 @@ class MainWindow(QMainWindow):
         self._dlc_loaded.clear()
 
     def closeEvent(self, event) -> None:
+        # 监控面板的节流样本必须**第一次** closeEvent 就同步落盘：外层可能紧接着
+        # deleteLater()，拖到淡出后的 _finish_close 就来不及了（幂等，第二次无害）。
+        try:
+            if self._monitor_panel is not None:
+                self._monitor_panel.flush()
+        except Exception as exc:                  # noqa: BLE001 - 落盘绝不影响关窗
+            app_log.error(f"监控面板退出落盘失败：{exc}")
         # 关闭也做一段淡出（用户 2026-10-31："关闭...还是没有动画"）。先忽略这次
         # close、淡到 0 再真正关；_closing 闸住重入（第二次进来直接走清理）。
         # 在途的"长大/缩小"覆盖层先撤：它是无父窗口，跟着进程退出会留下一个
