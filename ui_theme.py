@@ -538,13 +538,19 @@ QWidget {
 /* ---- 悬停提示 ----
    字号必须在这里写死。tooltip 默认取应用字体（入口设的是 12.5pt ≈ 16.7px），
    对一行中文提示来说太大了 —— 悬停这种瞬时信息不该比它旁边的正文还抢眼。
-   12px 与 Windows 系统提示同档。 */
+   12px 与 Windows 系统提示同档。
+   v3.0（用户 2026-11-25：「解释要简短精炼，框要和文本相适应，大小合适，有圆角」）：
+   · 文案已统一精简（见 main_window 各 setToolTip）；
+   · padding 收窄到 4px 8px —— 原来 5/9 在多行文本下两侧留白偏大，框看着比
+     文字宽一圈；Qt 的 tooltip 尺寸本来就按内容算（sizeHint），文案短了框会
+     自己贴上去，这里只是把最后那点固定余量也收掉；
+   · border-radius 保持 8px（截图里那个直角/大留白框就是长文案撑出来的）。 */
 QToolTip {
     background: @surface@;
     color: @ink@;
     border: 1px solid @line@;
     border-radius: 8px;
-    padding: 5px 9px;
+    padding: 4px 8px;
     font-size: 12px;
 }
 

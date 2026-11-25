@@ -76,8 +76,11 @@ COMBO_W = 176
 # ⚠️ 不能再往下调：body 的最小宽由"最宽标签 187 + 18 + 最宽字段 362"决定，
 # 把下限设到 body 之下没用（内容仍然要那么宽），只会让面板在窄屏上被裁。
 PANEL_MIN_W = 470
-# 「赛季」年份框的宽度：4 位数 + 内边距 + 右侧 chevron
+# 「赛季」年份下拉的宽度：4 位数 + 内边距 + 右侧 chevron
 SEASON_SPIN_W = 78
+# 赛季下拉的年份候选范围（与旧 ChevronSpinBox 的 setRange(2000, 2100) 一致）
+SEASON_MIN_YEAR = 2000
+SEASON_MAX_YEAR = 2100
 # 车辆那一排里的「模组数」框宽：两颗数字（上限 64）+ 内边距。
 # ⚠️ 上限 64 只有两位数的空间，chevron 已隐藏（set_arrows_visible(False)），
 #    框里只有居中的数字 —— 86 对"5"整整空一大截，压到 72 刚好不挤（用户点名"框太大"）。
@@ -1278,15 +1281,18 @@ class SettingsDialog(QDialog):
             self._custom_widgets["material"] = self.cmb_material
             self._custom_rows["material"] = (material_label, self.cmb_material)
 
-        # 「开屏动画」：预设（assets/splash/ 下扫出来的）/ 跟随主题 / 自定义文件。
-        # 只在这块做 UI；真正的播放/配置解析全在 splash_anim.py（接口层）。
-        self._build_splash_section(form)
-
         # 「车辆」一节已经在**最上面**建好（见本方法开头，用户 2026-11-03：
         # 「不要喧宾夺主，把车辆信息放在设置界面的最上面」）。
         #  ⚠️ 与 customize 的说明一致：车辆档案**不走 register_* 注册表**（它不是
         #     标量），所以这一节是手写的，其余定制项仍按 specs() 自动生成。
 
+        # v3.0 重排（用户 2026-11-25：「逻辑关联的挨在一起」）：
+        # 车辆 → 显示行数 → 外观（主题/材质）→ 定制功能（按组：数据显示/
+        # 数据判读/SOC/启动与窗口/动画）→ 开屏动画 → 界面按钮 → 数据管理
+        # （日志/会话库/协议/MCP）→ 版本。
+        # 「开屏动画」从主题下方挪到定制功能**之后**：它属于"启动行为"，与定制
+        # 功能里的「启动与窗口」组逻辑相邻（最大化/折叠/防息屏/开屏都是开机时
+        # 发生的事）；而且它有独立的预览/文件选择，放在分组后更自然。
         # 「定制功能」：BMS 专用配置的统一管理入口。控件**按注册表动态生成**
         # （customization.specs()），以后加定制配置这里一行都不用改。
         self._build_custom_section(form)
@@ -1298,9 +1304,18 @@ class SettingsDialog(QDialog):
         # 上面按注册表生成的（见 _build_custom_section 里的 _custom_rows）。
         self._sync_vehicle_rows()
 
+        # 「开屏动画」：预设（assets/splash/ 下扫出来的）/ 跟随主题 / 自定义文件。
+        # 只在这块做 UI；真正的播放/配置解析全在 splash_anim.py（接口层）。
+        # ⚠️ 预览按当前主题挑变体（self.cmb_theme 已在上面建好）。
+        self._build_splash_section(form)
+
         if button_specs:
             self._build_button_section(form, button_specs, set(hidden_buttons))
 
+        # v3.0：数据管理类归到一个视觉分组下（用户「逻辑关联的挨在一起」）。
+        # 日志 / 会话库 / 协议 / MCP 都是"数据怎么留 / 怎么读 / 怎么对接外部"，
+        # 放在按钮之后、版本之前，与上面的"显示与判读"分开。
+        form.addRow(self._caption("数据与接口"))
         # 日志一节放在**界面按钮的下方**（用户点名），整段一起随面板滚动
         self._build_log_section(form)
 
@@ -1416,6 +1431,42 @@ class SettingsDialog(QDialog):
     # 跟着车号走的两个「显示行数」：选了车就落在车辆档案里，没选车才写全局键。
     _VEHICLE_ROW_KEYS = ("volt_rows", "temp_rows")
 
+    # v3.0 定制功能的分组与组内顺序（用户 2026-11-25：「逻辑关联的挨在一起」）。
+    # ⚠️ 只影响**面板里的显示顺序**，注册表 / 存储 / custom_values() 一概不动。
+    # ⚠️ material / volt_rows / temp_rows 已提前到「主题」一节，不在这里。
+    # ⚠️ 布局注意：_caption 自带上 8px 留白，组间天然有呼吸，不需要再垫空行。
+    _CUSTOM_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("数据显示", (
+            "pad_zero",              # 显示补零
+            "rx_font_size",          # 接收区字体大小（带预览行）
+            "stamp_show_year", "stamp_show_month", "stamp_show_day",
+            "clock_show_date",        # 时钟显示年月日（同属"界面显示什么"）
+            "pause_snap_lines", "pause_snap_lines_max",   # 暂停定位行数
+            "highlight_errors",       # 高亮异常数据
+        )),
+        ("数据判读", (
+            "volt_limit_low", "volt_limit_high",   # 电压上下限
+            "broken_wire_mv",                       # 断线阈值
+            "temp_limit_low", "temp_limit_high",    # 温度上下限
+            "history_interval",                     # 历史数据采样间隔
+        )),
+        ("SOC", (
+            "soc_show",              # 显示 SOC 读数
+            "soc_source",            # SOC 数据来源
+            "volt_source",           # 总电压来源
+            "soc_ekf4",              # SOC 四状态 EKF
+        )),
+        ("启动与窗口", (
+            "startup_maximized",     # 启动时最大化
+            "maximize_keep_taskbar", # 最大化时保留任务栏
+            "send_collapsed_startup",# 默认折叠发送区
+            "keep_awake_on_rx",      # 读串口时保持屏幕唤醒
+        )),
+        ("动画", (
+            "anim_fps",              # 动画帧率
+        )),
+    )
+
     # ------------------------------------------------------------ 开屏动画
 
     def _build_splash_section(self, form: QFormLayout) -> None:
@@ -1525,19 +1576,27 @@ class SettingsDialog(QDialog):
         #
         # ⚠️ **数据格式不变**：车名仍是「车号-赛季」（如 E74-2026），老档案原样
         #    可用；赛季与车号只是从名字里拆出来分别编辑（customization.split_vehicle）。
-        self.spin_vehicle_season = ChevronSpinBox()
-        self.spin_vehicle_season.setRange(2000, 2100)
+        # v3.0（用户 2026-11-25）：赛季从 ChevronSpinBox 改成 **ChevronComboBox**
+        # —— 用户原话「设置里面的赛季做成下拉选择」。条目 = 年份 2000..2100，
+        # 与原数字框量程一致；弹层条目走 _POPUP_MAX_ROWS 封顶 + 整行吸附
+        # （同主题/SOC 来源那些下拉的既有行为）。
+        # ⚠️ 数据格式不变：车名仍是「车号-赛季」，_current_season() 从
+        #    currentText() 取值，存档链路一行不用动。
+        self.spin_vehicle_season = ChevronComboBox()
+        for _year in range(SEASON_MIN_YEAR, SEASON_MAX_YEAR + 1):
+            self.spin_vehicle_season.addItem(str(_year))
         # 默认当年（不是量程下限）：没有赛季的老档案也得显示一个像样的年份，
         # 否则一开面板就是 2000（看着像坏了）。
-        self.spin_vehicle_season.setValue(QDate.currentDate().year())
+        self.spin_vehicle_season.setCurrentIndex(
+            QDate.currentDate().year() - SEASON_MIN_YEAR)
         self.spin_vehicle_season.setFixedWidth(SEASON_SPIN_W)
-        self.spin_vehicle_season.set_arrows_visible(False)
-        # 数字居中（用户 2026-10-23），和下面的电芯/温度数量框同一观感
-        self.spin_vehicle_season.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        # 年份居中（沿用数字框时代 2026-10-23 的口径），和下面的电芯/温度数量框同一观感
+        self.spin_vehicle_season.setCenterText(True)
         self.spin_vehicle_season.setToolTip(
             "赛季 = 车名的后半段年份（E74-2026 的 2026）。\n"
             "改赛季只决定「车号」里列哪些车，不会自动改到别的车。")
-        self.spin_vehicle_season.valueChanged.connect(self._on_season_changed)
+        self.spin_vehicle_season.currentIndexChanged.connect(
+            self._on_season_changed)
 
         self.cmb_vehicle_number = ChevronComboBox()
         # 就地改写车号 = 改名（沿用"选车与改名合一"的老口径，回车/失焦生效）
@@ -1715,7 +1774,7 @@ class SettingsDialog(QDialog):
         self._shown_temps: list[int] = []
 
     def _current_season(self) -> str:
-        return str(self.spin_vehicle_season.value())
+        return self.spin_vehicle_season.currentText()
 
     def _refresh_number_combo(self) -> None:
         """按**当前赛季**重建车号下拉（当前项跟随 customization.current_vehicle）。
@@ -1781,7 +1840,9 @@ class SettingsDialog(QDialog):
         season_spin = self.spin_vehicle_season
         season_spin.blockSignals(True)
         if season.isdigit():
-            season_spin.setValue(int(season))
+            season_spin.setCurrentIndex(
+                max(SEASON_MIN_YEAR, min(SEASON_MAX_YEAR, int(season)))
+                - SEASON_MIN_YEAR)
         season_spin.blockSignals(False)
         self._refresh_number_combo()
 
@@ -2416,14 +2477,14 @@ class SettingsDialog(QDialog):
         self._veh_start(cells, temps)
         self._notify_vehicle_changed()
 
-    def _on_season_changed(self, value: int) -> None:
+    def _on_season_changed(self, index: int) -> None:
         """换赛季：只重排「车号」列表，**不自动选车**。
 
         为什么不自动选第一台：替用户挑一台 = 接着把模组结构按那台车改，
         一不留神就改错了车（这会影响接收区怎么排电池数据）。所以当前车不属于
         新赛季时就直接变成"未选车"，让用户自己点。
         """
-        season = str(value)
+        season = self.spin_vehicle_season.itemText(index)
         name = customization.current_vehicle()
         if name and customization.split_vehicle(name)[0] != season:
             customization.select_vehicle("")
@@ -2689,10 +2750,30 @@ class SettingsDialog(QDialog):
 
         每一行都是同一个形状：**左边行标签 + 右边控件**，行的左边缘与前两节
         （主题 / 毛玻璃强度）严格对齐。
+
+        v3.0（用户 2026-11-25：「优化设置界面里面的元素排布方式和顺序，逻辑
+        关联的挨在一起」）：注册表序 = 写代码的顺序，不是逻辑顺序。这里按
+        ``_CUSTOM_GROUPS`` 的归类**重排 + 插组标题**，让关联项相邻。未登记进
+        任何组的 key 落到队尾的「其它」—— 新加配置忘了归组也不会凭空消失。
         """
         specs = customization.specs()
         if not specs:
             return
+
+        # ---- v3.0 分组重排：组标题 -> 组内 key 的显示顺序 ----
+        ordered_keys: list[str] = []
+        for _group_title, _keys in self._CUSTOM_GROUPS:
+            form.addRow(self._caption(_group_title))
+            ordered_keys.extend(_keys)
+        # 没进任何组的 key → 兜底「其它」组
+        _rest = [s["key"] for s in specs if s["key"] not in ordered_keys]
+        if _rest:
+            form.addRow(self._caption("其它"))
+            ordered_keys.extend(_rest)
+        # 只保留注册表里实际存在的 key（防手写清单与注册表漂移），并重排 specs
+        _known = {s["key"] for s in specs}
+        _by_key = {s["key"]: s for s in specs}
+        specs = [_by_key[k] for k in ordered_keys if k in _known]
 
         # ⚠️ 这两张表在「主题」一节之前就建好了（见 _build_theme_section 上方）：
         #    「界面材质」会先登记进去，这里**不能重新赋值**，否则会被冲掉。
@@ -3810,12 +3891,6 @@ class SettingsDialog(QDialog):
         # 原来这里有一条按钮清单专用的滚动区；现在整个面板共用一条滚动条，
         # 网格直接跨两列铺进表单（用户点名"移除原先单独为界面按钮设置的滑轨"）。
         form.addRow(body)
-
-        hint = QLabel("只列出带文字的按钮和下拉框（编码、历史等）；"
-                      "纯图标按钮（打开串口、发送等）保持显示，左下角的设置按钮固定显示")
-        hint.setFont(ui_font(10.5))
-        hint.setWordWrap(True)
-        form.addRow(hint)
 
     def _on_buttons_changed(self, _checked: bool) -> None:
         if self._on_buttons is not None:

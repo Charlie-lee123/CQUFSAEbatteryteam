@@ -47,6 +47,25 @@ def attr_arg_is(code, attr_name, want) -> bool:
     return False
 
 
+def attr_chain_has(code, obj_attr: str, sig_attr: str) -> bool:
+    """`self.<obj_attr>.<sig_attr>` 这种属性链在字节码里出现过没有。
+
+    ⛔ 不能用函数级 ``co_names`` 判 —— v3.0 起 ``_build_vehicle_section`` 里
+    同时有**赛季**下拉的 ``currentIndexChanged`` 和**车号**下拉的 ``activated``，
+    函数级名字表两样都有，判不出"车号连的是哪个"。
+    这里只认「紧跟在 obj_attr 之后的那个属性名」，做到逐个控件精确判定。
+    """
+    ins = list(dis.get_instructions(code))
+    for i, op in enumerate(ins):
+        if op.opname in ("LOAD_ATTR", "LOAD_METHOD") and op.argval == obj_attr:
+            for nxt in ins[i + 1:i + 4]:
+                if nxt.opname in ("LOAD_ATTR", "LOAD_METHOD"):
+                    if nxt.argval == sig_attr:
+                        return True
+                    break
+    return False
+
+
 def collect_codes(co, out):
     out.append(co)
     for const in co.co_consts:
@@ -216,11 +235,16 @@ def run_checks(mw_codes, mw_by, us_codes, us_by, extra=None,
     # od73 自激环防护（仍然有效，别丢）：车号下拉必须连 `activated`，
     # ⛔ 连 `currentIndexChanged` 会被程序化 rebuild 的 setCurrentIndex 自激，
     #    把行数塌成 0（用户 2026-11-08 报过）。
+    # v3.0 起同一函数里还有**赛季**下拉的 currentIndexChanged（那个是安全的），
+    # ⛔ 所以必须逐控件判定，不能看函数级 co_names。
     build = us_by.get("_build_vehicle_section")
     if build:
-        bn = set(build.co_names)
         chk("车号下拉连 activated、不连 currentIndexChanged",
-            "activated" in bn and "currentIndexChanged" not in bn)
+            attr_chain_has(build, "cmb_vehicle_number", "activated")
+            and not attr_chain_has(build, "cmb_vehicle_number",
+                                   "currentIndexChanged"))
+        chk("赛季下拉连 currentIndexChanged（v3.0 新增，安全的那个）",
+            attr_chain_has(build, "spin_vehicle_season", "currentIndexChanged"))
 
     print("\n[P] od78 性能模式（整流 + 手势 + 浮层）")
     mods = extra or {}

@@ -2280,11 +2280,10 @@ def check_tooltip_and_buttons(app: QApplication) -> None:
         assert window._hidden_buttons == set(), window._hidden_buttons
         # 清单里每一项都得是"带文字的控件"或"能整体显隐的容器"，面板标签与控件
         # 显示名一一对应。
-        # ⚠️ 串口设置卡那三组（serial_params / rx_lines_box / actions_box）是
-        #    **容器**：一组里有好几个控件（标签+下拉框 / 标题+5 行按钮），没法用
-        #    一个 LabeledField 表达，所以 key 指向包住整组的 QWidget。面板里那枚
-        #    开关的标题由 BUTTON_SPECS 的 label 提供（ui_settings 按 specs 建
-        #    Switch），这里只校验"它是个能整体显隐的容器"。
+        # ⚠️ 串口设置卡的项（row_baud 等四行 / rx_lines_box / 六颗动作按钮）在
+        #    v3.0 起是**逐项开关**（用户「串口设置里面的所有按钮都要可以单独
+        #    设置显示开关」）。row_* 是单行容器（标签+下拉框），其余是 RowButton
+        #    或 rx_lines_box 容器，这里只校验"它是个能整体显隐的控件"。
         for key, label, _group in BUTTON_SPECS:
             widget = getattr(window, key)
             assert not isinstance(widget, IconButton), f"{key} 是图标按钮"
@@ -2295,7 +2294,47 @@ def check_tooltip_and_buttons(app: QApplication) -> None:
             else:
                 assert isinstance(widget, QWidget), \
                     f"{key} 不是可显隐的控件或容器: {type(widget)}"
+            if key == "btn_dlc":
+                # DLC 只在蓝牙广播模式显示（串口模式下默认隐藏是预期，不是 bug）
+                continue
             assert not widget.isHidden(), f"{key} 默认应当是显示的"
+
+        # v3.0 逐项开关：藏「波特率」一行不影响「停止位」；六颗动作按钮全藏时
+        # 整块数据工具组收起；恢复后原样回来。
+        window._preview_buttons(["row_baud"])
+        app.processEvents()
+        assert window.row_baud.isHidden(), "隐藏「波特率」后整行还在"
+        assert not window.cmb_baud.isVisible(), "隐藏「波特率」后下拉框还露着"
+        assert not window.row_stopbits.isHidden(), "隐藏「波特率」波及了「停止位」"
+        assert not window.serial_params.isHidden(), "还剩三行时整组不该收起"
+        _all_serial_rows = ["row_baud", "row_stopbits", "row_bytesize", "row_parity"]
+        window._preview_buttons(_all_serial_rows)
+        app.processEvents()
+        assert window.serial_params.isHidden(), "串口参数四行全藏时整组应收起"
+        window._preview_buttons([])
+        app.processEvents()
+        assert not window.row_baud.isHidden(), "恢复后「波特率」没有整行回来"
+        assert not window.serial_params.isHidden(), "恢复后串口参数组没有回来"
+        _all_actions = ["btn_monitor", "btn_marks", "btn_open_history",
+                        "btn_open_long_history", "btn_error_history", "btn_dlc"]
+        window._preview_buttons(_all_actions)
+        app.processEvents()
+        assert window.actions_box.isHidden(), "六颗动作按钮全藏时整块应收起"
+        window._preview_buttons(["btn_open_history"])
+        app.processEvents()
+        assert window.btn_open_history.isHidden(), "隐藏「近期数据」后按钮还在"
+        assert not window.btn_open_long_history.isHidden(), "隐藏「近期数据」波及了「历史数据」"
+        assert not window.actions_box.isHidden(), "只剩五颗时整块不该收起"
+        window._preview_buttons([])
+        app.processEvents()
+        assert not window.actions_box.isHidden(), "恢复后数据工具组没有回来"
+        # v3.0 旧组键迁移：老配置里的 serial_params / actions_box 要展开成逐项键
+        window._preview_buttons(["serial_params", "actions_box"])
+        app.processEvents()
+        assert window.serial_params.isHidden(), "旧键 serial_params 没有展开成四行隐藏"
+        assert window.actions_box.isHidden(), "旧键 actions_box 没有展开成六颗隐藏"
+        window._preview_buttons([])
+        app.processEvents()
 
         # 关掉一枚：它消失，同类别的其它控件不受影响，图标按钮更不该被卷进来
         window._preview_buttons(["chk_hex_view"])
@@ -3598,13 +3637,12 @@ def check_customization(app: QApplication) -> None:
                     (f"{name}下拉框的内容区装不下最长的条目："
                      f"需要 {wide}px，只有 {cr.width()}px")
 
-            # 6a-1b) SOC 数据来源只留正式措辞（用户 2026-11-21：「只显示括号内
-            #     的内容吧，改得正式一点」）—— 不许再出现"算出来的 / 读取到的"。
+            # 6a-1b) SOC 来源选项（v3.0 用户定案：「本地 / 主控」）
             _soc_opts = [lab for spec in
                          __import__("customization").specs()
                          if spec["key"] == "soc_source"
                          for lab, _v in spec["options"]]
-            assert _soc_opts == ["本地估算", "报文读取"], f"SOC 来源文案：{_soc_opts}"
+            assert _soc_opts == ["本地", "主控"], f"SOC 来源文案：{_soc_opts}"
 
             # 6a-1c) 弹层高度必须封顶到 _POPUP_MAX_ROWS 行（用户 2026-11-21：
             #     「这个太长太宽了」—— 30 档撑到 864px、跑出屏幕下缘）。
@@ -6069,7 +6107,7 @@ def check_vehicle_profiles(app: QApplication) -> None:
             _dlg._create_vehicle(customization.vehicle_key("面板车", "2026"))
             assert customization.current_vehicle() == "面板车-2026", \
                 f"新建后应当自动选中「车号-赛季」：{customization.current_vehicle()}"
-            assert _dlg.spin_vehicle_season.value() == 2026, "赛季框没有跟上当前车"
+            assert _dlg.spin_vehicle_season.currentText() == "2026", "赛季框没有跟上当前车"
             assert _dlg.cmb_vehicle_number.currentText() == "面板车", \
                 f"车号框没跟上当前车：{_dlg.cmb_vehicle_number.currentText()!r}"
             assert customization.active_profile() == ([25, 25, 25], [8, 8, 8]), \
@@ -6099,7 +6137,8 @@ def check_vehicle_profiles(app: QApplication) -> None:
                 "选了车但模组个数为 0 时，旧的三个全局参数必须重新露面"
 
             # ---- 7) 车号右端的 × ：必须二次确认，确认后才删、并清空当前选择 ----
-            _dlg.spin_vehicle_season.setValue(2026)
+            _dlg.spin_vehicle_season.setCurrentIndex(
+                _dlg.spin_vehicle_season.findText("2026"))
             _dlg.cmb_vehicle_number.setCurrentIndex(
                 _dlg.cmb_vehicle_number.findData("面板车-2026"))
             _orig_confirm = ui_settings.SettingsDialog._confirm_vehicle_delete
@@ -7175,8 +7214,8 @@ def check_v211_features() -> None:
     def _opts(key: str) -> list[str]:
         return [lab for spec in customization.specs() if spec["key"] == key
                 for lab, _v in spec["options"]]
-    assert _opts("soc_source") == ["本地估算", "报文读取"], _opts("soc_source")
-    assert _opts("volt_source") == ["本地估算", "BMS 上报"], _opts("volt_source")
+    assert _opts("soc_source") == ["本地", "主控"], _opts("soc_source")
+    assert _opts("volt_source") == ["本地", "主控"], _opts("volt_source")
     _soc_labels = " ".join(_opts("soc_source"))
     assert "BMS" not in _soc_labels and "车端" not in _soc_labels, _soc_labels
     assert customization.get("volt_source") in ("calc", "read")

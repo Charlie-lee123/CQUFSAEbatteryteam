@@ -322,19 +322,44 @@ BUTTON_SPECS: tuple[tuple[str, str, str], ...] = (
     ("chk_append_crlf", "换行",       "发送区"),
     ("chk_timer_send",  "定时发送",   "发送区"),
     ("history_box",     "历史",       "发送区"),
-    # ---- 串口设置卡（用户 2026-11-26「串口设置卡片里也能开关」）----
+    # ---- 串口设置卡（用户 2026-11-25：「串口设置里面的所有按钮都要可以单独
+    #      设置显示开关」→ 从 3 个组开关拆成逐项开关）----
     # key = getattr(self, key) 的属性名 → 必须与 main_window 里的属性**完全一致**。
-    ("serial_params",   "串口参数",   "串口设置"),
+    ("row_baud",        "波特率",     "串口设置"),
+    ("row_stopbits",    "停止位",     "串口设置"),
+    ("row_bytesize",    "数据位",     "串口设置"),
+    ("row_parity",      "校验位",     "串口设置"),
     ("rx_lines_box",    "保留行数",   "串口设置"),
-    ("actions_box",     "数据工具",   "串口设置"),
+    ("btn_monitor",     "监控面板",   "串口设置"),
+    ("btn_marks",       "查看标记",   "串口设置"),
+    ("btn_open_history",      "近期数据", "串口设置"),
+    ("btn_open_long_history", "历史数据", "串口设置"),
+    ("btn_error_history",     "历史报错", "串口设置"),
+    ("btn_dlc",         "DLC",       "串口设置"),
 )
 # ⛔ 「串口开关」「连接方式 / 目标列表」**故意不在表里**：藏了就切不了模式，
-#    等于把用户锁死。DLC 同样不在表里（不许隐藏），它只随连接方式出现/消失。
+#    等于把用户锁死。
+# ⚠️ DLC 进表了（用户「所有按钮都要可以单独设置显示开关」）：它不是面板入口，
+#    藏了随时能在设置里勾回来，不构成"锁死"。但显隐还要叠加模式规则（只在
+#    蓝牙广播模式出现），见 _refresh_config_visibility。
 
-# 串口设置卡里由 _refresh_config_visibility 统一管显隐的三个 key —— 它们的显隐
-# 要**叠加模式规则**（串口参数在蓝牙广播下整体隐藏），不能走 _apply_button_visibility
-# 那条"只按隐藏开关"的通用路径，否则两处各写一套必然打架。
-_CONFIG_VIS_KEYS = ("serial_params", "rx_lines_box", "actions_box")
+# 串口设置卡里由 _refresh_config_visibility 统一管显隐的 key —— 它们的显隐要
+# **叠加模式规则**（串口参数四行在蓝牙广播下隐藏、DLC 反过来只在蓝牙出现），
+# 不能走 _apply_button_visibility 那条"只按隐藏开关"的通用路径，否则两处各写
+# 一套必然打架。
+_CONFIG_VIS_KEYS = ("row_baud", "row_stopbits", "row_bytesize", "row_parity",
+                    "rx_lines_box", "btn_monitor", "btn_marks",
+                    "btn_open_history", "btn_open_long_history",
+                    "btn_error_history", "btn_dlc")
+
+# v3.0 之前「串口设置」是 3 个组开关（serial_params / rx_lines_box / actions_box）。
+# 老配置里隐藏过整组的，展开成对应的细粒度键，别让旧选择悄悄失效
+# （rx_lines_box 键名没变，不用映射）。
+_LEGACY_HIDDEN_EXPAND = {
+    "serial_params": ("row_baud", "row_stopbits", "row_bytesize", "row_parity"),
+    "actions_box": ("btn_monitor", "btn_marks", "btn_open_history",
+                    "btn_open_long_history", "btn_error_history", "btn_dlc"),
+}
 
 
 # 抓设置面板快照时把它挪到这里的坐标：屏幕外，用户看不见，但窗口对 DWM 仍是
@@ -1643,9 +1668,7 @@ class MainWindow(QMainWindow):
         self.lbl_soc_max.setToolTip(
             "SOC max：由正常电压区间内最高单体电压估算（充电时看它）")
         self.lbl_soc_volt.setToolTip(
-            "总电压来源见设置：「本地估算」= 清洗后电芯平均值 × 串数；"
-            "「BMS 上报」= 报文 V= 行的原文（本机该传感器恒为 0.00，"
-            "界面照实显示，不自动回退；要可用值请切本地估算）")
+            "总电压来源见设置：「本地」= 电芯均值 × 串数；「主控」= 报文 V= 原文")
         # 兼容别名：旧代码 / 自测用 lbl_soc 指主读数
         self.lbl_soc = self.lbl_soc_min
         self._soc_labels = (self.lbl_soc_mode, self.lbl_soc_min,
@@ -2126,24 +2149,32 @@ class MainWindow(QMainWindow):
 
         # 标签固定宽度，控件吃掉剩余宽度 —— 右侧表单的经典排法。
         # 64px 放得下「保留行数」四字，三字标签也因此对齐。
-        # ⚠️ 前四行是**串口专有**的（蓝牙广播下没有波特率/校验位可言），包成一个
-        #    容器整体显隐；「保留行数」是显示侧的事，两种模式都要，留在外面。
-        # ⚠️ 属性名**不带下划线**：BUTTON_SPECS 的 key 就是 getattr(self, key)，
-        #    所以「串口参数」这一组的 key = serial_params（见 BUTTON_SPECS）。
+        # ⚠️ 前四行是**串口专有**的（蓝牙广播下没有波特率/校验位可言），包进
+        #    serial_params 容器整体管理；「保留行数」是显示侧的事，两种模式都要，
+        #    留在外面。
+        # ⚠️ v3.0 起每行**各自**一个 row_* 容器：「界面按钮」里串口参数要逐项
+        #    开关（用户「串口设置里面的所有按钮都要可以单独设置显示开关」）。
+        # ⚠️ 属性名**不带下划线**：BUTTON_SPECS 的 key 就是 getattr(self, key)。
         self.serial_params = QWidget()
         params_col = QVBoxLayout(self.serial_params)
         params_col.setContentsMargins(0, 0, 0, 0)
         params_col.setSpacing(12)
-        for label, widget in (("波特率", self.cmb_baud), ("停止位", self.cmb_stopbits),
-                              ("数据位", self.cmb_bytesize), ("校验位", self.cmb_parity)):
-            row = QHBoxLayout()
+        for attr, label, widget in (
+                ("row_baud", "波特率", self.cmb_baud),
+                ("row_stopbits", "停止位", self.cmb_stopbits),
+                ("row_bytesize", "数据位", self.cmb_bytesize),
+                ("row_parity", "校验位", self.cmb_parity)):
+            box = QWidget()
+            row = QHBoxLayout(box)
+            row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(10)
             tag = self._field_label(label)
             tag.setFixedWidth(64)
             tag.setBuddy(widget)
             row.addWidget(tag)
             row.addWidget(widget, 1)
-            params_col.addLayout(row)
+            setattr(self, attr, box)
+            params_col.addWidget(box)
         col.addWidget(self.serial_params)
 
         # 「保留行数」整行（标签 + 下拉框）包进容器 rx_lines_box：要让"界面按钮"
@@ -2170,8 +2201,10 @@ class MainWindow(QMainWindow):
         # 全部一字不动；⛔ 仍走 col（panel 布局、挂 _config_content 定宽容器），
         # 新按钮也不进 _config_fields（窄档会被压到 66px、六字戳出底板）。
         # 组标题上方一条 1px line 分隔线，与上面的表单行明确分组。
-        # ⚠️ 整块（分隔线 + 小标题 + 6 行按钮）包进 actions_box：让"界面按钮"开关
-        #    能把这一整组一起收起（key = actions_box，属性名不带下划线）。
+        # ⚠️ 整块（分隔线 + 小标题 + 6 行按钮）包进 actions_box：v3.0 起六颗按钮
+        #    **逐颗**进 BUTTON_SPECS（用户「串口设置里面的所有按钮都要可以单独
+        #    设置显示开关」）；actions_box 只剩"组内一个不剩时整块收起"的职责
+        #    （见 _refresh_config_visibility），不再作为开关的 key。
         self.actions_box = QWidget()
         actions_box_col = QVBoxLayout(self.actions_box)
         actions_box_col.setContentsMargins(0, 0, 0, 0)
@@ -2221,9 +2254,7 @@ class MainWindow(QMainWindow):
         #    /「关闭近期数据」之间切（见 _refresh_replay_ui）。
         self.btn_open_history = RowButton("打开近期数据", outlined=True)
         self.btn_open_history.setToolTip(
-            "在接收区打开本地留存的近期数据：受保留行数上限、每个时间戳记一次，"
-            "用来看瞬时报错；回放中再点一次返回实时"
-            "（格式与实时一致，可搜索 / 定位异常 / 复制）")
+            "在接收区打开本地留存的近期数据；回放中再点一次返回实时")
         self.btn_open_history.clicked.connect(self._open_history)
         actions.addWidget(self.btn_open_history, alignment=Qt.AlignmentFlag.AlignHCenter)
 
@@ -2232,8 +2263,7 @@ class MainWindow(QMainWindow):
         # 共用 _replay_active、两者互斥。
         self.btn_open_long_history = RowButton("打开历史数据", outlined=True)
         self.btn_open_long_history.setToolTip(
-            "查看永不删除的历史数据，按设置里的采样间隔显示，用来看长期电压变化；"
-            "回放中再点一次返回实时")
+            "查看永不删除的历史数据，按采样间隔显示；再点一次返回实时")
         self.btn_open_long_history.clicked.connect(self._open_long_history)
         actions.addWidget(self.btn_open_long_history, alignment=Qt.AlignmentFlag.AlignHCenter)
 
@@ -2261,7 +2291,8 @@ class MainWindow(QMainWindow):
         # 放在动作列表之后再单独一行、文字用 ink_3（muted）当**次要动作**，与上面
         # 五颗主动作拉开层次；按钮本身仍是同款描边胶囊（用户「DLC 也一样」）。
         # 语义仍是单 DLC 直通：没装 → 提示安装，装了 → 直接进心率面板。
-        # ⚠️ 不进 BUTTON_SPECS —— 允许隐藏等于让用户把自己锁在 DLC 外面。
+        # ⚠️ v3.0 进 BUTTON_SPECS（用户「所有按钮都要可以单独设置显示开关」）：
+        #    它不是面板入口，藏了随时能勾回来，不构成"锁死"。
         # ⚠️ 只在**蓝牙广播模式**显示（串口模式下心率广播用不上）：显隐由
         #    _refresh_config_visibility 统一管（见 _on_link_mode_changed）。
         dlc_row = QVBoxLayout()
@@ -2401,7 +2432,7 @@ class MainWindow(QMainWindow):
         left.addWidget(self.txt_rx, 1)
 
         # 右侧功能键竖排 —— 搜索/暂停/清空/保存/全屏，全部带中文 tooltip
-        self.btn_search = IconButton(GLYPH_SEARCH, "在接收区中查找（Ctrl+F）",
+        self.btn_search = IconButton(GLYPH_SEARCH, "查找（Ctrl+F）",
                                      size=30, glyph_size=15)
         self.btn_search.clicked.connect(self._toggle_search)
         # 定位最近一次异常：从文档末尾往前找最近一行"电压/温度越界或 BMS ERROR"，
@@ -2967,7 +2998,7 @@ class MainWindow(QMainWindow):
         # 收起是连续的：先从当前高度压到 0 再隐藏（Reveal 内部做），
         # 所以这里不能直接 hide()，否则那 200ms 的过渡就没了。
         self._search_reveal.to(False)
-        self.btn_search.setToolTip("在接收区中查找（Ctrl+F）")
+        self.btn_search.setToolTip("查找（Ctrl+F）")
         self._reset_matches()
         self.txt_rx.setFocus()
 
@@ -10054,11 +10085,11 @@ class MainWindow(QMainWindow):
             # 只换「读哪个数」：估算 / 积分 / 零漂一行没动（见 _refresh_soc_now）
             self._set_soc_source(customization.get("soc_source"))
             app_log.info("SOC 数据来源已切换为 " +
-                         ("报文读取" if self._soc_source == "read" else "本地估算"))
+                         ("主控" if self._soc_source == "read" else "本地"))
         if "volt_source" in custom_changes:
             self._set_volt_source(customization.get("volt_source"))
             app_log.info("总电压来源已切换为 " +
-                         ("BMS 上报" if self._volt_source == "read" else "本地估算"))
+                         ("主控" if self._volt_source == "read" else "本地"))
         if "keep_awake_on_rx" in custom_changes:
             # 防息屏开关：立即 configure（当前是否在收由 WakeLock 自己记得）
             self._wake_lock.configure(bool(customization.get("keep_awake_on_rx")))
@@ -10133,13 +10164,20 @@ class MainWindow(QMainWindow):
         self._apply_button_visibility()
 
     def _apply_button_visibility(self) -> None:
+        # v3.0 旧组键迁移：老配置里隐藏过「串口参数 / 数据工具」整组的，展开成
+        # 对应的逐项键，别让旧选择悄悄失效（迁移后组键被下面的 known 交集丢掉）。
+        expanded = set()
+        for legacy, members in _LEGACY_HIDDEN_EXPAND.items():
+            if legacy in self._hidden_buttons:
+                expanded.update(members)
+        self._hidden_buttons = (self._hidden_buttons - set(_LEGACY_HIDDEN_EXPAND)) | expanded
         known = {key for key, _label, _group in BUTTON_SPECS}
         self._hidden_buttons &= known          # 旧配置里已删掉的键不要留着
         for key, _label, _group in BUTTON_SPECS:
             if key in _CONFIG_VIS_KEYS:
-                # 串口设置卡这三组的显隐要**叠加模式规则**（串口参数在蓝牙广播下
-                # 整体隐藏），由 _refresh_config_visibility 统一算，别在这里直接
-                # setVisible —— 两处各写一套必然打架。
+                # 串口设置卡这些项的显隐要**叠加模式规则**（串口参数四行在蓝牙
+                # 广播下整体隐藏），由 _refresh_config_visibility 统一算，别在这里
+                # 直接 setVisible —— 两处各写一套必然打架。
                 continue
             widget = getattr(self, key, None)
             if widget is not None:
@@ -10147,19 +10185,22 @@ class MainWindow(QMainWindow):
         # 「定时发送」藏起来时，紧跟其后的间隔时长数字框要一起收 —— 一个孤零零的
         # 「1000 ms」留在选项行里毫无意义，还会让人以为定时发送还开着。
         self.spin_interval.setVisible("chk_timer_send" not in self._hidden_buttons)
-        # 串口设置卡三组 + DLC：统一出口（模式规则 × 用户隐藏开关）。
+        # 串口设置卡逐项 + DLC：统一出口（模式规则 × 用户隐藏开关）。
         self._refresh_config_visibility()
 
     def _refresh_config_visibility(self) -> None:
         """串口设置卡的显隐 —— **唯一出口**（模式规则 × 用户隐藏开关）。
 
-        规则：
-          · 串口参数（波特率/停止位/数据位/校验位）：蓝牙广播模式没有这些概念
-            → 整体隐藏；再叠加用户是否隐藏了「串口参数」。
-          · 保留行数 / 数据工具：两种模式都要，只看用户隐藏状态。
-          · DLC：**只在蓝牙广播模式**出现（串口模式心率广播用不上）。它住在
-            「数据工具」组里，所以隐藏该组时自然跟着没 —— 但它**不受**「串口
-            参数」隐藏影响（两者是兄弟容器，不是父子）。
+        规则（v3.0 逐项开关）：
+          · 串口参数四行（波特率/停止位/数据位/校验位）：蓝牙广播模式没有这些
+            概念 → 全部隐藏；再逐行叠加用户是否隐藏了对应行。四行全没时把
+            serial_params 整块收起，不留一块空白。
+          · 保留行数 / 六颗动作按钮：两种模式都要，只看用户隐藏状态。
+          · DLC：**只在蓝牙广播模式**出现（串口模式心率广播用不上），同时尊重
+            自己的隐藏开关（v3.0 起它也可隐藏）。
+          · 数据工具组（actions_box = 分隔线 + 小标题 + 六颗按钮）：六颗全被
+            用户藏掉时整块收起；剩一颗也要露着（含只剩 DLC 时，串口模式下组
+            还在，按钮按模式规则不显示）。
 
         ⛔ 蓝牙广播模式下别让 DLC 跟着串口参数一起没了 —— 它在 actions_box 里。
         """
@@ -10185,14 +10226,31 @@ class MainWindow(QMainWindow):
             elif not widget.isHidden():
                 widget.setVisible(False)
 
-        # 串口参数：蓝牙广播模式没有这些概念 → 整体隐藏；再叠加用户是否隐藏了它。
-        _show(getattr(self, "serial_params", None),
-              (not ble) and ("serial_params" not in hidden))
-        # 保留行数 / 数据工具：两种模式都要，只看用户隐藏状态。
-        for key in ("rx_lines_box", "actions_box"):
-            _show(getattr(self, key, None), key not in hidden)
-        # DLC：只在蓝牙广播模式出现（串口模式心率广播用不上）。
-        _show(getattr(self, "btn_dlc", None), ble)
+        # 串口参数：蓝牙广播模式没有这些概念 → 全部隐藏；再逐行叠加用户隐藏。
+        # ⚠️ 每行**独立**判断（只在"整组是否显示"上做 or 累积）——早先写成把
+        #    上一行的结果串进下一行，隐藏「波特率」会把「停止位」一起带走
+        #    （自测「隐藏「波特率」波及了「停止位」」当场抓住）。
+        any_param_shown = False
+        for key in ("row_baud", "row_stopbits", "row_bytesize", "row_parity"):
+            visible = (not ble) and (key not in hidden)
+            _show(getattr(self, key, None), visible)
+            any_param_shown = any_param_shown or visible
+        _show(getattr(self, "serial_params", None), any_param_shown)
+        # 保留行数：两种模式都要，只看用户隐藏状态。
+        _show(getattr(self, "rx_lines_box", None), "rx_lines_box" not in hidden)
+        # 数据工具六颗：常规五颗只看用户隐藏；DLC 还要叠加蓝牙模式。
+        action_keys = ("btn_monitor", "btn_marks", "btn_open_history",
+                       "btn_open_long_history", "btn_error_history")
+        group_visible = False
+        for key in action_keys:
+            visible = key not in hidden
+            _show(getattr(self, key, None), visible)
+            group_visible = group_visible or visible
+        dlc_visible = ble and ("btn_dlc" not in hidden)
+        _show(getattr(self, "btn_dlc", None), dlc_visible)
+        group_visible = group_visible or dlc_visible
+        # 组内一个不剩时把整块（分隔线 + 小标题 + 按钮）收起，不留孤零零的标题。
+        _show(getattr(self, "actions_box", None), group_visible)
 
     def _apply_glass(self, value: int) -> None:
         """设置毛玻璃强度并立刻重绘。

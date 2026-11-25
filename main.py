@@ -36,13 +36,39 @@ from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWidgets import QApplication
 
 import customization
-from ui_brand import app_icon
 from ui_theme import apply_scheme, detect_system_scheme, ui_font
 # ⛔ 2026-11-03 录屏实证：``main_window`` 全家桶 import 约 312ms（Qt 控件 + 各
 #    ui_* 模块），而它**只有构造主窗时才需要**。放模块顶部意味着双击后要先付
 #    这 312ms 才轮到建开屏窗口 —— 挪到 main() 里、play_configured() **之后**
 #    再 import，开屏能早 0.3s 出现（onedir 实测 0.9s，优化后约 0.6s）。
 #    ⚠️ 只延后 import，不改变任何构造时机/顺序。
+#
+# v3.0（用户 2026-11-25「优化软件首次启动速度」）：``ui_brand`` 同样延后 ——
+#    它连带 ``PySide6.QtSvg``（QSvgRenderer），实测 ≈56ms 纯开销，而
+#    ``app_icon()`` 只在设置**应用窗口图标**时用得到（开屏窗口是 Tool 窗口，
+#    不占任务栏，图标早设晚设都看不出差别）。挪到 _build_window 里（开屏底图
+#    已经在屏上）后，这笔钱不再压在「双击 → 看见画面」的关键路径上。
+#    ⚠️ app_icon() 仍必须在**主窗显示之前**设好，否则任务栏会闪一下默认图标。
+
+
+def _app_icon():
+    """窗口/任务栏图标 —— **惰性**取（v3.0 启动提速）。
+
+    原来在模块顶层 ``from ui_brand import app_icon``：那一行连带把
+    ``PySide6.QtSvg``（QSvgRenderer）拉进来，实测 ≈56ms 纯开销，而图标本身
+    只在**主窗显示之前**设一次就够 —— 开屏窗口是 Tool 窗口、不占任务栏。
+
+    现在改成第一次真正要用时才 import，并且缓存同一个 QIcon（多次设同一个
+    图标不会重复读盘）。
+    """
+    global _APP_ICON
+    if _APP_ICON is None:
+        from ui_brand import app_icon
+        _APP_ICON = app_icon()
+    return _APP_ICON
+
+
+_APP_ICON = None
 
 
 def _prewarm_font_engine() -> None:
@@ -391,9 +417,9 @@ def main() -> int:
     _aud("qapp")  # QApplication 创建完成
     app.setApplicationName("CQUFSAE串口助手")
     app.setOrganizationName("MimoWorks")
-    # 窗口与任务栏图标。这一步不能省：--icon 只设了 exe 文件自身的图标，
-    # 运行时的窗口图标要在这里显式给。
-    app.setWindowIcon(app_icon())
+    # 窗口与任务栏图标 —— v3.0 起**延后**到 _build_window 里设（见那个函数的
+    # 说明）：它要求 import ui_brand（连带 QtSvg ≈56ms），而开屏窗口是 Tool
+    # 窗口、不占任务栏，图标早设晚设看不出差别；放到开屏底图上屏之后再付更划算。
     # 用 Fusion 打底：Windows 原生样式对自定义样式表的响应有不少怪脾气，
     # Fusion 更可预期，配色也由我们自己完全接管。
     app.setStyle("Fusion")
@@ -547,6 +573,10 @@ def main() -> int:
         nonlocal window
         if window is not None:
             return
+        # v3.0 启动提速：应用窗口图标在这里才设（第一次调用 _app_icon 会 import
+        # ui_brand 连带 QtSvg ≈56ms）。⛔ 必须在主窗 show() 之前设好，否则任务栏
+        # 会先闪一下 Qt 默认占位图标。
+        app.setWindowIcon(_app_icon())
         # ⛔⛔ main_window 全家桶（≈312ms）在这里才 import：开屏窗口已经在屏幕上，
         #    这段加载不挡"点开就有画面"。
         from main_window import MainWindow
