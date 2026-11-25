@@ -2177,7 +2177,8 @@ class MainWindow(QMainWindow):
         group_title.setFont(ui_font(10.5))
         actions_box_col.addWidget(group_title)
 
-        # 动作列表容器：竖排、行间 2px。全部 RowButton，无标签占位、无 64px 空格。
+        # 动作列表容器：竖排、行间 8px（用户「间距要适中」）。全部 RowButton，
+        # 无标签占位、无 64px 空格。
         # ⚠️ 五颗（查看标记 / 近期 / 历史 / 历史报错 / DLC）全走 RowButton 的
         #    outlined 态（常驻浅底 + 描边胶囊）：用户 2026-11-25 先点名「历史记录和
         #    近期记录仍需要按钮」，随后补「查看历史报错和标记也要」「DLC 也一样」。
@@ -2185,7 +2186,7 @@ class MainWindow(QMainWindow):
         #    保留 muted 文字当次要动作，但同样是描边按钮。
         actions = QVBoxLayout()
         actions.setContentsMargins(0, 3, 0, 0)
-        actions.setSpacing(2)
+        actions.setSpacing(8)   # 用户「间距要适中」：五颗统一 8px，别再 2/4 混搭
 
         # 「查看标记」（用户 2026-11-24「查看标记还是做成按钮吧」）：点它弹窗看列表
         # （见 _show_marks_dialog）。打标按钮仍在接收区右侧竖栏（Alt+M）。
@@ -2193,7 +2194,6 @@ class MainWindow(QMainWindow):
         self.btn_marks.setToolTip("查看整轮标记（仅本次会话）")
         self.btn_marks.clicked.connect(self._show_marks_dialog)
         actions.addWidget(self.btn_marks, alignment=Qt.AlignmentFlag.AlignHCenter)
-        actions.addSpacing(4)   # 四颗都是描边胶囊，彼此留一点呼吸
 
         # 「打开近期数据」（用户 2026-10-13 点名，2026-11-21 改名）：在软件内打开
         # 本地留存的接收数据，格式/风格/功能与实时接收一致。
@@ -2216,7 +2216,6 @@ class MainWindow(QMainWindow):
             "回放中再点一次返回实时")
         self.btn_open_long_history.clicked.connect(self._open_long_history)
         actions.addWidget(self.btn_open_long_history, alignment=Qt.AlignmentFlag.AlignHCenter)
-        actions.addSpacing(4)   # 回放两颗之间留一点呼吸
 
         # 「历史报错数据」（用户 2026-11-13 点名）：扫一遍本地留存的接收数据，
         # 把出现过的超温 / 超压 / 欠压 / BMS 报错逐条带时间戳列出来。
@@ -2225,7 +2224,6 @@ class MainWindow(QMainWindow):
             "查看历史接收数据里出现过的超温 / 超压 / 欠压 / BMS 报错，每条都带时间戳")
         self.btn_error_history.clicked.connect(self._open_error_history)
         actions.addWidget(self.btn_error_history, alignment=Qt.AlignmentFlag.AlignHCenter)
-        actions.addSpacing(4)   # 主操作收尾，再接次要（但同款描边）的 DLC
 
         actions_box_col.addLayout(actions)
 
@@ -2237,7 +2235,7 @@ class MainWindow(QMainWindow):
         # ⚠️ 只在**蓝牙广播模式**显示（串口模式下心率广播用不上）：显隐由
         #    _refresh_config_visibility 统一管（见 _on_link_mode_changed）。
         dlc_row = QVBoxLayout()
-        dlc_row.setContentsMargins(0, 2, 0, 0)
+        dlc_row.setContentsMargins(0, 8, 0, 0)   # 与上面四颗统一 8px 间距
         dlc_row.setSpacing(0)
         self.btn_dlc = RowButton("DLC", muted=True, outlined=True)
         self.btn_dlc.setToolTip("心率广播 DLC：未安装时提示安装，已安装直接打开")

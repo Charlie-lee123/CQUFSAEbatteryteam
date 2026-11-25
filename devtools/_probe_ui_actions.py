@@ -7,7 +7,7 @@ r"""一次性真平台探针：配置卡底部动作行改版的功能等价性 
   C clicked 连接的目标方法存在且可调用（handler 未丢）
   D 回放态文案切换与改前一致（打开/关闭 近期/历史）
   E 禁用逻辑：btn_dlc / btn_error_history 等 setEnabled(False) 生效
-  F 行高=32、DLC 是 muted；五颗像素上有浅底+描边，宽度按文字取、不撑满整行且水平居中
+  F 行高=32、DLC 是 muted；五颗像素上有浅底+描边，宽度按文字取、不撑满整行、水平居中，间距统一适中
   G 布局仍在 _config_content 内、不在 _config_fields；无 64px 占位残留
   H 窄档（把 config 收窄到 1/4）不抛异常、卡片最小宽不异常
   I QSettings 前后零变化
@@ -209,6 +209,26 @@ def main() -> int:
             offsets[attr] = round(p.x() - center, 1)
         check("F6 五颗按钮水平居中", all(abs(v) <= 2 for v in offsets.values()),
               f"offsets={offsets} center={center}")
+        # F7 用户「间距也要适中」：五颗之间统一 8px，别出现 2/4/6 混搭。
+        order = ("btn_marks", "btn_open_history", "btn_open_long_history",
+                 "btn_error_history", "btn_dlc")
+        # 串口模式下 DLC 隐藏、几何仍是旧值（实测量出 -24px 假红），临时显示量完再收。
+        dlc_hidden2 = win.btn_dlc.isHidden()
+        if dlc_hidden2:
+            win.btn_dlc.show()
+            app.processEvents()
+        spans = []
+        for attr in order:
+            b = getattr(win, attr)
+            top = b.mapTo(win._config_content, QPoint(0, 0)).y()
+            spans.append((top, top + b.height()))
+        gaps = [spans[i + 1][0] - spans[i][1] for i in range(len(spans) - 1)]
+        check("F7 五颗按钮间距统一适中（6~10px）",
+              all(6 <= g <= 10 for g in gaps) and max(gaps) - min(gaps) <= 1,
+              f"gaps={gaps} spans={spans}")
+        if dlc_hidden2:
+            win.btn_dlc.hide()
+            app.processEvents()
 
         # G 在 _config_content 内、不在 _config_fields、无 64px 占位残留
         check("G1 五颗都在 _config_content 内",
