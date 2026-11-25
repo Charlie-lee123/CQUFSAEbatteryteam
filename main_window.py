@@ -2113,6 +2113,13 @@ class MainWindow(QMainWindow):
             "接收区最多保留的行数，超出后最早的会被丢弃；可选预设，也可直接输入")
         self.cmb_rx_lines.editTextChanged.connect(self._on_rx_lines_text_changed)
 
+        # 用户 2026-11-25：配置卡这 7 个框里的字水平居中。逐个实例打标记，
+        # 不碰全局 QSS —— 设置面板里 SOC 来源/历史间隔/主题等下拉框仍左对齐。
+        for _combo in (self.cmb_link, self.cmb_port, self.cmb_baud,
+                       self.cmb_stopbits, self.cmb_bytesize, self.cmb_parity,
+                       self.cmb_rx_lines):
+            _combo.setCenterText(True)
+
         # 标签固定宽度，控件吃掉剩余宽度 —— 右侧表单的经典排法。
         # 64px 放得下「保留行数」四字，三字标签也因此对齐。
         # ⚠️ 前四行是**串口专有**的（蓝牙广播下没有波特率/校验位可言），包成一个
@@ -2177,7 +2184,7 @@ class MainWindow(QMainWindow):
         group_title.setFont(ui_font(10.5))
         actions_box_col.addWidget(group_title)
 
-        # 动作列表容器：竖排、行间 8px（用户「间距要适中」）。全部 RowButton，
+        # 动作列表容器：竖排、行间 12px（用户「间距再大一点，参考上面的按钮」）。全部 RowButton，
         # 无标签占位、无 64px 空格。
         # ⚠️ 五颗（查看标记 / 近期 / 历史 / 历史报错 / DLC）全走 RowButton 的
         #    outlined 态（常驻浅底 + 描边胶囊）：用户 2026-11-25 先点名「历史记录和
@@ -2186,7 +2193,7 @@ class MainWindow(QMainWindow):
         #    保留 muted 文字当次要动作，但同样是描边按钮。
         actions = QVBoxLayout()
         actions.setContentsMargins(0, 3, 0, 0)
-        actions.setSpacing(8)   # 用户「间距要适中」：五颗统一 8px，别再 2/4 混搭
+        actions.setSpacing(12)  # 用户「间距再大一点」：五颗统一 12px，与 col/params_col 一致
 
         # 「查看标记」（用户 2026-11-24「查看标记还是做成按钮吧」）：点它弹窗看列表
         # （见 _show_marks_dialog）。打标按钮仍在接收区右侧竖栏（Alt+M）。
@@ -2235,7 +2242,7 @@ class MainWindow(QMainWindow):
         # ⚠️ 只在**蓝牙广播模式**显示（串口模式下心率广播用不上）：显隐由
         #    _refresh_config_visibility 统一管（见 _on_link_mode_changed）。
         dlc_row = QVBoxLayout()
-        dlc_row.setContentsMargins(0, 8, 0, 0)   # 与上面四颗统一 8px 间距
+        dlc_row.setContentsMargins(0, 12, 0, 0)  # 与上面四颗统一 12px 间距
         dlc_row.setSpacing(0)
         self.btn_dlc = RowButton("DLC", muted=True, outlined=True)
         self.btn_dlc.setToolTip("心率广播 DLC：未安装时提示安装，已安装直接打开")

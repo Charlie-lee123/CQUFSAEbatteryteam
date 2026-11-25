@@ -1160,6 +1160,9 @@ class ChevronComboBox(QComboBox):
         self._fit_shift = 0
         self._fit_key = None
         self._fit_retried = False
+        # 水平居中（用户 2026-11-25 只要配置卡那 7 个框）：不碰全局 QSS，
+        # 由 setCenterText() 对本实例单独开，见 _fit_text_vertical / setEditable。
+        self._center_text = False
         self.currentTextChanged.connect(lambda _text: self._place_edit())
         edit = self.lineEdit()
         if edit is not None:
@@ -1179,6 +1182,27 @@ class ChevronComboBox(QComboBox):
         if editable and edit is not None:
             edit.installEventFilter(self)
             edit.textChanged.connect(lambda _text: self._place_edit())
+            # 居中标记可能在 setEditable(True) 之前就设了，补一次对齐。
+            if self._center_text:
+                edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._place_edit()
+
+    def setCenterText(self, enabled: bool = True) -> None:
+        """只把**本实例**的框内文字水平居中，不影响其它下拉框。
+
+        可编辑框的文字在内部 QLineEdit 里，QSS 的 ``text-align`` 对它无效，
+        直接给 lineEdit 设对齐；不可编辑框的文字由 QStyleSheetStyle 画，
+        Qt 6.12 + Fusion 下 ``text-align`` 实测**完全不起作用**（只有
+        ``padding-left`` 能挪文字），所以按字宽算一条左 padding 居中，
+        上下 padding 仍由 _fit_text_vertical 按实测墨迹标定，绝不改动。
+        """
+        self._center_text = bool(enabled)
+        edit = self.lineEdit()
+        if self.isEditable() and edit is not None:
+            edit.setAlignment(Qt.AlignmentFlag.AlignCenter if self._center_text
+                              else Qt.AlignmentFlag.AlignLeft)
+        else:
+            self._fit_key = None
             self._place_edit()
 
     def _place_edit(self) -> None:
@@ -1231,7 +1255,7 @@ class ChevronComboBox(QComboBox):
         text = self.currentText()
         dpr = self.devicePixelRatioF() or 1.0
         key = (self.font().key(), text, self.width(), self.height(),
-               round(dpr, 2))
+               round(dpr, 2), self._center_text)
         if key == self._fit_key:
             return                    # 这个组合量过且已稳定，别再抓图
         offset = _combo_label_ink_offset(self)
@@ -1249,14 +1273,24 @@ class ChevronComboBox(QComboBox):
         shift = int(round(-base_delta))        # 目标位移（正 = 下移）
         shift = max(-4, min(4, shift))
         self._fit_key = key
-        if shift == self._fit_shift:
+        # ⚠️ 竖直位移为 0 时原实现直接返回、不写实例 stylesheet；但水平居中
+        #   要靠那条 padding 才能落地（尤其 setCenterText 时 shift 往往正好是 0）。
+        #   所以居中标记打开时必须继续往下走，把算好的左 padding 写进去。
+        if shift == self._fit_shift and not self._center_text:
             return
         self._fit_shift = shift
         # 基准（全局 QSS）是上下 6/6；位移 s 要把上下各挪 s：上 6+s、下 6-s
         top = 6 + shift
         bottom = 6 - shift
+        # 水平：默认左对齐（padding-left 12）；setCenterText(True) 的实例按字宽
+        # 算左 padding，把墨迹中心摆到"去掉右侧 24px 箭头"的内容区中线。
+        # ⚠️ 只动 left，上下仍是标定值、右侧 10px 不变。
+        left = 12
+        if self._center_text:
+            text_w = self.fontMetrics().horizontalAdvance(text)
+            left = max(2, int(round((self.width() - self.ARROW_W - text_w) / 2 - 1)))
         self.setStyleSheet(
-            f"QComboBox {{ padding: {top}px 10px {bottom}px 12px; }}")
+            f"QComboBox {{ padding: {top}px 10px {bottom}px {left}px; }}")
 
     def resizeEvent(self, event) -> None:
         # 宿主先 resize，编辑框的坐标才是最终值 —— 这里再摆一次（缓存后很便宜）

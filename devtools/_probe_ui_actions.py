@@ -209,9 +209,13 @@ def main() -> int:
             offsets[attr] = round(p.x() - center, 1)
         check("F6 五颗按钮水平居中", all(abs(v) <= 2 for v in offsets.values()),
               f"offsets={offsets} center={center}")
-        # F7 用户「间距也要适中」：五颗之间统一 8px，别出现 2/4/6 混搭。
+        # F7 用户「间距再大一点」：按钮之间统一 12px，别出现混搭。
+        # 「监控面板」若也在这一列（另一路改动），必须一起量，否则会跨过它
+        # 量出 56px 假红；这里按属性存在与否自适应，5/6 颗都能验。
         order = ("btn_marks", "btn_open_history", "btn_open_long_history",
                  "btn_error_history", "btn_dlc")
+        if hasattr(win, "btn_monitor"):
+            order = ("btn_monitor",) + order
         # 串口模式下 DLC 隐藏、几何仍是旧值（实测量出 -24px 假红），临时显示量完再收。
         dlc_hidden2 = win.btn_dlc.isHidden()
         if dlc_hidden2:
@@ -223,8 +227,8 @@ def main() -> int:
             top = b.mapTo(win._config_content, QPoint(0, 0)).y()
             spans.append((top, top + b.height()))
         gaps = [spans[i + 1][0] - spans[i][1] for i in range(len(spans) - 1)]
-        check("F7 五颗按钮间距统一适中（6~10px）",
-              all(6 <= g <= 10 for g in gaps) and max(gaps) - min(gaps) <= 1,
+        check("F7 六颗按钮间距统一 12px（11~13px）",
+              all(11 <= g <= 13 for g in gaps) and max(gaps) - min(gaps) <= 1,
               f"gaps={gaps} spans={spans}")
         if dlc_hidden2:
             win.btn_dlc.hide()

@@ -473,7 +473,7 @@ class VehicleLibraryDialog(QDialog):
     def __init__(self, scheme: str = "dark", parent: QWidget | None = None,
                  auto_refresh: bool = True) -> None:
         super().__init__(parent)
-        self.setWindowTitle("在线车辆库")
+        self.setWindowTitle("在线车库")
         self.setModal(True)
         self.setMinimumWidth(620)
         self._scheme = scheme
@@ -1005,7 +1005,7 @@ class VehicleLibraryDialog(QDialog):
             self._show_note(f"索引登记失败：{index.get('error') or '未知原因'}")
             return
         file = str(result.get("file") or "")
-        self._set_status("✓ 已上传并登记到在线车辆库" + (f"（{file}）" if file else ""))
+        self._set_status("✓ 已上传并登记到在线车库" + (f"（{file}）" if file else ""))
 
     def _open_browser_upload(self) -> None:
         share = _vehicle_share_module()
@@ -1652,9 +1652,9 @@ class SettingsDialog(QDialog):
         self.btn_vehicle_import.setToolTip(
             "从别人给你的 .cqv.json 包导入车辆；同名的车按包里的结构更新")
         self.btn_vehicle_import.clicked.connect(self._import_vehicles)
-        self.btn_vehicle_library = InkButton("在线车辆库", variant="ghost")
+        self.btn_vehicle_library = InkButton("在线车库", variant="ghost")
         self.btn_vehicle_library.setToolTip(
-            "打开在线车辆库：浏览/导入别人的车，或把自己的车传上去")
+            "打开在线车库：浏览/导入别人的车，或把自己的车传上去")
         self.btn_vehicle_library.clicked.connect(self._open_vehicle_library)
         # 三颗**并排同一行**（用户 2026-10-31 明确要求：把这三个弄到同一行），
         # 文案去掉省略号。反馈文案（"✓ N 台"/"导入失败"…）一起算进等宽 ——

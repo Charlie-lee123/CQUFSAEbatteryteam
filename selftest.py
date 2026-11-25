@@ -2698,7 +2698,9 @@ def check_expand_and_copy_all(app: QApplication) -> None:
                         and window._tx_card.isVisible(), timeout=3.0), \
             "收起后卡片没有回来"
         if fullscreen_testable:
-            assert not window.isFullScreen(), \
+            # 退出全屏与 _expanded 翻转不是同一帧：动画收尾时 _expanded 已 False、
+            # 但窗口还在全屏态，立刻断言会间歇性假红（真机 3 次里踩到 2 次）。
+            assert wait_for(app, lambda: not window.isFullScreen(), timeout=3.0), \
                 "来路是普通窗口的展开，收起后窗口不该留在全屏"
             # 位置/高度必须精确复位；宽度允许落到"布局最小宽" —— 展开/收起会重算
             # 最小宽（三张卡片摆好后是 1134，刚 show 完的 839 是还没算稳的瞬时值），
@@ -2998,22 +3000,23 @@ def _measure_ink_wide(widget, exclude_right: int = 30) -> tuple:
     return (top, bottom, h / dpr, (rows[-1] + 1 - rows[0]) / dpr)
 
 
-def _measure_ink_left(widget, x_from: float = 6.0) -> float | None:
-    """量控件里文字墨迹最左的 x（逻辑像素），量不到返回 None。
+def _measure_ink_center(widget) -> float | None:
+    """量控件里文字墨迹的水平中心（逻辑像素），量不到返回 None。
 
-    ⚠️ 起点要从 6px（×dpr）开始扫：**左边框**那 1px 描边本身与背景有色差，
-    会被当成"墨迹"，量出来永远是贴在边框上的一个常数。
+    ⚠️ 起点 6px / 终点 width-30px：左边框 1px 描边、右边 30px 自绘 chevron
+    都与背景有色差，会把"墨迹"端点钉死在边框/箭头上（实测假绿/假红根源）。
     """
     pix = widget.grab()
     dpr = pix.devicePixelRatio() or 1.0
     img = pix.toImage()
     w, h = img.width(), img.height()
     y0, y1 = int(h * 0.25), int(h * 0.75)
-    for x in range(int(x_from * dpr), w):
+    xs = []
+    for x in range(int(6 * dpr), w - int(30 * dpr)):
         vals = [img.pixelColor(x, y).lightness() for y in range(y0, y1)]
         if vals and (max(vals) - min(vals)) > 60:
-            return x / dpr
-    return None
+            xs.append(x)
+    return ((xs[0] + xs[-1] + 1) / 2.0) / dpr if xs else None
 
 
 def _assert_switch_hit_geometry(toggle, tag: str) -> None:
@@ -3222,11 +3225,11 @@ def check_customization(app: QApplication) -> None:
         finally:
             _dlg.close()
 
-        # ---- 0c) 串口配置栏五行的文字左端要对齐（2026-10-12 用户点名）----
-        # 三种控件三种基准：不可编辑下拉框的文字被 QStyleSheetStyle 居中，
-        # 可编辑下拉框在 QLineEdit 里、还带字形左侧留白，数字框靠 textMargin
-        # —— 不统一的话一行一个台阶。两处的编辑框位置都只在 Move/Resize 时纠，
-        # 所以先主动 _place_edit() 一次（同 0b，不然反向验证测不出来）。
+        # ---- 0c) 串口配置栏四行参数的文字中心要对齐（2026-11-25 用户点名居中）----
+        # 旧版这里钉"文字左端对齐"；用户改成"框里的字居中"后，7 个配置 combo
+        # 都打了 setCenterText(True)：不可编辑框走计算 padding-left，可编辑框
+        # 走 QLineEdit.AlignCenter。判据随之改成"墨迹中心落在内容区中线"。
+        # 编辑框位置只在 Move/Resize 时纠，先主动 _place_edit() 一次。
         if sys.platform == "win32" and \
                 os.environ.get("QT_QPA_PLATFORM") != "offscreen":
             _form_ctls = (window.cmb_baud, window.cmb_stopbits,
@@ -3236,13 +3239,17 @@ def check_customization(app: QApplication) -> None:
                 if hasattr(_ctl, "_place_edit"):
                     _ctl._place_edit()
             app.processEvents()
-            _lefts = [_measure_ink_left(ctl) for ctl in _form_ctls]
-            assert all(v is not None for v in _lefts), \
-                f"串口配置栏里有控件没量到文字墨迹：{_lefts}"
-            assert max(_lefts) - min(_lefts) <= 1.5, \
-                (f"串口配置栏各控件的文字左边缘没对齐："
-                 f"{[round(v, 1) for v in _lefts]}"
-                 f"（最大差 {max(_lefts) - min(_lefts):.1f}px）")
+            _centers = [_measure_ink_center(ctl) for ctl in _form_ctls]
+            assert all(v is not None for v in _centers), \
+                f"串口配置栏里有控件没量到文字墨迹：{_centers}"
+            # 目标 = 去掉右侧 24px 箭头后的内容区中线；字形左右墨迹不完全对称，
+            # 留 4px 容差（真机实测四行都落在 target-2.5~+0.5）。
+            _targets = [(ctl.width() - 24) / 2.0 for ctl in _form_ctls]
+            _offsets = [round(c - t, 1) for c, t in zip(_centers, _targets)]
+            assert all(abs(o) <= 4 for o in _offsets), \
+                (f"串口配置栏四行参数的文字没居中："
+                 f"centers={[round(v, 1) for v in _centers]} "
+                 f"offsets={_offsets}")
 
         # （"点行标签不该切换开关"的回归放在 3) 段的开关循环里，与"按下即翻转"
         #   一起测 —— 那里本来就有每个开关的引用，不必再开一次面板。）
