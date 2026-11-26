@@ -78,7 +78,7 @@ from ui_controls import (
 )
 from ui_settings import SettingsDialog
 from ui_surface import Card, fade_in, paint_glass
-from ui_perf_mode import PerfModeOverlay
+from ui_perf_mode import PerfModeOverlay, _blur_pixmap
 from ui_theme import (
     CARD_PAD, CARD_RADIUS,
     DEFAULT_GLASS, GAP, GLYPH_CHEVRON_DOWN, GLYPH_CHEVRON_UP, GLYPH_CLEAR,
@@ -738,6 +738,78 @@ class _SwitchFade(QWidget):
             painter.end()
 
 
+class _ConfigFade(QWidget):
+    """串口配置卡「高斯模糊淡出」覆盖层（连接方式切换，用户 2026-11-26）。
+
+    两层合成：底下铺**不透明**的新版式清晰快照，上面叠旧版式的高斯模糊图按 α
+    淡出；α 归 0 时这一层与底下真控件逐像素相同，撤掉不跳。
+
+    ⛔⛔ 绝不能用 ``WA_TranslucentBackground`` —— 设置面板的 ``_VehFade`` 踩过：
+    带该属性的子控件内容会被合成两遍（正确位置 + 再偏移一个自身坐标），屏上
+    一套模糊一套清晰 = 叠影。
+    ⛔ 必须 ``WA_TransparentForMouseEvents``：淡出这 240ms 里用户点到的应该是
+    真控件，而不是一张图。
+    """
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self._base: QPixmap | None = None      # 新版式清晰图（不透明垫底）
+        self._blur: QPixmap | None = None      # 旧版式模糊图（按 α 叠在上面）
+        self._alpha = 0.0
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.hide()
+
+    def show_frame(self, base, blur, rect: QRect, alpha: float) -> None:
+        try:
+            self._base = base
+            self._blur = blur
+            self._alpha = max(0.0, min(1.0, float(alpha)))
+            if self.geometry() != rect:
+                self.setGeometry(rect)
+            if not self.isVisible():
+                self.show()
+            self.raise_()
+            self.update()
+        except RuntimeError:              # 卡片已销毁：静默收尾
+            self.clear()
+
+    def set_alpha(self, alpha: float) -> None:
+        a = max(0.0, min(1.0, float(alpha)))
+        if a != self._alpha:
+            self._alpha = a
+            self.update()
+
+    def clear(self) -> None:
+        self._base = None
+        self._blur = None
+        self._alpha = 0.0
+        try:
+            self.hide()
+        except RuntimeError:
+            pass
+
+    def paintEvent(self, event) -> None:          # noqa: N802 (Qt 命名)
+        if self._base is None:
+            return
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            # 垫底用 Source 整块替换：既盖掉底下真控件，也不和上一帧残留混合。
+            painter.setCompositionMode(
+                QPainter.CompositionMode.CompositionMode_Source)
+            painter.drawPixmap(self.rect(), self._base)
+            if self._blur is not None and self._alpha > 0.0:
+                painter.setCompositionMode(
+                    QPainter.CompositionMode.CompositionMode_SourceOver)
+                painter.setOpacity(self._alpha)
+                painter.drawPixmap(self.rect(), self._blur)
+        finally:
+            painter.end()
+
+
 class _CoverLabel(QLabel):
     """覆盖层窗口：每次 paintEvent 把源图按控件矩形**快速缩放**画出来。
 
@@ -1167,10 +1239,14 @@ class MainWindow(QMainWindow):
         # 每个字段原本的 tooltip（窄档会把标签文字挂上去，退出时要还原）
         self._config_tips: dict[QWidget, str] = {}
         # 上一次的连接方式（True=蓝牙广播）。None = 还没落过值（启动恢复那一次
-        # 不算"用户切换"，不播串口参数的收展动画，见 _on_link_mode_changed）。
+        # 不算"用户切换"，不播高斯模糊过渡，见 _on_link_mode_changed）。
         self._link_ble_state: bool | None = None
-        # 串口参数四行的高度收展补间（连接方式切换，见 _animate_serial_params）
+        # 配置卡连接方式切换的高斯模糊淡出补间（见 _play_config_blur_swap）
         self._params_tween: Tween | None = None
+        # 配置卡连接方式切换的**旧版式快照**，切完后在 blur swap 里模糊化用
+        self._config_swap_old: QPixmap | None = None
+        # 配置卡连接方式切换的覆盖层控件（见 _ConfigFade），复用不重复创建
+        self._params_fade: _ConfigFade | None = None
         # 窗口整体淡入淡出的补间（DWM 合成，**不是** QGraphicsOpacityEffect）
         self._win_fade: Tween | None = None
         # 上一次的窗口状态：用来分辨"从最小化还原"（见 changeEvent）
@@ -6756,6 +6832,18 @@ class MainWindow(QMainWindow):
         """
         ble = self._link_is_ble()
         prev_ble = getattr(self, "_link_ble_state", None)
+        # ⚠️ **换模式**才播过渡（用户 2026-11-26：连接方式切换要高斯模糊淡入
+        # 淡出）：先在**旧版式还挂在屏上**时抓配置卡快照，落完新版式再化开。
+        # 首次落值（启动恢复 link_mode）不播 —— 窗口还没显示，且这时用户还没
+        # 看过任何版式，播了反而像卡一下。
+        wants_swap = (prev_ble is not None and prev_ble != ble
+                      and self.isVisible())
+        old_shot = None
+        if wants_swap:
+            card = getattr(self, "_config_card", None)
+            if card is not None and card.width() > 0:
+                shot = card.grab(card.rect())
+                old_shot = shot if not shot.isNull() else None
         if not ble and self._ble_scanner is not None:
             self._finish_ble_scan(fill=False)      # 离开广播模式就别接着扫了
         self._port_label.setText("蓝牙设备" if ble else "串口选择")
@@ -6765,12 +6853,9 @@ class MainWindow(QMainWindow):
             if ble else "")
         # 串口专有参数的显隐 + DLC 的随模式显隐，统一走一个出口（见
         # _refresh_config_visibility）：串口参数在广播模式下整体隐藏；DLC 反过来，
-        # 只在广播模式下出现。
-        # ⚠️ **换模式**时才给串口参数一段高度收展（用户 2026-11-26「从串口到蓝牙
-        #    广播的时候，串口配置界面需要有动画」）；首次落值（启动恢复）不播 ——
-        #    那会儿窗口还没显示，[prev_ble] 也是 None。
-        self._refresh_config_visibility(
-            animate=prev_ble is not None and prev_ble != ble)
+        # 只在广播模式下出现。显隐本身**一帧落地**（即时语义），"糊一下化开"
+        # 的观感由 _play_config_blur_swap 在落定之后补上。
+        self._refresh_config_visibility()
         self._link_ble_state = ble
         # 广播是**单向**的（只能听，没有"发给设备"这条路，见 _on_send 的说明），
         # 所以发送区在广播模式下直接禁用 —— 比"点了才弹报错"友好。
@@ -6790,6 +6875,11 @@ class MainWindow(QMainWindow):
             self._set_state("未打开")
             self._refresh_ports(announce=False)
         self._settings.setValue("link_mode", "ble" if ble else "serial")
+        # 新版式落定、布局稳定后再播过渡：延迟一拍让 hide/show 先被布局消化，
+        # 否则抓到的"新图"还是旧几何。旧快照记在 _config_swap_old 里供它使用。
+        if wants_swap and old_shot is not None:
+            self._config_swap_old = old_shot
+            QTimer.singleShot(0, self._play_config_blur_swap)
 
     def _refresh_targets(self) -> None:
         """刷新按钮：按当前连接方式刷对应的目标列表。"""
@@ -10228,7 +10318,7 @@ class MainWindow(QMainWindow):
         # 串口设置卡逐项 + DLC：统一出口（模式规则 × 用户隐藏开关）。
         self._refresh_config_visibility()
 
-    def _refresh_config_visibility(self, *, animate: bool = False) -> None:
+    def _refresh_config_visibility(self) -> None:
         """串口设置卡的显隐 —— **唯一出口**（模式规则 × 用户隐藏开关）。
 
         规则（v3.0 逐项开关）：
@@ -10242,10 +10332,9 @@ class MainWindow(QMainWindow):
             用户藏掉时整块收起；剩一颗也要露着（含只剩 DLC 时，串口模式下组
             还在，按钮按模式规则不显示）。
 
-        ``animate``：只有**连接方式切换**才传 True —— 串口参数四行改走高度收展
-        补间（用户 2026-11-26：「从串口到蓝牙广播的时候，串口配置界面需要有
-        动画」）。设置面板里的逐项显隐仍是**一帧落地**（自测直接读 isHidden()
-        断言，等补间会假红），所以默认 False。
+        ⛔ 这里**永远是一帧落地**（即时语义）：设置面板里的逐项显隐靠它，自测也
+        直接读 ``isHidden()`` 断言，等补间就会假红。连接方式切换那一次的高斯
+        模糊过渡不在这里做 —— 见 ``_play_config_blur_swap``。
 
         ⛔ 蓝牙广播模式下别让 DLC 跟着串口参数一起没了 —— 它在 actions_box 里。
         """
@@ -10278,15 +10367,9 @@ class MainWindow(QMainWindow):
         any_param_shown = False
         for key in ("row_baud", "row_stopbits", "row_bytesize", "row_parity"):
             visible = (not ble) and (key not in hidden)
-            if not animate:
-                _show(getattr(self, key, None), visible)
+            _show(getattr(self, key, None), visible)
             any_param_shown = any_param_shown or visible
-        if animate:
-            # 行与整组的显隐都由补间负责（收起时行留到最后再 hide，中间帧不会
-            # 出现"行没了、容器还有高度"的空洞），见 _animate_serial_params。
-            self._animate_serial_params(any_param_shown)
-        else:
-            _show(getattr(self, "serial_params", None), any_param_shown)
+        _show(getattr(self, "serial_params", None), any_param_shown)
         # 保留行数：两种模式都要，只看用户隐藏状态。
         _show(getattr(self, "rx_lines_box", None), "rx_lines_box" not in hidden)
         # 数据工具六颗：常规五颗只看用户隐藏；DLC 还要叠加蓝牙模式。
@@ -10303,26 +10386,32 @@ class MainWindow(QMainWindow):
         # 组内一个不剩时把整块（分隔线 + 小标题 + 按钮）收起，不留孤零零的标题。
         _show(getattr(self, "actions_box", None), group_visible)
 
-    def _animate_serial_params(self, show: bool) -> None:
-        """串口参数四行的高度收展（连接方式切换专用，用户 2026-11-26 点名）。
+    def _play_config_blur_swap(self) -> None:
+        """连接方式切换的过渡：**高斯模糊淡出**（用户 2026-11-26 点名改的）。
 
-        为什么单开一个入口、不让 ``_refresh_config_visibility`` 一律走动画：设置
-        面板里的逐项显隐是**即时**语义（自测在那边直接读 ``isHidden()`` 断言，
-        等 240ms 补间就假红）。所以只有 ``_on_link_mode_changed`` 传 animate=True。
+        用户原话：「连接方式的切换动画弄成高斯模糊吧淡入淡出就切换好了」——
+        此前是 240ms 的高度收展（串口参数四行挤压/展开），那股"块在伸缩"的劲
+        不对，他要的是**糊一下、化开**。
 
-        实现只碰 ``maximumHeight`` + 行显隐，不掺位图/覆盖层：
-          · 收起：从当前高度补到 0，**到终点**才把四行和整块 hide（中间帧不会
-            出现"行没了但容器还有高度"的空洞，也不会先跳一下再收）。
-          · 展开：先把该露的行 show 出来，从 0 补到 ``sizeHint()``，到终点把
-            上限放开交还布局（不留下一个钉死的 maximumHeight）。
-          · 快速来回拨：新一段直接停掉旧补间、从**当前高度**接着走 —— 不跳。
+        时序（调用方保证旧图已抓、新版式已落定）：
+          ① 抓新版式的清晰快照当**不透明垫底**（淡出全程底下的像素恒为"新界面"，
+            不会闪、也不会透出后面的壁纸）；
+          ② 覆盖层先画垫底、再按 α 叠**旧版式的高斯模糊图**，240ms α 1→0；
+          ③ 到 0 直接撤层 —— 此时覆盖层与真控件逐像素相同，撤掉不跳。
+
+        观感因此是「旧界面糊成一团 → 化开 → 新界面」，全程没有位移、没有裁切。
+
+        ⛔ 覆盖层挂配置卡、rect 就是卡片自身矩形：串口参数收起后下面的行整体上移，
+           只盖住参数那四行的话，位移会在覆盖层下沿露出来。
+        ⛔ 位图路线，不用被项目禁用的 QGraphicsOpacityEffect/BlurEffect。
         """
-        box = getattr(self, "serial_params", None)
-        if box is None:
+        card = getattr(self, "_config_card", None)
+        if card is None or not animations_enabled():
             return
-
-        keys = ("row_baud", "row_stopbits", "row_bytesize", "row_parity")
-        rows = [(key, getattr(self, key, None)) for key in keys]
+        # 窗口没显示（启动恢复 link_mode）：不播，别在看不见的地方空转一次抓图。
+        if not card.isVisible() or card.width() <= 0 or card.height() <= 0:
+            self._config_swap_old = None
+            return
 
         old = getattr(self, "_params_tween", None)
         self._params_tween = None
@@ -10333,51 +10422,53 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 pass          # 宿主已析构（关窗时队列里还留着上一段）
 
-        def _settle() -> None:
-            """落到终态：放开上限、落定显隐，之后完全交还布局。"""
-            try:
-                box.setMaximumHeight(16777215)      # QWIDGETSIZE_MAX
-                if show:
-                    box.setVisible(True)
-                else:
-                    for _key, row in rows:
-                        if row is not None:
-                            row.setVisible(False)
-                    box.setVisible(False)
-            except RuntimeError:
-                pass
+        rect = card.rect()
+        shot_new = card.grab(rect)
+        blur_src = getattr(self, "_config_swap_old", None)
+        self._config_swap_old = None
+        if shot_new.isNull() or blur_src is None or blur_src.isNull():
+            return
+        # 高质量高斯模糊：块平均降采样 → 可分离真高斯 → 平滑放大回原尺寸
+        # （与设置面板车号切换同一口径，见 ui_perf_mode._blur_pixmap）。
+        blurred = _blur_pixmap(blur_src)
+        if blurred.isNull():
+            return
+        if blurred.size() != shot_new.size():
+            # 卡高变了（参数收起/展开）→ 居中裁切到新尺寸，别拉伸
+            # （拉伸会把模糊拉成方向性条带，一眼假）。
+            blurred = blurred.scaled(
+                shot_new.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation)
 
-        if show:
-            was_hidden = box.isHidden()
-            hidden = getattr(self, "_hidden_buttons", set())
-            for key, row in rows:
-                if row is not None and key not in hidden:
-                    row.setVisible(True)
-            box.setMaximumHeight(16777215)
-            box.setVisible(True)
-            target = box.sizeHint().height()
-            start = 0 if was_hidden else box.height()
-            if target <= max(start, 0) or not animations_enabled():
-                _settle()
-                return
-            box.setMaximumHeight(start)
-        else:
-            # 窗口还没显示（启动恢复 link_mode）/ 本来就是收起的：一帧落地，
-            # 别在用户看不到的地方空跑一段补间。
-            if box.isHidden() or not box.isVisible():
-                _settle()
-                return
-            start = box.height()
-            target = 0
-            if start <= 0 or not animations_enabled():
-                _settle()
-                return
+        overlay = getattr(self, "_params_fade", None)
+        if overlay is None:
+            overlay = _ConfigFade(card)
+            self._params_fade = overlay
+        overlay.show_frame(shot_new, blurred, rect, 1.0)
 
-        tween = Tween(240, in_out_quint,
-                      lambda v: box.setMaximumHeight(int(round(v))),
-                      _settle, parent=self, min_interval_ms=8)
+        tween = Tween(240, out_cubic,
+                      lambda v: self._config_fade_step(v),
+                      self._config_fade_done, parent=self, min_interval_ms=8)
         self._params_tween = tween
-        tween.start(start, target)
+        tween.start(1.0, 0.0)
+
+    def _config_fade_step(self, value: float) -> None:
+        overlay = getattr(self, "_params_fade", None)
+        if overlay is None:
+            return
+        try:
+            overlay.set_alpha(value)
+        except RuntimeError:
+            pass
+
+    def _config_fade_done(self) -> None:
+        overlay = getattr(self, "_params_fade", None)
+        if overlay is None:
+            return
+        try:
+            overlay.clear()
+        except RuntimeError:
+            pass
 
     def _apply_glass(self, value: int) -> None:
         """设置毛玻璃强度并立刻重绘。

@@ -544,13 +544,17 @@ QWidget {
    · padding 收窄到 4px 8px —— 原来 5/9 在多行文本下两侧留白偏大，框看着比
      文字宽一圈；Qt 的 tooltip 尺寸本来就按内容算（sizeHint），文案短了框会
      自己贴上去，这里只是把最后那点固定余量也收掉；
-   · border-radius 保持 8px（截图里那个直角/大留白框就是长文案撑出来的）。 */
+   · border-radius 从 8 提到 **12**（用户 2026-11-26「解释框的圆角再大一点」）。
+     ⛔ 不给到 CONTROL_RADIUS(16)：tooltip 高度只有一行多，16px 圆角会把短提示
+     的两头削成胶囊，边线上的文字反而被挤 —— 12 是"明显圆了又不吃字"的档。
+     ⛔ border 必须留着（@line@）：tooltip 贴在任意背景上，没有描边时浅色底在
+     浅色卡片上会糊成一片看不见边界。 */
 QToolTip {
     background: @surface@;
     color: @ink@;
     border: 1px solid @line@;
-    border-radius: 8px;
-    padding: 4px 8px;
+    border-radius: 12px;
+    padding: 4px 10px;
     font-size: 12px;
 }
 
