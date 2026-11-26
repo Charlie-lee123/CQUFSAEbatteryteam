@@ -242,6 +242,18 @@ COMPACT_SPECS = {
         "vertical": True, "rx_min_h": 130, "log_w": 48},
 }
 
+# 串口配置卡里下拉框的**宽度上限**（用户 2026-11-26：「这些框不需要这么大就不用
+# 做这么大」）。此前这些框带着 stretch=1、又没有上限，于是在 310px 宽的配置卡里
+# 一路撑到 ~330px（label 64 + gap 10 + 框），框里只写「115200 / None」也照样占满，
+# 右边一大片空白，跟设置面板那些 176 宽的下拉框完全不是一个观感。
+# 176 = ui_settings.COMBO_W 同一个数，全应用的下拉框因此看起来是一套。
+# ⚠️ 只设**上限**、不设固定宽：_apply_compact 还要在窄档把 minimumWidth 压到
+#    66/76，一旦 setFixedWidth，1/4 分屏（config_w=164）就塞不进去了。
+CONFIG_COMBO_MAX_W = 176
+# 「串口选择」装的是设备地址 / 蓝牙名称（「地址 — 名称 — -50dBm（有广播负载）」），
+# 比纯参数长，单独放宽一档；再长就靠控件自己 elide。
+CONFIG_PORT_MAX_W = 200
+
 # 收包合并（串口没有"帧"的概念，一次 read 给的往往只是一帧里的一小段）。
 # 每来一段就显示一行的话，数据会被切成碎块、数字还会被拦腰截断（"12.382" 和
 # "4 13.3825" 分在两行），每块再挂一个时间戳 —— 屏幕上完全没法看。
@@ -1154,6 +1166,11 @@ class MainWindow(QMainWindow):
         self._config_fields: list[tuple[QWidget, int]] = []
         # 每个字段原本的 tooltip（窄档会把标签文字挂上去，退出时要还原）
         self._config_tips: dict[QWidget, str] = {}
+        # 上一次的连接方式（True=蓝牙广播）。None = 还没落过值（启动恢复那一次
+        # 不算"用户切换"，不播串口参数的收展动画，见 _on_link_mode_changed）。
+        self._link_ble_state: bool | None = None
+        # 串口参数四行的高度收展补间（连接方式切换，见 _animate_serial_params）
+        self._params_tween: Tween | None = None
         # 窗口整体淡入淡出的补间（DWM 合成，**不是** QGraphicsOpacityEffect）
         self._win_fade: Tween | None = None
         # 上一次的窗口状态：用来分辨"从最小化还原"（见 changeEvent）
@@ -2065,12 +2082,20 @@ class MainWindow(QMainWindow):
             "蓝牙广播：只被动扫描广播包，不配对不连接（只能读，发不了）")
         self._config_fields.append((self.cmb_link, 0))
         self.cmb_link.currentTextChanged.connect(self._on_link_mode_changed)
+        # 记下建面板时的模式（永远是"串口"）。⛔ 不初始化的话，_restore_settings 里
+        #    的 setCurrentText(LINK_SERIAL) 因为值没变**不会发信号**，
+        #    _on_link_mode_changed 一次都跑不到 → _link_ble_state 一直是 None，
+        #    用户**第一次**真正切到广播时被当成"首次落值"、动画就被跳过了
+        #    （2026-11-26 探针实测：收起段一帧落地）。
+        self._link_ble_state = self._link_is_ble()
         link_row = QHBoxLayout()
         link_row.setSpacing(10)
         link_tag = self._field_label("连接方式")
         link_tag.setFixedWidth(64)
         link_tag.setBuddy(self.cmb_link)      # 窄档藏标签时靠它把文字挂到字段上
         link_row.addWidget(link_tag)
+        # stretch=1 + 上限宽 = 永远 176：框吃掉行内余量、吃满上限就停，行尾剩下的
+        # 空白自然留在右边（用户 2026-11-26「这些框不需要这么大」）。
         link_row.addWidget(self.cmb_link, 1)
         col.addLayout(link_row)
 
@@ -2095,6 +2120,7 @@ class MainWindow(QMainWindow):
         col.addWidget(self._port_label)
         port_row = QHBoxLayout()
         port_row.setSpacing(8)
+        # 同上：框有上限宽（200），刷新键紧跟框、行尾留白
         port_row.addWidget(self.cmb_port, 1)
         port_row.addWidget(self.btn_rescan)
         col.addLayout(port_row)
@@ -2142,10 +2168,15 @@ class MainWindow(QMainWindow):
 
         # 用户 2026-11-25：配置卡这 7 个框里的字水平居中。逐个实例打标记，
         # 不碰全局 QSS —— 设置面板里 SOC 来源/历史间隔/主题等下拉框仍左对齐。
+        # 用户 2026-11-26：再给它们**加上限宽**（见 CONFIG_COMBO_MAX_W）——
+        # 六行统一 176、端口 200，框不再一路撑满整行；stretch=1 仍在，框吃满上限
+        # 就停，余量留成右侧空白。窄档由 _apply_compact 压 minimumWidth 照旧生效。
         for _combo in (self.cmb_link, self.cmb_port, self.cmb_baud,
                        self.cmb_stopbits, self.cmb_bytesize, self.cmb_parity,
                        self.cmb_rx_lines):
             _combo.setCenterText(True)
+            _combo.setMaximumWidth(
+                CONFIG_PORT_MAX_W if _combo is self.cmb_port else CONFIG_COMBO_MAX_W)
 
         # 标签固定宽度，控件吃掉剩余宽度 —— 右侧表单的经典排法。
         # 64px 放得下「保留行数」四字，三字标签也因此对齐。
@@ -2172,6 +2203,7 @@ class MainWindow(QMainWindow):
             tag.setFixedWidth(64)
             tag.setBuddy(widget)
             row.addWidget(tag)
+            # stretch=1 + 上限宽：一律 176，四行右缘对齐
             row.addWidget(widget, 1)
             setattr(self, attr, box)
             params_col.addWidget(box)
@@ -2207,7 +2239,9 @@ class MainWindow(QMainWindow):
         #    （见 _refresh_config_visibility），不再作为开关的 key。
         self.actions_box = QWidget()
         actions_box_col = QVBoxLayout(self.actions_box)
-        actions_box_col.setContentsMargins(0, 0, 0, 0)
+        # 顶部多留 10px（用户 2026-11-26「可以整体下移一点」）：整块——分隔线、
+        # 小标题、六颗按钮——一起往下挪，和上面「保留行数」那行拉开呼吸感。
+        actions_box_col.setContentsMargins(0, 10, 0, 0)
         actions_box_col.setSpacing(0)
 
         divider = QWidget()
@@ -6721,6 +6755,7 @@ class MainWindow(QMainWindow):
         要连的东西"在两种模式下是一回事，没必要摆两套控件。
         """
         ble = self._link_is_ble()
+        prev_ble = getattr(self, "_link_ble_state", None)
         if not ble and self._ble_scanner is not None:
             self._finish_ble_scan(fill=False)      # 离开广播模式就别接着扫了
         self._port_label.setText("蓝牙设备" if ble else "串口选择")
@@ -6731,7 +6766,12 @@ class MainWindow(QMainWindow):
         # 串口专有参数的显隐 + DLC 的随模式显隐，统一走一个出口（见
         # _refresh_config_visibility）：串口参数在广播模式下整体隐藏；DLC 反过来，
         # 只在广播模式下出现。
-        self._refresh_config_visibility()
+        # ⚠️ **换模式**时才给串口参数一段高度收展（用户 2026-11-26「从串口到蓝牙
+        #    广播的时候，串口配置界面需要有动画」）；首次落值（启动恢复）不播 ——
+        #    那会儿窗口还没显示，[prev_ble] 也是 None。
+        self._refresh_config_visibility(
+            animate=prev_ble is not None and prev_ble != ble)
+        self._link_ble_state = ble
         # 广播是**单向**的（只能听，没有"发给设备"这条路，见 _on_send 的说明），
         # 所以发送区在广播模式下直接禁用 —— 比"点了才弹报错"友好。
         self.txt_tx.setEnabled(not ble)
@@ -10188,7 +10228,7 @@ class MainWindow(QMainWindow):
         # 串口设置卡逐项 + DLC：统一出口（模式规则 × 用户隐藏开关）。
         self._refresh_config_visibility()
 
-    def _refresh_config_visibility(self) -> None:
+    def _refresh_config_visibility(self, *, animate: bool = False) -> None:
         """串口设置卡的显隐 —— **唯一出口**（模式规则 × 用户隐藏开关）。
 
         规则（v3.0 逐项开关）：
@@ -10201,6 +10241,11 @@ class MainWindow(QMainWindow):
           · 数据工具组（actions_box = 分隔线 + 小标题 + 六颗按钮）：六颗全被
             用户藏掉时整块收起；剩一颗也要露着（含只剩 DLC 时，串口模式下组
             还在，按钮按模式规则不显示）。
+
+        ``animate``：只有**连接方式切换**才传 True —— 串口参数四行改走高度收展
+        补间（用户 2026-11-26：「从串口到蓝牙广播的时候，串口配置界面需要有
+        动画」）。设置面板里的逐项显隐仍是**一帧落地**（自测直接读 isHidden()
+        断言，等补间会假红），所以默认 False。
 
         ⛔ 蓝牙广播模式下别让 DLC 跟着串口参数一起没了 —— 它在 actions_box 里。
         """
@@ -10233,9 +10278,15 @@ class MainWindow(QMainWindow):
         any_param_shown = False
         for key in ("row_baud", "row_stopbits", "row_bytesize", "row_parity"):
             visible = (not ble) and (key not in hidden)
-            _show(getattr(self, key, None), visible)
+            if not animate:
+                _show(getattr(self, key, None), visible)
             any_param_shown = any_param_shown or visible
-        _show(getattr(self, "serial_params", None), any_param_shown)
+        if animate:
+            # 行与整组的显隐都由补间负责（收起时行留到最后再 hide，中间帧不会
+            # 出现"行没了、容器还有高度"的空洞），见 _animate_serial_params。
+            self._animate_serial_params(any_param_shown)
+        else:
+            _show(getattr(self, "serial_params", None), any_param_shown)
         # 保留行数：两种模式都要，只看用户隐藏状态。
         _show(getattr(self, "rx_lines_box", None), "rx_lines_box" not in hidden)
         # 数据工具六颗：常规五颗只看用户隐藏；DLC 还要叠加蓝牙模式。
@@ -10251,6 +10302,82 @@ class MainWindow(QMainWindow):
         group_visible = group_visible or dlc_visible
         # 组内一个不剩时把整块（分隔线 + 小标题 + 按钮）收起，不留孤零零的标题。
         _show(getattr(self, "actions_box", None), group_visible)
+
+    def _animate_serial_params(self, show: bool) -> None:
+        """串口参数四行的高度收展（连接方式切换专用，用户 2026-11-26 点名）。
+
+        为什么单开一个入口、不让 ``_refresh_config_visibility`` 一律走动画：设置
+        面板里的逐项显隐是**即时**语义（自测在那边直接读 ``isHidden()`` 断言，
+        等 240ms 补间就假红）。所以只有 ``_on_link_mode_changed`` 传 animate=True。
+
+        实现只碰 ``maximumHeight`` + 行显隐，不掺位图/覆盖层：
+          · 收起：从当前高度补到 0，**到终点**才把四行和整块 hide（中间帧不会
+            出现"行没了但容器还有高度"的空洞，也不会先跳一下再收）。
+          · 展开：先把该露的行 show 出来，从 0 补到 ``sizeHint()``，到终点把
+            上限放开交还布局（不留下一个钉死的 maximumHeight）。
+          · 快速来回拨：新一段直接停掉旧补间、从**当前高度**接着走 —— 不跳。
+        """
+        box = getattr(self, "serial_params", None)
+        if box is None:
+            return
+
+        keys = ("row_baud", "row_stopbits", "row_bytesize", "row_parity")
+        rows = [(key, getattr(self, key, None)) for key in keys]
+
+        old = getattr(self, "_params_tween", None)
+        self._params_tween = None
+        if old is not None:
+            try:
+                old.stop()
+                old.deleteLater()
+            except RuntimeError:
+                pass          # 宿主已析构（关窗时队列里还留着上一段）
+
+        def _settle() -> None:
+            """落到终态：放开上限、落定显隐，之后完全交还布局。"""
+            try:
+                box.setMaximumHeight(16777215)      # QWIDGETSIZE_MAX
+                if show:
+                    box.setVisible(True)
+                else:
+                    for _key, row in rows:
+                        if row is not None:
+                            row.setVisible(False)
+                    box.setVisible(False)
+            except RuntimeError:
+                pass
+
+        if show:
+            was_hidden = box.isHidden()
+            hidden = getattr(self, "_hidden_buttons", set())
+            for key, row in rows:
+                if row is not None and key not in hidden:
+                    row.setVisible(True)
+            box.setMaximumHeight(16777215)
+            box.setVisible(True)
+            target = box.sizeHint().height()
+            start = 0 if was_hidden else box.height()
+            if target <= max(start, 0) or not animations_enabled():
+                _settle()
+                return
+            box.setMaximumHeight(start)
+        else:
+            # 窗口还没显示（启动恢复 link_mode）/ 本来就是收起的：一帧落地，
+            # 别在用户看不到的地方空跑一段补间。
+            if box.isHidden() or not box.isVisible():
+                _settle()
+                return
+            start = box.height()
+            target = 0
+            if start <= 0 or not animations_enabled():
+                _settle()
+                return
+
+        tween = Tween(240, in_out_quint,
+                      lambda v: box.setMaximumHeight(int(round(v))),
+                      _settle, parent=self, min_interval_ms=8)
+        self._params_tween = tween
+        tween.start(start, target)
 
     def _apply_glass(self, value: int) -> None:
         """设置毛玻璃强度并立刻重绘。
