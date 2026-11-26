@@ -2469,6 +2469,14 @@ def check_tooltip_and_buttons(app: QApplication) -> None:
             for key, toggle in dialog._button_switches.items():
                 assert toggle.hitButton(QPoint(toggle.TRACK_W // 2, toggle.height() // 2)), \
                     f"{key} 点轨道中点没有命中（hitButton 回归）"
+            # 改动3（用户 2026-11-26）：分区标题字号缩小 + 变暗淡。_caption 是
+            # 所有分区共用的小标题工厂，钉住它的字号(10.5)和 objectName，
+            # 让样式表 @ink_2@ 生效（不再像正文一样又大又亮）。
+            cap = dialog._caption("启动与窗口")
+            assert cap.objectName() == "groupCaption", \
+                f"分区标题没走 groupCaption 样式: {cap.objectName()!r}"
+            assert abs(cap.font().pointSizeF() - 10.5) < 0.01, \
+                f"分区标题字号不是 10.5: {cap.font().pointSizeF()}"
         finally:
             dialog.close()
 
@@ -7341,6 +7349,46 @@ def check_link_switch_stable(app: QApplication) -> None:
                 f"连接方式来回切之后几何漂了：{(base)} → {now}"
                 f"（窗口高 {base[0]}→{now[0]}、卡高 {base[1]}→{now[1]}、"
                 f"发送区 y {base[2]}→{now[2]}、内容最小高 {base[3]}→{now[3]}）")
+
+        # 改动1（用户 2026-11-26）：「连接方式」框紧跟标签靠左、余白留右侧。
+        # stretch=1 会把框推到行尾（标签右缘到框左缘几百 px）；靠左后这段间隔
+        # 应≈link_row 的 spacing(10)。两者同父容器，x 差即可直接比较。
+        from PySide6.QtWidgets import QLabel
+        link_parent = window.cmb_link.parentWidget()
+        assert link_parent is not None, "连接方式框没有父容器"
+        link_tag = next((cand for cand in link_parent.findChildren(QLabel)
+                         if cand.text() == "连接方式"
+                         and cand.parentWidget() is link_parent),
+                        None)
+        assert link_tag is not None, "找不到「连接方式」标签"
+        gap = window.cmb_link.x() - (link_tag.x() + link_tag.width())
+        assert -2 <= gap <= 12, \
+            f"「连接方式」框没靠左：标签右缘到框左缘 {gap}px（期望≈spacing 10）"
+
+        # 改动2（用户 2026-11-26）：切换「连接方式」的任意方向都把「串口选择」框
+        # 当前显示的选中内容清空。可编辑 ComboBox 光 setCurrentIndex(-1) 不够，
+        # 必须连带 setEditText("") 才让屏上文本立刻为空。stub 掉扫描/过渡，
+        # 本用例只验清空，不真起 BLE 线程、不播模糊动画（会在下面 for 之后污染状态）。
+        from main_window import LINK_BLE, LINK_SERIAL
+        window.cmb_port.setEditText("COM7 — 残留文本")
+        assert window.cmb_port.currentText().strip(), "前置：串口框应当有残留文本"
+        _orig_scan = window._scan_ble_devices
+        _orig_swap = window._play_config_blur_swap
+        window._scan_ble_devices = lambda: None
+        window._play_config_blur_swap = lambda: None
+        try:
+            window.cmb_link.setCurrentText(LINK_BLE)
+            app.processEvents()
+            assert window.cmb_port.currentText() == "", \
+                f"切到蓝牙广播后串口框没清空: {window.cmb_port.currentText()!r}"
+            window.cmb_port.setEditText("AA:BB:CC:DD:EE:FF — 残留文本")
+            window.cmb_link.setCurrentText(LINK_SERIAL)
+            app.processEvents()
+            assert window.cmb_port.currentText() == "", \
+                f"切回串口后串口框没清空: {window.cmb_port.currentText()!r}"
+        finally:
+            window._scan_ble_devices = _orig_scan
+            window._play_config_blur_swap = _orig_swap
     finally:
         window.close()
         window.deleteLater()

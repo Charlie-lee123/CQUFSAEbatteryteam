@@ -4042,7 +4042,11 @@ class SettingsDialog(QDialog):
         上面的留白靠 QLabel 自己的 contentsMargins 撑（QFormLayout 不支持
         "某两行之间多留一点"），让一节与一节之间有呼吸。"""
         label = QLabel(text)
-        label.setFont(ui_font(12.5))
+        # 用户 2026-11-26：分区标题统一缩小 + 变暗淡（像"串口选择"那种系统设置
+        # 观感）。10.5pt 与 _inline_caption/_field_label 一档，groupCaption 让
+        # 它走样式表的 @ink_2@（暗灰），不再像正文一样又大又亮。
+        label.setFont(ui_font(10.5))
+        label.setObjectName("groupCaption")
         label.setContentsMargins(0, 8, 0, 0)
         return label
 

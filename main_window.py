@@ -2201,9 +2201,13 @@ class MainWindow(QMainWindow):
         link_tag.setFixedWidth(64)
         link_tag.setBuddy(self.cmb_link)      # 窄档藏标签时靠它把文字挂到字段上
         link_row.addWidget(link_tag)
-        # stretch=1 + 上限宽 = 永远 176：框吃掉行内余量、吃满上限就停，行尾剩下的
-        # 空白自然留在右边（用户 2026-11-26「这些框不需要这么大」）。
-        link_row.addWidget(self.cmb_link, 1)
+        # 用户 2026-11-26：框紧跟标签**靠左**、余白留在右侧（不再用 stretch=1
+        # 把框推到右边）。combo 自带上限宽 CONFIG_LINK_MAX_W=120，去掉 stretch
+        # 后它按 sizeHint 贴着标签排，行尾 addStretch 把剩余空间全吃掉。
+        # ⚠️ setMaximumWidth / _config_fields 记录都不动 —— _apply_compact 靠后者
+        #    在窄档压最小宽度，框靠左不影响这条紧凑逻辑。
+        link_row.addWidget(self.cmb_link)
+        link_row.addStretch(1)
         col.addLayout(link_row)
 
         # 串口选择独占一行，刷新按钮跟在右边。
@@ -6888,6 +6892,12 @@ class MainWindow(QMainWindow):
         两种模式**共用「选目标」那一行**（串口列表 / 蓝牙设备列表）—— "选一个
         要连的东西"在两种模式下是一回事，没必要摆两套控件。
         """
+        # 用户 2026-11-26：切换「连接方式」的**任意方向**都先把「串口选择」框
+        # 当前显示的选中内容清干净、不留残留。cmb_port 是可编辑 ComboBox，
+        # 光 clear()/setCurrentIndex(-1) 不一定清掉 lineEdit 里的文本，必须再
+        # setEditText("") 才保证屏上立刻为空（两个方向都要，见下方分支）。
+        self.cmb_port.setCurrentIndex(-1)
+        self.cmb_port.setEditText("")
         ble = self._link_is_ble()
         prev_ble = getattr(self, "_link_ble_state", None)
         # ⚠️ **换模式**才播过渡（用户 2026-11-26：连接方式切换要高斯模糊淡入
