@@ -2183,6 +2183,11 @@ class MainWindow(QMainWindow):
         self.cmb_port = ChevronComboBox()
         # 可编辑：没有物理串口时也能手输端口名，或直接输入 loop:// 做无硬件回环演示
         self.cmb_port.setEditable(True)
+        # 两行显示（用户 2026-11-26「串口选择区可以两行显示」）：串口条目
+        # "COM7 — USB-SERIAL CH340 (COM7)" 实测 247px，框内可见宽只有约 164px，
+        # 单行必然截断。两行模式把设备名画第一行、描述画第二行。
+        self.cmb_port.setObjectName("portCombo")
+        self.cmb_port.set_two_line_display(True)
         # 宽度由侧栏给出，这里只保底。可编辑下拉框宽度不足会滚动显示，波特率显示错位的老坑
         self._config_fields.append((self.cmb_port, 140))
         self.cmb_port.setMinimumWidth(140)
@@ -6512,8 +6517,16 @@ class MainWindow(QMainWindow):
         if line is not None:
             line.setCursorPosition(0)
 
-    def _fill_port_combo(self, ports: list[tuple[str, str]], keep_device: str = "") -> None:
-        """把扫描到的端口填进下拉框。``device`` 进 userData，描述只作显示。"""
+    def _fill_port_combo(self, ports: list[tuple[str, str]],
+                         keep_device: str = "", *, clear_selection: bool = False) -> None:
+        """把扫描到的端口填进下拉框。``device`` 进 userData，描述只作显示。
+
+        ``clear_selection=True``：填完名单后**不选任何一项**（框里空白）。
+        用于「蓝牙广播 → 串口」切换（用户 2026-11-26 点名"串口选择区要清空"）：
+        蓝牙模式下这个框里装的是蓝牙设备 MAC，直接沿用会把 MAC 当成端口名。
+        ⛔ QComboBox 在 clear()+addItem 后会自动选中第 0 项，所以必须显式
+           ``setCurrentIndex(-1)`` + ``setEditText("")`` 退回未选中态。
+        """
         self._known_ports = list(ports)
         self.cmb_port.blockSignals(True)
         self.cmb_port.clear()
@@ -6521,16 +6534,25 @@ class MainWindow(QMainWindow):
             self.cmb_port.addItem(f"{device}{PORT_LABEL_SEP}{description}", device)
             self.cmb_port.setItemData(self.cmb_port.count() - 1, device,
                                       Qt.ItemDataRole.ToolTipRole)
-        if keep_device:
+        if clear_selection:
+            self.cmb_port.setCurrentIndex(-1)
+            self.cmb_port.setEditText("")
+        elif keep_device:
             self._select_port(keep_device)
         elif not ports:
             self.cmb_port.setEditText("")
         self.cmb_port.blockSignals(False)
 
-    def _refresh_ports(self, announce: bool = True, keep_device: str = "") -> None:
-        """重新扫描串口（刷新按钮，或启动时铺一次）。"""
+    def _refresh_ports(self, announce: bool = True, keep_device: str = "",
+                       *, clear_selection: bool = False) -> None:
+        """重新扫描串口（刷新按钮，或启动时铺一次）。
+
+        ``clear_selection=True``：刷新后不保持任何选择（框里空白），用于
+        蓝牙→串口切换。默认 False：保持当前选中项（或显式 keep_device）。
+        """
         ports = list_serial_ports()
-        self._fill_port_combo(ports, keep_device or self._selected_port())
+        keep = "" if clear_selection else (keep_device or self._selected_port())
+        self._fill_port_combo(ports, keep, clear_selection=clear_selection)
         if announce:
             self._toast(f"发现 {len(ports)} 个串口" if ports else "未发现串口", 3000)
 
@@ -6571,7 +6593,8 @@ class MainWindow(QMainWindow):
         # 也会往底栏写一条，顺序反了"已断开"会被"发现 N 个串口"盖掉。
         dropped = self._worker.port if (self._worker is not None
                                         and self._worker.port not in devices) else ""
-        self._fill_port_combo(ports, self._selected_port())
+        self._fill_port_combo(ports, self._selected_port(),
+                              clear_selection=self.cmb_port.currentIndex() < 0)
         if dropped:
             self._close_port(f"{dropped} 已断开")
         else:
@@ -6873,7 +6896,9 @@ class MainWindow(QMainWindow):
             self._scan_ble_devices()
         else:
             self._set_state("未打开")
-            self._refresh_ports(announce=False)
+            # 从蓝牙广播切回串口：串口选择区**清空**（用户 2026-11-26 点名）。
+            # 蓝牙模式下框里装的是蓝牙设备 MAC，直接沿用会把 MAC 当成端口名填回串口框。
+            self._refresh_ports(announce=False, clear_selection=True)
         self._settings.setValue("link_mode", "ble" if ble else "serial")
         # 新版式落定、布局稳定后再播过渡：延迟一拍让 hide/show 先被布局消化，
         # 否则抓到的"新图"还是旧几何。旧快照记在 _config_swap_old 里供它使用。

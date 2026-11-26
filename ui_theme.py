@@ -750,6 +750,16 @@ QComboBox {
     text-align: left;
 }
 
+/* 串口选择框（用户 2026-11-26「串口选择区可以两行显示」）：允许两行显示，
+   高度从 34（min 20 + padding 12 + 边框 2）涨到 46（min 32）。条目由
+   ChevronComboBox._TwoLineEdit / _PopupItemDelegate 分两行画（设备名 +
+   描述），247px 宽的整串条目在 164px 可见宽里单行必然截断。
+   ⚠️ 只对 objectName=portCombo 的那一颗生效，其它下拉框一律 34。 */
+QComboBox#portCombo {
+    min-height: 32px;
+    max-height: 32px;
+}
+
 /* 可编辑下拉框内部那层 QLineEdit：Qt 的 QSS **不支持负 margin**（试过
    margin-left:-6px，实测完全无效、编辑框还停在原处），所以不在样式表里挪，
    改由 ChevronComboBox 在事件过滤器里摆（见 _place_edit）—— 和 ChevronSpinBox

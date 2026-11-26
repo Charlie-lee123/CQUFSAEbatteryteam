@@ -1041,8 +1041,15 @@ class _PopupItemDelegate(QStyledItemDelegate):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.delete_enabled = False
+        # 两行条目（串口选择，用户 2026-11-26「串口选择区可以两行显示」）：
+        # 第一行设备名、第二行描述。默认关 —— 其它下拉框一行都不变。
+        self.two_line = False
 
     def sizeHint(self, option, index) -> QSize:      # noqa: N802 (Qt 命名)
+        if self.two_line:
+            # 两行：每行按字体行高 + 行距 4，比单行 ROW_H 高一截
+            h2 = option.fontMetrics.height() * 2 + 8
+            return QSize(0, max(self.ROW_H, h2))
         height = max(self.ROW_H, option.fontMetrics.height() + 12)
         return QSize(0, height)
 
@@ -1060,6 +1067,33 @@ class _PopupItemDelegate(QStyledItemDelegate):
             painter.drawRoundedRect(QRectF(box), self.CHIP_RADIUS, self.CHIP_RADIUS)
             painter.restore()
 
+        raw = str(index.data() or "")
+        if self.two_line and "—" in raw:
+            # 两行条目：设备名（ink）在上、描述（ink_2 次级）在下
+            line1, line2 = ChevronComboBox.split_two_line(raw)
+            right_pad = self.PAD_X + (self.DELETE_W if self.delete_enabled else 0)
+            rect = option.rect.adjusted(self.PAD_X, 0, -right_pad, 0)
+            fm = option.fontMetrics
+            half = rect.height() // 2
+            r1 = QRect(rect.x(), rect.y(), rect.width(), half)
+            r2 = QRect(rect.x(), rect.y() + half, rect.width(), half)
+            painter.save()
+            painter.setFont(option.font)
+            painter.setPen(qcolor("ink"))
+            painter.drawText(r1,
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             fm.elidedText(line1, Qt.TextElideMode.ElideRight,
+                                           rect.width()))
+            painter.setPen(qcolor("ink_2"))
+            painter.drawText(r2,
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             fm.elidedText(line2, Qt.TextElideMode.ElideRight,
+                                           rect.width()))
+            painter.restore()
+            if self.delete_enabled and self._deletable(index):
+                self._paint_delete(painter, option)
+            return
+
         painter.save()
         painter.setPen(qcolor("ink"))
         painter.setFont(option.font)
@@ -1067,7 +1101,7 @@ class _PopupItemDelegate(QStyledItemDelegate):
         text_rect = option.rect.adjusted(self.PAD_X, 0, -right_pad, 0)
         # 超长条目（蓝牙设备那串 "MAC — 名字 — 信号 — 负载"）在屏幕宽度封顶后
         # 必须省略，否则文字会被视口硬裁成半个字。
-        text = option.fontMetrics.elidedText(str(index.data() or ""),
+        text = option.fontMetrics.elidedText(raw,
                                              Qt.TextElideMode.ElideRight,
                                              max(0, text_rect.width()))
         painter.drawText(text_rect,
@@ -1118,6 +1152,57 @@ _POPUP_MAX_ROWS = 8
 _POPUP_CHROME_H = 24
 
 
+class _TwoLineEdit(QLineEdit):
+    """两行显示的编辑框：把 ``设备名 — 描述`` 画成上下两行。
+
+    用户 2026-11-26 点名「串口选择区可以两行显示」：串口条目
+    ``COM7 — USB-SERIAL CH340 (COM7)`` 实测 247px 宽，而框内可见宽
+    只有约 164px，单行必然被截断、看不出是哪个串口。QLineEdit 原生
+    单行，无法换行，所以自己画。
+
+    行为：
+      · 未聚焦、有破折号 → 分两行画（第一行 ink、第二行 dimmer）；
+      · 聚焦/编辑中 → 走原生单行渲染，光标、选择、IME 都正常；
+      · 没有破折号/空文本 → 原生单行渲染（居中对齐）。
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._center = False
+
+    def set_center(self, enabled: bool) -> None:
+        self._center = bool(enabled)
+
+    def paintEvent(self, event) -> None:          # noqa: N802 (Qt 命名)
+        text = self.text()
+        if self.hasFocus() or not text or "—" not in text:
+            super().paintEvent(event)
+            return
+
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+            fm = QFontMetrics(self.font())
+            line1, line2 = ChevronComboBox.split_two_line(text)
+            w = self.width()
+            h = self.height()
+            # 第一行占上半、第二行占下半，各留 2px 呼吸边距
+            r1 = QRect(0, 2, w, max(1, h // 2 - 2))
+            r2 = QRect(0, h // 2, w, max(1, h // 2 - 2))
+            flags = (Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+                     if self._center else Qt.AlignmentFlag.AlignLeft
+                     | Qt.AlignmentFlag.AlignVCenter)
+            painter.setPen(qcolor("ink"))
+            painter.setFont(self.font())
+            painter.drawText(r1, flags, fm.elidedText(line1,
+                          Qt.TextElideMode.ElideRight, w))
+            painter.setPen(qcolor("ink_2"))
+            painter.drawText(r2, flags, fm.elidedText(line2,
+                          Qt.TextElideMode.ElideRight, w))
+        finally:
+            painter.end()
+
 class ChevronComboBox(QComboBox):
     """下拉框。箭头用系统图标字体自绘的 chevron，不用 QSS 的三角。
 
@@ -1127,10 +1212,21 @@ class ChevronComboBox(QComboBox):
 
     弹层条目由 :class:`_PopupItemDelegate` 接管绘制（QSS 的 ``::item`` 在 Fusion
     上失效，见那边的说明）。
+
+    **两行显示**（用户 2026-11-26「串口选择区可以两行显示」）：串口条目形如
+    ``COM7 — USB-SERIAL CH340 (COM7)``，实测 247px 宽，而框内可见宽只有 164px
+    （200 减 padding 12 减箭头 24）—— 单行必然被截断，看不见设备描述。QComboBox
+    原生没有"条目两行"这回事（QLineEdit 永远单行），所以这里自绘：
+      · 关闭状态：框内**分两行**画（第一行设备名、第二行描述）；
+      · 弹层条目：同样两行（见 _PopupItemDelegate 的 two_line 分支）。
+    ⛔ 只对**显式开启**的实例生效（``set_two_line_display(True)``），其余下拉框
+       一行都不变 —— 波特率"115200"这种短文本分两行反而是灾难。
     """
 
     ARROW_W = 24
     GLYPH_PX = 11
+    # 两行模式下的行高（逻辑像素）：两行文字 + 一点行距。
+    TWO_LINE_ROW_H = 15
     # 条目右端的「×」被点击：(条目文字)。只在 set_item_delete_enabled(True) 时发。
     delete_requested = Signal(str)
     # 可编辑时内部那层 QLineEdit 的目标 x。Qt 的 QSS 不支持负 margin，样式表
@@ -1163,6 +1259,9 @@ class ChevronComboBox(QComboBox):
         # 水平居中（用户 2026-11-25 只要配置卡那 7 个框）：不碰全局 QSS，
         # 由 setCenterText() 对本实例单独开，见 _fit_text_vertical / setEditable。
         self._center_text = False
+        # 两行显示（用户 2026-11-26「串口选择区可以两行显示」）：默认关，
+        # 只有串口选择框显式开启。见 set_two_line_display。
+        self._two_line = False
         self.currentTextChanged.connect(lambda _text: self._place_edit())
         edit = self.lineEdit()
         if edit is not None:
@@ -1180,12 +1279,35 @@ class ChevronComboBox(QComboBox):
         super().setEditable(editable)
         edit = self.lineEdit()
         if editable and edit is not None:
+            if self._two_line and not isinstance(edit, _TwoLineEdit):
+                # 两行模式在 setEditable 之前就开了：把默认编辑框换成两行版
+                self._install_two_line_edit()
+                return
             edit.installEventFilter(self)
             edit.textChanged.connect(lambda _text: self._place_edit())
             # 居中标记可能在 setEditable(True) 之前就设了，补一次对齐。
             if self._center_text:
                 edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._place_edit()
+
+    def _install_two_line_edit(self) -> None:
+        """把默认的内部 QLineEdit 换成两行版（见 _TwoLineEdit）。
+
+        QComboBox::setLineEdit 会接管新编辑框的所有权并删掉旧的；事件过滤
+        器与 textChanged→_place_edit 的连接要在这个新框上重建（setLineEdit
+        不会替我们接）。
+        """
+        edit = self.lineEdit()
+        if isinstance(edit, _TwoLineEdit):
+            return
+        new_edit = _TwoLineEdit(self)
+        new_edit.set_center(self._center_text)
+        if self._center_text:
+            new_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        new_edit.installEventFilter(self)
+        new_edit.textChanged.connect(lambda _text: self._place_edit())
+        self.setLineEdit(new_edit)
+        self._place_edit()
 
     def setCenterText(self, enabled: bool = True) -> None:
         """只把**本实例**的框内文字水平居中，不影响其它下拉框。
@@ -1204,6 +1326,70 @@ class ChevronComboBox(QComboBox):
         else:
             self._fit_key = None
             self._place_edit()
+
+    def set_two_line_display(self, enabled: bool = True) -> None:
+        """开/关**两行显示**（用户 2026-11-26「串口选择区可以两行显示」）。
+
+        开启后：
+          · 框**变高**（两行文字放得下）—— 由 _two_line_height 决定；
+          · 关闭状态的文字**分两行**画（第一行设备名、第二行描述）；
+          · 弹层条目同样两行（见 _PopupItemDelegate.two_line）。
+
+        ⛔ 分隔符固定用 ``—``（全角破折号）切两行：串口条目是
+           ``COM7 — USB-SERIAL CH340 (COM7)``、蓝牙条目是
+           ``AA:BB:… — 名字 — -46dBm（有负载）``，切点就是第一个破折号。
+           ⚠️ 用**第一个**破折号切，不是最后一个 —— 蓝牙那条有三个破折号，
+              切最后一个会把 MAC 和名字并到第一行、还是很长。
+        """
+        self._two_line = bool(enabled)
+        self._fit_key = None
+        if self._item_delegate is not None:
+            self._item_delegate.two_line = bool(enabled)
+        if bool(enabled) and self.isEditable():
+            self._install_two_line_edit()
+        elif not bool(enabled):
+            # 关掉两行模式：恢复原生单行编辑框（换了框才需要，否则原框还在）
+            edit = self.lineEdit()
+            if isinstance(edit, _TwoLineEdit):
+                edit.set_center(False)
+                edit.update()
+        self.updateGeometry()
+        self.update()
+        # 高度变了，编辑框要重新摆。
+        self._place_edit()
+
+    @staticmethod
+    def split_two_line(text: str) -> tuple[str, str]:
+        """``"COM7 — USB-SERIAL CH340 (COM7)"`` → ("COM7", "USB-SERIAL CH340 (COM7)")。
+
+        没有破折号就整体当第一行、第二行留空（短文本不该被硬拆）。
+        """
+        if not text:
+            return ("", "")
+        head, sep, tail = text.partition("—")
+        if not sep:
+            return (text.strip(), "")
+        return (head.strip(), tail.strip())
+
+    def _two_line_height(self) -> int:
+        """两行模式下这个框该有多高（逻辑像素）。
+
+        = 两行文字行高 + 上下 padding + 边框。padding/border 取 ui_theme 里
+        QComboBox 那条规则的实测量（6px 上下 + 1px 边框上下）。
+        ⚠️ 必须与 ui_theme 的 ``QComboBox#portCombo`` 规则一致（min/max-height
+            32 + 12 + 2 = 46）。
+        """
+        rows = 2 * self.TWO_LINE_ROW_H
+        return rows + 6 * 2 + 2
+
+    def sizeHint(self) -> QSize:                 # noqa: N802 (Qt 命名)
+        """两行模式下报更高的期望高度，布局据此给框留位（QSS 的 min/max 兜底）。"""
+        base = super().sizeHint()
+        if self._two_line:
+            return QSize(base.width(), self._two_line_height())
+        return base
+
+
 
     def _place_edit(self) -> None:
         """把文字摆到位 —— 编辑态摆内层编辑框，非编辑态调实例 padding。
@@ -1229,6 +1415,13 @@ class ChevronComboBox(QComboBox):
     def _place_editable(self) -> None:
         edit = self.lineEdit()
         if edit is None:
+            return
+        # 两行模式下：让 QComboBox 自己的布局把编辑框铺满内容区（高度=两行），
+        # 我们只做最小干预。若再按单行墨迹居中，编辑框会被压成一行高、
+        # 第二行没地方画（用户 2026-11-26「串口选择区可以两行显示」）。
+        if self._two_line:
+            if edit.x() != self.EDIT_TARGET_X:
+                edit.move(self.EDIT_TARGET_X, edit.y())
             return
         x = self.EDIT_TARGET_X
         y = edit.y()
@@ -1427,6 +1620,8 @@ class ChevronComboBox(QComboBox):
             view = self.view()
             self._item_delegate = _PopupItemDelegate(view)
             self._item_delegate.delete_enabled = self._item_delete
+            # 两行显示（串口选择，用户 2026-11-26）：先开标志后弹层也要生效
+            self._item_delegate.two_line = self._two_line
             view.setItemDelegate(self._item_delegate)
             # 「×」要能点中：弹层条目由委托画，命中判定得自己接鼠标。
             # 过滤器挂在 viewport 上（条目区域就是它），并且开鼠标跟踪 ——
@@ -1458,8 +1653,18 @@ class ChevronComboBox(QComboBox):
         """
         view = self.view()
         fm = view.fontMetrics()
-        widest = max((fm.horizontalAdvance(self.itemText(i))
-                      for i in range(self.count())), default=0)
+        # 两行模式下按**较长的那一行**量宽（条目在弹层里也分两行画），
+        # 按整串量会把弹层撑得 unnecessarily 宽。
+        widest = 0
+        for i in range(self.count()):
+            text = self.itemText(i)
+            if self._two_line and "—" in text:
+                line1, line2 = self.split_two_line(text)
+                w = max(fm.horizontalAdvance(line1),
+                        fm.horizontalAdvance(line2))
+            else:
+                w = fm.horizontalAdvance(text)
+            widest = max(widest, w)
         # 弹层**只按需要变宽**：够放下"最宽选项 + 委托左右的文字内边距"就行。
         # 这里原来写死 +84（那还是条目由 QSS 画、外边距 12px 时的旧余量），
         # 条目改由 _PopupItemDelegate 画、QSS margin 归零之后它就明显偏宽了
