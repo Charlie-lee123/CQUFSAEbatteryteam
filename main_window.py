@@ -11110,6 +11110,9 @@ class MainWindow(QMainWindow):
         try:
             if self._monitor_panel is not None:
                 self._monitor_panel.flush()
+                # 面板还开着就退出程序时不会走它自己的 closeEvent —— 在这里
+                # 补存一次几何，否则"上次位置"永远停在更早的一次关窗。
+                self._monitor_panel.persist_geometry()
         except Exception as exc:                  # noqa: BLE001 - 落盘绝不影响关窗
             app_log.error(f"监控面板退出落盘失败：{exc}")
         # 关闭也做一段淡出（用户 2026-10-31："关闭...还是没有动画"）。先忽略这次

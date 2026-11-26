@@ -7362,6 +7362,7 @@ def check_monitor_panel(app: QApplication) -> None:
     window = make_window()
     panel = None
     temp = None
+    temp2 = None
     try:
         window.show()
         for _ in range(10):
@@ -7423,16 +7424,46 @@ def check_monitor_panel(app: QApplication) -> None:
         assert temp._charts["soc"].samples(), "历史模式没把样本灌进曲线"
         temp.back_to_realtime()
         assert not temp._history_mode, "返回实时没退出历史模式"
+
+        # 位置/大小持久化：挪到非默认几何 → closeEvent 存盘 → 重建面板恢复。
+        # 用隔离目录，绝不污染用户真实监控目录。
+        temp.show()
+        for _ in range(4):
+            app.processEvents()
+        temp.move(137, 249)
+        temp.resize(777, 555)
+        for _ in range(4):
+            app.processEvents()
+        expected = (temp.x(), temp.y(), temp.width(), temp.height())
+        assert expected[2:] == (777, 555), f"resize 没生效：{expected}"
+        temp.close()                       # closeEvent → persist_geometry()
+        for _ in range(4):
+            app.processEvents()
+        temp2 = ui_monitor.MonitorPanel(None, data_dir=base)
+        # ⚠️ 必须 show() 之后再读几何：未显示的顶层窗口还没被窗口管理器定位，
+        #    它的 geometry() 与上次 show 过的窗口差一个标题栏高度（实测 29px）。
+        temp2.show()
+        for _ in range(4):
+            app.processEvents()
+        restored = (temp2.x(), temp2.y(), temp2.width(), temp2.height())
+        assert restored == expected, \
+            f"监控面板没记住位置/大小：{expected} → {restored}"
+        assert os.path.isfile(os.path.join(base, "settings.json")), \
+            "面板配置文件没落盘"
+        temp2.close()
+        temp2.deleteLater()
+        temp2 = None
         temp.close()
         temp.deleteLater()
         temp = None
     finally:
-        if temp is not None:
-            try:
-                temp.close()
-                temp.deleteLater()
-            except RuntimeError:
-                pass
+        for leftover in (temp2, temp):
+            if leftover is not None:
+                try:
+                    leftover.close()
+                    leftover.deleteLater()
+                except RuntimeError:
+                    pass
         window._monitor_panel = None
         window.close()
         window.deleteLater()

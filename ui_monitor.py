@@ -22,8 +22,10 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QDateTime, QElapsedTimer, Qt, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPalette, QPen
+from PySide6.QtCore import QByteArray, QDateTime, QElapsedTimer, Qt, QUrl
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QGuiApplication, QPainter, QPalette, QPen,
+)
 from PySide6.QtWidgets import (
     QCheckBox, QDateTimeEdit, QDialog, QGridLayout, QHBoxLayout, QLabel,
     QPushButton, QScrollArea, QVBoxLayout, QWidget,
@@ -268,6 +270,9 @@ class MonitorPanel(QDialog):
         self._build_ui()
         self._apply_cfg()
         self._update_status()
+        # 位置/大小在 _build_ui 之后恢复：布局此时才定下 sizeHint，
+        # restoreGeometry 覆盖掉上面那句默认 resize(900, 640)。
+        self._restore_geometry()
 
     # ------------------------------------------------------------------ 界面
 
@@ -350,10 +355,75 @@ class MonitorPanel(QDialog):
             data = json.loads((self._data_dir / "settings.json").read_text("utf-8"))
             if isinstance(data, dict) and isinstance(data.get("channels"), list):
                 picked = [str(x) for x in data["channels"] if x in CHANNEL_KEYS]
-                return {"channels": picked}
+                cfg: dict = {"channels": picked}
+                geo = data.get("geometry")
+                if isinstance(geo, str) and geo:
+                    cfg["geometry"] = geo
+                return cfg
         except (OSError, ValueError):
             pass
         return {"channels": list(DEFAULT_CHANNELS)}
+
+    # ---------------------------------------------------------- 几何持久化
+
+    def persist_geometry(self) -> None:
+        """把当前位置/大小/最大化状态存进自己的 settings.json。
+
+        ⛔ 只写面板自己的目录，不碰宿主 QSettings。base64 后的 QByteArray 是
+        Qt 原生格式（``saveGeometry``），跨版本、跨 DPI 都比手写 x/y/w/h 稳，
+        且自带最大化/全屏标志。
+
+        关窗（``closeEvent``）和主窗退出（``MainWindow.closeEvent``）都会调；
+        幂等，重复调用只多写一次文件。
+        """
+        try:
+            encoded = bytes(self.saveGeometry().toBase64()).decode("ascii")
+            if not encoded:
+                return
+            self._cfg["geometry"] = encoded
+            self._save_cfg()
+        except Exception as exc:                  # noqa: BLE001 - 几何绝不能崩主窗
+            app_log.error(f"监控面板几何保存失败：{exc}")
+
+    def _restore_geometry(self) -> None:
+        """恢复上次的位置/大小；无效或已落在新屏幕外时退回默认几何。"""
+        raw = self._cfg.get("geometry")
+        if not isinstance(raw, str) or not raw:
+            return
+        try:
+            payload = QByteArray.fromBase64(raw.encode("ascii"))
+            if payload.isEmpty() or not self.restoreGeometry(payload):
+                return
+        except Exception as exc:                  # noqa: BLE001
+            app_log.error(f"监控面板几何恢复失败：{exc}")
+            return
+        self._ensure_on_screen()
+
+    def _ensure_on_screen(self) -> None:
+        """恢复出的几何若整个落在已拔掉的屏幕外，拉回主屏可见区。
+
+        Qt 的 ``restoreGeometry`` 会记住原屏幕号；用户换过显示器/调过分辨率时
+        面板可能跑到看不见的地方 —— 那时"记住位置"反而变成"打不开"。
+        """
+        try:
+            rect = self.frameGeometry()
+            screens = QGuiApplication.screens()
+            if not screens:
+                return
+            for screen in screens:
+                overlap = rect.intersected(screen.availableGeometry())
+                if overlap.width() >= 80 and overlap.height() >= 60:
+                    return
+            primary = QGuiApplication.primaryScreen() or screens[0]
+            avail = primary.availableGeometry()
+            width = min(self.width(), avail.width())
+            height = min(self.height(), avail.height())
+            self.setGeometry(
+                avail.x() + (avail.width() - width) // 2,
+                avail.y() + (avail.height() - height) // 2,
+                width, height)
+        except Exception as exc:                  # noqa: BLE001
+            app_log.error(f"监控面板几何归位失败：{exc}")
 
     def _save_cfg(self) -> None:
         try:
@@ -559,9 +629,10 @@ class MonitorPanel(QDialog):
         self.lbl_mode.setVisible(True)
 
     def closeEvent(self, event) -> None:
-        """关窗只 hide（不销毁），但必须把节流窗口里的样本落盘。"""
+        """关窗只 hide（不销毁），但必须落盘样本 + 记住这次的位置/大小。"""
         try:
             self.flush()
         except Exception as exc:                  # noqa: BLE001
             app_log.error(f"监控面板关窗落盘失败：{exc}")
+        self.persist_geometry()
         super().closeEvent(event)
