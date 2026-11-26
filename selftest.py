@@ -3691,12 +3691,25 @@ def check_customization(app: QApplication) -> None:
                     f"{name}下拉框宽 {w.width()} ≠ 统一宽度 {COMBO_W}"
             rights = {left_x(w) + w.width() for _, w in appear}
             assert len(rights) == 1, f"三只下拉框右缘不齐：{rights}"
-            # 材质强度那一行（滑杆 + 数值）也要与下拉框同宽、同右缘，
-            # 否则整块看着是斜的（滑杆原来一路顶到 490）。
-            glass_right = (dialog.lbl_glass.mapTo(dialog, QPoint(0, 0)).x()
-                           + dialog.lbl_glass.width())
-            assert glass_right == rights.pop(), \
-                f"材质强度那一行右缘 {glass_right} 与下拉框不一致"
+            # 材质强度那一行（滑杆 + 数值）**左缘**与下拉框对齐，但整行单独一档
+            # GLASS_ROW_W=176 —— 用户 2026-11-26：「材质强度的长条可以长一点，和
+            # 之前一样」。下拉框统一收到 COMBO_W(140) 后滑杆只剩 90px，行程太挤；
+            # 所以这里**不再要求与下拉框同右缘**（那是 2026-11-21 的旧口径），
+            # 只要求整行宽 = GLASS_ROW_W 且三段之和正好填满（滑杆 + gap + 数值）。
+            from ui_settings import GLASS_ROW_W
+            glass_field = dialog.lbl_glass.parentWidget()
+            assert glass_field is not None, "材质强度那一行没有容器"
+            assert glass_field.width() == GLASS_ROW_W, \
+                f"材质强度整行宽 {glass_field.width()} ≠ {GLASS_ROW_W}"
+            _gap = glass_field.layout().spacing()
+            _sum = (dialog.slider_glass.width() + _gap
+                    + dialog.lbl_glass.width())
+            assert _sum == GLASS_ROW_W, \
+                (f"材质强度行内三段之和不等于整行宽：{_sum} ≠ {GLASS_ROW_W}"
+                 f"（滑杆 {dialog.slider_glass.width()} + gap {_gap} + 数值 "
+                 f"{dialog.lbl_glass.width()}）")
+            assert dialog.slider_glass.width() >= 120, \
+                f"材质强度滑杆太短（{dialog.slider_glass.width()}px），拖不动"
             # 最长条目必须能完整显示（框宽缩了但不能把字截了）。
             from PySide6.QtWidgets import QStyle, QStyleOptionComboBox
             for name, w in appear:
@@ -7278,6 +7291,62 @@ def check_rows_hint(app: QApplication) -> None:
             len(_counts_a) + len(_counts_b))
 
 
+def check_link_switch_stable(app: QApplication) -> None:
+    """连接方式切换**不许把窗口顶高**（用户 2026-11-26「从蓝牙广播切换成串口后跳一下」）。
+
+    根因：`_refresh_config_visibility` 里连着四次 `setVisible`，每调一次 Qt 就重算
+    一遍最小尺寸；"串口参数四行一次性重新露面"那一下算出来的最小高比稳态大
+    （实测 723 → 755），窗口被顶着长高 12px，等布局稳定后最小高回落到 723，
+    窗口却**不会自己缩回去** → 一次性的 12px 跳变。修法是批量改显隐时先
+    `QLayout.setEnabled(False)` 冻住布局（见 `_apply_config_visibility`）。
+
+    这里不真的切连接方式（那会起蓝牙扫描线程），而是直接按两种版式各跑几轮，
+    断言窗口高 / 卡高 / 发送区 y / 内容最小高 全程不乱。
+    """
+    window = make_window()
+    try:
+        window.resize(1400, 900)
+        window.show()
+        for _ in range(20):
+            app.processEvents()
+
+        card = window._config_card
+        tx = window._tx_card
+        lay = window._config_content.layout()
+        assert lay is not None, "配置卡内容容器没有布局"
+
+        def snap() -> tuple[int, int, int, int]:
+            return (window.height(), card.height(),
+                    tx.mapTo(window, QPoint(0, 0)).y(),
+                    lay.minimumSize().height())
+
+        window._refresh_config_visibility(ble=False)
+        app.processEvents()
+        base = snap()
+        # 串口版式的基本事实先立住：参数四行在、DLC 不在
+        assert not window.serial_params.isHidden(), "串口模式下串口参数被藏了"
+        assert window.btn_dlc.isHidden(), "串口模式下 DLC 不该出现"
+
+        for _ in range(3):
+            window._refresh_config_visibility(ble=True)
+            app.processEvents()
+            assert window.serial_params.isHidden(), "广播模式下串口参数没藏"
+            assert not window.btn_dlc.isHidden(), "广播模式下 DLC 没出现"
+            window._refresh_config_visibility(ble=False)
+            app.processEvents()
+            assert not window.serial_params.isHidden(), "切回串口后参数没回来"
+            assert window.btn_dlc.isHidden(), "切回串口后 DLC 没藏"
+            now = snap()
+            assert now == base, (
+                f"连接方式来回切之后几何漂了：{(base)} → {now}"
+                f"（窗口高 {base[0]}→{now[0]}、卡高 {base[1]}→{now[1]}、"
+                f"发送区 y {base[2]}→{now[2]}、内容最小高 {base[3]}→{now[3]}）")
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+
+
 def check_v211_features() -> None:
     """v2.11 四项增量：电压来源 / 工况死区 / 防息屏 / 整轮标记（纯逻辑，不碰真 OS）。"""
     import customization
@@ -7445,6 +7514,7 @@ CHECKS = [
     ("定位最近异常按钮", check_alert_locate),
     ("车辆与逐模组配置", check_vehicle_profiles),
     ("显示行数（每模组 N 排）", check_rows_hint),
+    ("连接方式切换几何不跳", check_link_switch_stable),
 ]
 
 

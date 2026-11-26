@@ -245,14 +245,19 @@ COMPACT_SPECS = {
 # 串口配置卡里下拉框的**宽度上限**（用户 2026-11-26：「这些框不需要这么大就不用
 # 做这么大」）。此前这些框带着 stretch=1、又没有上限，于是在 310px 宽的配置卡里
 # 一路撑到 ~330px（label 64 + gap 10 + 框），框里只写「115200 / None」也照样占满，
-# 右边一大片空白，跟设置面板那些 176 宽的下拉框完全不是一个观感。
-# 176 = ui_settings.COMBO_W 同一个数，全应用的下拉框因此看起来是一套。
+# 右边一大片空白，跟设置面板那些定宽下拉框完全不是一个观感。
+# ⚠️ 数值与 ``ui_settings.COMBO_W`` **不是同一个数了**（那边 2026-11-26 收到 152）：
+#    配置卡是 310px 宽的窄栏，框太窄会把「115200」「None」也挤到右边留白更多；
+#    两处各自以自己的文案为准，别再拿一个常数硬套两处。
 # ⚠️ 只设**上限**、不设固定宽：_apply_compact 还要在窄档把 minimumWidth 压到
 #    66/76，一旦 setFixedWidth，1/4 分屏（config_w=164）就塞不进去了。
 CONFIG_COMBO_MAX_W = 176
 # 「串口选择」装的是设备地址 / 蓝牙名称（「地址 — 名称 — -50dBm（有广播负载）」），
 # 比纯参数长，单独放宽一档；再长就靠控件自己 elide。
 CONFIG_PORT_MAX_W = 200
+# 「连接方式」只有两个选项（串口 / 蓝牙广播），文字短、没有长内容，
+# 不需要跟参数框一样宽（用户 2026-11-26 截图点名）。
+CONFIG_LINK_MAX_W = 120
 
 # 收包合并（串口没有"帧"的概念，一次 read 给的往往只是一帧里的一小段）。
 # 每来一段就显示一行的话，数据会被切成碎块、数字还会被拦腰截断（"12.382" 和
@@ -695,6 +700,32 @@ def _pump_build() -> None:
             QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
     except Exception:                     # noqa: BLE001 - 让出失败不该拖垮构造
         pass
+
+
+def _invalidate_layout_tree(root: QWidget) -> None:
+    """把 ``root`` 底下**每一层**布局的尺寸缓存都作废（含裸子布局）。
+
+    为什么需要：``QLayout.invalidate()`` 只标记自己，不保证往下递归；而
+    ``addLayout()`` 塞进去的裸布局（如包着 DLC 按钮的 ``dlc_row``）在子控件
+    隐藏后仍会把旧的 sizeHint 留在缓存里。那 32px 会顺着
+    actions_box → 内容容器 → 卡片 body 一路带上去，把卡片最小高从 723 顶成
+    755、窗口最小高从 980 顶成 1012 —— 用户看到的就是"切换时跳一下"
+    （2026-11-26 点名，实测只在"蓝牙广播 → 串口"复现，因为 DLC 那一行刚被藏掉）。
+    """
+    lay = root.layout()
+    if lay is None:
+        return
+    stack = [lay]
+    while stack:
+        cur = stack.pop()
+        cur.invalidate()
+        for i in range(cur.count()):
+            item = cur.itemAt(i)
+            if item is None:
+                continue
+            child = item.layout()
+            if child is not None:
+                stack.append(child)
 
 
 class _SwitchFade(QWidget):
@@ -2250,14 +2281,18 @@ class MainWindow(QMainWindow):
         # 用户 2026-11-25：配置卡这 7 个框里的字水平居中。逐个实例打标记，
         # 不碰全局 QSS —— 设置面板里 SOC 来源/历史间隔/主题等下拉框仍左对齐。
         # 用户 2026-11-26：再给它们**加上限宽**（见 CONFIG_COMBO_MAX_W）——
-        # 六行统一 176、端口 200，框不再一路撑满整行；stretch=1 仍在，框吃满上限
-        # 就停，余量留成右侧空白。窄档由 _apply_compact 压 minimumWidth 照旧生效。
+        # 六行统一 176、端口 200、连接方式 120，框不再一路撑满整行；stretch=1
+        # 仍在，框吃满上限就停，余量留成右侧空白。窄档由 _apply_compact 压
+        # minimumWidth 照旧生效。
         for _combo in (self.cmb_link, self.cmb_port, self.cmb_baud,
                        self.cmb_stopbits, self.cmb_bytesize, self.cmb_parity,
                        self.cmb_rx_lines):
             _combo.setCenterText(True)
-            _combo.setMaximumWidth(
-                CONFIG_PORT_MAX_W if _combo is self.cmb_port else CONFIG_COMBO_MAX_W)
+            if _combo is self.cmb_link:
+                _combo.setMaximumWidth(CONFIG_LINK_MAX_W)
+            else:
+                _combo.setMaximumWidth(
+                    CONFIG_PORT_MAX_W if _combo is self.cmb_port else CONFIG_COMBO_MAX_W)
 
         # 标签固定宽度，控件吃掉剩余宽度 —— 右侧表单的经典排法。
         # 64px 放得下「保留行数」四字，三字标签也因此对齐。
@@ -10343,7 +10378,7 @@ class MainWindow(QMainWindow):
         # 串口设置卡逐项 + DLC：统一出口（模式规则 × 用户隐藏开关）。
         self._refresh_config_visibility()
 
-    def _refresh_config_visibility(self) -> None:
+    def _refresh_config_visibility(self, *, ble: bool | None = None) -> None:
         """串口设置卡的显隐 —— **唯一出口**（模式规则 × 用户隐藏开关）。
 
         规则（v3.0 逐项开关）：
@@ -10362,12 +10397,44 @@ class MainWindow(QMainWindow):
         模糊过渡不在这里做 —— 见 ``_play_config_blur_swap``。
 
         ⛔ 蓝牙广播模式下别让 DLC 跟着串口参数一起没了 —— 它在 actions_box 里。
+
+        ``ble`` 只给自测用：传 None 按当前连接方式（生产路径）；显式 True/False
+        可以在**不真的切连接方式**（不起蓝牙扫描线程）的前提下验证两条版式。
         """
         hidden = getattr(self, "_hidden_buttons", set())
         # cmb_link 是配置卡里的控件，理论上这会儿已经建好；但 _refresh_config_visibility
         # 也可能在更早的时机被调（构造期），取不到就按"串口模式"处理（安全默认）。
-        link = getattr(self, "cmb_link", None)
-        ble = (link is not None and link.currentText() == LINK_BLE)
+        if ble is None:
+            link = getattr(self, "cmb_link", None)
+            ble = (link is not None and link.currentText() == LINK_BLE)
+        # ⛔ 批量改显隐之前先**冻结布局**：每调一次 setVisible，Qt 都会立刻重算
+        #    一遍最小尺寸，而"串口参数四行一次性重新露面"那一下算出来的最小高会
+        #    比稳态大（实测 723 → 755），窗口被顶着长高 12px；等布局稳定下来
+        #    最小高回到 723，窗口却**不会自己缩回去** —— 用户看到的就是
+        #    「从蓝牙广播切换成串口后跳一下」（2026-11-26 点名）。
+        #    QLayout.setEnabled(False) 正是为这种批量改动准备的：期间的 layout
+        #    请求全部攒着，恢复时只算一次、直接落稳态。
+        _host = getattr(self, "_config_content", None)
+        _card = getattr(self, "_config_card", None)
+        self._apply_config_visibility(ble, hidden)
+        # ⛔ 改完必须把**整棵布局树**的尺寸缓存清干净，再顺着控件链重播一次
+        #    updateGeometry。少清一层就会留一条"幽灵高度"：
+        #    实测蓝牙模式把 DLC 藏掉之后，包着它的 dlc_row（裸 QHBoxLayout）的
+        #    sizeHint 仍算 32px → actions_box → content → card.body 一路带上去，
+        #    card.minimumSizeHint 从 723 顶成 755，窗口最小高 980 → 1012，
+        #    于是「蓝牙广播切回串口」时窗口被顶高 12px 且**永不回缩**
+        #    （用户 2026-11-26 点名「这里会跳一下」）。
+        #    ⚠️ 别再试图用 setEnabled(False) 冻布局：禁用期间 minimumSizeHint
+        #    会退化成当前几何，反而把这个值缓存得更牢（实测 cycle1 正常、
+        #    cycle2 复发）。
+        if _host is not None:
+            _invalidate_layout_tree(_host)
+            _host.updateGeometry()
+        if _card is not None:
+            _card.updateGeometry()
+
+    def _apply_config_visibility(self, ble: bool, hidden: set) -> None:
+        """``_refresh_config_visibility`` 的显隐本体（调用方负责冻/解布局）。"""
 
         def _show(widget, visible: bool) -> None:
             """只在该改的时候改。
@@ -10385,6 +10452,14 @@ class MainWindow(QMainWindow):
             elif not widget.isHidden():
                 widget.setVisible(False)
 
+        # 先把"每个控件该显示还是该藏"算成一张表，**先统一藏、再统一显**。
+        # ⛔ 顺序不能省：显隐会逐步改变布局最小高的**中间态**。蓝牙广播切回串口时
+        #    如果先显参数四行、再去藏 DLC，中间就会同时挂着两套（最小高 659+32=691，
+        #    比稳态的 659 还大），Qt 立刻按 691 把窗口最小高记成 1012 并顶高窗口，
+        #    等布局落定回 980 时**窗口不会自己缩回去** —— 用户看到"跳一下"
+        #    （2026-11-26 点名）。先藏后显能让最小高全程单调：691 这个峰不会出现。
+        plan: list[tuple[object, bool]] = []
+
         # 串口参数：蓝牙广播模式没有这些概念 → 全部隐藏；再逐行叠加用户隐藏。
         # ⚠️ 每行**独立**判断（只在"整组是否显示"上做 or 累积）——早先写成把
         #    上一行的结果串进下一行，隐藏「波特率」会把「停止位」一起带走
@@ -10392,24 +10467,31 @@ class MainWindow(QMainWindow):
         any_param_shown = False
         for key in ("row_baud", "row_stopbits", "row_bytesize", "row_parity"):
             visible = (not ble) and (key not in hidden)
-            _show(getattr(self, key, None), visible)
+            plan.append((getattr(self, key, None), visible))
             any_param_shown = any_param_shown or visible
-        _show(getattr(self, "serial_params", None), any_param_shown)
+        plan.append((getattr(self, "serial_params", None), any_param_shown))
         # 保留行数：两种模式都要，只看用户隐藏状态。
-        _show(getattr(self, "rx_lines_box", None), "rx_lines_box" not in hidden)
+        plan.append((getattr(self, "rx_lines_box", None), "rx_lines_box" not in hidden))
         # 数据工具六颗：常规五颗只看用户隐藏；DLC 还要叠加蓝牙模式。
         action_keys = ("btn_monitor", "btn_marks", "btn_open_history",
                        "btn_open_long_history", "btn_error_history")
         group_visible = False
         for key in action_keys:
             visible = key not in hidden
-            _show(getattr(self, key, None), visible)
+            plan.append((getattr(self, key, None), visible))
             group_visible = group_visible or visible
         dlc_visible = ble and ("btn_dlc" not in hidden)
-        _show(getattr(self, "btn_dlc", None), dlc_visible)
+        plan.append((getattr(self, "btn_dlc", None), dlc_visible))
         group_visible = group_visible or dlc_visible
         # 组内一个不剩时把整块（分隔线 + 小标题 + 按钮）收起，不留孤零零的标题。
-        _show(getattr(self, "actions_box", None), group_visible)
+        plan.append((getattr(self, "actions_box", None), group_visible))
+
+        for widget, visible in plan:
+            if not visible:
+                _show(widget, False)
+        for widget, visible in plan:
+            if visible:
+                _show(widget, True)
 
     def _play_config_blur_swap(self) -> None:
         """连接方式切换的过渡：**高斯模糊淡出**（用户 2026-11-26 点名改的）。
@@ -10471,7 +10553,7 @@ class MainWindow(QMainWindow):
             self._params_fade = overlay
         overlay.show_frame(shot_new, blurred, rect, 1.0)
 
-        tween = Tween(240, out_cubic,
+        tween = Tween(400, out_cubic,
                       lambda v: self._config_fade_step(v),
                       self._config_fade_done, parent=self, min_interval_ms=8)
         self._params_tween = tween

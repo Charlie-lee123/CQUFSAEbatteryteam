@@ -67,11 +67,20 @@ FIELD_W = 210
 # 历史数据采样间隔）。用户 2026-11-21 截图点名：「请把框的宽度缩小，而且要对齐」——
 # 当时主题与界面材质是 FIELD_W(210)、开屏动画因为"按最长条目 +80"被撑到 233，
 # 三只框右缘差 23px，材质强度那一行的滑杆更是一路顶到 490。
-# 定宽依据（12.5pt 真字体实测）：下拉框自身 chrome=48（边框 + 右侧 24px 箭头区），
-# 最长条目是开屏动画的「无（直接进入）」119px → 完整显示需 167，取 176 留 9px 余量。
+# 定宽依据（按**产品字号 ui_font(12.5)** 实测，2026-11-26 复核）：
+# 下拉框自身 chrome=48（边框 + 右侧 24px 箭头区），最长条目是「自定义文件…」
+# 97.3px → 完整显示需 145.3，取 152 留 6.7px 余量。
+# ⛔ 别再往小里调：更小的唯一办法是再改文案（「无（直接进入）」在 12.5pt 下
+#    要 167px，2026-11-26 已按用户口径改成「无动画」=51px）。
 # ⚠️ 别再改回"按最长条目算"：那套算法只要换一条文案整组框就跟着变宽变窄，
-#    永远对不齐。要加长文案先看 119px 这条线。
-COMBO_W = 176
+#    永远对不齐。
+COMBO_W = 152
+# 「材质强度」整行单独一档：**滑杆不跟着下拉框一起缩**（用户 2026-11-26：
+# 「材质强度的长条可以长一点，和之前一样」）。旧口径就是 176 =
+# 滑杆 126 + 行内 gap 10 + 数值标签 40；收到 COMBO_W(152) 后滑杆只剩 102px，
+# 0~100 每档 1px 太挤，所以整行保留 176。⛔ 行宽与滑杆宽都要按它算，
+# 只改滑杆宽会被更窄的容器裁掉右边一截。
+GLASS_ROW_W = 176
 # 面板整体的**兜底下限**（真正的宽度按内容算，见 __init__ 末尾那行）。
 # ⚠️ 不能再往下调：body 的最小宽由"最宽标签 187 + 18 + 最宽字段 362"决定，
 # 把下限设到 body 之下没用（内容仍然要那么宽），只会让面板在窄屏上被裁。
@@ -1235,11 +1244,14 @@ class SettingsDialog(QDialog):
         self.slider_glass.setValue(max(0, min(100, int(glass))))
         # 让"滑杆 + 数值"整行与三只下拉框**同宽**（用户 2026-11-21 截图点名
         # "要对齐"：滑杆原来一路顶到 490，比 176 的框多出 145px，整块看着是斜的）。
-        # 滑杆自身 = COMBO_W - 数值标签 40 - 行内 spacing 10 = 126px，
-        # 0~100 无级拖动每档 1.26px，手感够用（数值另有一枚标签实时显示）。
+        # ⚠️ 2026-11-26：下拉框统一收到 COMBO_W(140)，但滑杆**不能跟着缩** ——
+        #    90px 的行程太短（用户："材质强度的长条可以长一点，和之前一样"）。
+        #    滑杆这一行单独保留旧口径 GLASS_ROW_W=176（滑杆 126 + gap 10 + 数值 40），
+        #    所以整行宽与滑杆宽都要按它算，**不能**再用 COMBO_W，否则 176 宽的行
+        #    会被 140 的容器裁掉右边一截。
         _GLASS_LBL_W = 40
         _GLASS_GAP = 10
-        self.slider_glass.setFixedWidth(COMBO_W - _GLASS_LBL_W - _GLASS_GAP)
+        self.slider_glass.setFixedWidth(GLASS_ROW_W - _GLASS_LBL_W - _GLASS_GAP)
         self.slider_glass.setToolTip(
             "拖动即可实时调整整个界面材质的强度（毛玻璃与液态玻璃共用）")
         self.lbl_glass = QLabel()
@@ -1254,7 +1266,7 @@ class SettingsDialog(QDialog):
         glass_row.addWidget(self.slider_glass, 1)
         glass_row.addWidget(self.lbl_glass)
         glass_field = self._row(glass_row)
-        glass_field.setFixedWidth(COMBO_W)
+        glass_field.setFixedWidth(GLASS_ROW_W)
         form.addRow(self._label("材质强度"), glass_field)
 
         # 「界面材质」：从「定制功能」里提到这里，紧跟在「材质强度」**下面**
@@ -1480,10 +1492,10 @@ class SettingsDialog(QDialog):
         # 2026-11-03 用户：「既然动画选择里面有无动画选项了那就不需要开屏动画
         # 开关了」—— 去掉总开关，只留下拉（第一项就是「无」）。
         self.cmb_splash = ChevronComboBox()
-        # "主界面"两个字去掉：「无（直接进主界面）」实测 153px，是整组下拉里最长的
-        # 一条，会把统一框宽逼到 201（比 FIELD_W 还宽，等于没缩）；改「无（直接
-        # 进入）」后 119px —— 与 COMBO_W 的口径一致（见 COMBO_W 的注释）。
-        self.cmb_splash.addItem("无（直接进入）", "none")
+        # 「无动画」= 直接进主界面。文案在 12.5pt 下只有 51px（完整显示需 99），
+        # 是整组下拉里最短的一条；旧文案「无（直接进入）」要 167px，会把统一
+        # 框宽逼回 176（用户 2026-11-26 又要框更窄，所以按他"无动画"的说法收短）。
+        self.cmb_splash.addItem("无动画", "none")
         # 只列**方案**（planA / planB）：同一方案的浅色/深色是变体，播放时按当前
         # 主题自动挑（用户 2026-11-03：「只保留 planA、planB 这些选项，然后系统
         # 自动选择当前主题相同的动画」）。
@@ -2761,17 +2773,28 @@ class SettingsDialog(QDialog):
             return
 
         # ---- v3.0 分组重排：组标题 -> 组内 key 的显示顺序 ----
+        # ⛔ 组标题**必须紧贴它自己那组的第一行**，所以这里只登记"哪一行之前该
+        #    插标题"，真正的 addRow 放到下面行循环里（按 specs 的顺序现插）。
+        #    老写法是先把五六个组标题一口气 addRow 完、再统一排控件 —— 面板上
+        #    于是出现一坨"只有标题、下面空空"的分组（用户 2026-11-26 截图点名
+        #    「这些地方怎么有空的啊」）。
+        _known = {s["key"] for s in specs}
+        # 已经提前到「主题」一节、这里不建行的 key（与下方循环里的 continue 一致）
+        _prebuilt = ("material", "volt_rows", "temp_rows")
         ordered_keys: list[str] = []
+        _caption_before: dict[str, str] = {}
         for _group_title, _keys in self._CUSTOM_GROUPS:
-            form.addRow(self._caption(_group_title))
+            _rendered = [k for k in _keys if k in _known and k not in _prebuilt]
+            if _rendered:
+                _caption_before.setdefault(_rendered[0], _group_title)
             ordered_keys.extend(_keys)
         # 没进任何组的 key → 兜底「其它」组
         _rest = [s["key"] for s in specs if s["key"] not in ordered_keys]
-        if _rest:
-            form.addRow(self._caption("其它"))
-            ordered_keys.extend(_rest)
+        _rest_rendered = [k for k in _rest if k not in _prebuilt]
+        if _rest_rendered:
+            _caption_before.setdefault(_rest_rendered[0], "其它")
+        ordered_keys.extend(_rest)
         # 只保留注册表里实际存在的 key（防手写清单与注册表漂移），并重排 specs
-        _known = {s["key"] for s in specs}
         _by_key = {s["key"]: s for s in specs}
         specs = [_by_key[k] for k in ordered_keys if k in _known]
 
@@ -2798,6 +2821,10 @@ class SettingsDialog(QDialog):
                         + ChevronSpinBox.TEXT_MARGIN[2] + 6)
                 _spin_w = max(_spin_w, int(need))
         for spec in specs:
+            # 组标题：插在**本组第一行之前**（见上面 _caption_before 的说明）。
+            _cap = _caption_before.get(spec["key"])
+            if _cap is not None:
+                form.addRow(self._caption(_cap))
             if spec["key"] in ("material", "volt_rows", "temp_rows"):
                 # 「界面材质」已在「主题 / 材质强度」那一对里生成；
                 # 「电压/温度数据行数」已提到主题**上方**（见 _build_theme_section
