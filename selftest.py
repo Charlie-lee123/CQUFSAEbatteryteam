@@ -2477,6 +2477,56 @@ def check_tooltip_and_buttons(app: QApplication) -> None:
                 f"分区标题没走 groupCaption 样式: {cap.objectName()!r}"
             assert abs(cap.font().pointSizeF() - 10.5) < 0.01, \
                 f"分区标题字号不是 10.5: {cap.font().pointSizeF()}"
+
+            # 改动4（用户 2026-11-26）：分区之间要有暗淡横线隔开。横线走
+            # QWidget#sectionDivider（QSS background: @line@、1px），所有分区
+            # 共用 dialog.form，标题以跨两列行插入，故每个 groupCaption 的
+            # 前一个 spanning 行必须是 sectionDivider。
+            from PySide6.QtWidgets import QFormLayout
+            import re
+            import ui_theme
+            # stylesheet() 会把 @line@ 展开成实际色值，所以"走 token"要在
+            # 原始模板 _QSS 上验（防止写死颜色）；展开后的 QSS 再验它与已知
+            # 走 @line@ 的 actionsGroupDivider 同色、且是 1px。
+            raw = ui_theme._QSS
+            assert "QWidget#sectionDivider" in raw, "没有 sectionDivider 样式块"
+            _raw_block = raw[raw.index("QWidget#sectionDivider {"):]
+            _raw_block = _raw_block[:_raw_block.index("}")]
+            assert "@line@" in _raw_block, \
+                f"sectionDivider 没走 @line@ token（别写死颜色）:\n{_raw_block}"
+            qss = stylesheet()
+            _div_block = qss[qss.index("QWidget#sectionDivider {"):]
+            _div_block = _div_block[:_div_block.index("}")]
+            _act_block = qss[qss.index("QWidget#actionsGroupDivider {"):]
+            _act_block = _act_block[:_act_block.index("}")]
+            def _bg(block):
+                return re.search(r"background:\s*([^;]+);", block).group(1).strip()
+
+            assert _bg(_div_block) == _bg(_act_block), (
+                f"sectionDivider 没和 actionsGroupDivider 同色（应同走 @line@）: "
+                f"{_bg(_div_block)} vs {_bg(_act_block)}")
+            assert "1px" in _div_block, f"sectionDivider 不是 1px:\n{_div_block}"
+
+            form = dialog.form
+            spanning = []
+            for row in range(form.rowCount()):
+                item = form.itemAt(row, QFormLayout.ItemRole.SpanningRole)
+                if item is not None and item.widget() is not None:
+                    spanning.append(item.widget())
+            captions = [w for w in spanning if w.objectName() == "groupCaption"]
+            assert captions, "设置面板没有找到任何分区标题"
+            for caption in captions:
+                idx = spanning.index(caption)
+                assert idx > 0 and spanning[idx - 1].objectName() == "sectionDivider", \
+                    f"分区标题「{caption.text()}」前面没有 1px 横线"
+            dividers = [w for w in spanning if w.objectName() == "sectionDivider"]
+            assert dividers, "设置面板没有找到任何分区横线"
+            for divider in dividers:
+                assert divider.minimumHeight() == 1 and divider.maximumHeight() == 1, (
+                    f"分区横线不是固定 1px: "
+                    f"{divider.minimumHeight()}/{divider.maximumHeight()}")
+            assert len(dividers) >= len(captions), \
+                f"横线数({len(dividers)})少于分区标题数({len(captions)})"
         finally:
             dialog.close()
 

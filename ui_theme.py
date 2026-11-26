@@ -1041,6 +1041,16 @@ QWidget#actionsGroupDivider {
     min-height: 1px;
 }
 
+/* 设置面板各分区标题上方的 1px 横线（用户 2026-11-26「分区也要有那种暗淡
+   的横线隔开」）。与 actionsGroupDivider 同一条 @line@ token，换主题时随
+   unpolish/polish 一起更新，绝不写死颜色。 */
+QWidget#sectionDivider {
+    background: @line@;
+    border: none;
+    max-height: 1px;
+    min-height: 1px;
+}
+
 /* 设置面板里按钮开关那段是放在滚动区里的。滚动区默认会按调色板的 Base
    铺一层底，在对话框自己的 surface 上会显出一块色差 —— 全部设成透明。 */
 QScrollArea {

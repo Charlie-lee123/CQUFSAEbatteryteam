@@ -1327,7 +1327,7 @@ class SettingsDialog(QDialog):
         # v3.0：数据管理类归到一个视觉分组下（用户「逻辑关联的挨在一起」）。
         # 日志 / 会话库 / 协议 / MCP 都是"数据怎么留 / 怎么读 / 怎么对接外部"，
         # 放在按钮之后、版本之前，与上面的"显示与判读"分开。
-        form.addRow(self._caption("数据与接口"))
+        self._section_header(form, "数据与接口")
         # 日志一节放在**界面按钮的下方**（用户点名），整段一起随面板滚动
         self._build_log_section(form)
 
@@ -1577,7 +1577,7 @@ class SettingsDialog(QDialog):
         - 每一行都是"左侧行标签 + 右侧控件"，与上面几节共用同一张表单，左边缘
           因此严格对齐（QFormLayout 的标签列宽按全表最宽算）。
         """
-        form.addRow(self._caption("车辆（电池箱）"))
+        self._section_header(form, "车辆（电池箱）")
 
         # ---- 赛季 / 车号行（用户 2026-10-22 定案）----
         # 原来是「车辆 [E74-2026 ▾] [新建] [删除]」。现在拆成
@@ -2824,7 +2824,7 @@ class SettingsDialog(QDialog):
             # 组标题：插在**本组第一行之前**（见上面 _caption_before 的说明）。
             _cap = _caption_before.get(spec["key"])
             if _cap is not None:
-                form.addRow(self._caption(_cap))
+                self._section_header(form, _cap)
             if spec["key"] in ("material", "volt_rows", "temp_rows"):
                 # 「界面材质」已在「主题 / 材质强度」那一对里生成；
                 # 「电压/温度数据行数」已提到主题**上方**（见 _build_theme_section
@@ -3114,7 +3114,7 @@ class SettingsDialog(QDialog):
         log_path = app_log.path()
         if not log_path:
             return
-        form.addRow(self._caption("日志"))
+        self._section_header(form, "日志")
 
         # 34 个字符（≈270px）：面板压到 470 宽之后，52 字符的省略版还是放不下，
         # 尾巴会被硬切（实测需 413px / 只有 282px）。完整路径在 tooltip 里。
@@ -3187,7 +3187,7 @@ class SettingsDialog(QDialog):
         can_pick_dir = callable(getattr(rx_history, "set_directory", None))
         if not history_path and not can_pick_dir:
             return          # 定位不到、又不能手动选：整段不显示（别给点不动的按钮）
-        form.addRow(self._caption("接收历史"))
+        self._section_header(form, "接收历史")
 
         self.lbl_history_path = _ElidedPathLabel(
             history_path if history_path else "（还没有历史文件）", ui_font(10.5))
@@ -3434,7 +3434,7 @@ class SettingsDialog(QDialog):
         事，软件自己去改别人的配置文件反而是越界。所以这里只负责把**完整上下文**
         （依赖、源码、注册片段、自检三条）一次性交出去，复制 → 粘给 Agent 即可。
         """
-        form.addRow(self._caption("MCP Service"))
+        self._section_header(form, "MCP Service")
         row = QHBoxLayout()
         row.setSpacing(10)
         # ⚠️ 提示文字必须短：这行给按钮留位之后，剩余宽度有限，长文案会被
@@ -3521,7 +3521,7 @@ class SettingsDialog(QDialog):
         db_path = rx_store.db_path()
         if not db_path:
             return          # 定位不到用户目录：整段不显示（同日志一节的处理）
-        form.addRow(self._caption("会话数据库"))
+        self._section_header(form, "会话数据库")
 
         # 用户 2026-11-01：「地址也要显示完全」—— 不再用 _elide_middle 中间掐成
         # "C:\Users\Lenovo\...\logs\sessions.db"，改成**完整路径 + 自动换行**
@@ -3664,7 +3664,7 @@ class SettingsDialog(QDialog):
         都可能变 —— 做成规则文件后，在面板里改、校验、试跑、保存即生效。
         """
         import rx_protocol
-        form.addRow(self._caption("协议"))
+        self._section_header(form, "协议")
         hint = QLabel("解析规则（JSON）。改完点「保存」立刻生效，不用重启；\n"
                       "「试跑」只做验证、不保存。")
         hint.setFont(ui_font(10.5))
@@ -3883,7 +3883,7 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------------ 按钮显隐
 
     def _build_button_section(self, form: QFormLayout, specs, hidden: set[str]) -> None:
-        form.addRow(self._caption("界面按钮"))
+        self._section_header(form, "界面按钮")
 
         # 按分组归拢，保持 specs 给的顺序（dict 自 Python 3.7 起保序）
         groups: dict[str, list[tuple[str, str]]] = {}
@@ -4049,6 +4049,21 @@ class SettingsDialog(QDialog):
         label.setObjectName("groupCaption")
         label.setContentsMargins(0, 8, 0, 0)
         return label
+
+    def _section_header(self, form: QFormLayout, text: str) -> None:
+        """分区标题 + 其上方 1px 暗淡横线（用户 2026-11-26「分区也要有那种
+        暗淡的横线隔开」，参照系统设置的分组细分隔线）。
+
+        横线走 `QWidget#sectionDivider`（ui_theme 里 background: @line@，
+        1px），随主题切换、不写死颜色。⛔ 不动 `_caption` 的返回类型/字号/
+        objectName —— 第 3 项自测断言依赖它仍是 groupCaption QLabel。
+        顺序固定：先横线行、后标题行，标题仍紧贴本组第一行之前。
+        """
+        divider = QWidget()
+        divider.setObjectName("sectionDivider")
+        divider.setFixedHeight(1)     # 真钉 1px：QFormLayout 会拉伸 row widget，
+        form.addRow(divider)          # 光靠 QSS 的 min/max-height 不够稳。
+        form.addRow(self._caption(text))
 
     def _label(self, text: str) -> QLabel:
         label = QLabel(text)
