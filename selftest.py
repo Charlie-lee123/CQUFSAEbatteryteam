@@ -2527,6 +2527,63 @@ def check_tooltip_and_buttons(app: QApplication) -> None:
                     f"{divider.minimumHeight()}/{divider.maximumHeight()}")
             assert len(dividers) >= len(captions), \
                 f"横线数({len(dividers)})少于分区标题数({len(captions)})"
+
+            # 本次改动（用户 2026-11-27「设置里有些行可以两行合成一行 / 调间距」）：
+            # 行距收紧 + 三处合并成单行。合并只动**布局**，存储键、控件类型、
+            # custom_values() 的取值口径全部不变；下面逐条钉住。
+            assert form.verticalSpacing() == 8, \
+                f"表单行间距不是 8: {form.verticalSpacing()}"
+            assert cap.contentsMargins().top() == 6, \
+                f"分区标题上边距不是 6: {cap.contentsMargins().top()}"
+            from ui_controls import ChevronSpinBox as _Spin
+            _merged = (
+                ("时间戳显示", ("stamp_show_year", "stamp_show_month",
+                             "stamp_show_day"), Switch),
+                ("电压范围", ("volt_limit_low", "volt_limit_high"), _Spin),
+                ("温度范围", ("temp_limit_low", "temp_limit_high"), _Spin),
+            )
+            for _label_text, _keys, _cls in _merged:
+                _labeled_rows = [
+                    r for r in range(form.rowCount())
+                    if form.itemAt(r, QFormLayout.ItemRole.LabelRole) is not None
+                    and form.itemAt(r, QFormLayout.ItemRole.LabelRole).widget() is not None
+                    and form.itemAt(r, QFormLayout.ItemRole.LabelRole).widget().text()
+                    == _label_text
+                ]
+                assert len(_labeled_rows) == 1, \
+                    f"合并行「{_label_text}」没出现在表单里（或出现多次）"
+                _field_item = form.itemAt(_labeled_rows[0],
+                                          QFormLayout.ItemRole.FieldRole)
+                assert _field_item is not None and _field_item.widget() is not None, \
+                    f"合并行「{_label_text}」没有字段容器"
+                _holder = _field_item.widget()
+                _inner = _holder.findChildren(_cls)
+                assert len(_inner) == len(_keys), \
+                    (f"合并行「{_label_text}」里应有 {len(_keys)} 个 "
+                     f"{_cls.__name__}，实际 {len(_inner)}")
+                for _key in _keys:
+                    _w = dialog._custom_widgets.get(_key)
+                    assert isinstance(_w, _cls), \
+                        f"合并键 {_key} 没登记到真控件: {type(_w).__name__}"
+                    assert _key in dialog._custom_rows, f"合并键 {_key} 没登记行"
+                    assert dialog._custom_rows[_key][1] is _w, \
+                        f"合并键 {_key} 的 _custom_rows 字段不是真控件"
+                # custom_values() 仍能按 key 读到改动后的值（只动内存控件，
+                # 随即还原，不碰 QSettings）
+                _w0 = dialog._custom_widgets[_keys[0]]
+                if _cls is Switch:
+                    _before = _w0.isChecked()
+                    _w0.setChecked(not _before)
+                    assert dialog.custom_values().get(_keys[0]) == (not _before), \
+                        f"custom_values 读不到合并开关 {_keys[0]}"
+                    _w0.setChecked(_before)
+                else:
+                    _before = _w0.value()
+                    _next = _before + 1 if _before < _w0.maximum() else _before - 1
+                    _w0.setValue(_next)
+                    assert dialog.custom_values().get(_keys[0]) == _next, \
+                        f"custom_values 读不到合并数字框 {_keys[0]}"
+                    _w0.setValue(_before)
         finally:
             dialog.close()
 
@@ -3681,6 +3738,14 @@ def check_customization(app: QApplication) -> None:
                     f"{spec['key']} 开关缺少状态描述（无障碍）"
                 labels = [c for c in dialog.findChildren(_QLabel)
                           if c.text() == spec["label"]]
+                if not labels and spec["key"] in dialog._MERGE_PREFIXES:
+                    # 行合并后，这三个开关的独立行标签收进字段区变成小字
+                    # （年/月/日）。改用登记表里**真实上屏**的那枚小标签继续验
+                    # "点文字不转发"，并钉住它的文案，不降低断言强度。
+                    _small = dialog._custom_rows[spec["key"]][0]
+                    assert _small.text() == dialog._MERGE_PREFIXES[spec["key"]], \
+                        f"合并键 {spec['key']} 的小字不对: {_small.text()!r}"
+                    labels = [c for c in dialog.findChildren(_QLabel) if c is _small]
                 assert labels, f"找不到 {spec['label']} 的行标签"
                 label = labels[0]
                 was = toggle.isChecked()
@@ -3728,14 +3793,29 @@ def check_customization(app: QApplication) -> None:
             #    每模组温度数」三件套是**隐藏**的（车辆档案接管了这三项），
             #    隐藏控件的 mapTo 没有意义（实测 x=24）。之前这条断言依赖
             #    "跑之前恰好没选车"，单跑这条用例就会假挂。
+            # 行合并后，合并行里的控件按「年/月/日」「~」横向排开，**它们自己**
+            # 本就不该贴在同一条竖线上；该对齐的是那一行字段的**容器**。
+            _merged_keys = {k for _label, _members
+                            in dialog._MERGE_GROUPS.values() for k in _members}
             fields = [dialog.cmb_theme, dialog.slider_glass]
-            fields += list(dialog._custom_widgets.values())
+            fields += [w for key, w in dialog._custom_widgets.items()
+                       if key not in _merged_keys]
             fields = [w for w in fields if not w.isHidden()]
             assert len(fields) >= 3, f"可见字段太少，断言没意义：{len(fields)}"
             edges = {left_x(w) for w in fields}
             assert len(edges) == 1, \
                 ("设置面板里的字段没有对齐到同一条竖线："
                  + "、".join(f"{type(w).__name__}={left_x(w)}" for w in fields))
+            _common_x = next(iter(edges))
+            for _label_text, _members in dialog._MERGE_GROUPS.values():
+                _holder = dialog._custom_widgets[_members[0]].parentWidget()
+                assert _holder is not None, f"合并行「{_label_text}」没有字段容器"
+                assert left_x(_holder) == _common_x, \
+                    f"合并行「{_label_text}」的容器没贴到字段竖线: " \
+                    f"{left_x(_holder)} vs {_common_x}"
+                for _key in _members:
+                    assert dialog._custom_widgets[_key].parentWidget() is _holder, \
+                        f"合并键 {_key} 不在同一行容器里"
 
             # 6a-1) 外观区那三只下拉框**同宽且左右缘都对齐**（用户 2026-11-21：
             #     「请把框的宽度缩小，而且要对齐」）。以前主题/界面材质是 FIELD_W、

@@ -1175,7 +1175,9 @@ class SettingsDialog(QDialog):
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         form.setHorizontalSpacing(18)
-        form.setVerticalSpacing(12)
+        # 2026-11-27 用户「调整一下设置里面各行间距」：12 → 8。分组之间另有
+        # _caption 的上边距撑开，这里只收紧**普通行**之间的空隙，不碰横向。
+        form.setVerticalSpacing(8)
         # ⛔ **不要**改成 WrapLongRows：它确实把 body 最小宽从 579 压到 392
         #    （2026-10-31 实测），但 QFormLayout 只在**字段**放不下时才把标签挪到
         #    上方，标签自己放不下时是**直接截断**—— 面板一窄，"材质强度""暂停定位
@@ -1478,6 +1480,28 @@ class SettingsDialog(QDialog):
             "anim_fps",              # 动画帧率
         )),
     )
+
+    # 2026-11-27 用户「有些地方其实可以两行合成一行，或者调成一行」：把逻辑上
+    # 同一件事的相邻项并成**一行**。key = 组内首 key（决定行插在哪、组标题挂
+    # 在谁前面），值 = (新行标签, 成员 key 顺序)。⛔ 只动**布局**：每个成员照旧
+    # 用自己 spec 建真控件并登记进 _custom_widgets / _custom_rows，存储键与
+    # custom_values() 一概不变。首 key 全都不是任何组的"第一个 rendered key"，
+    # 除了 volt_limit_low —— 它本来就是「数据判读」组首行，合并后组标题位置不变。
+    _MERGE_GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
+        "stamp_show_year": ("时间戳显示",
+                            ("stamp_show_year", "stamp_show_month", "stamp_show_day")),
+        "volt_limit_low": ("电压范围", ("volt_limit_low", "volt_limit_high")),
+        "temp_limit_low": ("温度范围", ("temp_limit_low", "temp_limit_high")),
+    }
+    # 合并行里各控件前面的小字：三个开关要「年 / 月 / 日」；两个范围只在第二个
+    # 框前放「~」。没登记的成员用原来的行标签做 _custom_rows 的书签（不上屏）。
+    _MERGE_PREFIXES: dict[str, str] = {
+        "stamp_show_year": "年",
+        "stamp_show_month": "月",
+        "stamp_show_day": "日",
+        "volt_limit_high": "~",
+        "temp_limit_high": "~",
+    }
 
     # ------------------------------------------------------------ 开屏动画
 
@@ -2797,6 +2821,12 @@ class SettingsDialog(QDialog):
         # 只保留注册表里实际存在的 key（防手写清单与注册表漂移），并重排 specs
         _by_key = {s["key"]: s for s in specs}
         specs = [_by_key[k] for k in ordered_keys if k in _known]
+        # 合并组：成员 key -> 首 key。首 key 那次迭代建好水平容器并**只** addRow
+        # 一次；后续成员沿用各自 spec 的创建分支建真控件，直接塞进这个容器，
+        # 不再各占表单一行。行序与组标题仍由首 key 决定，故标题位置不变。
+        _merge_owner = {k: first for first, (_text, _members)
+                        in self._MERGE_GROUPS.items() for k in _members}
+        _merge_layouts: dict[str, QHBoxLayout] = {}
 
         # ⚠️ 这两张表在「主题」一节之前就建好了（见 _build_theme_section 上方）：
         #    「界面材质」会先登记进去，这里**不能重新赋值**，否则会被冲掉。
@@ -2946,8 +2976,30 @@ class SettingsDialog(QDialog):
                 row_label = self._label(spec["label"])
             # 记**输入控件本身**（不是包装容器）：custom_values() 要在它身上取值
             self._custom_widgets[spec["key"]] = widget
-            form.addRow(row_label, field)
-            self._custom_rows[spec["key"]] = (row_label, field)
+            _owner = _merge_owner.get(spec["key"])
+            if _owner is not None:
+                if _owner == spec["key"]:
+                    # 首 key：建水平容器，表单里**只占一行**（组标签 + 容器）。
+                    _holder = QWidget()
+                    _h = QHBoxLayout(_holder)
+                    _h.setContentsMargins(0, 0, 0, 0)
+                    _h.setSpacing(10)
+                    _merge_layouts[_owner] = _h
+                    form.addRow(self._label(self._MERGE_GROUPS[_owner][0]), _holder)
+                else:
+                    _h = _merge_layouts[_owner]
+                _prefix = self._MERGE_PREFIXES.get(spec["key"])
+                if _prefix is not None:
+                    _small = self._inline_caption(_prefix)
+                    _h.addWidget(_small)
+                else:
+                    _small = row_label
+                _h.addWidget(field)
+                # 每个成员都登记：值可以换成组内的那枚小标签，但不能缺 key。
+                self._custom_rows[spec["key"]] = (_small, field)
+            else:
+                form.addRow(row_label, field)
+                self._custom_rows[spec["key"]] = (row_label, field)
             if preview is not None:
                 # 预览行整行跨两列，紧贴在它那根滑杆下面
                 form.addRow(preview)
@@ -4047,7 +4099,8 @@ class SettingsDialog(QDialog):
         # 它走样式表的 @ink_2@（暗灰），不再像正文一样又大又亮。
         label.setFont(ui_font(10.5))
         label.setObjectName("groupCaption")
-        label.setContentsMargins(0, 8, 0, 0)
+        # 2026-11-27：组间留白 8 → 6（与表单行距 12 → 8 一起收紧密度）。
+        label.setContentsMargins(0, 6, 0, 0)
         return label
 
     def _section_header(self, form: QFormLayout, text: str) -> None:
