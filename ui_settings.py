@@ -2994,6 +2994,13 @@ class SettingsDialog(QDialog):
                     _h.addWidget(_small)
                 else:
                     _small = row_label
+                # ⛔ 合并行的小标签必须水平 Fixed：_inline_caption 默认是
+                # Preferred，会被拉满字段列的 QHBoxLayout 抢走全部余量，把
+                # 「年/月/日」「~」撑成几百 px，控件被顶到两端（QA 真机截图
+                # 实证：电压行 ~ 宽 670px、两框相隔 700+px）。只在这里改，
+                # 不动 _inline_caption 本身（车辆区「赛季：」等还复用它）。
+                _small.setSizePolicy(QSizePolicy.Policy.Fixed,
+                                     QSizePolicy.Policy.Preferred)
                 _h.addWidget(field)
                 # 每个成员都登记：值可以换成组内的那枚小标签，但不能缺 key。
                 self._custom_rows[spec["key"]] = (_small, field)
@@ -3003,6 +3010,11 @@ class SettingsDialog(QDialog):
             if preview is not None:
                 # 预览行整行跨两列，紧贴在它那根滑杆下面
                 form.addRow(preview)
+        # 合并行的余量统一归到末尾：**所有成员 addWidget 之后**才加 stretch，
+        # 否则后几个成员会被推到它右边。这样控件都按 sizeHint 紧挨在左，
+        # 「年 [开关] 月 [开关] 日 [开关]」「2500 mV ~ 4500 mV」不再被拉开。
+        for _h in _merge_layouts.values():
+            _h.addStretch(1)
 
     @staticmethod
     def _slider_display_value(spec: dict, raw: int) -> float:

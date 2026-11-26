@@ -3816,6 +3816,33 @@ def check_customization(app: QApplication) -> None:
                 for _key in _members:
                     assert dialog._custom_widgets[_key].parentWidget() is _holder, \
                         f"合并键 {_key} 不在同一行容器里"
+                # QA 真机抓到的缺陷：小标签默认 Preferred，吃光字段列的余量，
+                # 把两端控件顶开（~ 宽 670px、两框相隔 700+px）。上面只钉了
+                # 容器左缘，抓不到内层被拉开 —— 这里按**真实几何**钉紧：
+                # ① 相邻子控件缺口必须接近 layout spacing(10)；
+                # ② 最后一个控件右缘必须离容器右缘很远（余量归到末尾 stretch）。
+                _lay = _holder.layout()
+                assert _lay is not None, f"合并行「{_label_text}」没有布局"
+                _children = [_lay.itemAt(i).widget() for i in range(_lay.count())]
+                _children = [w for w in _children if w is not None]
+                _children.sort(key=lambda w: w.mapTo(_holder, QPoint(0, 0)).x())
+                assert len(_children) >= len(_members), \
+                    f"合并行「{_label_text}」子控件太少：{len(_children)}"
+                _gaps = []
+                for _a, _b in zip(_children, _children[1:]):
+                    _ax = _a.mapTo(_holder, QPoint(0, 0)).x()
+                    _bx = _b.mapTo(_holder, QPoint(0, 0)).x()
+                    _gaps.append(_bx - (_ax + _a.width()))
+                assert _gaps and max(_gaps) <= 16, \
+                    f"合并行「{_label_text}」控件被空白缝顶开：gaps={_gaps}"
+                _last = _children[-1]
+                _last_right = (_last.mapTo(_holder, QPoint(0, 0)).x()
+                               + _last.width())
+                _slack = _holder.width() - _last_right
+                assert _slack > max(40, _holder.width() // 5), \
+                    (f"合并行「{_label_text}」余量没归到末尾 stretch："
+                     f"末控件右缘={_last_right} / 容器宽={_holder.width()} / "
+                     f"余量={_slack}")
 
             # 6a-1) 外观区那三只下拉框**同宽且左右缘都对齐**（用户 2026-11-21：
             #     「请把框的宽度缩小，而且要对齐」）。以前主题/界面材质是 FIELD_W、
