@@ -43,6 +43,12 @@ CHECK_PASSES = 2                 # 整条源链的重试轮数
 # 上一版的 version.py），而它的响应往往最快 —— "先回者胜"就会拿到陈旧版本号，
 # 用户点检查更新看到"已是最新"却拉不到包。窗口只有 300ms，代价远小于收益。
 PICK_GRACE_MS = 300
+# `@main` 解析的缓存 TTL（实测响应头 s-maxage=43200 = 12h）内，jsDelivr 可能仍返回
+# 上一版 version.py。检测时额外并行发一条"GitHub API 查 version.py 最新 commit sha
+# → jsDelivr `@sha` 取内容"的精确链：`@<sha>` 的缓存是**按内容寻址、永不过期**的，
+# 拿到的必然是 origin 当时的真实内容。这是 2026-11-26 根治 jsDelivr 误报的第二道
+# 防线（第一道是发布脚本主动 purge，见 devtools/_github_release.py 第 4 步）。
+SHA_SOURCE_TIMEOUT_MS = 4500
 # 代理策略层：系统代理 → 本机 Clash → 直连。全并行仍拿不到版本时逐层切，
 # 每层只跑 CHECK_PASSES 轮；最坏 ≈ 3 × 4.8s，典型 1s 内。
 CLASH_PROXY = ("127.0.0.1", 7897)
@@ -99,6 +105,8 @@ def version_sources() -> tuple:
     ② 各镜像加速的 GitHub raw（前缀见 MIRROR_PREFIXES）
     ③ GitHub raw 直连（开着代理的用户）
     ④ GitHub API 标签列表（兜底；只有版本号、没有哈希）
+    ⑤ GitHub API 查 version.py 最新 commit → jsDelivr `@sha` 取内容（缓存按
+       内容寻址、永不过期，见 SHA_SOURCE_TIMEOUT_MS 的长注释）
     """
     repo = _OWNER_REPO()
     raw = f"https://raw.githubusercontent.com/{repo}/main/version.py"
@@ -116,6 +124,11 @@ def version_sources() -> tuple:
     out.append(("GitHub raw", raw, parse_version_file, None))
     out.append(("GitHub API", f"https://api.github.com/repos/{repo}/tags",
                 parse_tags_json, None))
+    # ⑤ 精确链：先查 version.py 的最新 commit sha，再按 sha 从 jsDelivr 取内容。
+    #    两跳，所以单列一条源、由 _launch_pass 特殊处理（见 _on_one 的 sha 分支）。
+    out.append(("jsDelivr-sha", f"https://api.github.com/repos/{repo}/commits"
+                f"?path=version.py&per_page=1",
+                parse_commits_json, None))
     return tuple(out)
 
 
@@ -252,6 +265,21 @@ def parse_tags_json(text: str) -> dict | None:
         if parts and (best is None or parts > best[0]):
             best = (parts, name)
     return {"version": best[1]} if best else None
+
+
+def parse_commits_json(text: str) -> dict | None:
+    """GitHub commits API（path=version.py）→ {"version_sha": <最新提交 sha>}。
+
+    只取第一条：API 已按时间倒序。返回的 sha 用于拼 jsDelivr 的 ``@<sha>``
+    精确解析路径（缓存按内容寻址，永不过期），**本身不是版本号** —— 由
+    :meth:`UpdateChecker._on_one` 识别这个键并补第二跳。
+    """
+    import json
+    commits = json.loads(text)
+    if not isinstance(commits, list) or not commits:
+        return None
+    sha = commits[0].get("sha")
+    return {"version_sha": sha} if sha else None
 
 
 # ------------------------------------------------------------------ 完整性
@@ -443,9 +471,19 @@ class UpdateChecker(QObject):
             info = parser(data.decode("utf-8", errors="replace"))
         except Exception:
             info = None
-        if not (info and info.get("version")):
+        if not info:
             if prefix:
                 note_best_prefix(prefix)   # 活着就算数（即使这一版解析不出）
+            return
+        if info.get("version_sha") and not info.get("version"):
+            # 精确链第一跳（2026-11-26）：拿到 version.py 最新 commit sha，
+            # 二跳按 @sha 取内容 —— @<sha> 的缓存按内容寻址、永不过期，
+            # @main 被 CDN 钉在旧版（s-maxage=43200）时它是唯一说真话的源。
+            self._fetch_sha_version(info["version_sha"])
+            return
+        if not info.get("version"):
+            if prefix:
+                note_best_prefix(prefix)
             return
         info.setdefault("sha256", None)
         info.setdefault("setup_sha256", None)
@@ -454,27 +492,71 @@ class UpdateChecker(QObject):
             note_best_prefix(prefix)
         # 不立刻发射：开一个 PICK_GRACE_MS 的窗口把同期答案收齐，再取版本号最高的
         # 那条（jsDelivr 边沿缓存滞后时，靠这个窗口让镜像的正确答案盖过它）。
+        prev_max = max((c[0] for c in self._candidates), default=())
         self._candidates.append((version_tuple(info["version"]), info,
                                  self._seq, prefix))
         self._seq += 1
         self._timer.stop()               # 已有结果，别让"整轮兜底"再来打断
-        if not self._pick.isActive():
+        if version_tuple(info["version"]) > prev_max:
+            # 出现了**更高**的版本号：重开一次选择窗口（QTimer.start 对在跑的
+            # 计时器就是重启），给慢一步的 @sha 精确链 / 慢镜像留报到时间 ——
+            # 别让"先到的旧版"在 300ms 后锁死结果。
+            self._pick.start(PICK_GRACE_MS)
+        elif not self._pick.isActive():
             self._pick.start(PICK_GRACE_MS)
 
+    def _fetch_sha_version(self, sha: str) -> None:
+        """精确链第二跳：按 commit sha 从 jsDelivr 取 version.py。
+
+        ``@<sha>`` 的 CDN 缓存键就是这份内容本身（sha 变 = URL 变），不存在
+        "缓存了旧版"的问题；这条失败就失败，其余源照常兜底。
+        """
+        if self._done:
+            return
+        repo = _OWNER_REPO()
+        url = f"https://cdn.jsdelivr.net/gh/{repo}@{sha}/version.py"
+        request = QNetworkRequest(QUrl(url))
+        request.setTransferTimeout(SHA_SOURCE_TIMEOUT_MS)
+        request.setAttribute(
+            QNetworkRequest.RedirectPolicyAttribute,
+            QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy)
+        reply = self._nam.get(request)
+        self._replies.append(reply)      # 挂进统一清单，_abort_all 能正确掐掉它
+        reply.finished.connect(
+            lambda r=reply: self._on_one(r, "jsDelivr@sha",
+                                         parse_version_file, None))
+
     def _emit_best(self) -> None:
-        """窗口到点：取版本号最高者（同版本取先到的），发结果。"""
+        """窗口到点：取版本号最高者（同版本取先到的），发结果。
+
+        ⛔ 同版本候选间要**补哈希**（2026-11-26）：tags API 只有版本号没有
+        sha256 —— 若它恰好与 version.py 源并列同版本且先到，胜出的 info 就缺
+        哈希，下载完无法校验（"报了新版却装不上"，误报的孪生缺陷）。补齐规则：
+        同版本、有该哈希的候选里，``jsDelivr@sha``（按 commit 寻址、内容最
+        权威）优先，其余按到达序取第一个有值的。
+        """
         if self._done or not self._candidates:
             return
         self._done = True
         self._pick.stop()
         self._timer.stop()
-        _vt, info, _seq, prefix = max(self._candidates,
-                                      key=lambda c: (c[0], -c[2]))
+        winner = max(self._candidates, key=lambda c: (c[0], -c[2]))
+        info = winner[1]
+        for key in ("sha256", "setup_sha256"):
+            if info.get(key):
+                continue
+            same = [c[1] for c in self._candidates
+                    if c[0] == winner[0] and c[1] is not info and c[1].get(key)]
+            if not same:
+                continue
+            best = next((c for c in same if c.get("source") == "jsDelivr@sha"),
+                        same[0])
+            info[key] = best[key]
         self._candidates = []
         self._restore_proxy()
         self.checked.emit(info)
         # 镜像再留 400ms 的报到窗口：赢家若不是镜像，还得靠它认一条最快的下载源
-        if prefix is None:
+        if winner[3] is None:
             self._grace.start(400)
         else:
             self._abort_all()

@@ -1891,6 +1891,26 @@ def check_updater(app: QApplication) -> None:
     assert version_tuple("1.2") <= version_tuple("1.2.0"), \
         "元组前缀语义：同版本不得误判为新版"
 
+    # 2b) commits JSON 解析（2026-11-26 新增）：提取 version.py 最新 commit sha，
+    #     供 jsDelivr @sha 精确链用 —— @main 被边沿缓存钉在旧版（s-maxage=43200
+    #     实测 12 小时）时，它是唯一说真话的源。垃圾输入必须返回 None。
+    from updater import parse_commits_json
+    commits = _json.dumps([
+        {"sha": "cafe" * 10, "commit": {"message": "v9.9"}},
+        {"sha": "dead" * 10, "commit": {"message": "v9.8"}},
+    ])
+    assert parse_commits_json(commits) == {"version_sha": "cafe" * 10}, \
+        "commits 解析没取第一条（API 已按时间倒序）"
+    assert parse_commits_json("[]") is None, "空列表该返回 None"
+    # 垃圾输入会抛 JSONDecodeError —— 真实链路里由 _on_one 的 try/except 兜住
+    # （与其他解析器同一口径），这里只验证"确实会抛"，防有人悄悄改成吞错返回脏值。
+    try:
+        parse_commits_json("不是 JSON")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("垃圾输入没抛异常（_on_one 靠它走 except 分支）")
+
     # 3) 源链形态：首源是 jsDelivr（国内直连）、都走 https、镜像 ≥4 条
     sources = version_sources()
     assert len(sources) >= 6, f"版本源太少：{[s[0] for s in sources]}"
@@ -2079,15 +2099,19 @@ def check_updater(app: QApplication) -> None:
     #      继续返回上一版（实测滞后 12 小时），而它往往最先返回 —— "先回者胜"会让
     #      用户看到"已是最新"却拉不到包。下面用"慢一点但更新"的镜像验证覆盖逻辑。
     class _UrlAwareNam:
-        def __init__(self, mapping: dict) -> None:
+        def __init__(self, mapping: dict, delays: dict | None = None) -> None:
             self.mapping = mapping
+            # 按 URL 子串显式指定延迟（ms）：默认 jsdelivr 30 / 其余 150。
+            # 需要"让慢的那条后到"来逼出特定分支时用它（如同版本补哈希）。
+            self.delays = delays or {}
 
         def get(self, request):
             url = request.url().toString()
             body = next((v for k, v in self.mapping.items() if k in url), b"")
             reply = _FakeReply(body)
             # jsDelivr 那条 30ms 就回，镜像晚 150ms（模拟"最快的是旧的"）
-            delay = 30 if "jsdelivr" in url else 150
+            delay = next((ms for k, ms in self.delays.items() if k in url),
+                         30 if "jsdelivr" in url else 150)
             QTimer.singleShot(delay, reply.finished.emit)
             return reply
 
@@ -2103,6 +2127,58 @@ def check_updater(app: QApplication) -> None:
     assert _got[0]["version"] == "2.5", \
         f"多条源同时报到时必须取最高的版本，实得 {_got[0]['version']}（源 {_got[0].get('source')}）"
     assert _got[0]["source"] == "ghfast.top", _got[0].get("source")
+
+    #   e) @sha 精确链两跳（2026-11-26）：commits API 报 sha → 按 @sha 取到
+    #      **更高**的版本。jsDelivr @main 被钉在旧版时，这条是唯一说真话的源；
+    #      断言它必须盖过先到的旧版（发布后误报"已是最新"的根治兜底）。
+    _ck2 = _upd.UpdateChecker()
+    # ⛔ 键必须程序化拼（'feed'*10）：手数 feed 个数出过 11 vs 10 的偏差，
+    #    键对不上 URL → 假网络回空 body → 第二跳被静默丢弃、断言假红。
+    _sha = "feed" * 10
+    _ck2._nam = _UrlAwareNam({
+        "cdn.jsdelivr.net/gh/Charlie-lee123/CQUFSAEbatteryteam@main":
+            b'VERSION = "2.4"\n',                       # @main 旧（被缓存钉住）
+        "api.github.com/repos/Charlie-lee123/CQUFSAEbatteryteam/commits":
+            _json.dumps([{"sha": _sha}]).encode(),      # 第一跳：报 sha
+        "@" + _sha:
+            b'VERSION = "3.1"\nLATEST_EXE_SHA256 = "'
+            + b"ef" * 32 + b'"\n',                      # 第二跳：按 sha 取到新版
+    })
+    _got2: list = []
+    _ck2.checked.connect(_got2.append)
+    _ck2.start()
+    assert wait_for(app, lambda: bool(_got2), timeout=6.0), \
+        "@sha 精确链 6s 内没出结果"
+    assert _got2[0]["version"] == "3.1", \
+        (f"@sha 精确链没盖过被缓存的旧版：实得 {_got2[0]['version']}"
+         f"（源 {_got2[0].get('source')}）")
+    assert _got2[0]["source"] == "jsDelivr@sha", _got2[0].get("source")
+    assert _got2[0]["sha256"] == "ef" * 32, "@sha 源必须带上版本文件里的哈希"
+
+    #   f) 同版本候选间**补哈希**（2026-11-26）：tags API 只有版本号没有哈希，
+    #      若它先到且胜出，info 缺 sha256 → 下载完没法校验（"报了新版却装不上"，
+    #      误报的孪生缺陷）。⚠️ 时序必须钉死：tags 30ms 先到（同版本、seq 小 →
+    #      胜出），ghfast 150ms 后到但**带哈希** —— 断言 source 仍是 tags，
+    #      证明 sha256 是从同版本候选**补**来的，而不是 ghfast 自己胜出。
+    _ck3 = _upd.UpdateChecker()
+    _ck3._nam = _UrlAwareNam({
+        "api.github.com/repos/Charlie-lee123/CQUFSAEbatteryteam/tags":
+            _json.dumps([{"name": "v2.6"}]).encode(),   # 只有版本号、先到
+        "ghfast.top":
+            b'VERSION = "2.6"\nLATEST_EXE_SHA256 = "'
+            + b"cd" * 32 + b'"\n',                      # 同版本、带哈希、晚到
+    }, delays={"api.github.com": 30, "ghfast.top": 150})
+    _got3: list = []
+    _ck3.checked.connect(_got3.append)
+    _ck3.start()
+    assert wait_for(app, lambda: bool(_got3), timeout=6.0), \
+        "同版本补哈希 6s 内没出结果"
+    assert _got3[0]["version"] == "2.6", _got3[0]["version"]
+    assert _got3[0]["source"] == "GitHub API", \
+        f"tags 应当先到并胜出（时序前提），实得源 {_got3[0].get('source')}"
+    assert _got3[0]["sha256"] == "cd" * 32, \
+        (f"同版本胜者没从 version.py 源补上哈希："
+         f"{_got3[0].get('sha256')}")
 
     #   c) 无校验信息时必须**明确告诉用户**"服务端没给校验值"，不能再笼统地说
     #      "拿不到" —— 否则排查时分不清是发布没写完还是客户端 bug

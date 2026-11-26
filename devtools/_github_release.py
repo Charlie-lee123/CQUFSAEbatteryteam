@@ -304,12 +304,54 @@ def main() -> int:
             print(f"  ! latest 下载链路 [{name}] 暂时失败（{type(exc).__name__}）——"
                   f"本机代理对 objects.githubusercontent.com 不稳定，浏览器里能下就没事")
 
-    # 4) 回填提示：把这两行写进 version.py（客户端校验下载内容靠它们）
+    # 4) 主动清 jsDelivr 边沿缓存 —— **根治自动更新误报"已是最新"**（用户 2026-11-26
+    #    点名："jsDelivr 缓存问题再查查，以后别再误报"）。
+    #
+    #    根因（实测）：jsDelivr 对 `@main` 这类分支解析的响应头是
+    #    `Cache-Control: public, max-age=604800, s-maxage=43200` —— **边沿 TTL 12
+    #    小时**。发布新版本后，`version.py` 在 CDN 边沿要最多 12 小时才刷新，期间
+    #    `@main/version.py` 一直吐上一版的 VERSION。客户端 `UpdateChecker` 靠
+    #    "多源取最高版本"兜底，但只要 jsDelivr 三节点都还没刷新（发布后头几分钟极
+    #    常见），而镜像/直连又慢或不通，用户点检查更新就会看到"已是最新"，却拉不到
+    #    新包 —— 这正是 v3.0 发布后实测到的现象（两个节点仍返 2.10）。
+    #
+    #    ⚠️ **必须在这里清，不能只靠客户端**：客户端拿不到 origin 的真实最新 commit
+    #        sha，`@sha` 精确解析用不上（要先用 GitHub API 查一次，等于多绕一跳、
+    #        且 API 本身也可能被墙）。发布侧 purge 是无鉴权、1~2 秒完成的一步。
+    purge_jsdelivr(tag)
+
+    # 5) 回填提示：把这两行写进 version.py（客户端校验下载内容靠它们）
     print("\n记得把下面两行写回 version.py：")
     print(f'LATEST_EXE_SHA256 = "{exe_sha}"')
     if setup_info:
         print(f'LATEST_SETUP_SHA256 = "{setup_info[1]}"')
     return 0 if ok else 1
+
+
+def purge_jsdelivr(tag: str) -> None:
+    """清掉 jsDelivr 边沿缓存，让新版 version.py 立刻对所有客户端可见。
+
+    见 :func:`main` 第 4 步的长注释。对 `@main` 与 `@<tag>` 两个解析路径都清 ——
+    前者是 `version_sources()` 的版本检测源，后者是下载源可能用到的形式。
+
+    ⛔ 失败只告警、**绝不影响发布结果**：CDN 缓存最终自己会过期（12h），且客户端
+       还有"取最高版本 + 镜像/直连兜底"两道防线。发布已经完成，不能因为一步
+       锦上添花的清理把退出码变成失败。
+    """
+    paths = [f"/gh/{OWNER_REPO}@main/version.py",
+             f"/gh/{OWNER_REPO}@{tag}/version.py"]
+    for path in paths:
+        url = f"https://purge.jsdelivr.net{path}"
+        req = urllib.request.Request(url, method="GET",
+                                     headers={"User-Agent": "serialassistant-release"})
+        try:
+            with opener().open(req, timeout=30) as resp:
+                body = resp.read().decode(errors="replace")
+            status = json.loads(body).get("status") if body.startswith("{") else "?"
+            print(f"jsDelivr 缓存清理 [{path}]: {status}")
+        except Exception as exc:                      # noqa: BLE001
+            print(f"  ! jsDelivr 缓存清理 [{path}] 失败（{type(exc).__name__}: "
+                  f"{exc}）—— 不影响发布，缓存最迟 12 小时后自然过期")
 
 
 if __name__ == "__main__":
