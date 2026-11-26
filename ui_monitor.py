@@ -25,8 +25,8 @@ from pathlib import Path
 from PySide6.QtCore import QDateTime, QElapsedTimer, Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
-    QCheckBox, QDateTimeEdit, QGridLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QVBoxLayout, QWidget,
+    QCheckBox, QDateTimeEdit, QDialog, QGridLayout, QHBoxLayout, QLabel,
+    QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
 import app_log
@@ -215,16 +215,30 @@ class MonitorChart(QWidget):
             painter.end()
 
 
-class MonitorPanel(QWidget):
+class MonitorPanel(QDialog):
     """独立非模态浮窗：勾选通道画图、JSONL 落盘、按时间窗回看。
 
     主窗持有强引用（懒建单例）；关窗只 hide，不 ``deleteLater()``；
     退出/清空时 ``flush()`` 强制把节流窗口里的样本写下去。
+
+    ⛔⛔ **必须继承 QDialog（或至少带 Qt.Window 标志）**：它曾被写成裸
+    ``QWidget`` + ``parent=主窗`` —— 那样 ``show()`` 出来的是主窗里的**子控件**
+    而不是独立窗口（实测 ``isWindow()=False``、几何 (0,0,900,640)），控件直接
+    糊在页头和接收区上、没有标题栏也关不掉，用户报「监控面板不可用」。
+    与「查看标记」弹窗同一套做法（``QDialog(self)`` + ``show()``）。
     """
 
     def __init__(self, parent: QWidget | None = None,
                  data_dir: Path | str | None = None) -> None:
         super().__init__(parent)
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        # Qt.Tool：跟着主窗走、**始终压在主窗之上**（主窗默认整窗全屏，普通窗口
+        # 一切换焦点就被全屏的父窗盖住，看起来像"点没了"），且不占任务栏；
+        # 主窗最小化时它也自动收起。用户要的是"边收数据边看曲线"，必须一直可见。
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowCloseButtonHint)
         self._data_dir = (Path(data_dir) if data_dir is not None
                           else default_data_dir())
         self._data_dir.mkdir(parents=True, exist_ok=True)

@@ -7347,6 +7347,98 @@ def check_link_switch_stable(app: QApplication) -> None:
         app.processEvents()
 
 
+def check_monitor_panel(app: QApplication) -> None:
+    """数据监控面板：**必须是独立窗口**，而且样本能进图表、能落盘、能回看。
+
+    用户 2026-11-26 报「监控面板不可用」：`MonitorPanel` 当时是裸 ``QWidget`` +
+    ``parent=主窗``，``show()`` 出来的是主窗里的**子控件** —— ``isWindow()`` 为
+    False、几何 (0,0,900,640)，按钮和勾选框直接糊在页头和接收区上，没有标题栏
+    也关不掉。这条守的就是"它是窗口"这个最低契约（断言 ``isWindow()``），
+    顺带把样本→图表→JSONL→历史回看这条链路串起来。
+    """
+    import ui_monitor
+    from PySide6.QtCore import QDateTime
+
+    window = make_window()
+    panel = None
+    temp = None
+    try:
+        window.show()
+        for _ in range(10):
+            app.processEvents()
+        window._show_monitor()
+        for _ in range(10):
+            app.processEvents()
+        panel = window._monitor_panel
+        assert panel is not None, "监控面板没建出来"
+        assert panel.isWindow(), \
+            ("监控面板不是独立窗口（isWindow=False）——会变成主窗里的子控件，"
+             "糊在页头/接收区上且没有标题栏")
+        assert panel.parent() is window, "面板应挂在主窗下（生命周期绑定）"
+        assert panel.windowTitle() == "数据监控面板", panel.windowTitle()
+        assert panel.isVisible(), "show() 之后面板不可见"
+        # 关掉再打开：复用同一实例、还能再显示
+        panel.close()
+        for _ in range(4):
+            app.processEvents()
+        assert not panel.isVisible(), "关窗后应隐藏（不是销毁）"
+        window._show_monitor()
+        for _ in range(4):
+            app.processEvents()
+        assert window._monitor_panel is panel, "重复打开不应该重建面板"
+        assert panel.isVisible(), "关掉后重新打开面板不可见"
+
+        # 数据链路：用隔离目录单独建一块面板，别写用户真实监控目录
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "_check", "_monitor_selftest")
+        os.makedirs(base, exist_ok=True)
+        temp = ui_monitor.MonitorPanel(None, data_dir=base)
+        # ⚠️ 第一次 push 会按车号 set_vehicle() 换文件，所以先把目标文件清掉，
+        #    再看它到底往哪儿写。
+        target = temp._path_for("E74-2026")
+        if target.exists():
+            target.unlink()
+        for i in range(20):
+            temp.push_sample({"ts": 1000.0 + i, "soc": 50 + i * 0.1,
+                              "pack_v": 480.0 + i, "i_eff": 1.0 + i,
+                              "temp": 30.0, "cell_min": 3700.0,
+                              "cell_max": 3800.0, "cell_mean": 3750.0},
+                             vehicle="E74-2026")
+        app.processEvents()
+        assert temp._rt_count == 20, f"实时采样计数不对：{temp._rt_count}"
+        assert len(temp._rt["soc"]) == 20, len(temp._rt["soc"])
+        assert temp._charts["soc"].samples(), "SOC 曲线没有样本"
+        samples_path = temp._samples_path
+        assert samples_path == target, \
+            f"换车号后样本文件没跟着换：{samples_path.name}"
+        temp.flush()
+        assert samples_path.is_file(), f"样本没落盘：{samples_path}"
+        rows = [ln for ln in samples_path.read_text("utf-8").splitlines() if ln.strip()]
+        assert len(rows) >= 20, f"落盘行数不对：{len(rows)}"
+        temp.dt_start.setDateTime(QDateTime.fromSecsSinceEpoch(999))
+        temp.dt_end.setDateTime(QDateTime.fromSecsSinceEpoch(2000))
+        temp.load_history()
+        assert temp._history_mode, "加载历史没进历史模式"
+        assert temp._history_count >= 20, f"历史样本数不对：{temp._history_count}"
+        assert temp._charts["soc"].samples(), "历史模式没把样本灌进曲线"
+        temp.back_to_realtime()
+        assert not temp._history_mode, "返回实时没退出历史模式"
+        temp.close()
+        temp.deleteLater()
+        temp = None
+    finally:
+        if temp is not None:
+            try:
+                temp.close()
+                temp.deleteLater()
+            except RuntimeError:
+                pass
+        window._monitor_panel = None
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+
+
 def check_v211_features() -> None:
     """v2.11 四项增量：电压来源 / 工况死区 / 防息屏 / 整轮标记（纯逻辑，不碰真 OS）。"""
     import customization
@@ -7515,6 +7607,7 @@ CHECKS = [
     ("车辆与逐模组配置", check_vehicle_profiles),
     ("显示行数（每模组 N 排）", check_rows_hint),
     ("连接方式切换几何不跳", check_link_switch_stable),
+    ("数据监控面板（独立窗口/样本/回看）", check_monitor_panel),
 ]
 
 
