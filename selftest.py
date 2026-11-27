@@ -15,9 +15,11 @@
 
 from __future__ import annotations
 
+import ast
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -8326,6 +8328,121 @@ _CHANGED_MAP = {
 }
 
 
+# ---------------------------------------------------------------------------
+# 函数级路由：改了**哪几行** → 只跑真正相关的 check
+#
+# 为什么要有这层（用户 2026-11-27 原话）：
+#   「将软件的各个部分隔离开来，改动只修改对应部分内容……根本没有改动的你自测
+#     它干嘛。」
+# 文件级 ``_CHANGED_MAP`` 的问题是粒度太粗：改 `ui_settings.py` 里
+# `_flash` 的 1 行（纯 UI 反馈定时器），会把「定制功能注册表 / 启动时最大化 /
+# 默认折叠发送区 / 车辆与逐模组配置 / 连接方式切换」5 条全带出来，实际跑下来
+# 没一条跟那一行有关系。
+#
+# 做法：解析 `git diff -U0` 的 hunk 新侧行号 → AST 反查「这一行落在哪个函数」
+# → 查 ``_FUNC_CHECKS`` 只取该函数声明过的 check。
+#
+# ⛔ 三条铁律：
+#   ① ``_FUNC_CHECKS`` 只写**该函数改了、必须验证的行为**。拿不准就**不写**，
+#      让它回落到文件级（宁可多跑，不可漏跑）。
+#   ② 落到表里查不到的函数 / 模块级常量 / 整个文件被新建删 → 一律回落文件级
+#      ``_CHANGED_MAP``，不猜。
+#   ③ 本层的唯一作用是**缩小循环输入**。所有保护用户配置的代码（undo 旁路、
+#      finally 还原、锁）无条件照跑，与选集无关。
+_FUNC_CHECKS: dict[str, tuple[str, ...]] = {
+    # 纯 UI 反馈 / 文案定时器：改了只影响"按钮上的字几秒后复原"，
+    # 与布局、注册表、车辆档案全无关系。
+    "ui_settings.McpManualDialog._flash": (),
+    "ui_settings.McpManualDialog._copy": (),
+    "ui_settings.McpManualDialog._copy_json": (),
+    "ui_settings.VehicleLibraryDialog._clear_token": (),
+    # 结构判定
+    "customization.get": ("定制功能注册表", "车辆与逐模组配置"),
+    "customization.register": ("定制功能注册表",),
+    "customization.save_vehicle": ("车辆与逐模组配置",),
+    "customization.select_vehicle": ("车辆与逐模组配置", "启动时最大化"),
+}
+
+# hunk 头：@@ -old_start,old_len +new_start,new_len @@（-U0 时 len 可省）
+_DIFF_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def _func_spans(path: Path) -> list[tuple[int, int, str]]:
+    """→ [(起始行, 结束行, "模块.类.方法")]，用 AST 拿精确 end_lineno。"""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return []
+    spans: list[tuple[int, int, str]] = []
+    module = path.stem
+
+    def walk(node, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = f"{prefix}{child.name}"
+                end = getattr(child, "end_lineno", None) or child.lineno
+                spans.append((child.lineno, end, name))
+                walk(child, f"{name}.")          # 闭包里的回调也算这一段
+            elif isinstance(child, ast.ClassDef):
+                walk(child, f"{prefix}{child.name}.")
+
+    walk(tree, f"{module}.")
+    return spans
+
+
+def _innermost(spans: list[tuple[int, int, str]], line: int) -> str | None:
+    """落在 ``line`` 上的**最内层**函数名（区间最小者）。"""
+    best: tuple[int, str] | None = None
+    for start, end, name in spans:
+        if start <= line <= end:
+            width = end - start
+            if best is None or width < best[0]:
+                best = (width, name)
+    return best[1] if best else None
+
+
+def _changed_functions(files: set[str]) -> tuple[set[str], list[str]]:
+    """改动文件 → (命中的函数全名集合, 说明行)。
+
+    只认**落在 _FUNC_CHECKS 里声明过**的函数；落在别处一律不算命中，
+    由调用方回落文件级。返回 (空格集合) 表示"函数级判断无结论"。
+    """
+    root = Path(__file__).resolve().parent
+    base = ["git", "-c", "http.sslBackend=openssl", "-C", str(root),
+            "diff", "-U0", "--no-color"]
+    hits: set[str] = set()
+    notes: list[str] = []
+    for rel in sorted(files):
+        full = root / rel
+        if not full.suffix == ".py" or not full.exists():
+            continue
+        try:
+            proc = subprocess.run(base + ["--", rel], capture_output=True,
+                                  text=True, timeout=20, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return set(), []
+        if proc.returncode != 0:
+            return set(), []
+        spans = _func_spans(full)
+        if not spans:
+            continue
+        owner: set[str] = set()
+        for line in proc.stdout.splitlines():
+            match = _DIFF_HUNK_RE.match(line)
+            if not match:
+                continue
+            start = int(match.group(3))
+            length = int(match.group(4)) if match.group(4) else 1
+            for number in range(start, start + max(length, 1)):
+                name = _innermost(spans, number)
+                if name:
+                    owner.add(name)
+        if owner:
+            notes.append(f"{rel} → 函数 {'、'.join(sorted(owner))}")
+            hits.update(owner)
+    return hits, notes
+
+
 def _split_keywords(raw: str) -> list[str]:
     """``--only a,b`` / ``--only a，b`` → ``["a", "b"]``（中文逗号也认）。"""
     return [part.strip() for part in str(raw).replace("，", ",").split(",")
@@ -8495,12 +8612,43 @@ def _resolve_selection(sel: _Selection) -> tuple[list[tuple[str, object]] | None
                 print("     理由：这些文件影响面覆盖几乎所有用例，刻意不按条猜。")
                 fallback_why = "改动文件影响面过大"
             else:
-                tokens, notes, others = _changed_plan(files)
-                print("  --changed 依据：")
-                for note in notes:
-                    print(f"      {note}")
-                if others:
-                    print(f"      未映射到 check（忽略）：{'、'.join(others)}")
+                # ① 先试**函数级**：改了哪几行 → 落在哪个函数 → 该函数声明的 check。
+                #    能判死就不必带出同文件里无关的几组用例。
+                funcs, func_notes = _changed_functions(files)
+                declared = {name for name in funcs if name in _FUNC_CHECKS}
+                tokens: list[str] = []
+                if funcs and declared == funcs:
+                    # 所有命中的函数都在表里声明过 → 函数级可判
+                    for note in func_notes:
+                        print(f"  --changed 函数级：{note}")
+                    for name in sorted(declared):
+                        keywords = _FUNC_CHECKS[name]
+                        print(f"      {name} → "
+                              + ("（无关 check，跳过）" if not keywords
+                                 else '、'.join(keywords)))
+                        tokens.extend(keywords)
+                    if not tokens:
+                        # 改的全是纯 UI 反馈回调，确实一条都不用跑。
+                        # ⛔ 不是"漏跑"——这些函数没有任何断言覆盖它们，
+                        #    跑任何一条都是白跑。但仍要**明确告知**，不静默。
+                        print("      → 改动只影响界面反馈文案，无需跑任何 check")
+                        return [], " ".join(parts).strip()
+                else:
+                    # 有函数不在表里 / 落不到函数（模块级常量、整个文件新增）
+                    # → 回落文件级，宁可多跑不可漏跑。
+                    if func_notes:
+                        for note in func_notes:
+                            print(f"  --changed 函数级：{note}")
+                        missing_funcs = sorted(funcs - declared)
+                        if missing_funcs:
+                            print(f"      ⚠ 未声明映射，回落文件级："
+                                  f"{'、'.join(missing_funcs)}")
+                    tokens, notes, others = _changed_plan(files)
+                    print("  --changed 依据（文件级）：")
+                    for note in notes:
+                        print(f"      {note}")
+                    if others:
+                        print(f"      未映射到 check（忽略）：{'、'.join(others)}")
                 if not tokens:
                     fallback_why = "未能判定改动与 check 的对应关系"
                 else:
@@ -8740,6 +8888,14 @@ def main() -> int:
     picked, selection_desc = _resolve_selection(selection)
     if picked is None:
         return 2
+    if not picked:
+        # 函数级路由判定「改的都是纯 UI 反馈回调，没有任何 check 覆盖它们」。
+        # ⛔ 这不是错误（不返回 2），也不抢锁（不需要动 QSettings）。
+        #    但必须**明确**打印，避免看起来像"跑了但全过了"。
+        print(f"\n0 条需要跑（{selection_desc}）")
+        print("  改动只影响界面反馈文案/定时器，没有 check 覆盖这些行为；")
+        print("  如仍想全量验证，用 `--only` 指定或直接不带参数跑全量。")
+        return 0
 
     # 到这里才真的要跑 check（要动 QSettings）→ 抢锁。
     # ⛔ 释放必须在 `finally` 里，且 try 要包住**整个** _run_checks —— 里面任何
