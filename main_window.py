@@ -778,7 +778,7 @@ class _ConfigFade(QWidget):
     ⛔⛔ 绝不能用 ``WA_TranslucentBackground`` —— 设置面板的 ``_VehFade`` 踩过：
     带该属性的子控件内容会被合成两遍（正确位置 + 再偏移一个自身坐标），屏上
     一套模糊一套清晰 = 叠影。
-    ⛔ 必须 ``WA_TransparentForMouseEvents``：淡出这 240ms 里用户点到的应该是
+    ⛔ 必须 ``WA_TransparentForMouseEvents``：淡出这段里用户点到的应该是
     真控件，而不是一张图。
     """
 
@@ -984,6 +984,13 @@ class MainWindow(QMainWindow):
         self._ble_retiring: list[object] = []
         self._ble_seen: dict[str, dict] = {}
         self._ble_target = ""
+        # 「扫 N 秒后收尾」必须是**成员定时器**，不能用 QTimer.singleShot ——
+        # singleShot 发出去就撤不回来：用户在这 3.5 秒里切回串口后它照样触发
+        # （_finish_ble_scan 的 fill 默认为 True）→ _fill_ble_combo() 把蓝牙 MAC
+        # 重新填进刚清空的串口下拉框（2026-11-27 用户重复反馈的真根因）。
+        self._ble_scan_timer = QTimer(self)
+        self._ble_scan_timer.setSingleShot(True)
+        self._ble_scan_timer.timeout.connect(self._finish_ble_scan)
         # 可选 DLC（见 dlc_host）：当前只有「心率广播 DLC」一个。主界面只保留一颗
         # 常驻「DLC」按钮（右侧功能栏底部），点它打开管理面板（安装 / 启用 / 卸载）；
         # 启用后点面板里的「打开面板」即可查看心率可视化。
@@ -6910,7 +6917,7 @@ class MainWindow(QMainWindow):
         if wants_swap:
             card = getattr(self, "_config_card", None)
             if card is not None and card.width() > 0:
-                shot = card.grab(card.rect())
+                shot = card.grab(self._config_blur_zone())
                 old_shot = shot if not shot.isNull() else None
         if not ble and self._ble_scanner is not None:
             self._finish_ble_scan(fill=False)      # 离开广播模式就别接着扫了
@@ -6943,7 +6950,16 @@ class MainWindow(QMainWindow):
             self._set_state("未打开")
             # 从蓝牙广播切回串口：串口选择区**清空**（用户 2026-11-26 点名）。
             # 蓝牙模式下框里装的是蓝牙设备 MAC，直接沿用会把 MAC 当成端口名填回串口框。
+            # ⚠️ 先撤掉扫描收尾定时器：它是"3.5 秒后填一次设备列表"的预约，留着
+            #    就会在几秒后把刚清空的框重新填满 MAC（2026-11-27 重复反馈的真根因）。
+            timer = getattr(self, "_ble_scan_timer", None)
+            if timer is not None:
+                timer.stop()
             self._refresh_ports(announce=False, clear_selection=True)
+            # 再兜一次：刷新过程中若有别的路径把文本写回去（选中恢复之类），
+            # 这里保证屏上最终是空的。blockSignals 不用加（清空本就不该触发建链）。
+            self.cmb_port.setCurrentIndex(-1)
+            self.cmb_port.setEditText("")
         self._settings.setValue("link_mode", "ble" if ble else "serial")
         # 新版式落定、布局稳定后再播过渡：延迟一拍让 hide/show 先被布局消化，
         # 否则抓到的"新图"还是旧几何。旧快照记在 _config_swap_old 里供它使用。
@@ -6971,7 +6987,7 @@ class MainWindow(QMainWindow):
                                                       busy=True))
         self._ble_scanner = scanner
         scanner.open()
-        QTimer.singleShot(int(BLE_SCAN_SECONDS * 1000), self._finish_ble_scan)
+        self._ble_scan_timer.start(int(BLE_SCAN_SECONDS * 1000))
 
     def _on_ble_found(self, info: dict) -> None:
         self._ble_seen[info["address"]] = info
@@ -6982,6 +6998,11 @@ class MainWindow(QMainWindow):
         self._warn(f"蓝牙扫描起不来：\n{message}")
 
     def _finish_ble_scan(self, fill: bool = True) -> None:
+        # 收尾可能是定时器到点，也可能是"用户切走了"（_on_link_mode_changed）——
+        # 谁先到都先把定时器撤掉，别让它在几秒后再触发一次。
+        timer = getattr(self, "_ble_scan_timer", None)
+        if timer is not None:
+            timer.stop()
         scanner, self._ble_scanner = self._ble_scanner, None
         if scanner is not None:
             scanner.found.disconnect()
@@ -7002,7 +7023,9 @@ class MainWindow(QMainWindow):
                 scanner.finished.connect(self._reap_ble_retired)
             else:
                 scanner.deleteLater()
-        if fill:
+        # ⚠️ 填设备**必须**仍在广播模式：万一还有漏网的收尾（别的路径提前起了
+        #    新扫描、定时器竞态），也不能把蓝牙 MAC 当端口名填进串口模式的下拉框。
+        if fill and self._link_is_ble():
             self._fill_ble_combo()
 
     def _reap_ble_retired(self) -> None:
@@ -10503,6 +10526,40 @@ class MainWindow(QMainWindow):
             if visible:
                 _show(widget, True)
 
+    def _config_blur_zone(self) -> QRect:
+        """连接方式切换时该糊的区域：**串口开关那一行的下边缘 → 卡片底部**。
+
+        用户 2026-11-27：「串口开关以下的部分在切换连接方式的时候才高斯模糊」——
+        在此之前整张卡都糊（含"串口配置"标题和开关那一行），观感像整块面板在闪。
+
+        返回值是**卡片坐标系**下的矩形（``_ConfigFade`` 是卡片的子控件，直接吃）。
+        算不出来时退回 ``card.rect()``（宁可整卡糊，也不要糊错位置或抓空图）。
+        """
+        card = getattr(self, "_config_card", None)
+        if card is None:
+            return QRect()
+        full = card.rect()
+        if full.width() <= 0 or full.height() <= 0:
+            return full
+        btn = getattr(self, "btn_open", None)
+        if btn is None:
+            return full
+        try:
+            # 开关这一行的底边就是开关自身的底边（行高由开关撑起）。
+            # ⚠️ 走全局坐标中转，不用 mapTo(card, ...)：mapTo 要求 card 是开关的
+            #    祖先，而全屏时这行会被搬进接收区、两边的父子关系不成立。
+            bottom = card.mapFromGlobal(
+                btn.mapToGlobal(QPoint(0, btn.height()))).y()
+        except RuntimeError:                  # 开关已析构（关窗尾段）
+            return full
+        # -2 留一点重叠：交界处不会因为取整露出一条没糊的硬缝。
+        y = bottom - 2
+        if y <= 0 or y >= full.height():
+            # 开关被搬进接收区右侧功能列（全屏）或几何还没落定 → mapTo 出来的
+            # 坐标不在卡内，按整卡处理。
+            return full
+        return QRect(0, y, full.width(), full.height() - y)
+
     def _play_config_blur_swap(self) -> None:
         """连接方式切换的过渡：**高斯模糊淡出**（用户 2026-11-26 点名改的）。
 
@@ -10513,13 +10570,16 @@ class MainWindow(QMainWindow):
         时序（调用方保证旧图已抓、新版式已落定）：
           ① 抓新版式的清晰快照当**不透明垫底**（淡出全程底下的像素恒为"新界面"，
             不会闪、也不会透出后面的壁纸）；
-          ② 覆盖层先画垫底、再按 α 叠**旧版式的高斯模糊图**，240ms α 1→0；
+          ② 覆盖层先画垫底、再按 α 叠**旧版式的高斯模糊图**，560ms α 1→0
+            （2026-11-27 用户要"时间再适当长一点"，原 400ms）；
           ③ 到 0 直接撤层 —— 此时覆盖层与真控件逐像素相同，撤掉不跳。
 
         观感因此是「旧界面糊成一团 → 化开 → 新界面」，全程没有位移、没有裁切。
 
-        ⛔ 覆盖层挂配置卡、rect 就是卡片自身矩形：串口参数收起后下面的行整体上移，
-           只盖住参数那四行的话，位移会在覆盖层下沿露出来。
+        ⛔ 覆盖层只盖 ``_config_blur_zone()``（串口开关那一行以下 → 卡底）：
+           用户 2026-11-27「串口开关以下的部分在切换连接方式的时候才高斯模糊」。
+           区域从开关底边一直延伸到卡底 —— 串口参数收起/展开时下面的行整体上移，
+           盖短了位移会在覆盖层下沿露出来；盖到标题和开关那一行又成了整卡在闪。
         ⛔ 位图路线，不用被项目禁用的 QGraphicsOpacityEffect/BlurEffect。
         """
         card = getattr(self, "_config_card", None)
@@ -10539,7 +10599,10 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 pass          # 宿主已析构（关窗时队列里还留着上一段）
 
-        rect = card.rect()
+        rect = self._config_blur_zone()
+        if rect.isEmpty():
+            self._config_swap_old = None
+            return
         shot_new = card.grab(rect)
         blur_src = getattr(self, "_config_swap_old", None)
         self._config_swap_old = None
@@ -10551,11 +10614,17 @@ class MainWindow(QMainWindow):
         if blurred.isNull():
             return
         if blurred.size() != shot_new.size():
-            # 卡高变了（参数收起/展开）→ 居中裁切到新尺寸，别拉伸
-            # （拉伸会把模糊拉成方向性条带，一眼假）。
+            # 两张图都是**局部区**（开关以下 → 卡底），但串口参数收起/展开后这一
+            # 段的高度会变 → 尺寸对不上。按**新区域尺寸**做 KeepAspectRatioByExpanding
+            # 再居中裁切（拉伸会把模糊拉成方向性条带，一眼假）。
             blurred = blurred.scaled(
                 shot_new.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation)
+            dx = max(0, (blurred.width() - shot_new.width()) // 2)
+            dy = max(0, (blurred.height() - shot_new.height()) // 2)
+            blurred = blurred.copy(
+                dx, dy, min(shot_new.width(), blurred.width()),
+                min(shot_new.height(), blurred.height()))
 
         overlay = getattr(self, "_params_fade", None)
         if overlay is None:
@@ -10563,7 +10632,7 @@ class MainWindow(QMainWindow):
             self._params_fade = overlay
         overlay.show_frame(shot_new, blurred, rect, 1.0)
 
-        tween = Tween(400, out_cubic,
+        tween = Tween(560, out_cubic,
                       lambda v: self._config_fade_step(v),
                       self._config_fade_done, parent=self, min_interval_ms=8)
         self._params_tween = tween

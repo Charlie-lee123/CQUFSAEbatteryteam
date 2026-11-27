@@ -1141,10 +1141,13 @@ _POPUP_SCREEN_MARGIN = 12
 
 # 弹层**最多显示几行**，多出来的靠视图自己的滚动条滚（用户 2026-11-21 点名
 # "这个太长太宽了"：历史采样间隔 30 档，弹层撑到 864px 高、直接跑出屏幕下缘）。
-# ⛔ 不能靠 QComboBox.setMaxVisibleItems —— 本机 Qt 6.12 + Fusion 下它**完全不
-#    生效**：真机实测原生 QComboBox（30 项 / maxVisibleItems=10）弹层照样是
-#    30 行的 926px，ChevronComboBox 是 30 行的 864px；设成 6 也只降到 661px。
-#    所以高度必须自己按"行高 × 行数"封顶，见 _cap_popup_height。
+# 高度最终仍由 _cap_popup_height 按"行高 × 行数"封顶（容器几何归我们管）。
+# ⚠️ 但**光改容器几何不够**：super().showPopup() 里 Qt 会先按"全部条目"摆一版
+#    弹层并立刻画出来（放不下还会翻到控件上方），那一帧在我们改几何之前就上了
+#    屏幕。所以 showPopup 里还要把本值喂给 setMaxVisibleItems，让 Qt 自己算出来
+#    的也是 8 行 —— 详见 ChevronComboBox.showPopup 里的实测记录
+#    （devtools/_probe_rx_lines_maxvis.py：8 行 → Qt 自己给出 176x286@646，
+#     与我们的目标 651 只差 5px；不设的话它按 12 行给出 176x354 并翻到 y=260）。
 _POPUP_MAX_ROWS = 8
 
 # 弹层竖向除"行"以外的一圈常量高度：QSS 的 padding 6+6 + 边框 1+1 + 容器布局 5+5。
@@ -1537,6 +1540,17 @@ class ChevronComboBox(QComboBox):
         self._round_popup_window(container)
         self._ensure_popup_delegate()
         self._fit_popup_width()
+        # ⛔ **必须先告诉 Qt 最多显示几行**：`_cap_popup_height` 只改容器几何，
+        #    拦不住 Qt 自己算的那一版 —— super().showPopup() 内部会按**全部条目**
+        #    摆一次弹层并立刻画出来。实测（devtools/_probe_rx_lines_paint2.py）：
+        #    "保留行数"12 条 → Qt 摆成 176x354（12 行），而控件在 y=613、下方只剩
+        #    300px，Qt 判定放不下就**翻到控件上方 y=260** —— 于是用户点开时先看到
+        #    一个 12 行的大列表在控件上方闪一下，150ms 后才跳到正确位置的 8 行框
+        #    （用户 2026-11-27「保留行数的下拉动画有问题」就是这个）。
+        #    设了 maxVisibleItems 之后 Qt 自己算出来就是 8 行（176x286@646，与
+        #    我们的目标 651 只差 5px），首帧即正确，不再有那次大跳。
+        # ⚠️ 这里只影响"超过 8 条"的下拉；条目不足 8 条时 Qt 本来就不会截。
+        self.setMaxVisibleItems(_POPUP_MAX_ROWS)
         # ⛔ super() **之前**先把容器按目标位置摆成起始矮条（此刻窗口还隐藏，
         #    改几何不可见）：随后 super().showPopup() 里 Qt 会把弹层摆到它自己的
         #    默认位置（"当前项对齐控件"，整体压在控件框上/上边）——高频点击时
@@ -1814,6 +1828,8 @@ class ChevronComboBox(QComboBox):
         # ⚠️ 这里**不做"弹层还在不在"的守卫**：延后一拍时窗口还没被标成可见，
         #    拿 isVisible() 当开关会把动画整个跳过（实测：七个下拉全都一帧到位）。
         #    弹层真被关了的话，往隐藏窗口推几何也无害，收尾统一交给 hidePopup。
+        #    （下面那个 isVisible 分流是另一回事：不是"跳过动画"，而是"这条路上
+        #     补间根本画不出来"，见那段注释。）
         container = self.view().window()
         # ⛔ **不要**先把容器还原成满高再缩回去 —— 那一帧就是用户报的
         #    「展开后还是会有闪烁」（2026-11-02 第六轮）。目标矩形（含尺寸）在
@@ -1825,6 +1841,23 @@ class ChevronComboBox(QComboBox):
             target, below = self._popup_place()
         self._popup_target = target
         self._popup_below = below
+        # ⛔ 弹层窗口**还没映射**时不做补间 —— 补了也到不了屏幕。
+        #    实测（devtools/_probe_rx_lines_click.py，真实点击与程序化调用同结论）：
+        #    **可编辑**下拉（保留行数、波特率）的弹层容器 isVisible() 要到
+        #    100~160ms 才翻成 True，而这段补间只有 150ms —— 于是整段"25% 长到
+        #    100%"全作用在未映射窗口上，Paint 事件只有首帧和末帧（实测 6 次），
+        #    屏幕上是 Qt 自己摆的那一版：12 行满高 176x354 翻在控件上方 y=260，
+        #    150ms 后才"啪"地跳到 176x286@651（控件在 y=613）。
+        #    不可编辑的下拉（停止位/数据位/校验位…）展开那一刻 isVisible() 就是
+        #    True，补间照旧一帧不落 —— 所以这里只按"当前可见性"分流，不改动画本身。
+        #    未映射时直接把容器摆到目标矩形：窗口映射出来的第一帧就是对的，
+        #    不会出现"先在错误位置闪满高、再跳回来"。
+        if not container.isVisible():
+            if self._popup_tween is not None and self._popup_tween.running:
+                self._popup_tween.stop()      # 上一轮可能还没收尾，别让它接着推
+            container.setGeometry(target)
+            container.setWindowOpacity(1.0)
+            return
         start_h = max(14, int(target.height() * 0.25))
         if below:
             container.setGeometry(target.x(), target.y(), target.width(), start_h)

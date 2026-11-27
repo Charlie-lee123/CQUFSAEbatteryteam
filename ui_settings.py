@@ -1211,6 +1211,16 @@ class SettingsDialog(QDialog):
         # 不该沉到最底下的定制功能节里。
         # 存储/默认值仍在 customization 的 register_int("volt_rows"/"temp_rows")，
         # 这里只是把它们那两行提前生成（_build_custom_section 会跳过这两个 key）。
+        # 2026-11-27 二轮用户「这些都可以把两行弄在一行」：这两项并成**一行** ——
+        # 行标签「电压数据行数」+ 电压框，紧跟小字「温度采集数据行数」+ 温度框。
+        # ⛔ 两个框仍是各自独立的 ChevronSpinBox、各自登记、各自接
+        #    valueChanged→_on_rows_hint_changed（逐车语义一个都不能少）。
+        _rh_holder = QWidget()
+        _rh_layout = QHBoxLayout(_rh_holder)
+        _rh_layout.setContentsMargins(0, 0, 0, 0)
+        _rh_layout.setSpacing(10)
+        _rh_label: QLabel | None = None
+        _rh_count = 0
         for row_key in ("volt_rows", "temp_rows"):
             spec = next((s for s in customization.specs()
                          if s["key"] == row_key), None)
@@ -1226,10 +1236,31 @@ class SettingsDialog(QDialog):
             # （与 _build_custom_section 的 else 分支同一口径）。
             spin.valueChanged.connect(
                 lambda val, k=row_key: self._on_rows_hint_changed(k, int(val)))
-            row_label = self._label(spec["label"])
-            form.addRow(row_label, spin)
+            if _rh_count == 0:
+                # 首项的行标签留在表单 LabelRole 上（合并行的行名就是它）。
+                _rh_label = self._label(spec["label"])
+                _rh_layout.addWidget(spin)
+                _custom_label = _rh_label
+            else:
+                # 第二项起把原行标签收进字段区当行内小字（文案不变）。
+                _custom_label = self._inline_caption(spec["label"])
+                # 同 _build_custom_section 的合并分支：小标签必须水平 Fixed，否则
+                # 被拉满字段列，把两个框顶到两端（QA 真机截图实证过）。
+                _custom_label.setSizePolicy(QSizePolicy.Policy.Fixed,
+                                            QSizePolicy.Policy.Preferred)
+                _rh_layout.addWidget(_custom_label)
+                _rh_layout.addWidget(spin)
             self._custom_widgets[row_key] = spin
-            self._custom_rows[row_key] = (row_label, spin)
+            self._custom_rows[row_key] = (_custom_label, spin)
+            _rh_count += 1
+        # 余量归到末尾（所有成员 addWidget 之后再加 stretch），控件紧挨在左。
+        self._rows_hint_row: QWidget | None = None
+        if _rh_count and _rh_label is not None:
+            _rh_layout.addStretch(1)
+            form.addRow(_rh_label, _rh_holder)
+            # 两行并成一行后整行显隐要按**容器**走（拿 spin 找行位置会得 -1，
+            # 见 _sync_row_hint_widgets）。
+            self._rows_hint_row = _rh_holder
 
         # 2026-11-27 用户「这些都归纳为个性化」：主题 / 界面材质 / 材质效果 /
         # 开屏动画 / 动画文件 / 动画帧率 六项归到同一个「个性化」分组。
@@ -1243,7 +1274,15 @@ class SettingsDialog(QDialog):
             self.cmb_theme.addItem(label, value)
         index = self.cmb_theme.findData(theme_mode)
         self.cmb_theme.setCurrentIndex(index if index >= 0 else 0)
-        form.addRow(self._label("主题"), self.cmb_theme)
+        # 2026-11-27 二轮用户「这些都可以把两行弄在一行」：「主题 + 界面材质」并成
+        # **一行** —— 行标签「主题」+ 主题框，紧跟小字「界面材质」+ 材质框。
+        # 两框都保持 setFixedWidth(COMBO_W)。行只 addRow 一次（见下方材质那段）。
+        _theme_row_holder = QWidget()
+        _theme_row = QHBoxLayout(_theme_row_holder)
+        _theme_row.setContentsMargins(0, 0, 0, 0)
+        _theme_row.setSpacing(10)
+        _theme_row.addWidget(self.cmb_theme)
+        form.addRow(self._label("主题"), _theme_row_holder)
 
         # 面板刚建好时每个控件的**显示值**（custom_values 的基准，见 _snapshot_custom_baseline）
         self._custom_baseline: dict[str, object] = {}
@@ -1271,8 +1310,13 @@ class SettingsDialog(QDialog):
             self.cmb_material.currentIndexChanged.connect(
                 lambda _idx, s=material_spec, c=self.cmb_material:
                 self._on_choice_changed(s, c))
-            material_label = self._label(material_spec["label"])
-            form.addRow(material_label, self.cmb_material)
+            material_label = self._inline_caption(material_spec["label"])
+            # 与前面「主题」同一个容器、同一行（不另占一行）。
+            material_label.setSizePolicy(QSizePolicy.Policy.Fixed,
+                                         QSizePolicy.Policy.Preferred)
+            _theme_row.addWidget(material_label)
+            _theme_row.addWidget(self.cmb_material)
+            _theme_row.addStretch(1)
             self._custom_widgets["material"] = self.cmb_material
             self._custom_rows["material"] = (material_label, self.cmb_material)
 
@@ -1518,15 +1562,30 @@ class SettingsDialog(QDialog):
                             ("stamp_show_year", "stamp_show_month", "stamp_show_day")),
         "volt_limit_low": ("电压范围", ("volt_limit_low", "volt_limit_high")),
         "temp_limit_low": ("温度范围", ("temp_limit_low", "temp_limit_high")),
+        # 2026-11-27 二轮（用户 5 张截图点名「这些都可以把两行弄在一行」）：
+        # 「暂停定位行数」+「行数（最大化）」、「SOC 数据来源」+「总电压来源」。
+        "pause_snap_lines": ("暂停定位行数",
+                             ("pause_snap_lines", "pause_snap_lines_max")),
+        "soc_source": ("SOC 数据来源", ("soc_source", "volt_source")),
+        # ⚠️ 下面两组**不在** _build_custom_section 里拼行：成员要么不是注册表 key
+        #    （主题没有 customization 项），要么已经提前生成（volt_rows/temp_rows
+        #    在 _build_theme_section 上方的手写循环里并成一行）。登记在这里是为了
+        #    让"哪些 key 属于合并行"只有一个口径 —— 显隐/对齐/探针都按它判断，
+        #    不会把合并行里的第二只控件当成独立字段去比对左边缘。
+        "volt_rows": ("电压数据行数", ("volt_rows", "temp_rows")),
+        "material": ("主题", ("material",)),
     }
     # 合并行里各控件前面的小字：三个开关要「年 / 月 / 日」；两个范围只在第二个
-    # 框前放「~」。没登记的成员用原来的行标签做 _custom_rows 的书签（不上屏）。
+    # 框前放「~」；SOC 那两只只在第二个框前放「总电压来源」。没登记的成员用原来的
+    # 行标签做 _custom_rows 的书签（不上屏）。
     _MERGE_PREFIXES: dict[str, str] = {
         "stamp_show_year": "年",
         "stamp_show_month": "月",
         "stamp_show_day": "日",
         "volt_limit_high": "~",
         "temp_limit_high": "~",
+        "pause_snap_lines_max": "行数（最大化）",
+        "volt_source": "总电压来源",
     }
 
     # ------------------------------------------------------------ 开屏动画
@@ -1983,11 +2042,12 @@ class SettingsDialog(QDialog):
         这个要跟着车号走」；2026-11-21 又补一句：「电压数据和温度数据都要跟着车号
         走，没有选择车号就不显示」—— 所以：
 
-        - 有车号档案（``active_profile()`` 不是 None）→ 两行**露出**，显示这台车
-          存的两个行数（``customization.active_row_hints``）；
-        - 没有车号（或那台车还没有逐模组档案）→ 两行**整行隐藏**。判据与
+        - 有车号档案（``active_profile()`` 不是 None）→ 这一行（2026-11-27 起两项
+          并成一行）**露出**，显示这台车存的两个行数
+          （``customization.active_row_hints``）；
+        - 没有车号（或那台车还没有逐模组档案）→ 这一行**整行隐藏**。判据与
           ``_sync_grid_params_visibility`` 同一条：同一时刻只让一套参数露面
-          （没档案时主窗走的是旧三件套，这两行没有意义）。
+          （没档案时主窗走的是旧三件套，这两项没有意义）。
         - 0 永远表示「自动」（= 一排一个模组）。
 
         ⛔ 这里必须 ``blockSignals``：``setValue`` 会触发 ``valueChanged`` →
@@ -1995,10 +2055,17 @@ class SettingsDialog(QDialog):
         行数写进 B 车（"跟着车号走"直接失效）。
         """
         has_vehicle = customization.active_profile() is not None
-        for key in self._VEHICLE_ROW_KEYS:
-            widget = self._custom_widgets.get(key)
-            if widget is not None:
-                self._set_form_row_visible(widget, has_vehicle)
+        # ⚠️ 2026-11-27 二轮：这两项已并成**一行**（共用 _rows_hint_row 容器）。
+        #    此时拿 spin 去 getWidgetPosition 会得到 -1（它不在表单里，在容器里），
+        #    整行藏不掉 —— 有容器就按容器显隐，没有再退回逐键（老布局/兜底）。
+        row_holder = getattr(self, "_rows_hint_row", None)
+        if row_holder is not None:
+            self._set_form_row_visible(row_holder, has_vehicle)
+        else:
+            for key in self._VEHICLE_ROW_KEYS:
+                widget = self._custom_widgets.get(key)
+                if widget is not None:
+                    self._set_form_row_visible(widget, has_vehicle)
         if not has_vehicle:
             return
         volt, temp = customization.active_row_hints()

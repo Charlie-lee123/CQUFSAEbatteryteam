@@ -3818,6 +3818,11 @@ def check_customization(app: QApplication) -> None:
             for _label_text, _members in dialog._MERGE_GROUPS.values():
                 _holder = dialog._custom_widgets[_members[0]].parentWidget()
                 assert _holder is not None, f"合并行「{_label_text}」没有字段容器"
+                # ⚠️ 有的合并行会按当前车辆状态**整行隐藏**（「电压/温度数据行数」
+                #    没选车时就藏，见 _sync_row_hint_widgets）——隐藏行的几何没有
+                #    意义（实测左缘量到 24），跳过不判。
+                if not _holder.isVisibleTo(dialog):
+                    continue
                 assert left_x(_holder) == _common_x, \
                     f"合并行「{_label_text}」的容器没贴到字段竖线: " \
                     f"{left_x(_holder)} vs {_common_x}"
@@ -3847,10 +3852,16 @@ def check_customization(app: QApplication) -> None:
                 _last_right = (_last.mapTo(_holder, QPoint(0, 0)).x()
                                + _last.width())
                 _slack = _holder.width() - _last_right
-                assert _slack > max(40, _holder.width() // 5), \
+                # 「余量必须归到末尾 stretch」是防"控件被顶到两端"的判据；但合并行
+                # 自己也可能**把字段列正好撑满**（2026-11-27「主题 + 界面材质」合并
+                # 后在面板最小宽度下 152+10+58+10+152 恰好等于列宽 382），那时余量
+                # 必然是 0。所以：只要没溢出、且上面 max(gap)≤16 已过，就放行。
+                _self_filled = _holder.sizeHint().width() >= _holder.width() - 40
+                assert _slack >= 0 and (
+                    _slack > max(40, _holder.width() // 5) or _self_filled), \
                     (f"合并行「{_label_text}」余量没归到末尾 stretch："
                      f"末控件右缘={_last_right} / 容器宽={_holder.width()} / "
-                     f"余量={_slack}")
+                     f"余量={_slack} / sizeHint={_holder.sizeHint().width()}")
 
             # 6a-1) 外观区那三只下拉框**同宽且左右缘都对齐**（用户 2026-11-21：
             #     「请把框的宽度缩小，而且要对齐」）。以前主题/界面材质是 FIELD_W、
@@ -3862,8 +3873,16 @@ def check_customization(app: QApplication) -> None:
             for name, w in appear:
                 assert w.width() == COMBO_W, \
                     f"{name}下拉框宽 {w.width()} ≠ 统一宽度 {COMBO_W}"
-            rights = {left_x(w) + w.width() for _, w in appear}
-            assert len(rights) == 1, f"三只下拉框右缘不齐：{rights}"
+            # 2026-11-27「这些都可以把两行弄在一行」：界面材质已紧跟主题排在**同一
+            # 行**，它的右缘天然不再与主题/开屏动画对齐（那是旧版式）。现在只要求
+            # 各自独占一行的「主题」「开屏动画」右缘齐；界面材质改钉"排在主题右边"。
+            rights = {left_x(dialog.cmb_theme) + dialog.cmb_theme.width(),
+                      left_x(dialog.cmb_splash) + dialog.cmb_splash.width()}
+            assert len(rights) == 1, f"主题/开屏动画下拉框右缘不齐：{rights}"
+            _theme_right = left_x(dialog.cmb_theme) + dialog.cmb_theme.width()
+            assert left_x(dialog.cmb_material) > _theme_right, \
+                (f"界面材质没有排到主题右边（应同属一行）："
+                 f"{left_x(dialog.cmb_material)} vs {_theme_right}")
             # 材质效果那一行（滑杆 + 数值；旧名「材质强度」，用户 2026-11-27 改名）
             # **左缘**与下拉框对齐，但整行单独一档 GLASS_ROW_W=176 —— 用户
             # 2026-11-26：「材质强度的长条可以长一点，和之前一样」。下拉框统一
@@ -3908,11 +3927,13 @@ def check_customization(app: QApplication) -> None:
             assert _soc_opts == ["本地", "主控"], f"SOC 来源文案：{_soc_opts}"
 
             # 6a-1d) 2026-11-27「这些都归纳为个性化」：主题 / 界面材质 / 材质效果 /
-            # 开屏动画 / 动画文件 / 动画帧率 六项归到同一个「个性化」分组。标题走
-            # _section_header（横线 + groupCaption），组内六项必须连续；原「动画」
+            # 开屏动画 / 动画文件 / 动画帧率 归到同一个「个性化」分组。标题走
+            # _section_header（横线 + groupCaption），组内必须连续；原「动画」
             # 组因 anim_fps 提前生成、没有成员，不再插标题。
             # ⚠️ 同日追加「界面材质和材质强度应该对调，材质强度改成材质效果」：
             #    组内顺序固定为「界面材质 → 材质效果」，标签不再是「材质强度」。
+            # ⚠️ 同日再追加「这些都可以把两行弄在一行」：主题与界面材质并成一行
+            #    （行标签「主题」、界面材质降为容器内小字），故这里从六项变**五行**。
             from PySide6.QtWidgets import QFormLayout as _FormLayout
             _form = dialog.form
             _rows = []
@@ -3930,8 +3951,7 @@ def check_customization(app: QApplication) -> None:
                        if k == "caption" and t == "个性化"), None)
             assert _i is not None, f"找不到「个性化」分组：{_rows[:24]}"
             _want = [("field", x) for x in
-                     ("主题", "界面材质", "材质效果", "开屏动画", "动画文件",
-                      "动画帧率")]
+                     ("主题", "材质效果", "开屏动画", "动画文件", "动画帧率")]
             assert _rows[_i + 1:_i + 1 + len(_want)] == _want, \
                 ("「个性化」组六项不连续/顺序不对："
                  f"{_rows[_i + 1:_i + 1 + len(_want)]}")
