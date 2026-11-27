@@ -5,7 +5,7 @@
 > 生成于 2026-11-27（AST 实测，非手写推测）。行号随代码演进会漂，**以函数名/常量为准**（`grep -n` 一下比死记行号可靠）。结构性结论（分层、无环、三条数据流的顺序铁律）比行号稳定得多。
 > 分析脚本与原始数据在 `_check/_arch_ast.py`、`_check/_arch_graph.py`、`_check/_arch_slow.py`（`_check/` 不入库，脚本丢了可照本文描述重写）。
 >
-> **一句话结论**：这是一个「严格单向分层 + 单一入口汇聚」的项目，**没有循环 import**。绝大多数改动都能用「只动 1~2 个文件 + 跑 2~4 条 check（`selftest.py --only`）+ 不打包」完成。真正的坑不在依赖结构，而在 **① 子集跑红多半是「跨 check 状态依赖」而非产品 bug**、**② `_emit_block` 的三条下游吃三个不同版本文本**。
+> **一句话结论**：这是一个「严格单向分层 + 单一入口汇聚」的项目，**没有循环 import**。绝大多数改动都能用「只动 1~2 个文件 + 跑 2~4 条 check（`selftest.py --only`）+ 不打包」完成。真正的坑不在依赖结构，而在 **① 子集跑红多半是「跨 check 状态依赖」而非产品 bug**、**② `_emit_block` 的三条下游吃三个不同版本文本**、**③ `QTimer.singleShot` 捕获控件不带 context 会在宿主析构后打 traceback**（§7 第 4 条）。
 
 ---
 
@@ -554,7 +554,7 @@ QT_QPA_PLATFORM=windows .venv/Scripts/python.exe selftest.py --only "显示行�
 
 ---
 
-## 7. 最反直觉的 3 件事
+## 7. 最反直觉的 4 件事
 
 ### ① `selftest.py` 能跑子集（`--only`），但子集**一条前提都不少**，而且 check 之间**有状态依赖**
 
@@ -577,6 +577,23 @@ QT_QPA_PLATFORM=windows .venv/Scripts/python.exe selftest.py --only "显示行�
 ### ③ `ui_highlight` 的 `VOLT_HEADER_RE` / `TEMP_HEADER_RE` / `BMS_ERROR_RE` 是**"活代理"对象**，不是 `re.Pattern`
 
 `ui_highlight.py:54-93` 的 `_LivePattern` 每次 `match/finditer` 都去问当前协议（`rx_protocol`）。原因写在 `:48-52`：`main_window` 在**模块 import 时**就把 `VOLT_HEADER_RE` 这个名字绑走了（用它判 `new_round`），如果换成 `re.compile` 的结果对象，协议热切换后 `main_window` 那边永远是旧值。**改协议功能时不能"顺手把它换成普通正则"**，否则热切换静默失效。
+
+### ④ `QTimer.singleShot` 捕获控件时**必须带 context 参数**，否则宿主析构后回调打到已删对象
+
+三种写法的实测差别（2026-11-27，PySide6 6.12.0，宿主 `shiboken6.delete` 掉之后看回调是否抛）：
+
+| 写法 | 结论 |
+|---|---|
+| `singleShot(ms, lambda: w.setText(...))` 闭包捕获 | ⛔ **会抛** `already deleted` |
+| `singleShot(ms, lambda b=w: b.setText(...))` 默认参数捕获 | ⛔ **会抛**，和闭包一样 |
+| `singleShot(ms, w, callable)` **带 context** | ✅ 宿主一删就自动掐断，不抛 |
+| `singleShot(ms, w.bound_method)` 绑定方法 | ✅ 安全（同 context，PySide 自动关联） |
+
+**正确先例在 `main_window.py:5380`**（`QTimer.singleShot(1500, self, self._start_snap_worker)`），注释写明「无 context 的单发定时器不会随窗口销毁而取消……进程静默死掉（selftest 退出码 127 的根因）」。
+
+为什么这条反直觉：**抛异常不等于崩溃**。默认 `sys.excepthook` 只打印一段 traceback 然后**程序继续** —— 功能不受影响，但控制台噪音会掩盖真问题，而且这种写法会一直被复制。修它不是为了防崩，是为了防扩散。
+
+⚠️ 造复现时有个坑：`QDialog.close()` **默认只 hide**（没设 `WA_DeleteOnClose`），要 `deleteLater()` + `sendPostedEvents(None, QEvent.Type.DeferredDelete)` 才真删；或者直接 `shiboken6.delete(obj)`。只 `close() + processEvents()` 会得到「宿主还活着」的假结论（2026-11-27 踩过）。
 
 ---
 
