@@ -2555,10 +2555,18 @@ def check_tooltip_and_buttons(app: QApplication) -> None:
             # 双向核对：写死的清单必须与产品 `_MERGE_GROUPS` 的声明一致 ——
             # 产品侧改了成员却忘了改自测，这里给出明确的一句提示（比等到
             # 下面 `findChildren` 数量不符再去猜原因快得多）。
+            # ⚠️ 前提：`_MERGE_GROUPS` 里的**行标签唯一**（同标签只允许出现一次）。
+            #    下面按标签找声明，若有两条同标签，`next(...)` 会取到第一个从而
+            #    可能误判。当前 8 组的标签两两不同（2026-11-27 与 merge-clock-taskbar
+            #    核对确认），以后新增合并组时别用重复的行标签。
             for _label_text, _keys, _cls in _merged:
-                _declared = next((members for label, members
-                                  in dialog._MERGE_GROUPS.values()
-                                  if label == _label_text), None)
+                _matches = [members for label, members
+                            in dialog._MERGE_GROUPS.values()
+                            if label == _label_text]
+                assert len(_matches) == 1, \
+                    (f"合并行「{_label_text}」在 _MERGE_GROUPS 里出现 "
+                     f"{len(_matches)} 次（行标签必须唯一）")
+                _declared = _matches[0]
                 assert _declared == _keys, \
                     (f"合并行「{_label_text}」的成员与 ui_settings._MERGE_GROUPS "
                      f"不一致：自测写死 {_keys}，产品声明 {_declared}")
@@ -3804,14 +3812,28 @@ def check_customization(app: QApplication) -> None:
                 labels = [c for c in dialog.findChildren(_QLabel)
                           if c.text() == spec["label"]]
                 if not labels and spec["key"] in dialog._MERGE_PREFIXES:
-                    # 行合并后，这三个开关的独立行标签收进字段区变成小字
-                    # （年/月/日）。改用登记表里**真实上屏**的那枚小标签继续验
+                    # 行合并后，这几个开关的独立行标签收进字段区变成小字
+                    # （年/月/日/时钟）。改用登记表里**真实上屏**的那枚小标签继续验
                     # "点文字不转发"，并钉住它的文案，不降低断言强度。
                     _small = dialog._custom_rows[spec["key"]][0]
                     assert _small.text() == dialog._MERGE_PREFIXES[spec["key"]], \
                         f"合并键 {spec['key']} 的小字不对: {_small.text()!r}"
                     labels = [c for c in dialog.findChildren(_QLabel) if c is _small]
-                assert labels, f"找不到 {spec['label']} 的行标签"
+                if not labels:
+                    # ⚠️ 这里会给出一条**能直接定位原因**的提示（2026-11-27 实测）：
+                    #    合并行成员若被从 `_MERGE_PREFIXES` 里删掉，产品会退回用
+                    #    注册表原行标签（如「时钟显示年月日」）当小字 —— 此时按
+                    #    原标签查 QLabel 查不到，落到这条断言。光说"找不到行标签"
+                    #    会让人以为是布局坏了，实际是登记表少了一条。
+                    _merged_keys = {k for _m in dialog._MERGE_GROUPS.values()
+                                    for k in _m}
+                    _hint = ""
+                    if spec["key"] in _merged_keys and \
+                            spec["key"] not in dialog._MERGE_PREFIXES:
+                        _hint = ("（它是合并行成员，但 _MERGE_PREFIXES 缺这一条 ——"
+                                 " 产品会退回用原行标签当小字，所以按原标签查不到；"
+                                 " 把该 key 补回 _MERGE_PREFIXES 即可）")
+                    assert labels, f"找不到 {spec['label']} 的行标签{_hint}"
                 label = labels[0]
                 was = toggle.isChecked()
                 # 行标签**不该**再转发（2026-10-12 用户点名："要点击拨动开关内的
