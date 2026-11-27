@@ -29,9 +29,10 @@ BYTESIZE_CHOICES = {"5": 5, "6": 6, "7": 7, "8": 8}
 PARITY_CHOICES = {"none": serial.PARITY_NONE, "odd": serial.PARITY_ODD,
                   "even": serial.PARITY_EVEN, "mark": serial.PARITY_MARK,
                   "space": serial.PARITY_SPACE}
-# 下拉里显示的英文名（用户 2026-10-23：把「奇 / 偶 / 标记 / 空格」改成英文）
-PARITY_LABELS = {"none": "None", "odd": "Odd", "even": "Even",
-                 "mark": "Mark", "space": "Space"}
+# 下拉里显示的英文名（用户 2026-10-23：把「奇 / 偶 / 标记 / 空格」改成英文；
+# 用户 2026-11-27：首字母改成小写，即 none / odd / even / mark / space）
+PARITY_LABELS = {"none": "none", "odd": "odd", "even": "even",
+                 "mark": "mark", "space": "space"}
 # 状态栏里拼串口参数用的字母写法，串口圈约定是 8N1 这种，不写中文
 PARITY_LETTERS = {"none": "N", "odd": "O", "even": "E", "mark": "M", "space": "S"}
 # 老配置里存过的中文键（还有更老的「无」）。只在读取时用。

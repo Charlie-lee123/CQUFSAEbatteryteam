@@ -3690,6 +3690,43 @@ def check_customization(app: QApplication) -> None:
             for spec in customization.specs():
                 assert spec["key"] in dialog._custom_widgets, \
                     f"设置面板没有为 {spec['key']} 生成控件"
+            # 数字框宽度分两档（用户 2026-11-27「输入框太大了，可以适当缩小」）：
+            # 无 suffix 的短数字（0~64，最长两位）走 SPIN_COMPACT_W；
+            # 有 suffix 的（mV / ℃ / pt / Hz）必须让按实测文本撑宽的那档算，
+            # ⛔ 压窄会截断单位（"10000 mV" 曾截成 "10000 m"）。
+            # ⚠️ 峰值只断言"关系"不写死具体像素：字体/DPI 变了仍成立。
+            from ui_settings import SPIN_COMPACT_W as _compact_w
+            from ui_controls import ChevronSpinBox as _Spin
+            for spec in customization.specs():
+                _w = dialog._custom_widgets.get(spec["key"])
+                if not isinstance(_w, _Spin):
+                    continue
+                _suffix = spec.get("suffix") or ""
+                _label = f"{spec['key']}（suffix={_suffix!r}）"
+                if not _suffix:
+                    assert _w.width() == _compact_w, \
+                        (f"无 suffix 的数字框没走窄基准：{_label} "
+                         f"实际 {_w.width()} / 应为 {_compact_w}")
+                    # 最坏文本（最大值，一般是两位）连箭头一起必须放得下
+                    _fm = _w.fontMetrics()
+                    _need = (_fm.horizontalAdvance(str(spec["maximum"]))
+                             + _Spin.ARROW_W + _Spin.TEXT_MARGIN[0]
+                             + _Spin.TEXT_MARGIN[2])
+                    assert _need <= _compact_w, \
+                        (f"窄基准放不下最坏文本：{_label} 需要 {_need} "
+                         f"> {_compact_w}")
+                else:
+                    # 带单位的：宽度必须容得下"最大值 + 单位"，否则会截断
+                    _fm = _w.fontMetrics()
+                    _need = (_fm.horizontalAdvance(
+                                 f"{spec['maximum']}{_suffix}")
+                             + _Spin.ARROW_W + _Spin.TEXT_MARGIN[0]
+                             + _Spin.TEXT_MARGIN[2])
+                    assert _w.width() >= _need, \
+                        (f"带 suffix 的数字框被压窄后截断单位：{_label} "
+                         f"宽 {_w.width()} < 需要 {_need}")
+                    assert _w.width() >= _compact_w, \
+                        f"带 suffix 的框不该比窄基准还窄：{_label}"
             spin = dialog._custom_widgets["pause_snap_lines"]
             spin.setValue(9)
             changes = dialog.custom_values()
@@ -4156,7 +4193,7 @@ def check_config_parity_clock(app: QApplication) -> None:
     assert list(PARITY_LABELS) == list(PARITY_CHOICES), "显示名与存储键没一一对应"
     assert all(text.isascii() for text in PARITY_LABELS.values()), \
         f"下拉里还有中文：{PARITY_LABELS}"
-    assert PARITY_LABELS["odd"] == "Odd" and PARITY_LABELS["space"] == "Space"
+    assert PARITY_LABELS["odd"] == "odd" and PARITY_LABELS["space"] == "space"
     # 老配置存的是中文键 —— 必须能归一，否则升级后校验位全被打回 none
     assert parity_key("奇") == "odd" and parity_key("空格") == "space"
     assert parity_key("无") == "none" and parity_key("none") == "none"
@@ -4198,7 +4235,7 @@ def check_config_parity_clock(app: QApplication) -> None:
             "展开发送区没有把高度从接收区还回来"
 
         items = [window.cmb_parity.itemText(i) for i in range(window.cmb_parity.count())]
-        assert items == ["None", "Odd", "Even", "Mark", "Space"], items
+        assert items == ["none", "odd", "even", "mark", "space"], items
 
         # 没存过 -> 默认 none
         settings.remove("parity")
@@ -4217,13 +4254,13 @@ def check_config_parity_clock(app: QApplication) -> None:
             assert migrated.cmb_parity.currentData() == "none", migrated.cmb_parity.currentData()
         finally:
             migrated.close()
-        # 老版本存的是中文「偶」→ 归一成 even，下拉显示 Even
+        # 老版本存的是中文「偶」→ 归一成 even，下拉显示 even
         settings.setValue("parity", "偶")
         settings.sync()
         kept = make_window()
         try:
             assert kept.cmb_parity.currentData() == "even", kept.cmb_parity.currentData()
-            assert kept.cmb_parity.currentText() == "Even", kept.cmb_parity.currentText()
+            assert kept.cmb_parity.currentText() == "even", kept.cmb_parity.currentText()
         finally:
             kept.close()
 

@@ -54,6 +54,15 @@ THEME_MODES = (("跟随系统", "system"), ("浅色", "light"), ("深色", "dark
 # 108 → 100：一位数的"暂停定位行数/行数（最大化）/温度下限"等框不再空一大截
 # （用户点名"这个框也大了"）。
 SPIN_COLUMN_W = 100
+# 无单位的短数字框（电压/温度数据行数、模组个数、暂停定位行数…）：
+# 这些值最大 64、最长两位数字，100 的按 suffix 撑宽基准对它们明显过宽
+# （用户 2026-11-27：「输入框太大了，可以适当缩小」）。
+# ⚠️ 只给**无 suffix** 的 spec 用；有 suffix 的（mV / ℃ / pt / Hz）必须让
+#    下面那套"按实测文本撑宽"的逻辑算，压窄会截断单位。
+# 定宽依据（2026-11-27 实测，本机 ui_font(12.5) 面板）：两位数字 16px +
+# ARROW_W 22 + TEXT_MARGIN 左右 10+6 = 54，sizeHint 实测 60；
+# 74 = 60 + 14 余量（给高 DPI / 字体回退留缓冲），比 100 窄 26%。
+SPIN_COMPACT_W = 74
 # 按钮开关排几列。三列是为了"一屏放完"：
 # 两列时最后一行会被滚动区截掉半颗开关，看着像画坏了。
 BUTTON_COLUMNS = 4
@@ -1231,7 +1240,9 @@ class SettingsDialog(QDialog):
             spin.setValue(int(customization.get(row_key) or 0))
             if spec["tip"]:
                 spin.setToolTip(spec["tip"])
-            spin.setFixedWidth(SPIN_COLUMN_W)
+            # 短数字框（0~64，最长两位）走窄基准；这一行原先是 SPIN_COLUMN_W(100)，
+            # 用户 2026-11-27 截图点名"输入框太大了"。
+            spin.setFixedWidth(SPIN_COMPACT_W)
             # connect 在 setValue 之后 —— 建面板时那一次赋值不该被当成"用户改了"
             # （与 _build_custom_section 的 else 分支同一口径）。
             spin.valueChanged.connect(
@@ -2934,6 +2945,10 @@ class SettingsDialog(QDialog):
         # 2026-11-01 两轮点名"mV 的 V 没显示完全"）：固定 100 没把 suffix +
         # 右侧箭头(22) + 行内 textMargins(10+6) 算进去，"4500 mV" 必截。
         # 按实测自动定宽，字体/缩放变了也不会再截。
+        # ⚠️ 这套撑宽只服务于**有 suffix** 的框：无 suffix 的短数字框（0~64，
+        #    最长两位）走 SPIN_COMPACT_W（见下方 setFixedWidth 的分流），
+        #    否则会被 "10000 mV" 撑出来的 140 一起带大（用户 2026-11-27
+        #    「输入框太大了」）。
         _spin_w = SPIN_COLUMN_W
         _spin_fm = QFontMetrics(self.font())
         for spec in specs:
@@ -3016,7 +3031,10 @@ class SettingsDialog(QDialog):
                 # 一列数字框**共用一个宽度** —— 宽窄不一最显乱（"7" 与
                 # "10000 mV" 各占一块，右边缘参差不齐）。宽度按上面实测的
                 # _spin_w 取，保证最长的 "10000 mV" 连 suffix 一起完整显示。
-                spin.setFixedWidth(_spin_w)
+                # 无 suffix 的短数字（0~64，最长两位）用窄基准：
+                # "10000 mV" 撑出来的 140 对 "2" 是六成空白（用户 2026-11-27
+                # 「输入框太大了，可以适当缩小」）。
+                spin.setFixedWidth(_spin_w if spec.get("suffix") else SPIN_COMPACT_W)
                 if spec["key"] in self._VEHICLE_ROW_KEYS:
                     # 这两个行数是**逐车**的（用户 2026-11-13）：改了立刻写进当前
                     # 那台车，不等「确定」（与逐模组行同一个口径，见

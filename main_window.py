@@ -2269,7 +2269,8 @@ class MainWindow(QMainWindow):
 
         self.cmb_parity = ChevronComboBox()
         self.cmb_parity.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        # 显示英文名（None / Odd / Even / Mark / Space），存储值仍是键
+        # 显示英文名（none / odd / even / mark / space，用户 2026-11-27 要求
+        # 首字母小写；文案的唯一来源是 serial_io.PARITY_LABELS），存储值仍是键
         for _key, _label in PARITY_LABELS.items():
             self.cmb_parity.addItem(_label, _key)
 
