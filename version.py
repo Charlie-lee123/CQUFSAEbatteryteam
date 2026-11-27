@@ -33,9 +33,13 @@ SETUP_ASSET_SUFFIX = ".exe"
 #    哈希"时的兜底校验拿旧哈希去比新包，直接把更新卡死。发布完由脚本写回。
 # v3.0（用户 2026-11-27 定案：本轮改动仍算 3.0，不另立 3.1）→ 发布脚本在发
 # Release 时写回本版真实哈希，在那之前按规矩留空。
-LATEST_EXE_SHA256 = ""
+LATEST_EXE_SHA256 = (
+    "52781572719b5f63b7a5b6338f607329c2b10a5c3a06c74fa3d7edb9257638f2"
+)
 
 # 当前 Release 里**安装包**的 SHA256（同上，由发布脚本写回）。
 # 空串 = 尚未记录（同上：更新会明确报错而不是静默跳过）。
-LATEST_SETUP_SHA256 = ""
+LATEST_SETUP_SHA256 = (
+    "48613feecc51cd8fa0ea904e66ded4b18b280249a919ea0f090680417de4fbe5"
+)
 
