@@ -1,5 +1,16 @@
 # -*- coding: utf-8 -*-
-"""只跑 selftest 里**与设置面板/开关相关**的几条用例。
+"""⛔ 已被 `selftest.py --only` 取代，勿用于新验证；本文件不随 main() 同步。
+
+    保留原因只有一条：它是唯一记录了「当年串口原生崩溃 127」那段历史的文件
+    （见下面"为什么需要它"）。那段考古有价值，删了就没地方查了。
+    `docs/architecture.md` 也已标注它废弃。
+
+    要用子集请用：``selftest.py --only <关键词>`` / ``--changed``。
+    那个是同一份 `main()`（保护路径不会随改动失同步），本文件是**手抄副本**，
+    `main()` 以后每改一次（加锁、加钉值、改还原顺序……）这里都**不会**跟着变 ——
+    哪天拿它当"证据"，验的是过期的隔离逻辑。
+
+只跑 selftest 里**与设置面板/开关相关**的几条用例。
 
 为什么需要它：完整 `selftest.py` 在本机跑到串口那几条时会原生崩溃（退出码 127，
 无 Python traceback，跑两次崩的位置还不一样：11 条 / 4 条）。那是串口/原生层的
@@ -7,7 +18,7 @@
 本脚本照抄 `selftest.main()` 的**全套隔离**（QSettings 快照、网格清零、取消选车、
 接收历史与会话库指到临时目录），只把 CHECKS 换成指定的几条 —— 证据等价。
 
-用法：QT_QPA_PLATFORM=windows .venv\\Scripts\\python.exe -u devtools\\_selftest_subset.py
+用法（历史）：QT_QPA_PLATFORM=windows .venv\\Scripts\\python.exe -u devtools\\_selftest_subset.py
 """
 import sys
 import tempfile
