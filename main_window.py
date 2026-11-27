@@ -23,6 +23,12 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
+# ``shiboken6`` 是 PySide6 的 C++ 绑定层，用来判断包装的 C++ 对象是否还活着。
+# 目前只在一个地方需要：``_verify_fullscreen`` 被 ``QTimer.singleShot`` 的
+# lambda 延迟调用时，窗口可能已经析构 —— 那时访问 ``self`` 的任何属性都会抛
+# ``RuntimeError: Internal C++ object (MainWindow) already deleted``。
+import shiboken6
+
 # 建链挪进 SerialWorker 之后，界面层不再直接调 serial.* 了；这个 import 留着
 # 是因为串口异常的**语义**仍来自这个模块（后续在界面层写 except serial.SerialException
 # 时不必再想起来补 import）。
@@ -5074,6 +5080,19 @@ class MainWindow(QMainWindow):
         `_want_fullscreen` 置回真的那一瞬间抢跑，把窗口拽回全屏
         （自测「普通态没落下去」就是这么假挂的）。直接调用（token=None）不受限。
         """
+        # ⛔ 最外层先判"自己还活着"：这个方法会被 ``_schedule_verify`` 排进
+        #    ``QTimer.singleShot``，而窗口可能在定时器到点之前就析构掉了
+        #    （自测里每条 check 跑完就 close + deleteLater，延迟核对于是落到
+        #    一个已删除的 C++ 对象上）。此时访问 ``self`` 的**任何**属性 ——
+        #    包括下面第一行 ``self._keep_taskbar()`` 和 token 比较里的
+        #    ``self._verify_token`` —— 都会抛
+        #    ``RuntimeError: Internal C++ object (MainWindow) already deleted``，
+        #    表现为启动日志里一段没人认领的 traceback。
+        #    ⛔ 必须放在**最前面**，包括 token 校验之前：token 校验本身也要读
+        #       ``self``，挡不住这个崩溃。`except RuntimeError` 也能兜住，但那
+        #       要包住整个函数体；一次判断更省也更好读。
+        if not shiboken6.Shiboken.isValid(self):
+            return
         # ⛔ 保留任务栏模式：没有任何"该全屏"的核对可做（最大化态已铺满工作区），
         #    显式门禁，别依赖 _want_fullscreen（拨开关时会置真）。
         if self._keep_taskbar():
