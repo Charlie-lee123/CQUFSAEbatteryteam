@@ -5,7 +5,14 @@
 > 生成于 2026-11-27（AST 实测，非手写推测）。行号随代码演进会漂，**以函数名/常量为准**（`grep -n` 一下比死记行号可靠）。结构性结论（分层、无环、三条数据流的顺序铁律）比行号稳定得多。
 > 分析脚本与原始数据在 `_check/_arch_ast.py`、`_check/_arch_graph.py`、`_check/_arch_slow.py`（`_check/` 不入库，脚本丢了可照本文描述重写）。
 >
-> **一句话结论**：这是一个「严格单向分层 + 单一入口汇聚」的项目，**没有循环 import**。绝大多数改动都能用「只动 1~2 个文件 + 跑 2~4 条 check（`selftest.py --only`）+ 不打包」完成。真正的坑不在依赖结构，而在 **① 子集跑红多半是「跨 check 状态依赖」而非产品 bug**、**② `_emit_block` 的三条下游吃三个不同版本文本**、**③ `QTimer.singleShot` 捕获控件不带 context 会在宿主析构后打 traceback**（§7 第 4 条）。
+> **一句话结论**：这是一个「严格单向分层 + 单一入口汇聚」的项目，**没有循环 import** ——
+> 而且这一点现在由 `selftest.py` 第 42 条 `check_layer_isolation` **每次跑自测时静态强制**，
+> 一旦有人写出环或向上依赖就立刻报错（负向验证过，见 §1.1）。
+> 绝大多数改动都能用「只动 1~2 个文件 + `selftest.py --changed` 自动算出该跑哪几条 + 不打包」完成 ——
+> `--changed` 已做到**函数级**：改 `_flash` 那 1 行只会跑 0 条，不再带出同文件里无关的 5 条。
+> 真正的坑不在依赖结构，而在 **① 子集跑红多半是「跨 check 状态依赖」而非产品 bug**、
+> **② `_emit_block` 的三条下游吃三个不同版本文本**、
+> **③ `QTimer.singleShot` 的 `ms=0` 是特例：绑定方法也不安全，必须带显式 context**（§7 第 4 条）。
 
 ---
 
@@ -13,12 +20,22 @@
 
 ### 1.1 结论先行
 
+> ✅ 这份结论现在是**机器强制的**：`selftest.py` 第 42 条 `check_layer_isolation`
+> 每次全量/子集都会静态重算 import 图与层号，一旦出现环或向上依赖立刻报错。
+> 负向验证过：给 `app_log`(L0) 注入 `import main_window`(L6)，它立刻报出 5 条环路。
+> 所以下面这张表不再是"某次实测的快照"，而是**持续成立的约束**。
+
 | 问题 | 结论 | 证据 |
 |---|---|---|
-| 有反向依赖（底层 import 上层）吗？ | **没有**。39 个模块的完整 import 图（含函数内延迟 import）是 DAG | `_check/_arch_graph.py` 输出 `环 = 无环` |
+| 有反向依赖（底层 import 上层）吗？ | **没有**。39 个模块的完整 import 图（含函数内延迟 import）是 DAG | `check_layer_isolation` ① ② |
 | 有循环 import 吗？ | **没有**，一个都没有 | 同上，DFS 三色标记扫全图 |
-| `capability_api` 真的零 Qt 吗？ | **是**，顶层只 import `rx_export/soc_ekf/soc_est/soc_feed/version`；实测 `import capability_api` 后 `PySide6.QtWidgets not in sys.modules` | `capability_api.py:1-25`；实测输出 `qt_loaded=False` |
+| `capability_api` 真的零 Qt 吗？ | **是**，顶层只 import `rx_export/soc_ekf/soc_est/soc_feed/version`；`PySide6` 只在**函数内延迟 import** 并优雅降级（`:6-8` 有专门注释） | `check_layer_isolation` ③（走 AST 只看顶层） |
 | 哪些模块能在无 GUI 环境裸 import？ | 见下表 ①②③ | 实测 19 个模块逐个 `import` 全部 OK |
+
+⛔ **`capability_api` 那条判据我写错过一次**：第一版用 `"PySide6" not in 全文`，
+被文件头注释和 docstring 里的「PySide6」字样误判成 FAIL。判"有没有 import"
+**必须走 AST** 看 `isImport`/`isImportFrom` 且只遍历 `tree.body`（顶层），
+不能扫文本 —— 这文件刻意在函数内延迟 import Qt，文本里出现它完全正常。
 
 ### 1.2 实测层级（L0 = 最底层，无本地依赖）
 
@@ -474,39 +491,57 @@ MainWindow._schedule_place_soc() → _place_soc_settled  main_window.py:9608 / :
 
 （`capability_api` 的契约就写在 `capability_api.py:9-11`：顶层禁止 `QtWidgets/main_window/ui_*/updater`，改它之后**必须**跑这条断言。）
 
-### 6.2 ✅ `selftest.py` **已经支持** `--only / --skip / --changed / --list`（2026-11-27 新增，工作区未提交）
+### 6.2 ✅ `selftest.py` 支持 `--only / --skip / --changed / --list`，且 `--changed` 已到**函数级**
 
-**核实结论（推翻本文早前版本）**：当前工作区 `selftest.py` 比 HEAD 多 360 行（8691 行），新增了 `_Selection:8253` + `_parse_args:8271` + `_match_indexes:8317` + `_resolve_selection:8387`，`main():8479` 第一行就 `selection = _parse_args(sys.argv[1:])`（`:8480`），`QApplication([sys.argv[0], *selection.rest])`（`:8496`）只把**没被吃掉的**参数交给 Qt。用法常量在 `_SELFTEST_USAGE:8179-8191`。
+> 2026-11-27 定案。用户原话：「将软件的各个部分隔离开来，改动只修改对应部分内容……
+> 根本没有改动的你自测它干嘛。」
+
+**为什么必须做到函数级**：文件级映射粒度太粗。改 `ui_settings.py` 里
+`McpManualDialog._flash` 的 1 行（纯 UI 反馈定时器），文件级会带出「定制功能注册表 /
+启动时最大化 / 默认折叠发送区 / 车辆与逐模组配置 / 连接方式切换」**5 条**，
+跑下来没有一条跟那一行有关系。函数级路由把这种情况压到 **0 条**。
 
 ```bash
-# 精确跑两条（中文子串匹配，大小写不敏感；也可用序号 1-41）
-QT_QPA_PLATFORM=windows .venv/Scripts/python.exe selftest.py --only "显示行数（每模组 N 排）" --only "收包合并与暂停继续"
-# 逗号写法等价
+# 最常用：改完不知道跑什么
+QT_QPA_PLATFORM=windows .venv/Scripts/python.exe selftest.py --changed
+# 精确两条（中文子串，大小写不敏感；也可用序号 1-42）
+... selftest.py --only "显示行数（每模组 N 排）" --only "收包合并与暂停继续"
 ... selftest.py --only "显示行数,收包合并"
 # 全量排除最慢那条
 ... selftest.py --skip "全屏展开与复制全部"
-# 按 git 工作区改动自动推（唯一推荐给"改完不知道跑什么"的场景）
-... selftest.py --changed
 # 只列名称（不构造 QApplication，0 成本）
 .venv/Scripts/python.exe selftest.py --list
 ```
 
-**`--changed` 的实现（可直接当"改动半径表"的机器版用）**：
-- `_CHANGED_MAP:8203-8244` 是**文件→check 关键词**的显式映射（33 个文件，覆盖全部模块）。
-- `_FULL_RUN_FILES:8198` = `("main_window.py", "main.py", "selftest.py")` —— 改这三个**直接回落全量**（编排层影响面太大，刻意不猜）。
-- 取改动文件用 `git diff --name-only HEAD` + `git status --porcelain` 并集（`_git_changed_files:8329`），**含未跟踪文件**。
-- 未映射的文件只打印"忽略"，不报错；映射关键词一个都没匹配上则回落全量（`:8431-8433`）。
-- ⛔ **前提照样全钉**：`:8595-8596` 明确注释「只把**循环的输入**换成选集结果；上面那几十行前提一条不少地照跑」——选集**不跳过任何隔离**，所以子集不会污染用户配置。这是它比自写 runner 更安全的地方。
+**`--changed` 两段式路由（先函数级，判不了才回落文件级）**：
 
-**关键副作用（必须知道）**：
-- ⚠️ 每条 check 之后仍执行 `_close_top_windows(app, wait_ms=220)` + `_reset_pinned_state`（`:8613-8614`），**子集里的每条照样付 0.22s**。
-- ⚠️ `:8610-8612` 注释明写「这里**不**顺手重钉其它前提（试过，会打断依赖前一条 check 状态的用例：高亮开关 / 车号那几条会假红）」。→ **子集跑红的第一嫌疑是"跨 check 状态依赖"，不是产品代码**。遇到过就补上被跳过的那条一起跑。
-- ⚠️ `--only` 与 `--skip` 同时给：先 only 再 skip（`:8435-8456`）。选集为空 / 关键词全没匹配 → **退出码 2**（不会静默跑零条）。
+| 层 | 依据 | 何时生效 |
+|---|---|---|
+| ① 函数级 | `git diff -U0` 的 hunk 新侧行号 → AST `end_lineno` 反查最内层函数 → 查 `_FUNC_CHECKS` | 改动**全部**落在已声明的函数里 |
+| ② 文件级 | `_CHANGED_MAP`（文件 → check 关键词） | 有函数未声明 / 落不到函数（模块级常量、整个文件新增） |
+| ③ 全量 | `_FULL_RUN_FILES = ("main_window.py", "main.py", "selftest.py")` | 改这三个编排队列文件 |
 
-**旧方案已废弃**：`devtools/_selftest_subset.py`（11-12 写的，照抄 main 全套隔离 + `WANT` 元组）现在**不必再用**；`--only` 功能更强且不会因 main 改动而失同步。仓库里已无其它代码引用它。
+**`_FUNC_CHECKS` 的写法铁律**：
+- 只写**该函数改了必须验证的行为**。拿不准就**不写** → 自动回落文件级（宁可多跑，不可漏跑）。
+- 空元组 `()` = 该函数没有任何 check 覆盖它（如纯 UI 文案定时器）。此时 `--changed` 会打印
+  「改动只影响界面反馈文案，无需跑任何 check」并**退出码 0**（不是错误，也不抢锁）。
+  ⛔ 必须是**显式声明**才能得到空集；不写 = 回落文件级。这个区分是整套机制的安全阀。
 
-- **省什么**：41 条 → 2 条，从 ~3-5 分钟降到 ~20s；`--list` 0 成本。
-- **风险**：如上"跨 check 状态依赖"。另外 `--changed` 只认 `_CHANGED_MAP` 里登记的文件 —— **新增模块时必须把文件加进 `_CHANGED_MAP`**（`:8197-8198` 的注释就是这么要求的），否则 `--changed` 会静默漏跑。
+**其它要点**：
+- 取改动文件用 `git diff --name-only HEAD` + `git status --porcelain` 并集（含未跟踪文件）。
+- ⛔ **前提照样全钉**：选集只换**循环的输入**；`_apply_undo_markers` / 全局快照 /
+  单实例锁 / 每条之后的 `_close_top_windows` + `_reset_pinned_state` 一条不少地照跑。
+  这是它比自写 runner 安全的地方。
+- ⚠️ 每条 check 之后固定付 `_close_top_windows(app, wait_ms=220)` 的 0.22s，子集也一样。
+- ⚠️ **子集跑红的第一嫌疑是"跨 check 状态依赖"**，不是产品代码。`_run_checks` 里刻意
+  **不**顺手重钉其它前提（试过，会打断依赖前一条状态的用例：高亮开关、车号那几条会假红）。
+- 选集为空 / 关键词全没匹配 → 退出码 **2**；函数级判出"确实 0 条" → 退出码 **0**。
+
+**新增模块时必须做两件事**：① 加进 `_CHANGED_MAP`（否则 `--changed` 静默漏跑）；
+② 在 `check_layer_isolation` 的 `LAYERS` 里登记层号（见 §1，不登记会报错）。
+
+- **省什么**：42 条 → 0~5 条。纯 UI 回调改动从 ~3-5 分钟降到**不到 1 秒**（连 Qt 都不启动）。
+- **旧方案已废弃**：`devtools/_selftest_subset.py` 已被 `--only` 取代，也加了废弃提示。
 
 ### 6.3 开屏/启动耗时验证必须真平台 + 真实 exe
 
@@ -580,20 +615,46 @@ QT_QPA_PLATFORM=windows .venv/Scripts/python.exe selftest.py --only "显示行�
 
 ### ④ `QTimer.singleShot` 捕获控件时**必须带 context 参数**，否则宿主析构后回调打到已删对象
 
-三种写法的实测差别（2026-11-27，PySide6 6.12.0，宿主 `shiboken6.delete` 掉之后看回调是否抛）：
+实测差别（2026-11-27，PySide6 6.12.0 / Python 3.12.10 / Windows 真平台，
+宿主销毁后看回调是否抛）：
 
-| 写法 | 结论 |
+| 写法 | 宿主删后 |
 |---|---|
 | `singleShot(ms, lambda: w.setText(...))` 闭包捕获 | ⛔ **会抛** `already deleted` |
 | `singleShot(ms, lambda b=w: b.setText(...))` 默认参数捕获 | ⛔ **会抛**，和闭包一样 |
 | `singleShot(ms, w, callable)` **带 context** | ✅ 宿主一删就自动掐断，不抛 |
-| `singleShot(ms, w.bound_method)` 绑定方法 | ✅ 安全（同 context，PySide 自动关联） |
+| `singleShot(150, w.bound_method)` 绑定方法 | ✅ 静默（回调根本没跑） |
+| `singleShot(1, w.bound_method)` 绑定方法 | ✅ 静默 |
+| **`singleShot(0, w.bound_method)`** 绑定方法 | ⛔ **会抛** ← 见下 |
+
+**⛔ 最后一行是最反直觉的一条，也是我先前写错的地方**：我一度据此给全库
+54 处 singleShot 判了「绑定方法自带 receiver，免检」，**那个结论只对 `ms>0` 成立**。
+0ms 的 `QTimerEvent` 在 `singleShot()` 调用瞬间就**已投递进事件队列**，receiver
+登记只撤得回「还没投递」的定时器，撤不回已投递的事件。而带显式 context 的
+`singleShot(0, w, callable)` 连 0ms 也挡得住。
+
+⇒ 判据修正为两条：
+- **`ms > 0`**：绑定方法安全，无需改。
+- **`ms == 0`**：**必须带显式 context**，绑定方法不算防护。
+
+产品里的真实崩点：`ui_settings.py:663 QTimer.singleShot(0, self._refresh_index)`
+（VehicleLibraryDialog 一关就崩在 `_refresh_index → _run_task → _set_status →
+self.lbl_status.setText`）。已在 `54281c5` 修掉。
 
 **正确先例在 `main_window.py:5380`**（`QTimer.singleShot(1500, self, self._start_snap_worker)`），注释写明「无 context 的单发定时器不会随窗口销毁而取消……进程静默死掉（selftest 退出码 127 的根因）」。
 
 为什么这条反直觉：**抛异常不等于崩溃**。默认 `sys.excepthook` 只打印一段 traceback 然后**程序继续** —— 功能不受影响，但控制台噪音会掩盖真问题，而且这种写法会一直被复制。修它不是为了防崩，是为了防扩散。
 
-⚠️ 造复现时有个坑：`QDialog.close()` **默认只 hide**（没设 `WA_DeleteOnClose`），要 `deleteLater()` + `sendPostedEvents(None, QEvent.Type.DeferredDelete)` 才真删；或者直接 `shiboken6.delete(obj)`。只 `close() + processEvents()` 会得到「宿主还活着」的假结论（2026-11-27 踩过）。
+⚠️ 造复现时有两个坑（我都踩过）：
+1. `QDialog.close()` **默认只 hide**（没设 `WA_DeleteOnClose`），要 `deleteLater()` +
+   `sendPostedEvents(None, QEvent.Type.DeferredDelete)` 才真删；或者直接
+   `shiboken6.delete(obj)`。只 `close() + processEvents()` 会得到「宿主还活着」的假结论。
+2. **`parent=` 是一级隐式生命周期**。`McpManualDialog`/`VehicleLibraryDialog` 都是
+   `parent=self`（SettingsDialog 的子对象），设置面板收场 `deleteLater()` 会**连带删掉它们**。
+   判「宿主会不会被删」先看 `parent` 链，比造 `exec()` 便宜得多，也更准。
+
+⛔ 探针自身的坑：`dlg.findChildren(type(dlg))` 用 QDialog 类型找**子控件永远返回空**，
+会让"定时器打到已删按钮"的用例静默变成"不崩"。取按钮要用 `findChildren(InkButton)`。
 
 ---
 
