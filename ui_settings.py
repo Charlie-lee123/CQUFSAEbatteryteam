@@ -4109,10 +4109,26 @@ class SettingsDialog(QDialog):
         self._flash_btn(button, msg)
 
     def _flash_btn(self, button, text: str, ms: int = 3200) -> None:
-        """在按钮上原地显示结果，几秒后复原（和「检查更新」同一套反馈）。"""
+        """在按钮上原地显示结果，几秒后复原（和「检查更新」同一套反馈）。
+
+        ⛔⛔ 必须带 ``context``（第二个实参 = 按钮），不能写成
+           ``singleShot(ms, lambda ...)``：设置面板的收场在
+           ``main_window._on_settings_geometry_done`` 里是
+           ``dialog.close() + dialog.deleteLater()`` —— 面板**会真的析构**。
+           用户在点过这几个按钮之后 2.6~4 秒内关掉面板，定时器到点就落到
+           已删除的 ``InkButton`` 上，抛
+           ``RuntimeError: Internal C++ object (InkButton) already deleted``
+           （实测：控制台一段没人认领的 traceback，进程继续跑）。
+        ⛔ 带 context 后 Qt 会在宿主析构时自动掐断这条单发定时器 —— 已实测
+           A/B：不带 context 崩、带 context 静默不调。
+        ⛔ 这里也**不要**改成「闭包里 try/except RuntimeError」——那只是把异常
+           咽掉，定时器到点仍会白跑一遍注定失败的回调；带 context 是让它
+           **根本不发**。同类的 ``_flash_button`` 用的是 try 版，因为它的宿主
+           是常驻对话框（不析构），两处场景不同，别互相「统一」。
+        """
         original = button.text()
         button.setText(text)
-        QTimer.singleShot(ms, lambda b=button, o=original: b.setText(o))
+        QTimer.singleShot(ms, button, lambda b=button, o=original: b.setText(o))
 
     def _restore_export_text(self) -> None:
         self.btn_export_log.setText("导出日志")
