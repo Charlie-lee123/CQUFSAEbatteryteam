@@ -3864,25 +3864,26 @@ def check_customization(app: QApplication) -> None:
                     f"{name}下拉框宽 {w.width()} ≠ 统一宽度 {COMBO_W}"
             rights = {left_x(w) + w.width() for _, w in appear}
             assert len(rights) == 1, f"三只下拉框右缘不齐：{rights}"
-            # 材质强度那一行（滑杆 + 数值）**左缘**与下拉框对齐，但整行单独一档
-            # GLASS_ROW_W=176 —— 用户 2026-11-26：「材质强度的长条可以长一点，和
-            # 之前一样」。下拉框统一收到 COMBO_W(140) 后滑杆只剩 90px，行程太挤；
+            # 材质效果那一行（滑杆 + 数值；旧名「材质强度」，用户 2026-11-27 改名）
+            # **左缘**与下拉框对齐，但整行单独一档 GLASS_ROW_W=176 —— 用户
+            # 2026-11-26：「材质强度的长条可以长一点，和之前一样」。下拉框统一
+            # 收到 COMBO_W(140) 后滑杆只剩 90px，行程太挤；
             # 所以这里**不再要求与下拉框同右缘**（那是 2026-11-21 的旧口径），
             # 只要求整行宽 = GLASS_ROW_W 且三段之和正好填满（滑杆 + gap + 数值）。
             from ui_settings import GLASS_ROW_W
             glass_field = dialog.lbl_glass.parentWidget()
-            assert glass_field is not None, "材质强度那一行没有容器"
+            assert glass_field is not None, "材质效果那一行没有容器"
             assert glass_field.width() == GLASS_ROW_W, \
-                f"材质强度整行宽 {glass_field.width()} ≠ {GLASS_ROW_W}"
+                f"材质效果整行宽 {glass_field.width()} ≠ {GLASS_ROW_W}"
             _gap = glass_field.layout().spacing()
             _sum = (dialog.slider_glass.width() + _gap
                     + dialog.lbl_glass.width())
             assert _sum == GLASS_ROW_W, \
-                (f"材质强度行内三段之和不等于整行宽：{_sum} ≠ {GLASS_ROW_W}"
+                (f"材质效果行内三段之和不等于整行宽：{_sum} ≠ {GLASS_ROW_W}"
                  f"（滑杆 {dialog.slider_glass.width()} + gap {_gap} + 数值 "
                  f"{dialog.lbl_glass.width()}）")
             assert dialog.slider_glass.width() >= 120, \
-                f"材质强度滑杆太短（{dialog.slider_glass.width()}px），拖不动"
+                f"材质效果滑杆太短（{dialog.slider_glass.width()}px），拖不动"
             # 最长条目必须能完整显示（框宽缩了但不能把字截了）。
             from PySide6.QtWidgets import QStyle, QStyleOptionComboBox
             for name, w in appear:
@@ -3906,10 +3907,12 @@ def check_customization(app: QApplication) -> None:
                          for lab, _v in spec["options"]]
             assert _soc_opts == ["本地", "主控"], f"SOC 来源文案：{_soc_opts}"
 
-            # 6a-1d) 2026-11-27「这些都归纳为个性化」：主题 / 材质强度 / 界面材质 /
+            # 6a-1d) 2026-11-27「这些都归纳为个性化」：主题 / 界面材质 / 材质效果 /
             # 开屏动画 / 动画文件 / 动画帧率 六项归到同一个「个性化」分组。标题走
             # _section_header（横线 + groupCaption），组内六项必须连续；原「动画」
             # 组因 anim_fps 提前生成、没有成员，不再插标题。
+            # ⚠️ 同日追加「界面材质和材质强度应该对调，材质强度改成材质效果」：
+            #    组内顺序固定为「界面材质 → 材质效果」，标签不再是「材质强度」。
             from PySide6.QtWidgets import QFormLayout as _FormLayout
             _form = dialog.form
             _rows = []
@@ -3927,7 +3930,7 @@ def check_customization(app: QApplication) -> None:
                        if k == "caption" and t == "个性化"), None)
             assert _i is not None, f"找不到「个性化」分组：{_rows[:24]}"
             _want = [("field", x) for x in
-                     ("主题", "材质强度", "界面材质", "开屏动画", "动画文件",
+                     ("主题", "界面材质", "材质效果", "开屏动画", "动画文件",
                       "动画帧率")]
             assert _rows[_i + 1:_i + 1 + len(_want)] == _want, \
                 ("「个性化」组六项不连续/顺序不对："

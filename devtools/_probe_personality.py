@@ -63,7 +63,7 @@ def main() -> int:
             if lab is not None and lab.widget() is not None:
                 rows.append(("field", lab.widget().text()))
         print("[groups] " + " > ".join(t for k, t in rows if k == "caption"))
-        want = ["主题", "材质强度", "界面材质", "开屏动画", "动画文件", "动画帧率"]
+        want = ["主题", "界面材质", "材质效果", "开屏动画", "动画文件", "动画帧率"]
         idx = next((j for j, (k, t) in enumerate(rows)
                     if k == "caption" and t == "个性化"), None)
         assert idx is not None, f"没有「个性化」分组：{rows[:24]}"

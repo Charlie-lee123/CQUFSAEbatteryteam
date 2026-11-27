@@ -1231,7 +1231,7 @@ class SettingsDialog(QDialog):
             self._custom_widgets[row_key] = spin
             self._custom_rows[row_key] = (row_label, spin)
 
-        # 2026-11-27 用户「这些都归纳为个性化」：主题 / 材质强度 / 界面材质 /
+        # 2026-11-27 用户「这些都归纳为个性化」：主题 / 界面材质 / 材质效果 /
         # 开屏动画 / 动画文件 / 动画帧率 六项归到同一个「个性化」分组。
         # 标题必须走 _section_header（横线 + groupCaption），否则自测的
         # "每个 groupCaption 前一个是 sectionDivider"断言会挂。
@@ -1251,42 +1251,10 @@ class SettingsDialog(QDialog):
         #    （见上方）：逐车显示行数（volt_rows/temp_rows）与「界面材质」都会提前登记，
         #    这里不再重复初始化，避免把已登记的条目清空。
 
-        # 材质强度：0~100 无级，**两种材质共用**这一根滑杆。
-        # 0 = 清玻璃（几乎只剩一层很淡的底色），100 = 材质拉满（各自特征最明确）。
-        # 毛玻璃动的是颗粒与透明度，液态玻璃动的是镜面高光 / 内发光 / 中心提亮。
-        self.slider_glass = GlassSlider(Qt.Orientation.Horizontal)
-        self.slider_glass.setRange(0, 100)
-        self.slider_glass.setValue(max(0, min(100, int(glass))))
-        # 让"滑杆 + 数值"整行与三只下拉框**同宽**（用户 2026-11-21 截图点名
-        # "要对齐"：滑杆原来一路顶到 490，比 176 的框多出 145px，整块看着是斜的）。
-        # ⚠️ 2026-11-26：下拉框统一收到 COMBO_W(140)，但滑杆**不能跟着缩** ——
-        #    90px 的行程太短（用户："材质强度的长条可以长一点，和之前一样"）。
-        #    滑杆这一行单独保留旧口径 GLASS_ROW_W=176（滑杆 126 + gap 10 + 数值 40），
-        #    所以整行宽与滑杆宽都要按它算，**不能**再用 COMBO_W，否则 176 宽的行
-        #    会被 140 的容器裁掉右边一截。
-        _GLASS_LBL_W = 40
-        _GLASS_GAP = 10
-        self.slider_glass.setFixedWidth(GLASS_ROW_W - _GLASS_LBL_W - _GLASS_GAP)
-        self.slider_glass.setToolTip(
-            "拖动即可实时调整整个界面材质的强度（毛玻璃与液态玻璃共用）")
-        self.lbl_glass = QLabel()
-        self.lbl_glass.setFont(ui_font(11.5))
-        self.lbl_glass.setFixedWidth(_GLASS_LBL_W)
-        self.lbl_glass.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._refresh_glass_label(self.slider_glass.value())
-        self.slider_glass.valueChanged.connect(self._on_glass_changed)
-
-        glass_row = QHBoxLayout()
-        glass_row.setSpacing(_GLASS_GAP)
-        glass_row.addWidget(self.slider_glass, 1)
-        glass_row.addWidget(self.lbl_glass)
-        glass_field = self._row(glass_row)
-        glass_field.setFixedWidth(GLASS_ROW_W)
-        form.addRow(self._label("材质强度"), glass_field)
-
-        # 「界面材质」：从「定制功能」里提到这里，紧跟在「材质强度」**下面**
-        # （用户 2026-10-22："把材质强度放到界面材质的上面"）。这两个是一对 ——
-        # 一个选材质、一个调它的强度，中间隔着一整节车辆档案就说不通了。
+        # 「界面材质」：先选材质、再调它的效果强弱。**这一对现在的顺序是
+        # 「界面材质 → 材质效果」**（用户 2026-11-27：「界面材质和材质强度
+        # 应该对调，材质强度改成材质效果」）——2026-10-22 曾要求反过来
+        # （强度在上），本次按新诉求对调，别再改回去。
         # 存储/默认值仍在 customization 的 register_choice("material")，
         # 这里只是把它的那一行提前生成（_build_custom_section 会跳过它）。
         material_spec = next((spec for spec in customization.specs()
@@ -1308,8 +1276,41 @@ class SettingsDialog(QDialog):
             self._custom_widgets["material"] = self.cmb_material
             self._custom_rows["material"] = (material_label, self.cmb_material)
 
+        # 材质效果（旧名「材质强度」）：0~100 无级，**两种材质共用**这一根滑杆。
+        # 0 = 清玻璃（几乎只剩一层很淡的底色），100 = 材质拉满（各自特征最明确）。
+        # 毛玻璃动的是颗粒与透明度，液态玻璃动的是镜面高光 / 内发光 / 中心提亮。
+        self.slider_glass = GlassSlider(Qt.Orientation.Horizontal)
+        self.slider_glass.setRange(0, 100)
+        self.slider_glass.setValue(max(0, min(100, int(glass))))
+        # 让"滑杆 + 数值"整行与三只下拉框**同宽**（用户 2026-11-21 截图点名
+        # "要对齐"：滑杆原来一路顶到 490，比 176 的框多出 145px，整块看着是斜的）。
+        # ⚠️ 2026-11-26：下拉框统一收到 COMBO_W(140)，但滑杆**不能跟着缩** ——
+        #    90px 的行程太短（用户："材质强度的长条可以长一点，和之前一样"）。
+        #    滑杆这一行单独保留旧口径 GLASS_ROW_W=176（滑杆 126 + gap 10 + 数值 40），
+        #    所以整行宽与滑杆宽都要按它算，**不能**再用 COMBO_W，否则 176 宽的行
+        #    会被 140 的容器裁掉右边一截。
+        _GLASS_LBL_W = 40
+        _GLASS_GAP = 10
+        self.slider_glass.setFixedWidth(GLASS_ROW_W - _GLASS_LBL_W - _GLASS_GAP)
+        self.slider_glass.setToolTip(
+            "拖动即可实时调整界面材质的效果强弱（毛玻璃与液态玻璃共用）")
+        self.lbl_glass = QLabel()
+        self.lbl_glass.setFont(ui_font(11.5))
+        self.lbl_glass.setFixedWidth(_GLASS_LBL_W)
+        self.lbl_glass.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._refresh_glass_label(self.slider_glass.value())
+        self.slider_glass.valueChanged.connect(self._on_glass_changed)
+
+        glass_row = QHBoxLayout()
+        glass_row.setSpacing(_GLASS_GAP)
+        glass_row.addWidget(self.slider_glass, 1)
+        glass_row.addWidget(self.lbl_glass)
+        glass_field = self._row(glass_row)
+        glass_field.setFixedWidth(GLASS_ROW_W)
+        form.addRow(self._label("材质效果"), glass_field)
+
         # 2026-11-27 用户「这些都归纳为个性化」：开屏动画 / 动画文件从这里接到
-        # 主题 / 材质强度 / 界面材质后面，与下面提前生成的「动画帧率」同属
+        # 主题 / 界面材质 / 材质效果后面，与下面提前生成的「动画帧率」同属
         # 「个性化」一节。预览按当前主题挑变体 —— cmb_theme 已在上面建好。
         self._build_splash_section(form)
 
@@ -1330,7 +1331,7 @@ class SettingsDialog(QDialog):
 
         # v3.0 重排（用户 2026-11-25：「逻辑关联的挨在一起」）+ 2026-11-27
         # 「这些都归纳为个性化」修订：
-        # 车辆 → 显示行数 → 【个性化：主题/材质强度/界面材质/开屏动画/动画文件/
+        # 车辆 → 显示行数 → 【个性化：主题/界面材质/材质效果/开屏动画/动画文件/
         # 动画帧率】→【数据显示】→【数据判读】→【SOC】→【启动与窗口】→【其它】
         # → 界面按钮 → 数据管理（日志/会话库/协议/MCP）→ 版本。
         # 「开屏动画」「动画帧率」挪进「个性化」—— 它们和主题/材质一样都是
@@ -2884,7 +2885,7 @@ class SettingsDialog(QDialog):
                 self._section_header(form, _cap)
             if spec["key"] in ("material", "volt_rows", "temp_rows", "anim_fps"):
                 # 「动画帧率」已在「个性化」节里提前生成；
-                # 「界面材质」已在「主题 / 材质强度」那一对里生成；
+                # 「界面材质」已在「主题 / 界面材质 / 材质效果」那一组里生成；
                 # 「电压/温度数据行数」已提到主题**上方**（见 _build_theme_section
                 # 开头），_custom_widgets / _custom_rows 也已提前登记。
                 continue
