@@ -434,8 +434,21 @@ class McpManualDialog(QDialog):
             self._flash(button, "✓ 空")
 
     def _flash(self, button, text: str) -> None:
+        """把复制按钮的文案临时改成 ``text``，1.2 秒后复原成「复制」。
+
+        ⛔⛔ 必须带 ``context``（第二个实参 = 按钮）：本对话框是
+           ``McpManualDialog(self._scheme, parent=self)`` —— parent 就是
+           ``SettingsDialog``，而设置面板收场时走
+           ``dialog.close() + dialog.deleteLater()``。**Qt 删父对象会连带删子
+           对象**，所以用户关掉设置面板的那一刻，本对话框已经跟着没了
+           （实测 ``Shiboken.isValid`` 返回 False）。定时器若不带 context，
+           1.2 秒后就会落到已删除的 ``InkButton`` 上抛
+           ``RuntimeError: Internal C++ object (InkButton) already deleted``。
+        ⛔ 别因为「用户通常在这个对话框里点完复制就关它」而觉得不会触发：
+           关的是**外层设置面板**，路径短得多。
+        """
         button.setText(text)
-        QTimer.singleShot(1200, lambda b=button: b.setText("复制"))
+        QTimer.singleShot(1200, button, lambda b=button: b.setText("复制"))
 
     def _copy_json(self) -> None:
         import json
@@ -660,7 +673,16 @@ class VehicleLibraryDialog(QDialog):
         self._sync_availability()
         if auto_refresh:
             # 事件循环起来之后再发请求：exec() 之前 show 都没出，先拉也没有意义
-            QTimer.singleShot(0, self._refresh_index)
+            # ⛔⛔ 这里 ms=0 **也必须**带 context（第二个实参 = self）：
+            #    0ms 定时器的事件在 ``singleShot()`` 调用瞬间就已经投递进事件
+            #    队列，receiver 登记只撤得回「还没投递」的定时器，撤不回已投递
+            #    的事件。所以「绑定方法自带 receiver 所以安全」这条**只在 ms>0
+            #    时成立**（实测：150ms/1ms 静默，0ms 照崩）。
+            #    本对话框 parent 是 ``SettingsDialog``，面板一关就被连带析构；
+            #    崩溃点是 ``_refresh_index`` → ``_run_task`` → ``_set_status``
+            #    → ``self.lbl_status.setText(...)``，实测抛
+            #    ``RuntimeError: Internal C++ object (QLabel) already deleted``。
+            QTimer.singleShot(0, self, self._refresh_index)
 
     # -- 外观 ------------------------------------------------------------
 
@@ -954,7 +976,14 @@ class VehicleLibraryDialog(QDialog):
         self.lbl_note.setVisible(False)
         self._set_status("✓ 已清除本机保存的令牌")
         self.btn_clear_token.setText("✓ 已清除")
-        QTimer.singleShot(1800, lambda: self.btn_clear_token.setText("清除令牌"))
+        # ⛔⛔ 必须带 context（第二个实参 = 按钮）：本对话框是
+        #    ``VehicleLibraryDialog(self._scheme, parent=self)``，parent 就是
+        #    ``SettingsDialog``。设置面板收场走 ``deleteLater()``，**Qt 删父对象
+        #    会连带删子对象** —— 用户关掉设置面板时本对话框已随之析构（实测
+        #    ``Shiboken.isValid`` = False）。不带 context 的话这 1.8 秒后的
+        #    回调会打到已删除的 ``InkButton``，抛 already deleted。
+        QTimer.singleShot(1800, self.btn_clear_token,
+                          lambda: self.btn_clear_token.setText("清除令牌"))
 
     def _reset_overwrite(self) -> None:
         """撤回"确认覆盖"的待定态（切换车辆 / 刷新清单 / 上一次成功之后）。"""
