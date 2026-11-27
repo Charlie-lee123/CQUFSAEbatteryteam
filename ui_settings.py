@@ -75,6 +75,13 @@ FIELD_W = 210
 # ⚠️ 别再改回"按最长条目算"：那套算法只要换一条文案整组框就跟着变宽变窄，
 #    永远对不齐。
 COMBO_W = 152
+# 「本地 / 主控」两字短选项下拉专用宽度（SOC 数据来源 / 总电压来源）。
+# 用户 2026-11-27 截图点名「像这些地方框用不到那么大的就把框长度缩小」——
+# 这两只框里只有「本地」「主控」两个字，铺满 COMBO_W(152) 空一大截。
+# 12.5pt 下两字 ≈34px + chrome 48 = 82px，取 96 留余量。
+# ⛔ 只收窄这两只，**不动 COMBO_W**：主题/界面材质/开屏动画里最长条目
+#    「自定义文件…」要 145px，缩了会被截（见上面 COMBO_W 的定宽依据）。
+SHORT_CHOICE_W = 96
 # 「材质强度」整行单独一档：**滑杆不跟着下拉框一起缩**（用户 2026-11-26：
 # 「材质强度的长条可以长一点，和之前一样」）。旧口径就是 176 =
 # 滑杆 126 + 行内 gap 10 + 数值标签 40；收到 COMBO_W(152) 后滑杆只剩 102px，
@@ -1224,6 +1231,12 @@ class SettingsDialog(QDialog):
             self._custom_widgets[row_key] = spin
             self._custom_rows[row_key] = (row_label, spin)
 
+        # 2026-11-27 用户「这些都归纳为个性化」：主题 / 材质强度 / 界面材质 /
+        # 开屏动画 / 动画文件 / 动画帧率 六项归到同一个「个性化」分组。
+        # 标题必须走 _section_header（横线 + groupCaption），否则自测的
+        # "每个 groupCaption 前一个是 sectionDivider"断言会挂。
+        self._section_header(form, "个性化")
+
         self.cmb_theme = ChevronComboBox()
         self.cmb_theme.setFixedWidth(COMBO_W)
         for label, value in THEME_MODES:
@@ -1295,18 +1308,33 @@ class SettingsDialog(QDialog):
             self._custom_widgets["material"] = self.cmb_material
             self._custom_rows["material"] = (material_label, self.cmb_material)
 
+        # 2026-11-27 用户「这些都归纳为个性化」：开屏动画 / 动画文件从这里接到
+        # 主题 / 材质强度 / 界面材质后面，与下面提前生成的「动画帧率」同属
+        # 「个性化」一节。预览按当前主题挑变体 —— cmb_theme 已在上面建好。
+        self._build_splash_section(form)
+
+        # 「动画帧率」同样归进「个性化」：从 _CUSTOM_GROUPS 的「动画」组提前到
+        # 这里生成（_build_custom_section 因 _prebuilt 会跳过它，空组不再插标题）。
+        # 滑杆行的生成抽成 _build_slider_row，与原定制节共用同一份实现，值初始化 /
+        # maximum_fn 夹取 / 复原按钮 / 两张登记表一个不少。
+        # ⚠️ 必须在 _snapshot_custom_baseline() 之前生成，否则基准里缺这个 key。
+        _anim_fps_spec = next((s for s in customization.specs()
+                               if s["key"] == "anim_fps"), None)
+        if _anim_fps_spec is not None:
+            self._build_slider_row(form, _anim_fps_spec)
+
         # 「车辆」一节已经在**最上面**建好（见本方法开头，用户 2026-11-03：
         # 「不要喧宾夺主，把车辆信息放在设置界面的最上面」）。
         #  ⚠️ 与 customize 的说明一致：车辆档案**不走 register_* 注册表**（它不是
         #     标量），所以这一节是手写的，其余定制项仍按 specs() 自动生成。
 
-        # v3.0 重排（用户 2026-11-25：「逻辑关联的挨在一起」）：
-        # 车辆 → 显示行数 → 外观（主题/材质）→ 定制功能（按组：数据显示/
-        # 数据判读/SOC/启动与窗口/动画）→ 开屏动画 → 界面按钮 → 数据管理
-        # （日志/会话库/协议/MCP）→ 版本。
-        # 「开屏动画」从主题下方挪到定制功能**之后**：它属于"启动行为"，与定制
-        # 功能里的「启动与窗口」组逻辑相邻（最大化/折叠/防息屏/开屏都是开机时
-        # 发生的事）；而且它有独立的预览/文件选择，放在分组后更自然。
+        # v3.0 重排（用户 2026-11-25：「逻辑关联的挨在一起」）+ 2026-11-27
+        # 「这些都归纳为个性化」修订：
+        # 车辆 → 显示行数 → 【个性化：主题/材质强度/界面材质/开屏动画/动画文件/
+        # 动画帧率】→【数据显示】→【数据判读】→【SOC】→【启动与窗口】→【其它】
+        # → 界面按钮 → 数据管理（日志/会话库/协议/MCP）→ 版本。
+        # 「开屏动画」「动画帧率」挪进「个性化」—— 它们和主题/材质一样都是
+        # "界面观感"；原「动画」组因成员被提前，成了空组，不再插标题。
         # 「定制功能」：BMS 专用配置的统一管理入口。控件**按注册表动态生成**
         # （customization.specs()），以后加定制配置这里一行都不用改。
         self._build_custom_section(form)
@@ -1318,10 +1346,7 @@ class SettingsDialog(QDialog):
         # 上面按注册表生成的（见 _build_custom_section 里的 _custom_rows）。
         self._sync_vehicle_rows()
 
-        # 「开屏动画」：预设（assets/splash/ 下扫出来的）/ 跟随主题 / 自定义文件。
-        # 只在这块做 UI；真正的播放/配置解析全在 splash_anim.py（接口层）。
-        # ⚠️ 预览按当前主题挑变体（self.cmb_theme 已在上面建好）。
-        self._build_splash_section(form)
+        # 开屏动画 / 动画帧率已提前并入上面的「个性化」节（2026-11-27）。
 
         if button_specs:
             self._build_button_section(form, button_specs, set(hidden_buttons))
@@ -2804,7 +2829,9 @@ class SettingsDialog(QDialog):
         #    「这些地方怎么有空的啊」）。
         _known = {s["key"] for s in specs}
         # 已经提前到「主题」一节、这里不建行的 key（与下方循环里的 continue 一致）
-        _prebuilt = ("material", "volt_rows", "temp_rows")
+        # 2026-11-27「个性化」：anim_fps 已提前到开屏节之后生成（见 _build_ui），
+        # 这里跳过；原「动画」组因此没有 rendered key，不再插标题。
+        _prebuilt = ("material", "volt_rows", "temp_rows", "anim_fps")
         ordered_keys: list[str] = []
         _caption_before: dict[str, str] = {}
         for _group_title, _keys in self._CUSTOM_GROUPS:
@@ -2855,7 +2882,8 @@ class SettingsDialog(QDialog):
             _cap = _caption_before.get(spec["key"])
             if _cap is not None:
                 self._section_header(form, _cap)
-            if spec["key"] in ("material", "volt_rows", "temp_rows"):
+            if spec["key"] in ("material", "volt_rows", "temp_rows", "anim_fps"):
+                # 「动画帧率」已在「个性化」节里提前生成；
                 # 「界面材质」已在「主题 / 材质强度」那一对里生成；
                 # 「电压/温度数据行数」已提到主题**上方**（见 _build_theme_section
                 # 开头），_custom_widgets / _custom_rows 也已提前登记。
@@ -2883,59 +2911,11 @@ class SettingsDialog(QDialog):
                 # 现在只有开关自己的命中区（= 自绘轨道，见 Switch.hitButton）才算。
                 row_label = self._label(spec["label"])
             elif spec.get("widget") == "slider":
-                # 滑动**无级**调节（用户点名）。取值类型仍是 int（见 customization
-                # 的 register_slider），只是控件换成滑杆 + 右侧数值标签；要表达
-                # 小数时按 spec["scale"] 换算（字号存的是半磅）。
-                slider = GlassSlider(Qt.Orientation.Horizontal)
-                # 右端可以按运行环境现算（``maximum_fn``）：动画帧率的上限就是
-                # **当前显示器的最高刷新率** —— 每开一次面板都重算，换屏不用重启。
-                maximum = int(spec["maximum"])
-                maximum_fn = spec.get("maximum_fn")
-                if callable(maximum_fn):
-                    try:
-                        maximum = int(maximum_fn())
-                    except Exception:      # noqa: BLE001 - 取不到就用注册表里的上限
-                        maximum = int(spec["maximum"])
-                maximum = max(int(spec["minimum"]), min(int(spec["maximum"]), maximum))
-                slider.setRange(int(spec["minimum"]), maximum)
-                # 老配置里存过 240、而当前屏幕只有 165 → 夹进量程，别让滑杆
-                # 显示一个够不着的值（真正生效值也会被 ui_anim 再夹一次）。
-                slider.setValue(max(int(spec["minimum"]),
-                                    min(maximum, int(customization.get(spec["key"])))))
-                # 160 而不是 190（2026-10-31）：滑杆行 = 滑杆 + 数值 + 复原图标
-                # = 290，当时是全表最宽的一行，比模组行还宽、替面板定宽。
-                # 160 仍然够拖（0~100 的滑杆，一像素约 0.6 格）。
-                slider.setMinimumWidth(160)
-                if spec["tip"]:
-                    slider.setToolTip(spec["tip"])
-                value_label = QLabel()
-                value_label.setFont(ui_font(11.5))
-                value_label.setMinimumWidth(56)
-                value_label.setAlignment(Qt.AlignmentFlag.AlignRight
-                                         | Qt.AlignmentFlag.AlignVCenter)
-                self._refresh_slider_label(spec, slider.value(), value_label)
-                slider.valueChanged.connect(
-                    lambda value, s=spec, lab=value_label:
-                    self._on_slider_changed(s, value, lab))
-                slider_row = QHBoxLayout()
-                slider_row.setSpacing(10)
-                slider_row.addWidget(slider, 1)
-                slider_row.addWidget(value_label)
-                # 「复原」：一键回到注册表里的默认值。setValue 会触发
-                # valueChanged，数值标签 / 预览 / 主窗口的实时预览全部跟着走。
-                # 用**图标**（环形箭头 = 重置的通用符号，用户点名"还原按键用图标"）
-                # —— 图标按钮必须带 tooltip 与读屏名称，否则只能靠猜。
-                reset_btn = IconButton(GLYPH_REFRESH, "恢复默认值", size=24,
-                                       glyph_size=13)
-                reset_btn.setAccessibleName("恢复默认值")
-                reset_btn.clicked.connect(
-                    lambda _=False, s=spec, sl=slider: sl.setValue(int(s["default"])))
-                slider_row.addWidget(reset_btn)
-                field = self._row(slider_row)
-                widget = slider
-                row_label = self._label(spec["label"])
-                if spec.get("preview"):
-                    preview = self._build_slider_preview(spec, slider)
+                # 滑杆行抽成 helper：「个性化」节里提前生成的「动画帧率」也复用
+                # 同一份实现。helper 自己完成 addRow + 两张登记表登记 + 预览行，
+                # 所以这里 continue，跳过下面的统一 addRow（否则会重复插行）。
+                self._build_slider_row(form, spec)
+                continue
             elif spec["kind"] == "choice":
                 # 枚举（二选一起步）：下拉框。选中即回调 on_custom 做实时预览 ——
                 # 换材质要**当场**看到，不能等按确定（用户点名"实时生效"）。
@@ -2946,7 +2926,12 @@ class SettingsDialog(QDialog):
                 combo.setCurrentIndex(index if index >= 0 else 0)
                 if spec.get("tip"):
                     combo.setToolTip(spec["tip"])
-                combo.setFixedWidth(COMBO_W)
+                if spec["key"] in ("soc_source", "volt_source"):
+                    # 「本地 / 主控」两字短选项专用窄框（用户 2026-11-27 点名
+                    # 「框用不到那么大的就把框长度缩小」）；其它下拉仍用 COMBO_W。
+                    combo.setFixedWidth(SHORT_CHOICE_W)
+                else:
+                    combo.setFixedWidth(COMBO_W)
                 combo.currentIndexChanged.connect(
                     lambda _idx, s=spec, c=combo: self._on_choice_changed(s, c))
                 field = combo
@@ -3015,6 +3000,78 @@ class SettingsDialog(QDialog):
         # 「年 [开关] 月 [开关] 日 [开关]」「2500 mV ~ 4500 mV」不再被拉开。
         for _h in _merge_layouts.values():
             _h.addStretch(1)
+
+    def _build_slider_row(self, form: QFormLayout, spec: dict) -> QLabel | None:
+        """按注册表 spec 生成一根滑杆行（滑杆 + 数值 + 复原按钮）。
+
+        2026-11-27「个性化」分组把「动画帧率」提前生成，与定制节里的其它滑杆
+        （如 rx_font_size）共用这份实现：tooltip / 值初始化 / ``maximum_fn``
+        夹取 / 复原按钮 / ``_custom_widgets`` 与 ``_custom_rows`` 登记一处定义，
+        避免两处各写一遍慢慢漂移。行与预览行都在这里 addRow（调用方不要再插），
+        返回预览标签供需要时引用。
+        """
+        # 滑动**无级**调节（用户点名）。取值类型仍是 int（见 customization
+        # 的 register_slider），只是控件换成滑杆 + 右侧数值标签；要表达
+        # 小数时按 spec["scale"] 换算（字号存的是半磅）。
+        slider = GlassSlider(Qt.Orientation.Horizontal)
+        # 右端可以按运行环境现算（``maximum_fn``）：动画帧率的上限就是
+        # **当前显示器的最高刷新率** —— 每开一次面板都重算，换屏不用重启。
+        maximum = int(spec["maximum"])
+        maximum_fn = spec.get("maximum_fn")
+        if callable(maximum_fn):
+            try:
+                maximum = int(maximum_fn())
+            except Exception:      # noqa: BLE001 - 取不到就用注册表里的上限
+                maximum = int(spec["maximum"])
+        maximum = max(int(spec["minimum"]), min(int(spec["maximum"]), maximum))
+        slider.setRange(int(spec["minimum"]), maximum)
+        # 老配置里存过 240、而当前屏幕只有 165 → 夹进量程，别让滑杆
+        # 显示一个够不着的值（真正生效值也会被 ui_anim 再夹一次）。
+        slider.setValue(max(int(spec["minimum"]),
+                            min(maximum, int(customization.get(spec["key"])))))
+        # 160 而不是 190（2026-10-31）：滑杆行 = 滑杆 + 数值 + 复原图标
+        # = 290，当时是全表最宽的一行，比模组行还宽、替面板定宽。
+        # 160 仍然够拖（0~100 的滑杆，一像素约 0.6 格）。
+        slider.setMinimumWidth(160)
+        if spec["tip"]:
+            slider.setToolTip(spec["tip"])
+        value_label = QLabel()
+        value_label.setFont(ui_font(11.5))
+        value_label.setMinimumWidth(56)
+        value_label.setAlignment(Qt.AlignmentFlag.AlignRight
+                                 | Qt.AlignmentFlag.AlignVCenter)
+        self._refresh_slider_label(spec, slider.value(), value_label)
+        slider.valueChanged.connect(
+            lambda value, s=spec, lab=value_label:
+            self._on_slider_changed(s, value, lab))
+        slider_row = QHBoxLayout()
+        slider_row.setSpacing(10)
+        slider_row.addWidget(slider, 1)
+        slider_row.addWidget(value_label)
+        # 「复原」：一键回到注册表里的默认值。setValue 会触发
+        # valueChanged，数值标签 / 预览 / 主窗口的实时预览全部跟着走。
+        # 用**图标**（环形箭头 = 重置的通用符号，用户点名"还原按键用图标"）
+        # —— 图标按钮必须带 tooltip 与读屏名称，否则只能靠猜。
+        reset_btn = IconButton(GLYPH_REFRESH, "恢复默认值", size=24,
+                               glyph_size=13)
+        reset_btn.setAccessibleName("恢复默认值")
+        reset_btn.clicked.connect(
+            lambda _=False, s=spec, sl=slider: sl.setValue(int(s["default"])))
+        slider_row.addWidget(reset_btn)
+        field = self._row(slider_row)
+        widget = slider
+        row_label = self._label(spec["label"])
+        # 记**输入控件本身**（不是包装容器）：custom_values() 要在它身上取值。
+        self._custom_widgets[spec["key"]] = widget
+        form.addRow(row_label, field)
+        self._custom_rows[spec["key"]] = (row_label, field)
+        preview = None
+        if spec.get("preview"):
+            preview = self._build_slider_preview(spec, slider)
+        if preview is not None:
+            # 预览行整行跨两列，紧贴在它那根滑杆下面
+            form.addRow(preview)
+        return preview
 
     @staticmethod
     def _slider_display_value(spec: dict, raw: int) -> float:

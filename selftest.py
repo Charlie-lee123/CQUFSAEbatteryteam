@@ -3406,8 +3406,16 @@ def check_customization(app: QApplication) -> None:
             # 「复原」按钮（图标）一键回默认值，数值标签 / 预览 / 实时回调都跟着走
             # （放在拖大之后再点 —— 当前值 == 默认值时 setValue 不触发，测不到）
             from ui_controls import IconButton as _IconBtn
-            _reset = next(b for b in _dlg.findChildren(_IconBtn)
-                          if b.accessibleName() == "恢复默认值")
+            # ⚠️ 必须按**这根滑杆所在的行**找复原按钮：2026-11-27 起「动画帧率」
+            # 提前到面板顶部的「个性化」节，全局 findChildren 的第一个复原按钮
+            # 是它的，点它不会动 rx_font_size（曾导致本断言 25 != 21 假红）。
+            _row_widget = _slider.parentWidget()
+            assert _row_widget is not None, "rx_font_size 滑杆没有行容器"
+            _resets = [b for b in _row_widget.findChildren(_IconBtn)
+                       if b.accessibleName() == "恢复默认值"]
+            assert len(_resets) == 1, \
+                f"字号行里的复原按钮数量不对：{len(_resets)}"
+            _reset = _resets[0]
             assert _reset.toolTip(), "图标按钮没带 tooltip（用户只能靠猜）"
             _reset.click()
             app.processEvents()
@@ -3897,6 +3905,72 @@ def check_customization(app: QApplication) -> None:
                          if spec["key"] == "soc_source"
                          for lab, _v in spec["options"]]
             assert _soc_opts == ["本地", "主控"], f"SOC 来源文案：{_soc_opts}"
+
+            # 6a-1d) 2026-11-27「这些都归纳为个性化」：主题 / 材质强度 / 界面材质 /
+            # 开屏动画 / 动画文件 / 动画帧率 六项归到同一个「个性化」分组。标题走
+            # _section_header（横线 + groupCaption），组内六项必须连续；原「动画」
+            # 组因 anim_fps 提前生成、没有成员，不再插标题。
+            from PySide6.QtWidgets import QFormLayout as _FormLayout
+            _form = dialog.form
+            _rows = []
+            for _r in range(_form.rowCount()):
+                _sp = _form.itemAt(_r, _FormLayout.ItemRole.SpanningRole)
+                if _sp is not None and _sp.widget() is not None:
+                    _w = _sp.widget()
+                    if _w.objectName() == "groupCaption":
+                        _rows.append(("caption", _w.text()))
+                    continue
+                _lab = _form.itemAt(_r, _FormLayout.ItemRole.LabelRole)
+                if _lab is not None and _lab.widget() is not None:
+                    _rows.append(("field", _lab.widget().text()))
+            _i = next((j for j, (k, t) in enumerate(_rows)
+                       if k == "caption" and t == "个性化"), None)
+            assert _i is not None, f"找不到「个性化」分组：{_rows[:24]}"
+            _want = [("field", x) for x in
+                     ("主题", "材质强度", "界面材质", "开屏动画", "动画文件",
+                      "动画帧率")]
+            assert _rows[_i + 1:_i + 1 + len(_want)] == _want, \
+                ("「个性化」组六项不连续/顺序不对："
+                 f"{_rows[_i + 1:_i + 1 + len(_want)]}")
+            assert ("caption", "动画") not in _rows, \
+                ("原「动画」组标题还在："
+                 f"{[t for k, t in _rows if k == 'caption']}")
+
+            # 6a-1e) 动画帧率提前生成后，两张登记表 / 基准 / 复原按钮一个不丢。
+            _fps = dialog._custom_widgets.get("anim_fps")
+            assert _fps is not None, "anim_fps 没登记进 _custom_widgets"
+            _fps_row = dialog._custom_rows.get("anim_fps")
+            assert _fps_row is not None, "anim_fps 没登记进 _custom_rows"
+            assert _fps_row[0].text() == "动画帧率", \
+                f"anim_fps 行标签不对：{_fps_row[0].text()}"
+            # _custom_rows 存的是 (行标签, 字段容器)，不是滑杆本身
+            assert _fps_row[1] is _fps.parentWidget(), \
+                "anim_fps 登记的字段容器不是滑杆所在的行容器"
+            assert "anim_fps" in dialog._custom_baseline, \
+                "anim_fps 没进 _custom_baseline（提前生成后漏登记）"
+            _reset_btns = [b for b in _fps.parentWidget().findChildren(QPushButton)
+                           if b.accessibleName() == "恢复默认值"]
+            assert _reset_btns, "动画帧率行丢了「恢复默认值」复原按钮"
+
+            # 6a-1f) 「本地 / 主控」短下拉框收窄，但内容区仍装得下两字选项。
+            # 宽度断言读常量反推，不写死用户可配置的数值。
+            from ui_settings import SHORT_CHOICE_W
+            for _key in ("soc_source", "volt_source"):
+                _w = dialog._custom_widgets.get(_key)
+                assert _w is not None, f"找不到 {_key} 下拉"
+                assert _w.width() == SHORT_CHOICE_W, \
+                    f"{_key} 框宽 {_w.width()} ≠ SHORT_CHOICE_W({SHORT_CHOICE_W})"
+                _opt = QStyleOptionComboBox()
+                _opt.initFrom(_w)
+                _opt.currentText = _w.currentText()
+                _cr = _w.style().subControlRect(
+                    QStyle.ComplexControl.CC_ComboBox, _opt,
+                    QStyle.SubControl.SC_ComboBoxEditField, _w)
+                _need = max((_w.fontMetrics().horizontalAdvance(_w.itemText(i))
+                             for i in range(_w.count())), default=0)
+                assert _need <= _cr.width(), \
+                    (f"{_key} 窄框把选项文字截了：需 {_need}px，"
+                     f"内容区只有 {_cr.width()}px")
 
             # 6a-1c) 弹层高度必须封顶到 _POPUP_MAX_ROWS 行（用户 2026-11-21：
             #     「这个太长太宽了」—— 30 档撑到 864px、跑出屏幕下缘）。
