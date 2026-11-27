@@ -7895,6 +7895,139 @@ def check_monitor_panel(app: QApplication) -> None:
         app.processEvents()
 
 
+def check_layer_isolation() -> None:
+    """架构分层隔离：模块间依赖必须单向，**零循环 import**。
+
+    用户 2026-11-27：「将软件的各个部分隔离开来，改动只修改对应部分内容」。
+    那条要求能成立的前提，就是这张图里**没有环**：只要 A 依赖 B、B 又依赖 A，
+    改 A 就可能要动 B，改动面就不再可控。
+
+    本检查只看两件事（都很快，**不构造任何窗口**，毫秒级）：
+
+    ① 静态 import 图**无环** —— 用 DFS 三色标记扫全部 39 个模块，包括函数内
+       的延迟 import（全项目只有 ``customization.py:291`` 一处是刻意的）。
+    ② 分层编号单调不降 —— 每个模块被赋予 ``LAYER`` 里的层号，依赖只能指向
+       **不高于自己**的层。同层互依允许，向上依赖即失败。
+
+    ⛔ 别把这条改成"抽查几个模块"：它的全部价值就是**穷尽**。新增模块必须
+       在 ``LAYERS`` 里登记层号，否则本检查报"未登记" —— 这是故意的，
+       逼你当场想清楚它属于哪一层，而不是悄悄挂到 main_window 下面。
+    """
+    import ast as _ast
+    import os as _os
+
+    root = _os.path.dirname(_os.path.abspath(__file__))
+
+    # 层号越小越底层。依据 docs/architecture.md（实测得出，不是设计愿景）。
+    LAYERS: dict[str, int] = {
+        # L0 无内部依赖的地基
+        "app_log": 0, "version": 0, "ui_theme": 0, "ui_anim": 0,
+        "soc_est": 0, "rx_export": 0, "perf_mode": 0, "serial_io": 0,
+        "ble_io": 0, "marks_model": 0, "soc_display": 0, "wake_lock": 0,
+        "_snap_worker": 0,
+        # L1
+        "customization": 1, "rx_history": 1, "rx_protocol": 1, "soc_feed": 1,
+        "soc_ekf": 1, "soc_profiles": 1, "ui_controls": 1, "ui_backdrop": 1,
+        "ui_monitor": 1, "ui_perf_mode": 1, "dlc_host": 1, "drv_assist": 1,
+        "mcp_bridge": 1, "capability_api": 1,
+        # L2
+        "rx_store": 2, "ui_brand": 2, "ui_highlight": 2, "ui_surface": 2,
+        "updater": 2, "vehicle_share": 2,
+        # L3
+        "splash_motion": 3, "vehicle_anim": 3,
+        # L4
+        "splash_anim": 4,
+        # L5
+        "ui_settings": 5,
+        # L6
+        "main_window": 6,
+        # L7
+        "main": 7, "selftest": 7,
+    }
+
+    def _local_imports(path: str) -> set[str]:
+        """该文件 import 的**本项目**模块名（含函数内延迟 import）。"""
+        try:
+            tree = _ast.parse(open(path, encoding="utf-8", errors="replace").read())
+        except (OSError, SyntaxError):
+            return set()
+        found: set[str] = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Import):
+                for alias in node.names:
+                    found.add(alias.name.split(".")[0])
+            elif isinstance(node, _ast.ImportFrom):
+                if node.level == 0 and node.module:
+                    found.add(node.module.split(".")[0])
+        return {name for name in found if name in LAYERS}
+
+    graph: dict[str, set[str]] = {}
+    for name in LAYERS:
+        path = _os.path.join(root, f"{name}.py")
+        if _os.path.exists(path):
+            graph[name] = _local_imports(path)
+
+    assert graph, "一个模块都没扫到 —— 检查本检查的工作目录是否指错了"
+
+    # ---- ① DFS 三色标记找环 ----------------------------------------
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {name: WHITE for name in graph}
+    cycles: list[str] = []
+
+    def visit(node: str, trail: list[str]) -> None:
+        color[node] = GRAY
+        for dep in sorted(graph.get(node, ())):
+            if color.get(dep, BLACK) == GRAY:
+                start = trail.index(dep) if dep in trail else 0
+                cycles.append(" → ".join([*trail[start:], dep]))
+            elif color.get(dep) == WHITE:
+                visit(dep, [*trail, dep])
+        color[node] = BLACK
+
+    for name in sorted(graph):
+        if color[name] == WHITE:
+            visit(name, [name])
+
+    assert not cycles, (
+        "发现循环 import（会让'改一处只影响一处'失效）：\n    "
+        + "\n    ".join(cycles[:5])
+    )
+
+    # ---- ② 层号单调不降 --------------------------------------------
+    upward: list[str] = []
+    for name, deps in sorted(graph.items()):
+        mine = LAYERS[name]
+        for dep in sorted(deps):
+            if LAYERS[dep] > mine:
+                upward.append(f"{name}(L{mine}) → {dep}(L{LAYERS[dep]})")
+    assert not upward, (
+        "存在向上依赖（低层 import 了高层，改动面会失控）：\n    "
+        + "\n    ".join(upward[:8])
+    )
+
+    # ---- ③ capability_api 顶层必须零 Qt ------------------------------
+    # ⛔ 只看**顶层** import，不看全文本：该文件刻意在函数内延迟 import
+    #    PySide6 并优雅降级（模块头注释 :6-8 说明了为什么），文本里出现
+    #    "PySide6" 是正常的。我第一版拿 `"PySide6" not in text` 断言，
+    #    被注释和 docstring 直接误判 —— 判"有没有 import"必须走 AST。
+    api_path = _os.path.join(root, "capability_api.py")
+    if _os.path.exists(api_path):
+        tree = _ast.parse(open(api_path, encoding="utf-8", errors="replace").read())
+        top_qt: list[str] = []
+        for node in tree.body:                     # 只遍历模块顶层
+            if isinstance(node, _ast.Import):
+                for alias in node.names:
+                    if alias.name.split(".")[0] == "PySide6":
+                        top_qt.append(alias.name)
+            elif isinstance(node, _ast.ImportFrom):
+                if node.level == 0 and (node.module or "").split(".")[0] == "PySide6":
+                    top_qt.append(node.module or "PySide6")
+        assert not top_qt, (
+            "capability_api 在**顶层** import 了 Qt（要在无 Qt 的进程里被调用，"
+            f"必须改成函数内延迟 import）：{'、'.join(top_qt)}"
+        )
+
+
 def check_v211_features() -> None:
     """v2.11 四项增量：电压来源 / 工况死区 / 防息屏 / 整轮标记（纯逻辑，不碰真 OS）。"""
     import customization
@@ -8064,6 +8197,7 @@ CHECKS = [
     ("显示行数（每模组 N 排）", check_rows_hint),
     ("连接方式切换几何不跳", check_link_switch_stable),
     ("数据监控面板（独立窗口/样本/回看）", check_monitor_panel),
+    ("架构分层隔离（零循环依赖）", check_layer_isolation),
 ]
 
 
