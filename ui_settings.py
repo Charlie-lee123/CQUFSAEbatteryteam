@@ -1535,7 +1535,13 @@ class SettingsDialog(QDialog):
             "pad_zero",              # 显示补零
             "rx_font_size",          # 接收区字体大小（带预览行）
             "stamp_show_year", "stamp_show_month", "stamp_show_day",
-            "clock_show_date",        # 时钟显示年月日（同属"界面显示什么"）
+            # ⚠️ 顺序依赖（2026-11-27「时钟显示年月日和时间戳显示并成一排」）：
+            #    clock_show_date 必须排在 stamp_show_year **之后** —— 前者没有
+            #    自己的行容器，靠 _merge_owner 路由到 stamp_show_year 那一行，
+            #    迭代到它时容器已经被创建好（见 _build_custom_section 的合并
+            #    分支）。若把本行调换到 stamp_show_year 之前，`_merge_layouts`
+            #    里还没有 owner 条目 → KeyError。
+            "clock_show_date",        # 时钟显示年月日（并入「时间戳显示」那一行）
             "pause_snap_lines", "pause_snap_lines_max",   # 暂停定位行数
             "highlight_errors",       # 高亮异常数据
         )),
@@ -1569,8 +1575,16 @@ class SettingsDialog(QDialog):
     # custom_values() 一概不变。首 key 全都不是任何组的"第一个 rendered key"，
     # 除了 volt_limit_low —— 它本来就是「数据判读」组首行，合并后组标题位置不变。
     _MERGE_GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
+        # 2026-11-27 三轮：用户「时钟显示年月日和「时间戳显示」并成一排」——
+        # 四个开关同属"时间戳/时钟显示什么"，合成一行（clock_show_date **加在
+        # 最后**，保持"年月日在前"的语义）。行标签仍是「时间戳显示」，第 4 个
+        # 开关靠小字「时钟」区分（否则"日/时钟"两个开关看着分不清）。
+        # ⚠️ _CUSTOM_GROUPS 里 clock_show_date 的 key **不删**：ordered_keys
+        #    与 _caption_before 兜底都按它算；合并后它走 else 分支塞进已有容器，
+        #    自然不再占一行。⚠️ 它必须排在 stamp_show_year 之后（见组内注释）。
         "stamp_show_year": ("时间戳显示",
-                            ("stamp_show_year", "stamp_show_month", "stamp_show_day")),
+                            ("stamp_show_year", "stamp_show_month",
+                             "stamp_show_day", "clock_show_date")),
         "volt_limit_low": ("电压范围", ("volt_limit_low", "volt_limit_high")),
         "temp_limit_low": ("温度范围", ("temp_limit_low", "temp_limit_high")),
         # 2026-11-27 二轮（用户 5 张截图点名「这些都可以把两行弄在一行」）：
@@ -1578,6 +1592,16 @@ class SettingsDialog(QDialog):
         "pause_snap_lines": ("暂停定位行数",
                              ("pause_snap_lines", "pause_snap_lines_max")),
         "soc_source": ("SOC 数据来源", ("soc_source", "volt_source")),
+        # 2026-11-27 三轮：用户截图点名「启动时最大化」+「最大化时保留任务栏」
+        # 两个开关并成一排。⚠️ startup_maximized 是「启动与窗口」组的**第一个
+        # rendered key**（_CUSTOM_GROUPS 里它排第一）—— 合并后组标题
+        # （_caption_before 兜底 + _section_header）仍挂在它前面，位置不变。
+        # 第二枚开关的小字取「时保留任务栏」：连起来读作「启动时最大化 [开]
+        # 时保留任务栏 [开]」，语义连贯。实测（devtools/_probe_merge_rows.py，
+        # offscreen）合并行 186px，更短的「保留任务栏」只有 172px —— 两者都
+        # 远低于 380px 阈值，所以取语义更连贯的长版；真机若溢出再换短版。
+        "startup_maximized": ("启动时最大化",
+                              ("startup_maximized", "maximize_keep_taskbar")),
         # ⚠️ 下面两组**不在** _build_custom_section 里拼行：成员要么不是注册表 key
         #    （主题没有 customization 项），要么已经提前生成（volt_rows/temp_rows
         #    在 _build_theme_section 上方的手写循环里并成一行）。登记在这里是为了
@@ -1586,16 +1610,22 @@ class SettingsDialog(QDialog):
         "volt_rows": ("电压数据行数", ("volt_rows", "temp_rows")),
         "material": ("主题", ("material",)),
     }
-    # 合并行里各控件前面的小字：三个开关要「年 / 月 / 日」；两个范围只在第二个
-    # 框前放「~」；SOC 那两只只在第二个框前放「总电压来源」。没登记的成员用原来的
-    # 行标签做 _custom_rows 的书签（不上屏）。
+    # 合并行里各控件前面的小字：四个开关要「年 / 月 / 日 / 时钟」；两个范围只在
+    # 第二个框前放「~」；SOC 那两只只在第二个框前放「总电压来源」；最大化那一行
+    # 第二只开关前放「时保留任务栏」。没登记的成员用原来的行标签做 _custom_rows
+    # 的书签（不上屏）。
     _MERGE_PREFIXES: dict[str, str] = {
         "stamp_show_year": "年",
         "stamp_show_month": "月",
         "stamp_show_day": "日",
+        # 行标签是「时间戳显示」，四个成员只靠字形区分会很挤 —— 加「时钟」
+        # 明示这一枚是时钟的日期，而不是时间戳的"日"。
+        "clock_show_date": "时钟",
         "volt_limit_high": "~",
         "temp_limit_high": "~",
         "pause_snap_lines_max": "行数（最大化）",
+        # 与行标签连读：「启动时最大化 [开] 时保留任务栏 [开]」。
+        "maximize_keep_taskbar": "时保留任务栏",
         "volt_source": "总电压来源",
     }
 

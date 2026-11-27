@@ -6,12 +6,17 @@
 不走肉眼验证，也不会弹出窗口打断你。
 
 用法（在 SerialAssistant 目录下）：
-    .venv\\Scripts\\python.exe selftest.py
+    .venv\\Scripts\\python.exe selftest.py                  # 全量跑 41 条
+    .venv\\Scripts\\python.exe selftest.py --list           # 列出序号+名称后退出
+    .venv\\Scripts\\python.exe selftest.py --only 定制功能  # 只跑匹配的几条
+    .venv\\Scripts\\python.exe selftest.py --changed        # 按 git 改动自动选集
+详见 ``_SELFTEST_USAGE``（``--only`` / ``--skip`` / ``--changed`` 的完整说明）。
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 
@@ -2536,12 +2541,27 @@ def check_tooltip_and_buttons(app: QApplication) -> None:
             assert cap.contentsMargins().top() == 6, \
                 f"分区标题上边距不是 6: {cap.contentsMargins().top()}"
             from ui_controls import ChevronSpinBox as _Spin
+            # 合并行成员**显式写死**（2026-11-27 三轮：时间戳行 3 → 4 枚、
+            # 新增「启动时最大化」2 枚）。⛔ 别改成读 `_MERGE_GROUPS` 来自动跟随：
+            # 那样"有人把合并行拆散"也会静默通过（每行只剩 1 枚、数量自洽），
+            # 回归保护就没了。写死的代价只是改布局时要同步这里一行。
             _merged = (
                 ("时间戳显示", ("stamp_show_year", "stamp_show_month",
-                             "stamp_show_day"), Switch),
+                             "stamp_show_day", "clock_show_date"), Switch),
+                ("启动时最大化", ("startup_maximized", "maximize_keep_taskbar"), Switch),
                 ("电压范围", ("volt_limit_low", "volt_limit_high"), _Spin),
                 ("温度范围", ("temp_limit_low", "temp_limit_high"), _Spin),
             )
+            # 双向核对：写死的清单必须与产品 `_MERGE_GROUPS` 的声明一致 ——
+            # 产品侧改了成员却忘了改自测，这里给出明确的一句提示（比等到
+            # 下面 `findChildren` 数量不符再去猜原因快得多）。
+            for _label_text, _keys, _cls in _merged:
+                _declared = next((members for label, members
+                                  in dialog._MERGE_GROUPS.values()
+                                  if label == _label_text), None)
+                assert _declared == _keys, \
+                    (f"合并行「{_label_text}」的成员与 ui_settings._MERGE_GROUPS "
+                     f"不一致：自测写死 {_keys}，产品声明 {_declared}")
             for _label_text, _keys, _cls in _merged:
                 _labeled_rows = [
                     r for r in range(form.rowCount())
@@ -3892,13 +3912,26 @@ def check_customization(app: QApplication) -> None:
                 # 「余量必须归到末尾 stretch」是防"控件被顶到两端"的判据；但合并行
                 # 自己也可能**把字段列正好撑满**（2026-11-27「主题 + 界面材质」合并
                 # 后在面板最小宽度下 152+10+58+10+152 恰好等于列宽 382），那时余量
-                # 必然是 0。所以：只要没溢出、且上面 max(gap)≤16 已过，就放行。
+                # 必然是 0。
+                # ⚠️ 另一种合法情形（2026-11-27 三轮「时间戳显示」并成 4 枚开关后
+                #    实测）：字段列宽 382、行内自然宽 308，控件**按自然宽度左对齐**、
+                #    右端余 74 —— 这同样说明"没有被空白缝顶开"（gap 已单独判过），
+                #    只是没把余量摊到控件之间的缝里。所以判据改成三选一：
+                #      ① 余量够大（> max(40, 宽//5)）—— 老规格；
+                #      ② 行内自然宽正好把列撑满（本行自己填满）；
+                #      ③ 余量 ≥ 0、所有缺口 ≤16、且**末尾确实有 stretch**（真正的
+                #         "余量归到末尾"的机制判据，比量像素更准）。
                 _self_filled = _holder.sizeHint().width() >= _holder.width() - 40
+                _has_tail_stretch = (
+                    _lay.count() > 0 and _lay.itemAt(_lay.count() - 1).spacerItem()
+                    is not None)
                 assert _slack >= 0 and (
-                    _slack > max(40, _holder.width() // 5) or _self_filled), \
+                    _slack > max(40, _holder.width() // 5)
+                    or _self_filled or _has_tail_stretch), \
                     (f"合并行「{_label_text}」余量没归到末尾 stretch："
                      f"末控件右缘={_last_right} / 容器宽={_holder.width()} / "
-                     f"余量={_slack} / sizeHint={_holder.sizeHint().width()}")
+                     f"余量={_slack} / sizeHint={_holder.sizeHint().width()} / "
+                     f"末尾有 stretch={_has_tail_stretch}")
 
             # 6a-1) 外观区那三只下拉框**同宽且左右缘都对齐**（用户 2026-11-21：
             #     「请把框的宽度缩小，而且要对齐」）。以前主题/界面材质是 FIELD_W、
@@ -7619,8 +7652,32 @@ def check_link_switch_stable(app: QApplication) -> None:
                     tx.mapTo(window, QPoint(0, 0)).y(),
                     lay.minimumSize().height())
 
+        def settle() -> None:
+            """把**在跑的**分割器补间跑完、布局推到稳态，再读几何。
+
+            ⛔ 为什么必须等：`_animate_splitter` 是 240ms 的 Tween（`TX_ANIM_MS`），
+            `_on_split_anim` 每帧 `setSizes`。配置卡一改显隐，分割器就把剩余空间
+            重新分配 → 补间在跑 → 此时读 `tx.mapTo(window).y()` 读到的是**动画
+            中途值**。2026-11-27 全量跑实测到 862→871（9px）、878→879（1px）两种，
+            单跑 5 次却一次不复现 —— 差别只在"前面那些 check 让补间还没跑完"。
+            光 `processEvents()` 两次推不完 240ms，必须按真实时间等。
+            """
+            tween = getattr(window, "_split_tween", None)
+            from PySide6.QtTest import QTest as _QT
+            tried = 0
+            while tween is not None and getattr(tween, "running", False):
+                app.processEvents()
+                # 真实时间推进（QTest.qWait 会跑事件循环），单帧上限 20ms
+                _QT.qWait(20)
+                tried += 1
+                if tried > 60:      # 240ms 补间最多等 1.2s，超了就是异常
+                    break
+            # 补间落终态后布局还要再走一轮（setSizes → 子控件 resize → 再重算）
+            for _ in range(6):
+                app.processEvents()
+
         window._refresh_config_visibility(ble=False)
-        app.processEvents()
+        settle()
         base = snap()
         # 串口版式的基本事实先立住：参数四行在、DLC 不在
         assert not window.serial_params.isHidden(), "串口模式下串口参数被藏了"
@@ -7628,14 +7685,16 @@ def check_link_switch_stable(app: QApplication) -> None:
 
         for _ in range(3):
             window._refresh_config_visibility(ble=True)
-            app.processEvents()
+            settle()
             assert window.serial_params.isHidden(), "广播模式下串口参数没藏"
             assert not window.btn_dlc.isHidden(), "广播模式下 DLC 没出现"
             window._refresh_config_visibility(ble=False)
-            app.processEvents()
+            settle()
             assert not window.serial_params.isHidden(), "切回串口后参数没回来"
             assert window.btn_dlc.isHidden(), "切回串口后 DLC 没藏"
             now = snap()
+            # 补间已 settle 完，四项都必须是**精确**相等 —— 用户报的 bug 就是
+            # 窗口被顶高 12px（723→755 那一类），任何一项差 1px 都不放行。
             assert now == base, (
                 f"连接方式来回切之后几何漂了：{(base)} → {now}"
                 f"（窗口高 {base[0]}→{now[0]}、卡高 {base[1]}→{now[1]}、"
@@ -8147,8 +8206,348 @@ def _heal_polluted_keys(settings: QSettings) -> None:
 os.environ.setdefault("SA_SKIP_DRIVER_PROMPT", "1")
 
 
+# --------------------------------------------------------------- 子集运行
+#
+# 用户诉求（2026-11-27）：「以后修改的时候只改某一部分……不用全部重新跑自测，
+# 不要消耗不必要的 token」。41 条全量跑一趟要好几分钟，改一行文案也得等全套。
+# 所以这里加一层**只决定"跑哪几条 check"**的选集，其它一切照旧。
+#
+# ⛔⛔ 铁律：选集**只影响 `for name, func in picked` 这个循环的输入**，绝不影响
+#    `main()` 里任何"保护用户真实配置"的代码。哪怕只跑 1 条，下面这些也必须
+#    原样、无条件执行（原本就没有一条是"只在某些 check 前才需要"的写法）：
+#      _heal_polluted_keys / _heal_hidden_buttons / _apply_undo_vehicles /
+#      _apply_undo_markers / global_snapshot 全量快照 / _mark_undo /
+#      _mark_undo_vehicles / 网格四键+lite 键钉 0 / pad_zero·rx_blocks·
+#      highlight_errors 钉前提 / _saved_vehicle + select_vehicle("") /
+#      link_mode 保存（含"原本不存在→remove"）/ rx_history._resolve_dir 与
+#      rx_store.set_db_path 指临时目录 / 每条之后的 _close_top_windows +
+#      _reset_pinned_state / 收尾两轮无条件还原 + shutdown+rmtree +
+#      _clear_undo_markers + select_vehicle(_saved_vehicle)。
+#
+# ⛔ 为什么**不**做"按需跳过前提"的优化（比如"只跑 HEX 编解码就不用钉 pad_zero"）：
+#    那需要维护 41 条 × 十几个前提的依赖矩阵，错一个格子就是**永久污染用户配置**
+#    ——本项目已经被咬过三次（车号被清空、custom/highlight_errors 被拨成 true、
+#    hidden_buttons 被写成测试签名）。这些前提加起来只花几百毫秒，收益远小于风险。
+#    「全部前提照旧无条件钉、收尾无条件还原」是刻意选择的保守设计，别"优化"它。
+
+_SELFTEST_USAGE = """\
+用法：python selftest.py [选项]
+
+  （不带选项）              全量跑全部 check（老行为，输出格式与退出码不变）
+  --list                    列出全部 check 的序号与名称后退出（不构造 QApplication）
+  --only <关键词|序号>      只跑名称包含该关键词（大小写不敏感、子串匹配）或序号匹配的 check
+  --skip <关键词|序号>      在全集中排除匹配项
+  --changed                 按 git 工作区改动的文件推断该跑哪几条，并打印选中依据
+
+--only / --skip 可重复给，也可用逗号分隔：--only 定制功能,校验位
+两者同时给时先 --only 再 --skip。选集为空 / 关键词一个都没匹配上 → 退出码 2。
+退出码：有 FAIL → 1，无 FAIL → 0。
+"""
+
+# `--changed` 用：改了这些文件就**回落到全量**。
+#   · main_window.py 是 11260 行的编排层（收发/回放/导出/设置/几何全在里面），
+#     改它基本什么都可能受影响 —— 刻意保守，不做细粒度猜测。
+#   · main.py 是进程入口（splash/字体预热/主题装填），同理。
+#   · selftest.py 本身改了 → 必须全量重验，否则等于"改完考卷不重考"。
+_FULL_RUN_FILES = ("main_window.py", "main.py", "selftest.py")
+
+# 文件 → 该文件改动会影响到的 check 名称关键词（子串匹配，大小写不敏感）。
+# ⛔ 这张表是**显式常量**，不许改成"猜"。原则：宁可多跑（多匹配几条只多花几十秒），
+#    不可漏跑（漏了就等于这轮改动没被验证）。新增模块时把它加进来。
+_CHANGED_MAP = {
+    "ui_settings.py": ("定制功能注册表", "定制功能", "车辆与逐模组配置",
+                       "连接方式切换", "启动时最大化", "默认折叠发送区"),
+    "customization.py": ("定制功能注册表", "定制功能", "启动时最大化",
+                         "默认折叠发送区", "显示行数", "车辆与逐模组配置",
+                         "校验位"),
+    "ui_controls.py": ("毛玻璃强度与箭头控件", "提示字号与按钮显隐", "校验位",
+                       "自绘标题栏三键", "全屏展开", "串口插拔"),
+    "ui_highlight.py": ("收包合并与暂停继续", "显示行数", "历史数据回放",
+                        "回车发送", "定位最近异常", "界面端到端收发"),
+    "ui_monitor.py": ("数据监控面板",),
+    "ui_theme.py": ("QSS token", "浅色纯白背景", "界面端到端收发"),
+    "ui_surface.py": ("浅色纯白背景", "毛玻璃强度与箭头控件"),
+    "ui_backdrop.py": ("浅色纯白背景", "毛玻璃强度与箭头控件"),
+    "ui_anim.py": ("动画引擎",),
+    "ui_brand.py": ("自绘标题栏三键",),
+    "splash_anim.py": ("动画引擎",),
+    "splash_motion.py": ("动画引擎",),
+    "serial_io.py": ("校验位", "串口枚举", "串口插拔", "串口建链",
+                     "loop://", "HEX", "增量文本解码", "界面端到端收发",
+                     "v2.11 四功能"),
+    "ble_io.py": ("蓝牙广播接收", "串口插拔"),
+    "rx_export.py": ("结构化导出",),
+    "rx_history.py": ("历史接收数据", "历史数据回放", "接收历史目录",
+                      "回放分页", "串口插拔"),
+    "rx_store.py": ("会话数据库", "回放分页", "历史数据回放"),
+    "rx_protocol.py": ("协议脚本化",),
+    "vehicle_share.py": ("车辆档案导出导入",),
+    "updater.py": ("自动更新模块",),
+    "version.py": ("自动更新模块", "安装包脚本"),
+    "mcp_bridge.py": ("MCP",),
+    "capability_api.py": ("MCP",),
+    "marks_model.py": ("v2.11 四功能", "定位最近异常"),
+    "wake_lock.py": ("v2.11 四功能",),
+    "soc_est.py": ("v2.11 四功能",),
+    "soc_feed.py": ("v2.11 四功能",),
+    "soc_profiles.py": ("v2.11 四功能",),
+    "soc_ekf.py": ("v2.11 四功能",),
+    "soc_display.py": ("v2.11 四功能",),
+    "perf_mode.py": ("界面端到端收发", "收包合并与暂停继续"),
+    "installer/SerialAssistant.iss": ("安装包脚本",),
+}
+
+
+def _split_keywords(raw: str) -> list[str]:
+    """``--only a,b`` / ``--only a，b`` → ``["a", "b"]``（中文逗号也认）。"""
+    return [part.strip() for part in str(raw).replace("，", ",").split(",")
+            if part.strip()]
+
+
+class _Selection:
+    """`selftest.py` 的命令行选集（只描述"跑哪几条"，不碰任何配置）。"""
+
+    def __init__(self) -> None:
+        self.list_only = False      # --list
+        self.changed = False        # --changed
+        self.only: list[str] = []
+        self.skip: list[str] = []
+        self.only_given = False     # 区分"--only 了但解析出空"与"没给"
+        self.error: str | None = None
+        self.rest: list[str] = []   # 留给 QApplication 的其余参数
+
+    @property
+    def active(self) -> bool:
+        """是否给了任何选集参数（决定结尾用"子集"还是老格式）。"""
+        return self.only_given or bool(self.skip) or self.changed
+
+
+def _parse_args(argv: list[str]) -> _Selection:
+    """扫描 ``sys.argv[1:]``（自己扫，不用 argparse —— 它会把 Qt 的参数吃掉）。"""
+    sel = _Selection()
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--list":
+            sel.list_only = True
+            index += 1
+            continue
+        if arg == "--changed":
+            sel.changed = True
+            index += 1
+            continue
+        handled = False
+        for opt, target in (("--only", "only"), ("--skip", "skip")):
+            value = None
+            if arg == opt:
+                if index + 1 >= len(argv):
+                    sel.error = f"{opt} 后面缺少关键词"
+                    return sel
+                value = argv[index + 1]
+                if value.startswith("--"):      # 把下一个选项当关键词吃掉 = 静默错选集
+                    sel.error = f"{opt} 后面缺少关键词（紧跟着的是 {value}）"
+                    return sel
+                index += 2
+            elif arg.startswith(opt + "="):
+                value = arg[len(opt) + 1:]
+                index += 1
+            if value is None:
+                continue
+            words = _split_keywords(value)
+            if not words:
+                sel.error = f"{opt} 后面没有有效关键词（收到 {value!r}）"
+                return sel
+            if target == "only":
+                sel.only_given = True
+                sel.only.extend(words)
+            else:
+                sel.skip.extend(words)
+            handled = True
+            break
+        if handled:
+            continue
+        sel.rest.append(arg)
+        index += 1
+    return sel
+
+
+def _match_indexes(token: str) -> list[int]:
+    """关键词/序号 → 匹配到的 check 下标（0 基）。序号从 1 开始，与 ``--list`` 一致。"""
+    if token.isdigit():
+        number = int(token)
+        if 1 <= number <= len(CHECKS):
+            return [number - 1]
+        return []
+    needle = token.casefold()
+    return [i for i, (name, _func) in enumerate(CHECKS)
+            if needle in name.casefold()]
+
+
+def _git_changed_files() -> tuple[set[str] | None, str]:
+    """工作区改动文件的**相对路径**集合（用 ``git diff --name-only HEAD`` +
+    ``git status --porcelain`` 取并集，覆盖已暂存/未暂存/未跟踪）。
+
+    返回 ``(files, "")`` 或 ``(None, 出错原因)`` —— 取不到就回落到全量。
+    本机 git 必须带 ``-c http.sslBackend=openssl``（见 MEMORY.md）。
+    """
+    root = Path(__file__).resolve().parent
+    base = ["git", "-c", "http.sslBackend=openssl", "-C", str(root)]
+    files: set[str] = set()
+    try:
+        for extra in (["diff", "--name-only", "HEAD"], ["status", "--porcelain"]):
+            proc = subprocess.run(base + extra, capture_output=True, text=True,
+                                  timeout=20, check=False)
+            if proc.returncode != 0:
+                detail = (proc.stderr or "").strip().splitlines()
+                return None, detail[-1] if detail else f"git 退出码 {proc.returncode}"
+            for line in proc.stdout.splitlines():
+                line = line.rstrip()
+                if not line:
+                    continue
+                path = line[3:] if extra[0] == "status" else line
+                if " -> " in path:              # 重命名：R  old -> new
+                    path = path.split(" -> ", 1)[1]
+                path = path.strip().strip('"').replace("\\", "/")
+                while path.startswith("./"):
+                    path = path[2:]
+                if path:
+                    files.add(path)
+    except (OSError, subprocess.SubprocessError) as exc:      # noqa: BLE001
+        return None, f"{type(exc).__name__}: {exc}"
+    return files, ""
+
+
+def _lookup_map(path: str) -> tuple[str, ...] | None:
+    """路径 → ``_CHANGED_MAP`` 里的关键词（先按完整相对路径，再按文件名）。"""
+    if path in _CHANGED_MAP:
+        return _CHANGED_MAP[path]
+    return _CHANGED_MAP.get(path.rsplit("/", 1)[-1])
+
+
+def _changed_plan(files: set[str]) -> tuple[list[str], list[str], list[str]]:
+    """改动文件 → (关键词, 命中说明, 未识别的文件)。"""
+    tokens: list[str] = []
+    notes: list[str] = []
+    unknown: list[str] = []
+    for path in sorted(files):
+        if path.rsplit("/", 1)[-1] in _FULL_RUN_FILES:
+            continue                             # 由调用方先判全量
+        keywords = _lookup_map(path)
+        if not keywords:
+            unknown.append(path)
+            continue
+        tokens.extend(keywords)
+        notes.append(f"{path} → {'、'.join(keywords)}")
+    return tokens, notes, unknown
+
+
+def _resolve_selection(sel: _Selection) -> tuple[list[tuple[str, object]] | None, str]:
+    """算出本次实际要跑的 check 列表。
+
+    返回 ``(picked, desc)``；选集为空时**已打印原因**并返回 ``(None, desc)``，
+    由调用方以退出码 2 结束。``desc`` 用于开头/结尾那两行说明。
+    """
+    parts: list[str] = []
+    base = list(CHECKS)
+    fallback_why = ""
+    missing: list[str] = []
+
+    if sel.changed:
+        parts.append("--changed")
+        files, error = _git_changed_files()
+        if files is None:
+            fallback_why = f"读不到 git 改动（{error}）"
+        elif not files:
+            fallback_why = "工作区没有改动"
+        else:
+            heavy = sorted(path for path in files
+                           if path.rsplit("/", 1)[-1] in _FULL_RUN_FILES)
+            if heavy:
+                print(f"  ⚠ 改动了编排层/入口/自测本体（{'、'.join(heavy)}）")
+                print("     理由：这些文件影响面覆盖几乎所有用例，刻意不按条猜。")
+                fallback_why = "改动文件影响面过大"
+            else:
+                tokens, notes, others = _changed_plan(files)
+                print("  --changed 依据：")
+                for note in notes:
+                    print(f"      {note}")
+                if others:
+                    print(f"      未映射到 check（忽略）：{'、'.join(others)}")
+                if not tokens:
+                    fallback_why = "未能判定改动与 check 的对应关系"
+                else:
+                    matched: set[int] = set()
+                    for token in tokens:
+                        hits = _match_indexes(token)
+                        if not hits:
+                            print(f"  ⚠ 映射表关键词没匹配到 check：{token}")
+                        matched.update(hits)
+                    base = [CHECKS[i] for i in sorted(matched)]
+                    print(f"      → 按改动选中 {len(base)} 条")
+
+    if fallback_why:
+        print(f"  ⚠ {fallback_why} → 回落到全量")
+        base = list(CHECKS)
+
+    if sel.only_given:
+        parts.append("--only " + ",".join(sel.only))
+        picked_names: set[str] = set()
+        for token in sel.only:
+            hits = _match_indexes(token)
+            if not hits:
+                missing.append(token)
+                continue
+            picked_names.update(CHECKS[i][0] for i in hits)
+        base = [item for item in base if item[0] in picked_names]
+
+    if sel.skip:
+        parts.append("--skip " + ",".join(sel.skip))
+        removed: set[str] = set()
+        for token in sel.skip:
+            hits = _match_indexes(token)
+            if not hits:
+                missing.append(token)
+                continue
+            removed.update(CHECKS[i][0] for i in hits)
+        if removed:
+            base = [item for item in base if item[0] not in removed]
+
+    desc = " ".join(parts).strip()
+    if fallback_why:
+        desc = f"{desc}，回落全量".strip("，")
+    if not base:
+        # 一个都没匹配上：明确说清是哪个关键词，并列出全部名称 —— 不静默跑零条。
+        if missing:
+            print(f"没有匹配的 check：{'、'.join(missing)}")
+        else:
+            print("选集为空：没有任何 check 需要跑。")
+        print("可用的 check 名称：")
+        for number, (name, _func) in enumerate(CHECKS, 1):
+            print(f"  {number:>2}. {name}")
+        return None, desc
+    for token in missing:
+        print(f"  ⚠ 没有匹配的 check：{token}")
+    return base, desc
+
+
 def main() -> int:
-    app = QApplication(sys.argv)
+    selection = _parse_args(sys.argv[1:])
+    if selection.error:
+        print(f"参数错误：{selection.error}\n")
+        print(_SELFTEST_USAGE)
+        return 2
+    if selection.list_only:
+        for number, (name, _func) in enumerate(CHECKS, 1):
+            print(f"{number:>2}. {name}")
+        print(f"\n共 {len(CHECKS)} 条")
+        return 0
+    picked, selection_desc = _resolve_selection(selection)
+    if picked is None:
+        return 2
+    if selection.active:
+        print(f"本次只跑 {len(picked)}/{len(CHECKS)} 条（{selection_desc}）")
+
+    app = QApplication([sys.argv[0], *selection.rest])
     # ⚠️ 起手环境必须和 main.py 一致：**Fusion + 应用字体（MiSans 12.5）**。
     #    不设应用字体时，所有"继承默认字体"的控件（下拉框、数字框、标签……）
     #    会退化成系统 9pt —— 自测量到的几何/墨迹和用户看到的是两套东西。
@@ -8247,7 +8646,9 @@ def main() -> int:
     _selftest_db_dir = Path(_tempfile.mkdtemp(prefix="selftest_db_"))
     _rxs.set_db_path(str(_selftest_db_dir / "sessions.db"))
     failed = 0
-    for name, func in CHECKS:
+    # ⚠️ 只把**循环的输入**换成选集结果；上面那几十行前提一条不少地照跑（见
+    #    `_SELFTEST_USAGE` 上方的长注释：这是刻意的保守设计）。
+    for name, func in picked:
         try:
             func(app) if func.__code__.co_argcount else func()
         except Exception as exc:
@@ -8331,7 +8732,12 @@ def main() -> int:
     except Exception:                     # noqa: BLE001 - 清日志失败不许影响退出码
         pass
 
-    print(f"\n{len(CHECKS) - failed}/{len(CHECKS)} 项通过")
+    if selection.active:
+        # 子集运行：分母是本次实际跑的数量，并在括号里留下选集依据，便于日志追溯。
+        print(f"\n{len(picked) - failed}/{len(picked)} 项通过（子集：{selection_desc}）")
+    else:
+        # 全量运行：**逐字**保持老格式与老分母，别改（发布门禁 grep 这一行）。
+        print(f"\n{len(CHECKS) - failed}/{len(CHECKS)} 项通过")
     return 1 if failed else 0
 
 
