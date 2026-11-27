@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import datetime
+import json
 import os
 import subprocess
 import sys
@@ -8556,12 +8558,180 @@ def _resolve_selection(sel: _Selection) -> tuple[list[tuple[str, object]] | None
     return base, desc
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 单实例锁
+#
+# 为什么必须有：两条自测**并发跑**会互相踩 QSettings —— `_heal_*` 的写前日志、
+# `custom/*` 的钉值、`link_mode` 的还原全是全局状态，历史上已经因此污染过用户
+# 真实配置三次。宁可拒绝启动，也不能让两条同时跑。
+#
+# 为什么用内核字节锁（`msvcrt.locking`）而不是"锁文件 + pid 判活"：
+#   pid 判活的每个分支都有**误放**风险，而误放的后果最严重。典型漏洞：
+#   `OpenProcess` 打不开不等于进程已退出 —— 进程活着但权限不足时返回
+#   ACCESS_DENIED，若当成"已退出"就会去接管一把**别人正在持有**的锁；这个 bug
+#   只在提权差异下显形（持锁方以管理员跑、后来者普通权限），日常同权限跑永远绿，
+#   一旦触发就是"两条并发 → 污染配置"的最坏结果。
+#   交给内核持有则进程一死立刻释放，不存在"残留锁"这个概念，也就不需要 pid 判活、
+#   创建时间、pid 复用识别、超时失效这些分支。
+#
+# 偏移量为什么是 4096：锁加在 offset 4096 的一个字节上，前面 4KB 留给 JSON
+#   持有人信息。**不能锁在 offset 0** —— 那样后来的进程连 `read()` 都会
+#   PermissionError（有缓冲读一次抓 8KB，会覆盖锁字节），就看不到"谁在持锁"了。
+#   同理读取方必须用**无缓冲** `os.read(fd, 4096)`，不能用 `open().read()`。
+# ══════════════════════════════════════════════════════════════════════════
+
+_LOCK_OFFSET = 4096          # 锁字节偏移；前 4KB 给持有人 JSON
+_LOCK_HEAD_BYTES = 4096      # 读持有人信息的上限，必须 <= _LOCK_OFFSET
+# msvcrt.locking 抢不到时的 errno（都表示"别人持着"，不是基础设施故障）
+_LOCK_BUSY_ERRNOS = (13, 36)  # EACCES / EDEADLK
+
+try:                          # 字节锁只有 Windows 有；非 Windows 整段降级为无锁
+    import msvcrt as _msvcrt
+except ImportError:           # pragma: no cover - 本项目只发 Windows 版
+    _msvcrt = None
+
+
+def _lock_path() -> str:
+    return str(Path(__file__).resolve().parent / "_check" / ".selftest.lock")
+
+
+class SelftestLock:
+    """保证同一时刻只有一个自测在跑。
+
+    ``acquire()`` **永不抛异常**：
+      · 抢不到（别人持着）→ ``(False, 给人看的说明)``，调用方以退出码 2 结束；
+      · 基础设施故障（目录建不出、文件打不开……）→ ``(True, 警告)``，**降级成
+        无锁运行**。理由：锁是防手误的便利设施，不能变成新的故障点 —— 宁可偶尔
+        没锁住，也不能让自测因为建不出目录就跑不起来。
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._fd: int | None = None
+        self.held = False
+
+    def _read_holder(self) -> dict | None:
+        """读锁文件前 4KB。**必须无缓冲**，否则有缓冲读会抓到锁字节而报错。"""
+        try:
+            handle = os.open(self.path, os.O_RDONLY | os.O_BINARY)
+        except OSError:
+            return None
+        try:
+            raw = os.read(handle, _LOCK_HEAD_BYTES)
+        except OSError:
+            return None
+        finally:
+            os.close(handle)
+        text = raw.split(b"\x00", 1)[0].decode("utf-8", "replace").strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _write_holder(self) -> None:
+        """把"谁在持锁"写进前 4KB。失败不影响互斥，只是提示里少了细节。"""
+        if self._fd is None:
+            return
+        payload = json.dumps({
+            "pid": os.getpid(),
+            "at": datetime.datetime.now().astimezone().isoformat(
+                timespec="seconds"),
+            "argv": list(sys.argv[1:]),
+        }, ensure_ascii=False).encode("utf-8")
+        body = payload[:_LOCK_OFFSET].ljust(_LOCK_OFFSET, b"\x00")
+        try:
+            os.lseek(self._fd, 0, os.SEEK_SET)
+            os.write(self._fd, body)
+            os.fsync(self._fd)
+        except OSError:
+            pass
+
+    def _describe(self, info: dict | None) -> str:
+        if not info:
+            return "\n".join((
+                "另一个自测正在运行（拿不到它的进程信息）",
+                f"  锁文件：{self.path}",
+                "如果确认那个进程已经不在了，删掉锁文件再跑即可。",
+            ))
+        argv = info.get("argv") or []
+        return "\n".join((
+            f"另一个自测正在运行（pid={info.get('pid', '?')}）",
+            f"  开始于：{info.get('at', '?')}",
+            f"  参数：  {' '.join(str(x) for x in argv) or '(无)'}",
+            f"  锁文件：{self.path}",
+            "如果确认那个进程已经不在了，删掉锁文件再跑即可。",
+        ))
+
+    def acquire(self) -> tuple[bool, str]:
+        """见类 docstring：永不抛异常，故障一律降级为 ``(True, 警告)``。"""
+        if _msvcrt is None:               # 非 Windows：没有字节锁可用
+            return True, "⚠ 本平台没有 msvcrt 字节锁，本次无锁运行"
+        folder = os.path.dirname(self.path)
+        try:
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+        except OSError as exc:
+            return True, (f"⚠ 建不出锁目录（{exc.__class__.__name__}），"
+                          "本次无锁运行")
+
+        try:
+            handle = os.open(self.path,
+                             os.O_CREAT | os.O_RDWR | os.O_BINARY)
+        except OSError as exc:
+            return True, (f"⚠ 打不开锁文件（{exc.__class__.__name__}），"
+                          "本次无锁运行")
+
+        try:
+            # 保证文件至少到 _LOCK_OFFSET+1，否则锁不到文件尾之外的那一字节
+            if os.fstat(handle).st_size < _LOCK_OFFSET + 1:
+                os.lseek(handle, _LOCK_OFFSET, os.SEEK_SET)
+                os.write(handle, b"\x00")
+            os.lseek(handle, _LOCK_OFFSET, os.SEEK_SET)
+            _msvcrt.locking(handle, _msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            os.close(handle)
+            if getattr(exc, "errno", None) in _LOCK_BUSY_ERRNOS:
+                return False, self._describe(self._read_holder())
+            return True, (f"⚠ 锁不上锁文件（{exc.__class__.__name__}: "
+                          f"{exc}），本次无锁运行")
+
+        self._fd = handle
+        self.held = True
+        self._write_holder()
+        return True, ""
+
+    def release(self) -> None:
+        """解锁并关句柄。异常一律吞掉 —— 收尾阶段不能让锁影响退出码。"""
+        handle, self._fd = self._fd, None
+        self.held = False
+        if handle is None:
+            return
+        try:
+            os.lseek(handle, _LOCK_OFFSET, os.SEEK_SET)
+            _msvcrt.locking(handle, _msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(handle)
+            except OSError:
+                pass
+
+
 def main() -> int:
     selection = _parse_args(sys.argv[1:])
     if selection.error:
         print(f"参数错误：{selection.error}\n")
         print(_SELFTEST_USAGE)
         return 2
+    # ⛔⛔ `--list` / 参数错误 / 无匹配 三条路径**刻意不抢锁**（就在下面这几个
+    #      早退分支里 return）。它们是 0 成本查询，不该因为"另一个自测在跑"而
+    #      被拒绝 —— 排查问题时恰恰最需要一边跑一边能查清单。
+    #      以后有人想"统一入口，一律先抢锁"时请住手：那会把 `--list` 变成会
+    #      失败的命令，而它原来的全部价值就是"永远能立刻回答有哪些 check"。
     if selection.list_only:
         for number, (name, _func) in enumerate(CHECKS, 1):
             print(f"{number:>2}. {name}")
@@ -8570,6 +8740,27 @@ def main() -> int:
     picked, selection_desc = _resolve_selection(selection)
     if picked is None:
         return 2
+
+    # 到这里才真的要跑 check（要动 QSettings）→ 抢锁。
+    # ⛔ 释放必须在 `finally` 里，且 try 要包住**整个** _run_checks —— 里面任何
+    #    一条 check 抛异常、任何一个 finally 还原失败，都不能把锁留下。
+    lock = SelftestLock(_lock_path())
+    lock_ok, lock_message = lock.acquire()
+    if not lock_ok:
+        print(lock_message)
+        return 2
+    if lock_message:                    # 降级为无锁：只提示，不阻止运行
+        print(lock_message)
+    try:
+        return _run_checks(selection, picked, selection_desc)
+    finally:
+        lock.release()
+
+
+def _run_checks(selection: _Selection,
+                picked: list[tuple[str, object]],
+                selection_desc: str) -> int:
+    """真正跑 check 的那一段（调用方已抢到锁，且会用 finally 释放）。"""
     if selection.active:
         print(f"本次只跑 {len(picked)}/{len(CHECKS)} 条（{selection_desc}）")
 
