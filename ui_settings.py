@@ -1283,7 +1283,10 @@ class SettingsDialog(QDialog):
                 _custom_label = _rh_label
             else:
                 # 第二项起把原行标签收进字段区当行内小字（文案不变）。
-                _custom_label = self._inline_caption(spec["label"])
+                # ⛔ 用 _merge_caption 不用 _inline_caption：这是**完整设置名**
+                # （"温度采集数据行数"），必须与左边的"电压数据行数"同字体，
+                # 否则右边又粗又小（用户 2026-11-27 截图点名）。
+                _custom_label = self._merge_caption(spec["label"])
                 # 同 _build_custom_section 的合并分支：小标签必须水平 Fixed，否则
                 # 被拉满字段列，把两个框顶到两端（QA 真机截图实证过）。
                 _custom_label.setSizePolicy(QSizePolicy.Policy.Fixed,
@@ -1350,7 +1353,7 @@ class SettingsDialog(QDialog):
             self.cmb_material.currentIndexChanged.connect(
                 lambda _idx, s=material_spec, c=self.cmb_material:
                 self._on_choice_changed(s, c))
-            material_label = self._inline_caption(material_spec["label"])
+            material_label = self._merge_caption(material_spec["label"])
             # 与前面「主题」同一个容器、同一行（不另占一行）。
             material_label.setSizePolicy(QSizePolicy.Policy.Fixed,
                                          QSizePolicy.Policy.Preferred)
@@ -1639,6 +1642,13 @@ class SettingsDialog(QDialog):
         "volt_rows": ("电压数据行数", ("volt_rows", "temp_rows")),
         "material": ("主题", ("material",)),
     }
+    # 合并行前缀里属于**完整设置名**的那几个（不是"年"/"~"这类辅助标注）——
+    # 字体必须与行标签 _label 一致（12.5pt 常规），不能用 _inline_caption 的
+    # 10.5pt+groupCaption 粗体。用户 2026-11-27 五张截图点名。
+    _MERGE_PLAIN_NAMES: frozenset[str] = frozenset({
+        "行数（最大化）", "总电压来源", "时保留任务栏",
+    })
+
     # 合并行里各控件前面的小字：四个开关要「年 / 月 / 日 / 时钟」；两个范围只在
     # 第二个框前放「~」；SOC 那两只只在第二个框前放「总电压来源」；最大化那一行
     # 第二只开关前放「时保留任务栏」。没登记的成员用原来的行标签做 _custom_rows
@@ -3120,7 +3130,16 @@ class SettingsDialog(QDialog):
                     _h = _merge_layouts[_owner]
                 _prefix = self._MERGE_PREFIXES.get(spec["key"])
                 if _prefix is not None:
-                    _small = self._inline_caption(_prefix)
+                    # ⛔ 分两类，别一律用 _inline_caption（用户 2026-11-27
+                    # 五张截图点名"字体要和前面的保持一致"）：
+                    #   · 辅助标注（"年"/"月"/"日"/"时钟"/"~"）—— 小字 10.5pt
+                    #   · 完整设置名（"行数（最大化）"/"总电压来源"/
+                    #     "时保留任务栏"）—— 与行标签同款 12.5pt 常规
+                    # 不改 _inline_caption 本身：车辆区「赛季：」等还靠它。
+                    if _prefix in self._MERGE_PLAIN_NAMES:
+                        _small = self._merge_caption(_prefix)
+                    else:
+                        _small = self._inline_caption(_prefix)
                     _h.addWidget(_small)
                 else:
                     _small = row_label
@@ -4354,16 +4373,39 @@ class SettingsDialog(QDialog):
         return label
 
     def _inline_caption(self, text: str) -> QLabel:
-        """行内小标签（"赛季：" / "车号："）。
+        """行内**辅助小字**（"赛季：" / "年" / "月" / "~"）。
 
         字号与「模组 i」里那些"电芯数量："一致（10.5pt 的 groupCaption），
         这样同一张面板里"字段名前缀"看着是同一种东西。⛔ 最小宽度必须钉住
         文字宽度：字段区不够宽时 QLayout 会把这个 min 小的标签压扁（踩过，
         "个"被压成 2px）。
+
+        ⛔ **只给"辅助标注"用，别给合并行里第二个设置项的名字用** ——
+        那是完整的设置名（"温度采集数据行数"/"界面材质"/"总电压来源"…），
+        和同一行第一项的 `_label` 放一起时 10.5pt+groupCaption(粗体) 会明显
+        "一半粗一半细"（用户 2026-11-27 五张截图点名）。那种用 `_merge_caption`。
         """
         label = QLabel(text)
         label.setFont(ui_font(10.5))
         label.setObjectName("groupCaption")
+        label.setMinimumWidth(label.fontMetrics().horizontalAdvance(text) + 2)
+        return label
+
+    def _merge_caption(self, text: str) -> QLabel:
+        """合并行里**第二个设置项的名字**：字体与行标签 `_label` 完全一致。
+
+        用户 2026-11-27 五张截图：「字体要和前面的保持一致啊，这种两个设置在
+        一排的可以单独优化排列」。截图里「电压数据行数 [2] **温度采集数据行数**
+        [2]」这行，后一个标签又粗又小 —— 因为走了 `_inline_caption`
+        （10.5pt + groupCaption，QSS `font-weight:600`），而前一个走 `_label`
+        （12.5pt 常规）。这里统一成 12.5pt 常规、**不挂** groupCaption
+        objectName（避免粗体 + 变暗），只保留最小宽度钉住防被压扁。
+
+        ⛔ 别改 `_inline_caption` 来"一劳永逸"：车辆区「赛季：」、时间戳行的
+        「年/月/日/时钟」、范围行的「~」都复用它，那些是辅助标注，本来就该小。
+        """
+        label = QLabel(text)
+        label.setFont(ui_font(12.5))
         label.setMinimumWidth(label.fontMetrics().horizontalAdvance(text) + 2)
         return label
 
