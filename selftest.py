@@ -3825,8 +3825,9 @@ def check_customization(app: QApplication) -> None:
                     #    注册表原行标签（如「时钟显示年月日」）当小字 —— 此时按
                     #    原标签查 QLabel 查不到，落到这条断言。光说"找不到行标签"
                     #    会让人以为是布局坏了，实际是登记表少了一条。
-                    _merged_keys = {k for _m in dialog._MERGE_GROUPS.values()
-                                    for k in _m}
+                    _merged_keys = {k for _label, _members
+                                    in dialog._MERGE_GROUPS.values()
+                                    for k in _members}
                     _hint = ""
                     if spec["key"] in _merged_keys and \
                             spec["key"] not in dialog._MERGE_PREFIXES:
@@ -8282,8 +8283,10 @@ _CHANGED_MAP = {
     "customization.py": ("定制功能注册表", "定制功能", "启动时最大化",
                          "默认折叠发送区", "显示行数", "车辆与逐模组配置",
                          "校验位"),
+    # 「接收区搜索」的 SearchEdit（回车/Shift+回车分支）就住在 ui_controls.py，
+    # 改它会直接影响搜索键行为，不能漏。
     "ui_controls.py": ("毛玻璃强度与箭头控件", "提示字号与按钮显隐", "校验位",
-                       "自绘标题栏三键", "全屏展开", "串口插拔"),
+                       "自绘标题栏三键", "全屏展开", "串口插拔", "接收区搜索"),
     "ui_highlight.py": ("收包合并与暂停继续", "显示行数", "历史数据回放",
                         "回车发送", "定位最近异常", "界面端到端收发"),
     "ui_monitor.py": ("数据监控面板",),
@@ -8304,7 +8307,8 @@ _CHANGED_MAP = {
     "rx_store.py": ("会话数据库", "回放分页", "历史数据回放"),
     "rx_protocol.py": ("协议脚本化",),
     "vehicle_share.py": ("车辆档案导出导入",),
-    "updater.py": ("自动更新模块",),
+    # INSTALL_DISPLAY_NAMES 决定"安装版是否认得自己"，改名相关回归必须带上。
+    "updater.py": ("自动更新模块", "改名无残留"),
     "version.py": ("自动更新模块", "安装包脚本"),
     "mcp_bridge.py": ("MCP",),
     "capability_api.py": ("MCP",),
