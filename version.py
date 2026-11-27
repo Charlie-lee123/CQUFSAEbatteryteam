@@ -4,7 +4,7 @@
 避免入口模块被反向 import（main 一被 import 就会拉起 MainWindow）。
 """
 
-VERSION = "3.1"
+VERSION = "3.0"
 
 OWNER_REPO = "Charlie-lee123/CQUFSAEbatteryteam"
 
@@ -31,7 +31,8 @@ SETUP_ASSET_SUFFIX = ".exe"
 #        校验值，请稍后再试"，而不是拿旧哈希硬比、也不是静默跳过校验。
 # ⚠️ 升版本时必须先清空成空串：留着**上一版**的哈希会让"拉到的版本文件没解析出
 #    哈希"时的兜底校验拿旧哈希去比新包，直接把更新卡死。发布完由脚本写回。
-# v3.1 尚未发布 → 这里按规矩留空（发布脚本会在发 Release 时写回并同步 commit）。
+# v3.0（用户 2026-11-27 定案：本轮改动仍算 3.0，不另立 3.1）→ 发布脚本在发
+# Release 时写回本版真实哈希，在那之前按规矩留空。
 LATEST_EXE_SHA256 = ""
 
 # 当前 Release 里**安装包**的 SHA256（同上，由发布脚本写回）。

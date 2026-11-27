@@ -1,6 +1,27 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 import os
+import sys
+
+# ---------------------------------------------------------------------------
+# Windows 版本资源（2026-11-27 补）
+#
+# 用户报「现在还是 V3.0」，一部分原因是 **exe 里根本没有版本资源**：
+# ``EXE()`` 不传 ``version=`` 时 PyInstaller 不写这个块，Windows 属性页
+# 「详细信息」的文件版本/产品版本全空白，任务管理器、卸载列表、任何第三方
+# 版本检测都读不到 —— 唯一能看版本的地方只剩程序自己的设置面板。
+#
+# 现在版本号只在 ``version.py`` 里写一次，这里渲染成资源文件交给 EXE。
+# ⛔ 不要在 .spec 里硬编码版本字符串。
+sys.path.insert(0, os.path.dirname(os.path.abspath(SPEC)))
+import version_file                                       # noqa: E402
+from version import VERSION                               # noqa: E402
+
+_version_file = os.path.join(os.path.dirname(os.path.abspath(SPEC)),
+                             "_check", "_version_info.txt")
+os.makedirs(os.path.dirname(_version_file), exist_ok=True)
+with open(_version_file, "w", encoding="utf-8") as _fh:
+    _fh.write(version_file.render(VERSION))
 
 # ---------------------------------------------------------------------------
 # 运行时裁剪（2026-10-17）
@@ -214,4 +235,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['assets/app.ico'],
+    version=_version_file,
 )
