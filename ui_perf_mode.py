@@ -11,9 +11,10 @@
 ## 模糊怎么算
 
 真高斯（可分离卷积、不依赖 cv2/scipy），但**先降采样再卷积**：
-2900×1800 的整窗图直接卷 sigma=32 要 ~600ms，双击后那一下必卡；降 6 倍后
-只需要 ~25ms，升回原尺寸时 Qt 的双线性插值会把降采样丢掉的细节补平 ——
-背景本来就是一张要被糊掉的图，这个误差看不出来。
+2400×1670 的整窗图在全分辨率上直接卷积要几百毫秒，双击后那一下必卡；
+**降 8 倍**后卷积只要 ~20ms（实测整段 ~70ms，大头是最后的平滑放大），
+升回原尺寸时 Qt 的双线性插值会把降采样丢掉的细节补平 —— 背景本来就要被
+糊掉，这点误差看不出来。
 
 ⛔ 不用 ``QGraphicsBlurEffect``：项目铁律，离屏合成会让整窗掉帧。
 """
@@ -34,7 +35,7 @@ from ui_theme import qcolor, ui_font
 #: 缩小倍数：2400×1670 的整窗图 6 倍降采样要 ~118ms、8 倍 ~70ms
 #: （耗时大头是最后的平滑放大，不是卷积本身），8 倍是"够糊且不卡"的平衡点
 _SHRINK = 8
-#: 屏幕上的模糊半径（逻辑像素）
+#: 模糊半径（**物理**像素 —— grab() 拿到的就是设备像素图，dpr=2 时等于 8 逻辑像素）
 _SIGMA_LOGICAL = 16.0
 
 
@@ -61,8 +62,13 @@ def _gaussian(arr, sigma: float):
     return out
 
 
-def _blur_pixmap(pix: QPixmap, sigma: float = _SIGMA_LOGICAL) -> QPixmap:
-    """把一张位图糊掉。失败（没 numpy / 图坏了）时退回多级缩放近似。"""
+def _blur_pixmap(pix: QPixmap, sigma: float = _SIGMA_LOGICAL,
+                 desaturate: float = 1.0) -> QPixmap:
+    """把一张位图糊掉。失败（没 numpy / 图坏了）时退回多级缩放近似。
+
+    ``desaturate``：<1 时按比例压向灰度（车号过渡要"毛玻璃"而不是灰蒙蒙一片）。
+    全项目只有这一份"降采样 → 真高斯 → 平滑放大"，别在别处再写第二份。
+    """
     if pix is None or pix.isNull():
         return pix
     try:
@@ -87,6 +93,14 @@ def _blur_pixmap(pix: QPixmap, sigma: float = _SIGMA_LOGICAL) -> QPixmap:
         small = arr[: small_h * shrink, : small_w * shrink].reshape(
             small_h, shrink, small_w, shrink, 4).mean(axis=(1, 3))
         small = _gaussian(small, max(0.8, sigma / shrink))
+
+        if desaturate < 1.0:
+            # ⛔ 只去饱和、**不提亮**：糊层一旦比面板底色亮，整块模糊区就成了
+            #    一块"发白的矩形"，边界肉眼可见（车号动画的"残影"有一半是它）。
+            rgb = small[:, :, :3]
+            lum = rgb.mean(axis=2, keepdims=True)
+            rgb = np.clip(lum + (rgb - lum) * desaturate, 0.0, 255.0)
+            small = np.concatenate((rgb, small[:, :, 3:4]), axis=2)
 
         out = np.clip(small, 0, 255).astype(np.uint8)
         out = np.ascontiguousarray(out)

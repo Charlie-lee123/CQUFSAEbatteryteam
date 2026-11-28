@@ -704,6 +704,11 @@ class Switch(QCheckBox):
     def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
         self._t = 1.0 if self.isChecked() else 0.0
+        # 文字在**左**、轨道在右（用户 2026-11-27 截图：「这里开关和文字位置
+        # 换一下」）。默认 False = 老口径（轨道左、文字右），只有显式
+        # ``set_text_first(True)`` 的实例才翻过来 —— 定制功能区的无文字开关
+        # 与「串口开关」等都不受影响。
+        self._text_first = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFont(ui_font(11.0))
         # 无障碍：自绘控件没有原生勾选框，读屏软件拿不到任何线索 —— 必须
@@ -728,18 +733,39 @@ class Switch(QCheckBox):
     def _on_accessible_state(self, _checked: bool) -> None:
         self._sync_accessible_state()
 
+    def set_text_first(self, enabled: bool = True) -> None:
+        """文字挪到轨道**左边**（默认是轨道在左、文字在右）。
+
+        只影响本实例：``sizeHint`` / ``paintEvent`` / ``hitButton`` 三处都按
+        ``_text_first`` 现算几何，命中区始终跟着绘制走（别在这里另写一套判定，
+        否则又会出现"点得到但看不见 / 看得见点不到"）。
+        """
+        enabled = bool(enabled)
+        if enabled == self._text_first:
+            return
+        self._text_first = enabled
+        self.updateGeometry()
+        self.update()
+
+    def _text_w(self) -> int:
+        """文字区宽度（没有文字就是 0）。"""
+        if not self.text():
+            return 0
+        return QFontMetrics(self.font()).horizontalAdvance(self.text())
+
     def sizeHint(self) -> QSize:
         metrics = QFontMetrics(self.font())
         width = int(self.TRACK_W)
         if self.text():
-            width += int(self.GAP_PX) + metrics.horizontalAdvance(self.text())
+            width += int(self.GAP_PX) + self._text_w()
         return QSize(width, max(int(self.TRACK_H) + 6, metrics.height() + 2))
 
     minimumSizeHint = sizeHint
 
     def _track_rect(self) -> QRectF:
         """胶囊轨道在控件里的位置（与 paintEvent 的绘制几何保持一致）。"""
-        return QRectF(0.0, (self.height() - self.TRACK_H) / 2.0,
+        left = float(self._text_w() + self.GAP_PX) if self._text_first else 0.0
+        return QRectF(left, (self.height() - self.TRACK_H) / 2.0,
                       self.TRACK_W, self.TRACK_H)
 
     def hitButton(self, pos: QPoint) -> bool:
@@ -764,9 +790,14 @@ class Switch(QCheckBox):
             cy = min(max(point.y(), track.top() + radius), track.bottom() - radius)
             return QLineF(point, QPointF(cx, cy)).length() <= radius
         if self.text():
-            text_rect = QRectF(self.TRACK_W + self.GAP_PX, 0.0,
-                               self.width() - self.TRACK_W - self.GAP_PX,
-                               float(self.height()))
+            # 文字区矩形跟着 `_text_first` 换边（默认在轨道右侧）
+            if self._text_first:
+                text_rect = QRectF(0.0, 0.0,
+                                   float(self._text_w()), float(self.height()))
+            else:
+                text_rect = QRectF(track.right() + self.GAP_PX, 0.0,
+                                   self.width() - track.right() - self.GAP_PX,
+                                   float(self.height()))
             return text_rect.contains(point)
         return False
 
@@ -810,7 +841,9 @@ class Switch(QCheckBox):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         enabled = self.isEnabled()
-        track = QRectF(0.0, (self.height() - self.TRACK_H) / 2.0, self.TRACK_W, self.TRACK_H)
+        # 轨道位置统一走 _track_rect()：命中区、绘制、sizeHint 三处必须是
+        # **同一份几何**，否则「看得见点不到」的老 bug 会以新形式回来。
+        track = self._track_rect()
         radius = self.TRACK_H / 2.0
         path = QPainterPath()
         path.addRoundedRect(track, radius, radius)
@@ -839,10 +872,16 @@ class Switch(QCheckBox):
         if self.text():
             painter.setPen(qcolor("ink") if enabled else qcolor("ink_disabled"))
             painter.setFont(self.font())
-            painter.drawText(
-                QRectF(self.TRACK_W + self.GAP_PX, 0.0,
-                       self.width() - self.TRACK_W - self.GAP_PX, float(self.height())),
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.text())
+            if self._text_first:
+                text_rect = QRectF(0.0, 0.0, float(self._text_w()),
+                                   float(self.height()))
+            else:
+                text_rect = QRectF(track.right() + self.GAP_PX, 0.0,
+                                   self.width() - track.right() - self.GAP_PX,
+                                   float(self.height()))
+            painter.drawText(text_rect,
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             self.text())
 
 
 # ------------------------------------------------------------------ 滑杆

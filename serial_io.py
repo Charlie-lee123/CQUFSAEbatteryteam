@@ -66,14 +66,40 @@ def _port_sort_key(device: str) -> tuple[str, int]:
     return (head.lower(), int(digits) if digits else -1)
 
 
-def list_serial_ports() -> list[tuple[str, str]]:
+# 蓝牙虚拟串口的 hwid 特征。Windows 把「已配对的蓝牙 SPP 设备」暴露成一个
+# COM 口，它的 hwid 一定是 ``BTHENUM\...``（本机实测两条都是），而描述固定是
+# 「蓝牙链接上的标准串行」。这类口**不属于「串口」视图** —— 用户 2026-11-27
+# 原话：「串口就串口，蓝牙就蓝牙，在串口不要显示蓝牙」。
+_BLUETOOTH_HWID = "BTHENUM"
+
+
+def is_bluetooth_port(hwid: str) -> bool:
+    r"""这个串口是不是 Windows 给**蓝牙 SPP 设备**造的虚拟串口。
+
+    判据只认 hwid 前缀，**不认描述文字**：描述是本地化的（中文「蓝牙链接上的
+    标准串行」/ 英文 "Standard Serial over Bluetooth link"），换系统语言就失效；
+    而 ``BTHENUM\`` 是设备总线的标识，任何语言下都一样。
+    """
+    return str(hwid or "").upper().startswith(_BLUETOOTH_HWID)
+
+
+def list_serial_ports(*, include_bluetooth: bool = True) -> list[tuple[str, str]]:
     """返回 [(设备名, 描述)]，按端口号排序。没有串口时返回空列表。
 
     ⚠️ 元组的**第一个**元素才是能交给 pyserial 打开的端口名，第二个只是给人看的
     描述（界面上拼成 "COM3 — STMicroelectronics STLink ..."）。两者搞混的后果见
     ``main_window._selected_port`` 的说明。
+
+    ``include_bluetooth=False``：滤掉 Windows 给蓝牙 SPP 设备造的虚拟串口
+    （见 ``is_bluetooth_port``）。界面上的「连接方式 = 串口」走这条 ——
+    串口视图里只该有真串口，蓝牙那条路由「连接方式 = 蓝牙广播」负责。
+    默认 True 保持「枚举全部」的通用语义（自测与诊断探针可能想看全量）。
     """
-    ports = [(p.device, p.description or p.device) for p in list_ports.comports()]
+    ports: list[tuple[str, str]] = []
+    for p in list_ports.comports():
+        if not include_bluetooth and is_bluetooth_port(getattr(p, "hwid", "")):
+            continue
+        ports.append((p.device, p.description or p.device))
     return sorted(ports, key=lambda item: _port_sort_key(item[0]))
 
 

@@ -91,21 +91,27 @@ COMBO_W = 152
 # ⛔ 只收窄这两只，**不动 COMBO_W**：主题/界面材质/开屏动画里最长条目
 #    「自定义文件…」要 145px，缩了会被截（见上面 COMBO_W 的定宽依据）。
 SHORT_CHOICE_W = 96
-# 「材质强度」整行单独一档：**滑杆不跟着下拉框一起缩**（用户 2026-11-26：
-# 「材质强度的长条可以长一点，和之前一样」）。旧口径就是 176 =
-# 滑杆 126 + 行内 gap 10 + 数值标签 40；收到 COMBO_W(152) 后滑杆只剩 102px，
-# 0~100 每档 1px 太挤，所以整行保留 176。⛔ 行宽与滑杆宽都要按它算，
-# 只改滑杆宽会被更窄的容器裁掉右边一截。
-GLASS_ROW_W = 176
+# ⛔ 这里**没有**「材质效果整行宽」常量（原 GLASS_ROW_W = 176，2026-11-27 废除）。
+# 固定值一出现就必然跟别的控件漂移：2026-11-21 曾要求整行与下拉框同宽 → 收到 176
+# 比下拉栏窄一大截；2026-11-26 又要求「别跟着下拉框缩」。现在的口径是**结构同源**：
+# 材质效果行与「动画帧率」行都用 stretch=1 的滑杆 + 56px 数值标签，
+# 于是两根滑杆宽度恒等、右端天然对齐（用户 2026-11-27：「弄得和动画帧率的一样长」）。
+# 要调宽度请改那两行的**结构**，别再引入新的固定行宽。
 # 面板整体的**兜底下限**（真正的宽度按内容算，见 __init__ 末尾那行）。
 # ⚠️ 不能再往下调：body 的最小宽由"最宽标签 187 + 18 + 最宽字段 362"决定，
 # 把下限设到 body 之下没用（内容仍然要那么宽），只会让面板在窄屏上被裁。
 PANEL_MIN_W = 470
-# 「赛季」年份下拉的宽度：4 位数 + 内边距 + 右侧 chevron
-SEASON_SPIN_W = 78
-# 赛季下拉的年份候选范围（与旧 ChevronSpinBox 的 setRange(2000, 2100) 一致）
-SEASON_MIN_YEAR = 2000
-SEASON_MAX_YEAR = 2100
+# 「赛季」年份下拉的宽度：4 位数 + 内边距 + 右侧 chevron。
+# ⚠️ 78 是**截断**过的宽度（实测内容区只剩 36px，装 "2026" 的 37px 刚好差 1px，
+#    用户 2026-11-27 截图「2026 要显示完全啊」）。按实测重算：
+#    文字 37 + 左 padding 12 + 右 padding 10 + chevron 24 + 边框 2 = 85 → 取 92 留余量。
+SEASON_SPIN_W = 92
+# 赛季下拉的年份候选范围（用户 2026-11-27：「这个赛季从2026开始，到2030就可以了」）。
+# ⛔ 曾经是 2000~2100（101 项，弹层要滚很久）；现在只覆盖车队在用的年份区间。
+#    老档案里若存着范围外的年份（如 E74-2019），_sync_vehicle_rows_impl 会按
+#    SEASON_MIN/MAX 夹进来 —— 夹不进去就退回当前年份，不会崩。
+SEASON_MIN_YEAR = 2026
+SEASON_MAX_YEAR = 2030
 # 车辆那一排里的「模组数」框宽：两颗数字（上限 64）+ 内边距。
 # ⚠️ 上限 64 只有两位数的空间，chevron 已隐藏（set_arrows_visible(False)），
 #    框里只有居中的数字 —— 86 对"5"整整空一大截，压到 72 刚好不挤（用户点名"框太大"）。
@@ -1095,8 +1101,7 @@ class VehicleLibraryDialog(QDialog):
 # 一下、再淡出露出新数据（观感与旧版一致）。实现极简：覆盖层盖住不透明清晰快照，
 # 模糊图在其上按 α 淡出；淡出期间**绝不重抓图**（旧版 resync 的 hide→grab→异步
 # update 有竞态窗口，是半透明多层残影的元凶）。连点靠统一 stop 互斥，不需要 seq。
-_VEH_SIGMA_MAX = 24.0         # 高斯强度（物理像素；图像按 1/4 计算，内部 σ/4）
-_VEH_BLUR_DIV = 4             # 1/4 降采样：全分辨率 6 档 551ms → 1/4 仅 26~31ms
+_VEH_SIGMA_MAX = 24.0         # 高斯强度（**物理**像素；在 1/8 图上按 σ/8 卷积）
 _VEH_FADE_MS = 650            # 淡出时长（ms）
 _VEH_BLUR_SIDE_CHARS = 0      # 糊层左右各外扩几个字符宽（盖过视口边缘、不留清晰窄缝）
 
@@ -1369,20 +1374,25 @@ class SettingsDialog(QDialog):
         self.slider_glass = GlassSlider(Qt.Orientation.Horizontal)
         self.slider_glass.setRange(0, 100)
         self.slider_glass.setValue(max(0, min(100, int(glass))))
-        # 让"滑杆 + 数值"整行与三只下拉框**同宽**（用户 2026-11-21 截图点名
-        # "要对齐"：滑杆原来一路顶到 490，比 176 的框多出 145px，整块看着是斜的）。
-        # ⚠️ 2026-11-26：下拉框统一收到 COMBO_W(140)，但滑杆**不能跟着缩** ——
-        #    90px 的行程太短（用户："材质强度的长条可以长一点，和之前一样"）。
-        #    滑杆这一行单独保留旧口径 GLASS_ROW_W=176（滑杆 126 + gap 10 + 数值 40），
-        #    所以整行宽与滑杆宽都要按它算，**不能**再用 COMBO_W，否则 176 宽的行
-        #    会被 140 的容器裁掉右边一截。
-        _GLASS_LBL_W = 40
+        # 长度口径（用户 2026-11-27 截图：「材质效果的滑动长条可以弄得和动画
+        # 帧率的一样长」）：**不再固定 176**，改成与滑杆行同一套 —— 滑杆吃满
+        # 字段列的余量（stretch=1）、数值标签同一档 56px，于是两根滑杆右端
+        # 天然对齐、长度恒等（实测同一面板下都是 328px）。
+        # ⚠️ 历史口径留档：2026-11-21 曾要求整行与下拉框同宽 → 收到 176 反而
+        #    比 490 窄；2026-11-26 又要求"别跟着下拉框缩"。两次都是**固定值**
+        #    在跟别的控件比，本次改成"跟同一列里最宽的滑杆比"，不再出现漂移。
+        _GLASS_LBL_W = 56          # 与 _build_slider_row 的数值标签同宽（对齐右端）
         _GLASS_GAP = 10
-        self.slider_glass.setFixedWidth(GLASS_ROW_W - _GLASS_LBL_W - _GLASS_GAP)
+        self.slider_glass.setMinimumWidth(160)
         self.slider_glass.setToolTip(
             "拖动即可实时调整界面材质的效果强弱（毛玻璃与液态玻璃共用）")
         self.lbl_glass = QLabel()
         self.lbl_glass.setFont(ui_font(11.5))
+        # ⛔ 用 setFixedWidth 而不是 setMinimumWidth（2026-11-27 实测踩过）：
+        #    两根滑杆都是 stretch=1，谁右侧的标签宽，谁的滑杆就短。标签宽由自己
+        #    的文字决定 —— "100%" 比 "120" 宽约 19px，且随字号/DPI 变，于是面板
+        #    一拉宽两行就分出 473 vs 454 的差（用户要的是"一样长"）。
+        #    钉死同宽后，两根滑杆在**任何面板宽度**下都严格等长、右端齐平。
         self.lbl_glass.setFixedWidth(_GLASS_LBL_W)
         self.lbl_glass.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._refresh_glass_label(self.slider_glass.value())
@@ -1393,7 +1403,7 @@ class SettingsDialog(QDialog):
         glass_row.addWidget(self.slider_glass, 1)
         glass_row.addWidget(self.lbl_glass)
         glass_field = self._row(glass_row)
-        glass_field.setFixedWidth(GLASS_ROW_W)
+        # ⛔ 不 setFixedWidth：字段列有多宽就多宽，和「动画帧率」那一行同源。
         form.addRow(self._label("材质效果"), glass_field)
 
         # 2026-11-27 用户「这些都归纳为个性化」：开屏动画 / 动画文件从这里接到
@@ -1786,10 +1796,13 @@ class SettingsDialog(QDialog):
         self.spin_vehicle_season = ChevronComboBox()
         for _year in range(SEASON_MIN_YEAR, SEASON_MAX_YEAR + 1):
             self.spin_vehicle_season.addItem(str(_year))
-        # 默认当年（不是量程下限）：没有赛季的老档案也得显示一个像样的年份，
-        # 否则一开面板就是 2000（看着像坏了）。
+        # 默认当年（不是量程下限）：没有赛季的老档案也得显示一个像样的年份。
+        # ⚠️ 夹一下：当年若不在候选区间（比如 2031 年还在跑这台车），
+        #    `year - MIN` 会越界成 -1 或 count()，下拉框直接空白。
+        _now_year = QDate.currentDate().year()
         self.spin_vehicle_season.setCurrentIndex(
-            QDate.currentDate().year() - SEASON_MIN_YEAR)
+            max(0, min(self.spin_vehicle_season.count() - 1,
+                       _now_year - SEASON_MIN_YEAR)))
         self.spin_vehicle_season.setFixedWidth(SEASON_SPIN_W)
         # 年份居中（沿用数字框时代 2026-10-23 的口径），和下面的电芯/温度数量框同一观感
         self.spin_vehicle_season.setCenterText(True)
@@ -2040,10 +2053,12 @@ class SettingsDialog(QDialog):
         season, _number = customization.split_vehicle(current)
         season_spin = self.spin_vehicle_season
         season_spin.blockSignals(True)
-        if season.isdigit():
-            season_spin.setCurrentIndex(
-                max(SEASON_MIN_YEAR, min(SEASON_MAX_YEAR, int(season)))
-                - SEASON_MIN_YEAR)
+        if season.isdigit() and SEASON_MIN_YEAR <= int(season) <= SEASON_MAX_YEAR:
+            season_spin.setCurrentIndex(int(season) - SEASON_MIN_YEAR)
+        # ⚠️ 赛季在候选区间外（本功能只列 2026~2030，而老档案可能是 2019）：
+        #    **不要**夹到边界值 —— 那会让面板显示 "2026" 而车名其实叫 "E74-2019"，
+        #    用户以为赛季被悄悄改了。保持当前索引不动即可，改车号/新建车时才按
+        #    当前选中的年份落盘（见 _on_season_changed / _on_add_vehicle）。
         season_spin.blockSignals(False)
         self._refresh_number_combo()
 
@@ -2343,79 +2358,26 @@ class SettingsDialog(QDialog):
         return QRect(int(left), int(top), int(right - left), int(bottom - top))
 
     def _veh_blur_pixmap(self, pix: "QPixmap | None") -> "QPixmap | None":
-        """高质量毛玻璃：块平均降采样 → 可分离真高斯 → 平滑放大 → 1:1 贴图。
+        """车号过渡的毛玻璃：复用 ``ui_perf_mode._blur_pixmap``（全项目唯一一份）。
 
-        ⛔ 不是「把小位图交给 drawPixmap 拉伸」：那样等于降分辨率，文字会糊成
-        马赛克、还带一层次级波纹（用户 2026-11-13「要高级的高斯模糊」）。
-        这里按 ``ui_perf_mode._blur_pixmap`` 已验证的口径：
-          ① **块平均**降采样（理想低通，比隔点抽样少一大截高频噪点）；
-          ② ``splash_motion._gaussian`` 可分离真高斯，σ 按降采样比换算；
-          ③ SmoothTransformation 平滑放大回**原尺寸**；
-          ④ 保持原 dpr，覆盖层 1:1 贴图（不再二次缩放）。
-        另外做一次轻微的亮度/去饱和，让糊层像毛玻璃而不是一张灰蒙蒙的图。
-        失败返回 None（覆盖层那一段直接跳过，不崩动画）。
+        ⛔ 这里**不再自己写**降采样 + 卷积（2026-11-13 曾有两份实现，参数一改
+        就分叉，两边糊出来的东西不一样）。``0.82`` 是去饱和系数：让糊层像毛玻璃
+        而不是灰蒙蒙一片；⛔ 不提亮（提亮会让糊区变成一块发白的矩形）。
         """
         if pix is None or pix.isNull():
             return None
         try:
-            import numpy as np
-            import splash_motion
-            from PySide6.QtGui import QImage
+            from ui_perf_mode import _blur_pixmap
 
-            dpr = pix.devicePixelRatioF() or 1.0
-            image = pix.toImage().convertToFormat(
-                QImage.Format.Format_RGBA8888)
-            width, height = image.width(), image.height()
-            if width < 8 or height < 8:
-                return pix
-            stride = image.bytesPerLine()
-            raw = np.frombuffer(image.constBits(), dtype=np.uint8,
-                                count=stride * height).reshape(height, stride)
-            arr = raw[:, : width * 4].reshape(height, width, 4).astype(np.float32)
-
-            div = _VEH_BLUR_DIV
-            small_w, small_h = width // div, height // div
-            if small_w < 8 or small_h < 8:
-                div = 2
-                small_w, small_h = width // div, height // div
-            # 块平均 = 理想低通；隔点抽样会在模糊图里残留次级波纹。
-            small = arr[: small_h * div, : small_w * div].reshape(
-                small_h, div, small_w, div, 4).mean(axis=(1, 3))
-            small = splash_motion._gaussian(
-                small.astype(np.float32), _VEH_SIGMA_MAX / float(div))
-            if small is None:
+            out = _blur_pixmap(pix, _VEH_SIGMA_MAX, desaturate=0.82)
+            if out is None or out.isNull():
                 return None
-            small = np.asarray(small, dtype=np.float32)
-
-            # 毛玻璃质感：轻微去饱和（保持黑白灰系统，不引第三种色）。
-            # ⛔ 不要在这里**提亮**（曾经 +6.0）：糊层一旦比面板底色亮，整块模糊
-            #    区域就成了一块"发白的矩形"，边界肉眼可见 —— 用户反复说的"残影"
-            #    有一半是这块矩形本身（真机逐帧：淡出结束后逐像素完全一致，没有
-            #    任何残留层，见 _check/ghost2/）。只去饱和、不动亮度，观感就是
-            #    "这片内容失焦"，而不是"贴了一层东西"。
-            rgb = small[:, :, :3]
-            lum = rgb.mean(axis=2, keepdims=True)
-            rgb = np.clip(lum + (rgb - lum) * 0.82, 0.0, 255.0)
-            small = np.concatenate((rgb, small[:, :, 3:4]), axis=2)
-
-            out = np.clip(small, 0, 255).astype(np.uint8)
-            out = np.ascontiguousarray(out)
-            blurred = QImage(out.data, small_w, small_h, 4 * small_w,
-                             QImage.Format.Format_RGBA8888).copy()
-            result = QPixmap.fromImage(blurred).scaled(
-                width, height, Qt.AspectRatioMode.IgnoreAspectRatio,
-                Qt.TransformationMode.SmoothTransformation)
             # ⚠️ PySide6 的 QPixmap 只有 setDevicePixelRatio（无 F 版本），
-            #    写 setDevicePixelRatioF 会 AttributeError → 被 except 吞掉 → 整段
-            #    模糊静默失效（2026-11-13 实测踩过）。
-            result.setDevicePixelRatio(dpr)
-            return result
+            #    写 setDevicePixelRatioF 会 AttributeError → 整段模糊静默失效。
+            out.setDevicePixelRatio(pix.devicePixelRatioF() or 1.0)
+            return out
         except Exception as exc:      # noqa: BLE001 - 降级必须留痕，不能静默
-            try:
-                import app_log
-                app_log.warning(f"车号过渡高斯模糊降级：{exc!r}")
-            except Exception:        # noqa: BLE001
-                pass
+            app_log.warning(f"车号过渡高斯模糊降级：{exc!r}")
             return None
 
     def _update_module_row_values(self, cells: list[int], temps: list[int]) -> None:
@@ -3201,7 +3163,10 @@ class SettingsDialog(QDialog):
             slider.setToolTip(spec["tip"])
         value_label = QLabel()
         value_label.setFont(ui_font(11.5))
-        value_label.setMinimumWidth(56)
+        # ⛔ setFixedWidth：滑杆是 stretch=1，标签宽一点滑杆就短一截。标签宽度
+        #    若跟着文字走（"120" 与 "100%" 不等宽），「材质效果」那根滑杆就永远
+        #    跟本行对不齐 —— 用户 2026-11-27 要的是"一样长"。
+        value_label.setFixedWidth(56)
         value_label.setAlignment(Qt.AlignmentFlag.AlignRight
                                  | Qt.AlignmentFlag.AlignVCenter)
         self._refresh_slider_label(spec, slider.value(), value_label)
@@ -3216,12 +3181,16 @@ class SettingsDialog(QDialog):
         # valueChanged，数值标签 / 预览 / 主窗口的实时预览全部跟着走。
         # 用**图标**（环形箭头 = 重置的通用符号，用户点名"还原按键用图标"）
         # —— 图标按钮必须带 tooltip 与读屏名称，否则只能靠猜。
-        reset_btn = IconButton(GLYPH_REFRESH, "恢复默认值", size=24,
-                               glyph_size=13)
-        reset_btn.setAccessibleName("恢复默认值")
-        reset_btn.clicked.connect(
-            lambda _=False, s=spec, sl=slider: sl.setValue(int(s["default"])))
-        slider_row.addWidget(reset_btn)
+        # ⛔ 「动画帧率」**不放这颗按钮**（用户 2026-11-27：「动画帧率的长条也
+        #    不需要恢复默认值」）—— 它的默认值就是个中庸的 120，用户既然会手动
+        #    拖，就不需要一个"回到 120"的捷径；省下的宽度全给滑杆（实测 +34px）。
+        if spec["key"] != "anim_fps":
+            reset_btn = IconButton(GLYPH_REFRESH, "恢复默认值", size=24,
+                                   glyph_size=13)
+            reset_btn.setAccessibleName("恢复默认值")
+            reset_btn.clicked.connect(
+                lambda _=False, s=spec, sl=slider: sl.setValue(int(s["default"])))
+            slider_row.addWidget(reset_btn)
         field = self._row(slider_row)
         widget = slider
         row_label = self._label(spec["label"])

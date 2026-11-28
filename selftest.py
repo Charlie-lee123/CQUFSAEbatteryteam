@@ -34,7 +34,8 @@ from pathlib import Path
 
 from ble_io import BleBroadcastWorker
 from serial_io import (
-    SerialWorker, StreamDecoder, _port_sort_key, list_serial_ports, parse_hex, to_hex,
+    SerialWorker, StreamDecoder, _port_sort_key, is_bluetooth_port, list_serial_ports,
+    parse_hex, to_hex,
 )
 
 
@@ -457,6 +458,15 @@ def check_port_enumeration() -> None:
     # 时就会挑错人（本机 COM 号上到两位数就会撞上）
     assert sorted(["COM10", "COM2", "COM3", "COM1"], key=_port_sort_key) == \
         ["COM1", "COM2", "COM3", "COM10"], "端口名没按数字排序"
+    # 蓝牙 SPP 虚拟串口必须被串口视图滤掉（用户 2026-11-27：「串口就串口，
+    # 蓝牙就蓝牙，在串口不要显示蓝牙」）。判据只认 hwid 的 BTHENUM 前缀 ——
+    # 描述文字随系统语言变，拿它判会在英文系统上漏。
+    assert is_bluetooth_port(r"BTHENUM\{00001101-0000-1000-8000-00805F9B34FB}_LOCALMFG&0000"), \
+        "蓝牙 SPP 串口没被识别"
+    assert is_bluetooth_port("bthenum\\x"), "hwid 小写时没识别出蓝牙"
+    assert not is_bluetooth_port(r"USB VID:PID=0483:374B SER=..."), "USB 串口被误判成蓝牙"
+    assert not is_bluetooth_port(""), "空 hwid 被误判成蓝牙"
+    assert not is_bluetooth_port(None), "None hwid 被误判成蓝牙"
     print(f"      本机串口: {ports if ports else '无（用 loop:// 自测即可）'}")
 
 
@@ -516,7 +526,7 @@ def check_port_hotplug(app: QApplication) -> None:
     snapshot = {key: settings.value(key) for key in settings.allKeys()}
     real_ports = mw.list_serial_ports
     fake: list[tuple[str, str]] = []
-    mw.list_serial_ports = lambda: list(fake)
+    mw.list_serial_ports = lambda **_: list(fake)   # 接受 include_bluetooth 等关键字
     window = make_window()
     warnings: list[str] = []
     window._warn = warnings.append          # 手动打开失败会弹模态框，自测里换成记录
@@ -3981,25 +3991,46 @@ def check_customization(app: QApplication) -> None:
                 (f"界面材质没有排到主题右边（应同属一行）："
                  f"{left_x(dialog.cmb_material)} vs {_theme_right}")
             # 材质效果那一行（滑杆 + 数值；旧名「材质强度」，用户 2026-11-27 改名）
-            # **左缘**与下拉框对齐，但整行单独一档 GLASS_ROW_W=176 —— 用户
-            # 2026-11-26：「材质强度的长条可以长一点，和之前一样」。下拉框统一
-            # 收到 COMBO_W(140) 后滑杆只剩 90px，行程太挤；
-            # 所以这里**不再要求与下拉框同右缘**（那是 2026-11-21 的旧口径），
-            # 只要求整行宽 = GLASS_ROW_W 且三段之和正好填满（滑杆 + gap + 数值）。
-            from ui_settings import GLASS_ROW_W
+            # 长度口径（用户 2026-11-27 截图：「材质效果的滑动长条可以弄得和动画
+            # 帧率的一样长」）：**不再有 GLASS_ROW_W 这一档固定值**，改成与
+            # 「动画帧率」那行同一套结构 —— 滑杆 stretch=1 吃满余量 + 数值标签
+            # 56px，于是两根滑杆等宽、右端对齐。
+            # ⚠️ 旧口径留档（别再往回改）：2026-11-21 要求整行与下拉框同宽 →
+            #    收到 176 比下拉栏窄一大截；2026-11-26 又要求「别跟着下拉框缩」。
+            #    两次都是拿**固定值**去跟别的控件比，必然漂移。现在的判据是
+            #    「跟同一列里那根基准滑杆比」—— 结构同源，宽度就恒等。
             glass_field = dialog.lbl_glass.parentWidget()
             assert glass_field is not None, "材质效果那一行没有容器"
-            assert glass_field.width() == GLASS_ROW_W, \
-                f"材质效果整行宽 {glass_field.width()} ≠ {GLASS_ROW_W}"
-            _gap = glass_field.layout().spacing()
-            _sum = (dialog.slider_glass.width() + _gap
-                    + dialog.lbl_glass.width())
-            assert _sum == GLASS_ROW_W, \
-                (f"材质效果行内三段之和不等于整行宽：{_sum} ≠ {GLASS_ROW_W}"
-                 f"（滑杆 {dialog.slider_glass.width()} + gap {_gap} + 数值 "
-                 f"{dialog.lbl_glass.width()}）")
-            assert dialog.slider_glass.width() >= 120, \
-                f"材质效果滑杆太短（{dialog.slider_glass.width()}px），拖不动"
+            assert glass_field.layout() is not None, "材质效果行没有布局"
+            # 结构同源：滑杆拿 stretch，数值标签是行末最后一个（右边没有按钮）
+            _glay = glass_field.layout()
+            assert _glay.itemAt(0).widget() is dialog.slider_glass, \
+                "材质效果行第一个不是滑杆"
+            assert _glay.itemAt(_glay.count() - 1).widget() is dialog.lbl_glass, \
+                ("材质效果行的数值标签不在行末（滑杆没吃到余量，会短一截）")
+            # 与「动画帧率」那根滑杆对照（这是本次改动的**用户可见目的**：一样长）
+            _fps_slider = dialog._custom_widgets.get("anim_fps")
+            # 数值标签与滑杆行的同一档，否则两根滑杆的右端错开。
+            # ⛔ 必须查实测宽度而不是 minimumWidth：stretch=1 的滑杆旁边若有
+            #    一个"最小 56 但内容更宽"的标签，滑杆就会短掉那点差额（实测
+            #    473 vs 454）。只有钉死宽度才能保证任何面板宽度下都等长。
+            _g_lbl_w = dialog.lbl_glass.width()
+            _f_lbl_w = (_fps_slider.parentWidget().layout().itemAt(1).widget()
+                        .width() if _fps_slider is not None else _g_lbl_w)
+            assert _g_lbl_w == _f_lbl_w == 56, \
+                (f"两侧数值标签宽 {_g_lbl_w}/{_f_lbl_w} 不都是 56"
+                 f"（标签宽不等 → 滑杆长度不等）")
+            assert dialog.slider_glass.minimumWidth() >= 160, \
+                (f"材质效果滑杆最小宽 {dialog.slider_glass.minimumWidth()} < 160，"
+                 f"行程太挤拖不动")
+            if _fps_slider is not None:
+                assert dialog.slider_glass.width() == _fps_slider.width(), \
+                    (f"材质效果滑杆 {dialog.slider_glass.width()}px 与动画帧率滑杆 "
+                     f"{_fps_slider.width()}px 不等长（用户要求一样长）")
+                _g_right = left_x(dialog.slider_glass) + dialog.slider_glass.width()
+                _f_right = left_x(_fps_slider) + _fps_slider.width()
+                assert _g_right == _f_right, \
+                    (f"两根滑杆右端没对齐：材质 {_g_right} vs 帧率 {_f_right}")
             # 最长条目必须能完整显示（框宽缩了但不能把字截了）。
             from PySide6.QtWidgets import QStyle, QStyleOptionComboBox
             for name, w in appear:
@@ -4068,9 +4099,23 @@ def check_customization(app: QApplication) -> None:
                 "anim_fps 登记的字段容器不是滑杆所在的行容器"
             assert "anim_fps" in dialog._custom_baseline, \
                 "anim_fps 没进 _custom_baseline（提前生成后漏登记）"
+            # ⛔ 「动画帧率」行**不该有**复原按钮（用户 2026-11-27：「动画帧率的
+            #    长条也不需要恢复默认值」）。它的默认值 120 只是个中庸值，用户既然
+            #    会手拖就不需要「回到 120」的捷径；省下的宽度全给滑杆。
             _reset_btns = [b for b in _fps.parentWidget().findChildren(QPushButton)
                            if b.accessibleName() == "恢复默认值"]
-            assert _reset_btns, "动画帧率行丢了「恢复默认值」复原按钮"
+            assert not _reset_btns, \
+                ("动画帧率行又长出「恢复默认值」按钮了（用户明确要求去掉）；"
+                 f"找到 {len(_reset_btns)} 颗")
+            # 本该在的还必须在：字号行的复原按钮不受牵连
+            _font_slider = dialog._custom_widgets.get("rx_font_size")
+            assert _font_slider is not None, "rx_font_size 滑杆不见了"
+            _font_resets = [b for b in _font_slider.parentWidget()
+                            .findChildren(QPushButton)
+                            if b.accessibleName() == "恢复默认值"]
+            assert len(_font_resets) == 1, \
+                (f"字号行的复原按钮被误删了（应保留 1 颗，实际 "
+                 f"{len(_font_resets)} 颗）")
 
             # 6a-1f) 「本地 / 主控」短下拉框收窄，但内容区仍装得下两字选项。
             # 宽度断言读常量反推，不写死用户可配置的数值。
@@ -5305,7 +5350,7 @@ def check_send_enter_and_stamp(app: QApplication) -> None:
     _cu_pin.set("volt_limit_high", 4500)
     real_ports = mw.list_serial_ports
     fake: list[tuple[str, str]] = [("loop://", "回环端口（假）")]
-    mw.list_serial_ports = lambda: list(fake)
+    mw.list_serial_ports = lambda **_: list(fake)   # 接受 include_bluetooth 等关键字
     window = make_window()
     try:
         window.show()

@@ -132,7 +132,7 @@ REPLAY_PAGE_LINES = 1200        # 近期数据：一页多少行（约 10~12 轮
 REPLAY_PAGE_POINTS = 100        # 历史数据：一页多少个采样点
 # 历史数据一页的**行数上限**：一条采样点几行由数据源决定（E74 实测 24 行/点，
 # 别的车可能 8 行/点），只卡点数时"一页多高、要花多久"不可预测。1200 行 ≈ 50 点
-# ≈ 60ms（见 devtools/_perf_replay_hist.py），与近期 REPLAY_PAGE_LINES=1200 对齐 ——
+# ≈ 60ms（E74 实测 50 点 ≈ 1200 行），与近期 REPLAY_PAGE_LINES=1200 对齐 ——
 # 两条回放路径翻出来的"一页"看上去一样多。⛔ 按采样点整块追加，最多超出一条点。
 REPLAY_PAGE_MAX_LINES = 1200
 # 触发提前量（像素）：离顶部还有这么远就开始取下一页，快速拖动也来得及。
@@ -297,6 +297,16 @@ LINK_SERIAL, LINK_BLE = LINK_CHOICES
 # 点刷新时扫多久（秒）。广播包密度不高（每个设备每秒几包），3.5 秒足够把周围
 # 设备列全；再长用户就要等得心急了。
 BLE_SCAN_SECONDS = 3.5
+
+# 连接方式切换的高斯模糊参数（用户 2026-11-27：「连接模式切换的高斯模糊可以
+# 参考车号切换，时间可以再长一点」）。这两个值刻意与设置面板的**车号切换**
+# 对齐（那边是 ui_settings._VEH_SIGMA_MAX = 24 物理像素 / _VEH_FADE_MS = 650ms）：
+#   · 强度 24 物理像素（dpr=2 → 12 逻辑像素）比 _blur_pixmap 的默认 16 明显更糊，
+#     两张截图放一起能看出是同一套观感；
+#   · 650ms 比原来的 560ms 再长一点 —— 用户要的"时间可以再长一点"就是这一档，
+#     再往 800ms 就会觉得"切个连接方式怎么这么久"。
+_CFG_BLUR_SIGMA = 24.0
+_CFG_BLUR_MS = 650
 
 # 时间戳打在哪儿：**只打在每一轮数据的轮首**，也就是用户要的"只放在 Voltage1 前面"。
 #
@@ -2499,8 +2509,13 @@ class MainWindow(QMainWindow):
         # 分屏收窄时这一行要整条改成竖排（见 _set_opts_vertical）
         self._rx_opts_lay = opts
         self.chk_timestamp = Switch("显示时间戳")
+        # 文字在左、轨道在右（用户 2026-11-27 截图：「这里开关和文字位置换一下」）。
+        # 同一排的「HEX 显示」与「编码」一起换，否则这一行左边是"文字+轨道"、
+        # 右边是"轨道+文字"，看着像两套控件拼起来的。
+        self.chk_timestamp.set_text_first(True)
         self.chk_timestamp.setChecked(True)
         self.chk_hex_view = Switch("HEX 显示")
+        self.chk_hex_view.set_text_first(True)
         self.cmb_encoding = ChevronComboBox()
         self.cmb_encoding.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.cmb_encoding.addItems(ENCODINGS)
@@ -6615,8 +6630,13 @@ class MainWindow(QMainWindow):
 
         ``clear_selection=True``：刷新后不保持任何选择（框里空白），用于
         蓝牙→串口切换。默认 False：保持当前选中项（或显式 keep_device）。
+
+        ⛔ 只枚举**真串口**（``include_bluetooth=False``）：Windows 会把已配对的
+        蓝牙 SPP 设备装成一个 COM 口，那是「连接方式 = 蓝牙广播」那条路的东西，
+        放进串口列表里等于让用户对着一个打不开的串口点。用户 2026-11-27 原话：
+        「串口就串口，蓝牙就蓝牙，在串口不要显示蓝牙」。
         """
-        ports = list_serial_ports()
+        ports = list_serial_ports(include_bluetooth=False)
         keep = "" if clear_selection else (keep_device or self._selected_port())
         self._fill_port_combo(ports, keep, clear_selection=clear_selection)
         if announce:
@@ -6650,7 +6670,7 @@ class MainWindow(QMainWindow):
         self._driver_ticks += 1
         if self._driver_ticks % DRIVER_CHECK_POLLS == 0:
             self._maybe_install_drivers(force=True)
-        ports = list_serial_ports()
+        ports = list_serial_ports(include_bluetooth=False)
         if ports == self._known_ports:
             return
 
@@ -6888,7 +6908,8 @@ class MainWindow(QMainWindow):
         # 关掉之后重扫一次：设备可能已经拔了，下拉框不该继续留着它
         # （蓝牙广播模式下不扫串口 —— 否则会把设备列表冲掉）
         if not self._link_is_ble():
-            self._fill_port_combo(list_serial_ports(), self._selected_port())
+            self._fill_port_combo(list_serial_ports(include_bluetooth=False),
+                                  self._selected_port())
 
     def _reap_retired(self) -> None:
         """给"建链中被取消"的 worker 收尸：**确认线程真的结束了**再销毁。
@@ -10590,8 +10611,8 @@ class MainWindow(QMainWindow):
         时序（调用方保证旧图已抓、新版式已落定）：
           ① 抓新版式的清晰快照当**不透明垫底**（淡出全程底下的像素恒为"新界面"，
             不会闪、也不会透出后面的壁纸）；
-          ② 覆盖层先画垫底、再按 α 叠**旧版式的高斯模糊图**，560ms α 1→0
-            （2026-11-27 用户要"时间再适当长一点"，原 400ms）；
+          ② 覆盖层先画垫底、再按 α 叠**旧版式的高斯模糊图**，``_CFG_BLUR_MS``(650ms)
+            α 1→0（400ms → 560ms → 650ms；用户 2026-11-27：「时间可以再长一点」）；
           ③ 到 0 直接撤层 —— 此时覆盖层与真控件逐像素相同，撤掉不跳。
 
         观感因此是「旧界面糊成一团 → 化开 → 新界面」，全程没有位移、没有裁切。
@@ -10630,7 +10651,11 @@ class MainWindow(QMainWindow):
             return
         # 高质量高斯模糊：块平均降采样 → 可分离真高斯 → 平滑放大回原尺寸
         # （与设置面板车号切换同一口径，见 ui_perf_mode._blur_pixmap）。
-        blurred = _blur_pixmap(blur_src)
+        # ⚠️ 用户 2026-11-27「连接模式切换的高斯模糊可以参考车号切换」：
+        #    强度与时长都对齐车号切换那一套 —— σ 用 _CFG_BLUR_SIGMA（= 车号那边的
+        #    _VEH_SIGMA_MAX 24 物理像素，比默认的 16 明显更"糊"），时长用
+        #    _CFG_BLUR_MS，去饱和沿用 0.82 的毛玻璃口径。
+        blurred = _blur_pixmap(blur_src, _CFG_BLUR_SIGMA, desaturate=0.82)
         if blurred.isNull():
             return
         if blurred.size() != shot_new.size():
@@ -10652,7 +10677,7 @@ class MainWindow(QMainWindow):
             self._params_fade = overlay
         overlay.show_frame(shot_new, blurred, rect, 1.0)
 
-        tween = Tween(560, out_cubic,
+        tween = Tween(_CFG_BLUR_MS, out_cubic,
                       lambda v: self._config_fade_step(v),
                       self._config_fade_done, parent=self, min_interval_ms=8)
         self._params_tween = tween
@@ -11161,7 +11186,11 @@ class MainWindow(QMainWindow):
             app.aboutToQuit.connect(self._shutdown_dlc)
 
     def _dlc_add_launcher(self, text: str, callback, tooltip: str = "") -> None:
-        """插件上下文注册面板回调（不生成按钮，只存起来由「DLC」按钮调用）。"""
+        """插件上下文注册面板回调（不生成按钮，只存起来由「DLC」按钮调用）。
+
+        ``tooltip`` 留着是为了不破坏已发布插件的调用签名（面板不用它）。
+        """
+        _ = tooltip
         self._dlc_launcher_cbs[text] = callback
 
     def _dlc_open_panel(self, plugin_id: str) -> bool:
