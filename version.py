@@ -34,12 +34,12 @@ SETUP_ASSET_SUFFIX = ".exe"
 # v3.0（用户 2026-11-27 定案：本轮改动仍算 3.0，不另立 3.1）→ 发布脚本在发
 # Release 时写回本版真实哈希，在那之前按规矩留空。
 LATEST_EXE_SHA256 = (
-    "6c21cc09584e868bde94d5997f562c23c437475629b6f3b13dbfe8345256a751"
+    "bf5eaad01cc4092d6996f3dd8006059d2dc69d594d3fb558ba708c479d40af4f"
 )
 
 # 当前 Release 里**安装包**的 SHA256（同上，由发布脚本写回）。
 # 空串 = 尚未记录（同上：更新会明确报错而不是静默跳过）。
 LATEST_SETUP_SHA256 = (
-    "ecd1d8462d70aa39ea471282fafe6f6fae46dd32b45256a0818a152cd5205cb7"
+    "5571fc560171e1acf49214cc326189491cff5bb26310735310ae12e3bc543452"
 )
 
